@@ -1,0 +1,737 @@
+"""PrimitiveExecutor - Data-driven tool execution with recursive chain resolution.
+
+Routes tools to Lilux primitives based on __executor_id__ metadata.
+Loads tools on-demand from .ai/tools/ with 3-tier space precedence.
+
+Architecture:
+    Layer 1: Primitives (__executor_id__ = None) - Execute directly via Lilux
+    Layer 2: Runtimes (__executor_id__ = "subprocess") - Resolve ENV_CONFIG first
+    Layer 3: Tools (__executor_id__ = "python_runtime") - Delegate to runtimes
+
+Caching:
+    - Chain cache: Caches resolved execution chains with hash-based invalidation
+    - Metadata cache: Caches tool metadata with hash-based invalidation
+    - Automatic invalidation when file content changes (via Lilux hash functions)
+"""
+
+import ast
+import hashlib
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from lilux.primitives.subprocess import SubprocessPrimitive, SubprocessResult
+from lilux.primitives.http_client import HttpClientPrimitive, HttpResult
+from lilux.runtime.env_resolver import EnvResolver
+
+from rye.executor.chain_validator import ChainValidator, ChainValidationResult
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CacheEntry:
+    """Cache entry with hash for invalidation."""
+
+    data: Any
+    content_hash: str
+
+
+@dataclass
+class ExecutionResult:
+    """Result of tool execution."""
+
+    success: bool
+    data: Any = None
+    error: Optional[str] = None
+    duration_ms: float = 0.0
+    chain: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ChainElement:
+    """Element in the executor chain."""
+
+    item_id: str
+    path: Path
+    space: str  # "project", "user", "system"
+    tool_type: Optional[str] = None
+    executor_id: Optional[str] = None
+    env_config: Optional[Dict[str, Any]] = None
+    config_schema: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None
+
+
+class PrimitiveExecutor:
+    """Data-driven executor that routes tools to Lilux primitives.
+
+    No hardcoded executor IDs - all resolved from .ai/tools/ filesystem.
+
+    Three-layer routing:
+        1. Primitive (__executor_id__ = None): Direct Lilux execution
+        2. Runtime (__executor_id__ = "subprocess"): ENV_CONFIG resolution + primitive
+        3. Tool (__executor_id__ = "python_runtime"): Delegate to runtime
+    """
+
+    # Primitive name to Lilux primitive class mapping
+    PRIMITIVE_MAP = {
+        "subprocess": SubprocessPrimitive,
+        "http_client": HttpClientPrimitive,
+    }
+
+    def __init__(
+        self,
+        project_path: Optional[Path] = None,
+        user_space: Optional[Path] = None,
+        system_space: Optional[Path] = None,
+    ):
+        """Initialize executor with space paths.
+
+        Args:
+            project_path: Project root for .ai/ resolution
+            user_space: User space (~/.ai/)
+            system_space: System space (site-packages/rye/.ai/)
+        """
+        self.project_path = Path(project_path) if project_path else Path.cwd()
+        self.user_space = Path(user_space) if user_space else self._get_user_space()
+        self.system_space = (
+            Path(system_space) if system_space else self._get_system_space()
+        )
+
+        self.env_resolver = EnvResolver(project_path=self.project_path)
+        self.chain_validator = ChainValidator()
+
+        # Primitive instances (lazy loaded)
+        self._primitives: Dict[str, Any] = {}
+
+        # Caches with hash-based invalidation
+        self._chain_cache: Dict[
+            str, CacheEntry
+        ] = {}  # item_id -> CacheEntry(chain, hash)
+        self._metadata_cache: Dict[
+            str, CacheEntry
+        ] = {}  # path -> CacheEntry(metadata, hash)
+
+    async def execute(
+        self,
+        item_id: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        validate_chain: bool = True,
+    ) -> ExecutionResult:
+        """Execute a tool by resolving its executor chain recursively.
+
+        Args:
+            item_id: Tool identifier (e.g., "git", "python_runtime")
+            parameters: Runtime parameters for the tool
+            validate_chain: Whether to validate chain before execution
+
+        Returns:
+            ExecutionResult with execution details
+        """
+        import time
+
+        start_time = time.time()
+        parameters = parameters or {}
+
+        try:
+            # 1. Build the executor chain
+            chain = await self._build_chain(item_id)
+
+            if not chain:
+                return ExecutionResult(
+                    success=False,
+                    error=f"Tool not found: {item_id}",
+                    duration_ms=(time.time() - start_time) * 1000,
+                )
+
+            # 2. Validate chain if requested
+            if validate_chain:
+                validation = self._validate_chain(chain)
+                if not validation.valid:
+                    return ExecutionResult(
+                        success=False,
+                        error=f"Chain validation failed: {'; '.join(validation.issues)}",
+                        chain=[self._chain_element_to_dict(e) for e in chain],
+                        duration_ms=(time.time() - start_time) * 1000,
+                    )
+
+            # 3. Resolve environment through the chain
+            resolved_env = self._resolve_chain_env(chain)
+
+            # 4. Execute via the root primitive
+            result = await self._execute_chain(chain, parameters, resolved_env)
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            return ExecutionResult(
+                success=result.get("success", False),
+                data=result.get("data"),
+                error=result.get("error"),
+                duration_ms=duration_ms,
+                chain=[self._chain_element_to_dict(e) for e in chain],
+                metadata={"resolved_env_keys": list(resolved_env.keys())},
+            )
+
+        except Exception as e:
+            logger.exception(f"Execution failed for {item_id}: {e}")
+            return ExecutionResult(
+                success=False,
+                error=str(e),
+                duration_ms=(time.time() - start_time) * 1000,
+            )
+
+    async def _build_chain(
+        self, item_id: str, force_refresh: bool = False
+    ) -> List[ChainElement]:
+        """Build executor chain by following __executor_id__ recursively.
+
+        Chain is ordered: [tool, runtime, ..., primitive]
+        Root of chain (last element) has executor_id = None.
+
+        Uses hash-based caching for performance. Chain is automatically
+        invalidated when any file in the chain changes.
+
+        Args:
+            item_id: Starting tool identifier
+            force_refresh: Skip cache and rebuild from filesystem
+
+        Returns:
+            List of ChainElements from tool to primitive
+        """
+        # Check cache first (unless force refresh)
+        if not force_refresh:
+            cached_chain = self._get_cached_chain(item_id)
+            if cached_chain is not None:
+                return cached_chain
+
+        chain: List[ChainElement] = []
+        visited: set[str] = set()
+        current_id = item_id
+        current_space = "project"  # Start resolution from project space
+
+        while current_id:
+            # Detect circular dependencies
+            if current_id in visited:
+                raise ValueError(f"Circular dependency detected: {current_id}")
+            visited.add(current_id)
+
+            # Resolve tool path with precedence
+            resolved = self._resolve_tool_path(current_id, current_space)
+            if not resolved:
+                if chain:
+                    raise ValueError(f"Executor not found: {current_id}")
+                return []  # Tool not found
+
+            path, space = resolved
+
+            # Load metadata (with caching)
+            metadata = self._load_metadata_cached(path)
+
+            element = ChainElement(
+                item_id=current_id,
+                path=path,
+                space=space,
+                tool_type=metadata.get("tool_type"),
+                executor_id=metadata.get("executor_id"),
+                env_config=metadata.get("env_config"),
+                config_schema=metadata.get("config_schema"),
+                config=metadata.get("config"),
+            )
+            chain.append(element)
+
+            # Check if we've reached a primitive
+            if element.executor_id is None:
+                break
+
+            # Move to next executor in chain
+            current_id = element.executor_id
+            current_space = space  # Maintain space context for resolution
+
+        # Cache the resolved chain
+        if chain:
+            self._cache_chain(item_id, chain)
+
+        return chain
+
+    def _load_metadata_cached(self, path: Path) -> Dict[str, Any]:
+        """Load metadata with hash-based caching."""
+        # Check cache first
+        cached = self._get_cached_metadata(path)
+        if cached is not None:
+            return cached
+
+        # Cache miss - load from file
+        metadata = self._load_metadata(path)
+
+        # Cache for future access
+        self._cache_metadata(path, metadata)
+
+        return metadata
+
+    def _resolve_tool_path(
+        self, item_id: str, current_space: str = "project"
+    ) -> Optional[Tuple[Path, str]]:
+        """Resolve tool path using 3-tier space precedence.
+
+        Resolution order: project > user > system
+        Each space can shadow tools from lower-precedence spaces.
+
+        Args:
+            item_id: Tool identifier
+            current_space: Current tool's space (affects resolution rules)
+
+        Returns:
+            (path, space) tuple or None if not found
+        """
+        # Determine search order based on current space
+        if current_space == "system":
+            # System tools can only depend on system tools
+            search_order = [
+                (self.system_space / "tools", "system"),
+            ]
+        elif current_space == "user":
+            # User tools can depend on user or system tools
+            search_order = [
+                (self.user_space / "tools", "user"),
+                (self.system_space / "tools", "system"),
+            ]
+        else:  # project
+            # Project tools can depend on any space
+            search_order = [
+                (self.project_path / ".ai" / "tools", "project"),
+                (self.user_space / "tools", "user"),
+                (self.system_space / "tools", "system"),
+            ]
+
+        extensions = [".py", ".yaml", ".yml"]
+
+        for base_path, space in search_order:
+            if not base_path.exists():
+                continue
+
+            # Search in root
+            for ext in extensions:
+                direct_path = base_path / f"{item_id}{ext}"
+                if direct_path.exists():
+                    return (direct_path, space)
+
+            # Search in subdirectories (rye/core/primitives/, etc.)
+            for ext in extensions:
+                for file_path in base_path.rglob(f"{item_id}{ext}"):
+                    if file_path.is_file() and file_path.stem == item_id:
+                        return (file_path, space)
+
+        return None
+
+    def _load_metadata(self, path: Path) -> Dict[str, Any]:
+        """Load tool metadata from file.
+
+        Extracts:
+            - __tool_type__
+            - __executor_id__
+            - __category__
+            - __version__
+            - CONFIG_SCHEMA
+            - ENV_CONFIG
+            - CONFIG
+
+        Args:
+            path: Path to tool file
+
+        Returns:
+            Metadata dict
+        """
+        metadata: Dict[str, Any] = {}
+
+        try:
+            content = path.read_text(encoding="utf-8")
+
+            if path.suffix == ".py":
+                metadata = self._parse_python_metadata(content)
+            elif path.suffix in (".yaml", ".yml"):
+                metadata = self._parse_yaml_metadata(content)
+
+        except Exception as e:
+            logger.warning(f"Failed to load metadata from {path}: {e}")
+
+        return metadata
+
+    def _parse_python_metadata(self, content: str) -> Dict[str, Any]:
+        """Parse Python file for metadata using AST.
+
+        Extracts module-level assignments and dict literals.
+        """
+        metadata: Dict[str, Any] = {}
+
+        try:
+            tree = ast.parse(content)
+
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    target = node.targets[0]
+                    if isinstance(target, ast.Name):
+                        name = target.id
+
+                        # Simple string/None assignments
+                        if isinstance(node.value, ast.Constant):
+                            if name == "__version__":
+                                metadata["version"] = node.value.value
+                            elif name == "__tool_type__":
+                                metadata["tool_type"] = node.value.value
+                            elif name == "__executor_id__":
+                                metadata["executor_id"] = node.value.value
+                            elif name == "__category__":
+                                metadata["category"] = node.value.value
+
+                        # Dict assignments (CONFIG_SCHEMA, ENV_CONFIG, CONFIG)
+                        elif isinstance(node.value, ast.Dict):
+                            if name == "CONFIG_SCHEMA":
+                                metadata["config_schema"] = self._ast_dict_to_dict(
+                                    node.value
+                                )
+                            elif name == "ENV_CONFIG":
+                                metadata["env_config"] = self._ast_dict_to_dict(
+                                    node.value
+                                )
+                            elif name == "CONFIG":
+                                metadata["config"] = self._ast_dict_to_dict(node.value)
+
+        except SyntaxError:
+            logger.warning("Failed to parse Python file")
+
+        return metadata
+
+    def _ast_dict_to_dict(self, node: ast.Dict) -> Dict[str, Any]:
+        """Convert AST Dict node to Python dict (limited support)."""
+        result = {}
+
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant):
+                key_str = key.value
+                result[key_str] = self._ast_to_value(value)
+
+        return result
+
+    def _ast_to_value(self, node: ast.AST) -> Any:
+        """Convert AST node to Python value (limited support)."""
+        if isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.Dict):
+            return self._ast_dict_to_dict(node)
+        elif isinstance(node, ast.List):
+            return [self._ast_to_value(item) for item in node.elts]
+        elif isinstance(node, ast.Name):
+            # Handle None, True, False
+            if node.id == "None":
+                return None
+            elif node.id == "True":
+                return True
+            elif node.id == "False":
+                return False
+        return None
+
+    def _parse_yaml_metadata(self, content: str) -> Dict[str, Any]:
+        """Parse YAML file for metadata."""
+        try:
+            import yaml
+
+            data = yaml.safe_load(content)
+
+            if not isinstance(data, dict):
+                return {}
+
+            return {
+                "version": data.get("version"),
+                "tool_type": data.get("tool_type"),
+                "executor_id": data.get("executor_id"),
+                "category": data.get("category"),
+                "config_schema": data.get("config_schema"),
+                "env_config": data.get("env_config"),
+                "config": data.get("config"),
+            }
+        except Exception:
+            return {}
+
+    def _validate_chain(self, chain: List[ChainElement]) -> ChainValidationResult:
+        """Validate executor chain using ChainValidator."""
+        # Convert to format expected by ChainValidator
+        chain_dicts = [self._chain_element_to_dict(e) for e in chain]
+        return self.chain_validator.validate_chain(chain_dicts)
+
+    def _chain_element_to_dict(self, element: ChainElement) -> Dict[str, Any]:
+        """Convert ChainElement to dict for validation/serialization."""
+        return {
+            "item_id": element.item_id,
+            "path": str(element.path),
+            "space": element.space,
+            "tool_type": element.tool_type,
+            "executor_id": element.executor_id,
+        }
+
+    def _resolve_chain_env(self, chain: List[ChainElement]) -> Dict[str, str]:
+        """Resolve environment variables through the chain.
+
+        Each runtime in the chain can contribute ENV_CONFIG.
+        Variables are resolved in order (tool → runtime → primitive).
+
+        Args:
+            chain: Executor chain
+
+        Returns:
+            Merged resolved environment
+        """
+        merged_env: Dict[str, str] = {}
+
+        # Process chain in reverse (primitive to tool) for proper override
+        for element in reversed(chain):
+            if element.env_config:
+                resolved = self.env_resolver.resolve(
+                    env_config=element.env_config,
+                    tool_env=merged_env,
+                )
+                merged_env.update(resolved)
+
+        return merged_env
+
+    async def _execute_chain(
+        self,
+        chain: List[ChainElement],
+        parameters: Dict[str, Any],
+        resolved_env: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Execute via the root primitive in the chain.
+
+        Args:
+            chain: Executor chain (last element is primitive)
+            parameters: Runtime parameters
+            resolved_env: Resolved environment from chain
+
+        Returns:
+            Execution result dict
+        """
+        if not chain:
+            return {"success": False, "error": "Empty chain"}
+
+        # Get the root primitive (last in chain)
+        primitive_element = chain[-1]
+
+        if primitive_element.executor_id is not None:
+            return {
+                "success": False,
+                "error": f"Chain root is not a primitive: {primitive_element.item_id}",
+            }
+
+        # Get or create primitive instance
+        primitive_name = primitive_element.item_id
+        primitive = self._get_primitive(primitive_name)
+
+        if not primitive:
+            return {
+                "success": False,
+                "error": f"Unknown primitive: {primitive_name}",
+            }
+
+        # Build config from chain
+        config = self._build_execution_config(chain, resolved_env, parameters)
+
+        # Execute
+        try:
+            result = await primitive.execute(config, parameters)
+
+            # Convert primitive result to dict
+            if isinstance(result, SubprocessResult):
+                return {
+                    "success": result.success,
+                    "data": {
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "return_code": result.return_code,
+                    },
+                    "error": result.stderr if not result.success else None,
+                }
+            elif isinstance(result, HttpResult):
+                return {
+                    "success": result.success,
+                    "data": {
+                        "status_code": result.status_code,
+                        "body": result.body,
+                        "headers": result.headers,
+                    },
+                    "error": result.error,
+                }
+            else:
+                return {"success": True, "data": result}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _get_primitive(self, name: str) -> Optional[Any]:
+        """Get or create primitive instance by name."""
+        if name in self._primitives:
+            return self._primitives[name]
+
+        primitive_class = self.PRIMITIVE_MAP.get(name)
+        if primitive_class:
+            self._primitives[name] = primitive_class()
+            return self._primitives[name]
+
+        return None
+
+    def _build_execution_config(
+        self,
+        chain: List[ChainElement],
+        resolved_env: Dict[str, str],
+        parameters: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build execution config by merging chain configs.
+
+        Args:
+            chain: Executor chain
+            resolved_env: Resolved environment variables
+            parameters: Runtime parameters
+
+        Returns:
+            Merged config dict for primitive execution
+        """
+        config: Dict[str, Any] = {}
+
+        # Merge configs from chain (primitive first, then overrides)
+        for element in reversed(chain):
+            if element.config:
+                config.update(element.config)
+
+        # Apply environment
+        config["env"] = resolved_env
+
+        # Template substitution for ${VAR} in config values
+        config = self._template_config(config, resolved_env)
+
+        return config
+
+    def _template_config(
+        self, config: Dict[str, Any], env: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Substitute ${VAR} templates in config values."""
+        import re
+
+        def substitute(value: Any) -> Any:
+            if isinstance(value, str):
+
+                def replace_var(match: re.Match[str]) -> str:
+                    var_expr = match.group(1)
+                    if ":-" in var_expr:
+                        var_name, default = var_expr.split(":-", 1)
+                        return env.get(var_name, default)
+                    return env.get(var_expr, "")
+
+                return re.sub(r"\$\{([^}]+)\}", replace_var, value)
+            elif isinstance(value, dict):
+                return {k: substitute(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [substitute(item) for item in value]
+            return value
+
+        return substitute(config)
+
+    def _get_user_space(self) -> Path:
+        """Get user space path."""
+        from rye.utils.path_utils import get_user_space
+
+        return get_user_space()
+
+    def _get_system_space(self) -> Path:
+        """Get system space path (bundled with rye)."""
+        from rye.utils.path_utils import get_system_space
+
+        return get_system_space()
+
+    # -------------------------------------------------------------------------
+    # Cache Management
+    # -------------------------------------------------------------------------
+
+    def _compute_file_hash(self, path: Path) -> str:
+        """Compute SHA256 hash of file content."""
+        try:
+            content = path.read_bytes()
+            return hashlib.sha256(content).hexdigest()
+        except Exception:
+            return ""
+
+    def _get_cached_metadata(self, path: Path) -> Optional[Dict[str, Any]]:
+        """Get cached metadata if file unchanged."""
+        path_key = str(path)
+
+        if path_key not in self._metadata_cache:
+            return None
+
+        cached = self._metadata_cache[path_key]
+        current_hash = self._compute_file_hash(path)
+
+        if current_hash != cached.content_hash:
+            # File changed - invalidate
+            del self._metadata_cache[path_key]
+            return None
+
+        return cached.data
+
+    def _cache_metadata(self, path: Path, metadata: Dict[str, Any]) -> None:
+        """Cache metadata with content hash."""
+        path_key = str(path)
+        content_hash = self._compute_file_hash(path)
+        self._metadata_cache[path_key] = CacheEntry(
+            data=metadata,
+            content_hash=content_hash,
+        )
+
+    def _get_cached_chain(self, item_id: str) -> Optional[List[ChainElement]]:
+        """Get cached chain if all files unchanged."""
+        if item_id not in self._chain_cache:
+            return None
+
+        cached = self._chain_cache[item_id]
+        chain: List[ChainElement] = cached.data
+
+        # Verify all chain elements still have same hash
+        combined_hash = self._compute_chain_hash(chain)
+
+        if combined_hash != cached.content_hash:
+            # Some file changed - invalidate
+            del self._chain_cache[item_id]
+            return None
+
+        return chain
+
+    def _cache_chain(self, item_id: str, chain: List[ChainElement]) -> None:
+        """Cache chain with combined hash of all elements."""
+        combined_hash = self._compute_chain_hash(chain)
+        self._chain_cache[item_id] = CacheEntry(
+            data=chain,
+            content_hash=combined_hash,
+        )
+
+    def _compute_chain_hash(self, chain: List[ChainElement]) -> str:
+        """Compute combined hash of all files in chain."""
+        combined = ""
+        for element in chain:
+            file_hash = self._compute_file_hash(element.path)
+            combined += file_hash
+        return hashlib.sha256(combined.encode()).hexdigest()
+
+    def invalidate_tool(self, item_id: str) -> None:
+        """Invalidate cache for a specific tool."""
+        if item_id in self._chain_cache:
+            del self._chain_cache[item_id]
+
+    def clear_caches(self) -> None:
+        """Clear all caches."""
+        self._chain_cache.clear()
+        self._metadata_cache.clear()
+
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        return {
+            "chain_cache_size": len(self._chain_cache),
+            "metadata_cache_size": len(self._metadata_cache),
+        }
