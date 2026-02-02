@@ -23,29 +23,31 @@ The content bundle (`.ai/` directory) contains all tool definitions, directives,
 ```
 .ai/
 ├── tools/
-│   ├── rye/                        # RYE bundled tools (auto-installed)
-│   │   ├── core/                   # ⚠️ SYSTEM SPACE - Immutable, pip-installed to site-packages, hash-validated with lockfiles
-│   │   │   ├── primitives/         # Execution primitives
-│   │   │   ├── runtimes/           # Language runtimes
-│   │   │   ├── parsers/            # Content parsing
-│   │   │   ├── extractors/         # Metadata extraction
-│   │   │   ├── protocol/           # Communication protocols
-│   │   │   ├── sinks/              # Event output
-│   │   │   └── system/             # System information (paths, runtime info)
-│   │   ├── agent/                  # LLM agent execution within RYE (App tools - shadowable)
-│   │   │    ├── capabilities/      # Sandboxing (enforced in threads only)
-│   │   │    ├── telemetry/              # System monitoring and diagnostics
-│   │   │    ├── llm/                    # LLM provider configs
-│   │   │    └── threads/               # Thread management
-│   │   ├── registry/               # Tool distribution (App tools - shadowable)
-│   │   ├── rag/                    # Semantic search (optional, App tools - shadowable)
-│   │   ├── telemetry/              # System monitoring and diagnostics (App tools - shadowable)
-│   │   ├── mcp/                    # MCP protocol for agent comms (App tools - shadowable)
-│   │   └── {other}/                # User/custom tool categories (App tools - shadowable)
-│   │       └── {category}/         # Any category (python, user, etc.)
-│   │           └── *.py, *.yaml
-├── directives/                     # Workflow definitions (always shadowable)
-├── knowledge/                      # Knowledge entries
+│    └─ rye/                        # RYE bundled tools, the system space - Immutable, pip-installed to site-packages, hash-validated with lockfiles
+│       ├── core/                   # The core tooling which the primary tools use or base tool foundations
+│       │   ├── primitives/         # Execution primitives
+│       │   ├── runtimes/           # Language runtimes
+│       │   ├── parsers/            # Content parsing
+│       │   ├── extractors/         # Metadata extraction
+│       │   ├── protocol/           # Communication protocols
+│       │   ├── sinks/              # Event output
+│       │   └── system/             # System information (paths, runtime info)
+│       │
+│       ├── agent/                  # LLM agent execution within RYE
+│       │   ├── capabilities/       # Sandboxing (enforced in llm threads through the safety harness)
+│       │   ├── telemetry/          # Agent monitoring and diagnostics through the safety harness
+│       │   ├── llm/                # Base LLM provider configs. User extends to provide their own API keys, model selection, etc.
+│       │   ├── mcp/                # MCP protocol for agent. (still a little unsure if we need an agent specific mcp tool here).
+│       │   ├── harness/            # Agent harness that processes llm loop and tool calls
+│       │   └── threads/            # Thread management.
+│       │
+│       ├── registry/               # Primary items distribution.
+│       ├── rag/                    # Personal Semantic search which user extends with their perefences.
+│       ├── telemetry/              # System monitoring and diagnostics, giving tool to access mcp logging.
+│       └── mcp/                    # MCP protocol tools for rye os.
+│
+├── directives/                     # Workflow definitions for core rye functionality.
+├── knowledge/                      # Knowledge entries for rye and lilux documentation.
 └── ...
 ```
 

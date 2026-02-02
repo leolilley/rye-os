@@ -34,7 +34,7 @@ rye/
 │   ├── load.py              # mcp__rye__load implementation
 │   ├── execute.py           # mcp__rye__execute implementation
 │   ├── sign.py              # mcp__rye__sign implementation
-│   └── help.py              # mcp__rye__help implementation
+
 └── utils/                   # Utility functions
 ```
 
@@ -82,7 +82,7 @@ class RYE:
 | `mcp__rye__load` | `load.py` | Load item content for inspection |
 | `mcp__rye__execute` | `execute.py` | Run directives/tools, load knowledge |
 | `mcp__rye__sign` | `sign.py` | Validate and sign items |
-| `mcp__rye__help` | `help.py` | Get usage guidance |
+
 
 **These are hardcoded Python modules** - LLM calls these, and they load items from `.ai/` on demand.
 

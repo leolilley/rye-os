@@ -86,9 +86,9 @@ rye/
     └── schema_extractor.py # Metadata extraction
 ```
 
-### The 5 MCP Tools
+### The 4 MCP Tools
 
-LLM sees exactly 5 tools:
+LLM sees exactly 4 tools:
 
 | Tool | Purpose |
 |------|---------|
@@ -96,7 +96,6 @@ LLM sees exactly 5 tools:
 | `mcp__rye__load` | Load item content |
 | `mcp__rye__execute` | Execute an item |
 | `mcp__rye__sign` | Validate and sign |
-| `mcp__rye__help` | Get usage guidance |
 
 ### The 3 Item Types
 

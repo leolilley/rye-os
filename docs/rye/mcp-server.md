@@ -50,8 +50,7 @@ RYE's MCP server exposes a **universal tool interface** to LLMs via the Model Co
         "mcp__rye__search",
         "mcp__rye__load",
         "mcp__rye__execute",
-        "mcp__rye__sign",
-        "mcp__rye__help"
+        "mcp__rye__sign"
       ]
     }
   }
@@ -173,24 +172,6 @@ Response:
 
 **Batch signing:** Use glob patterns like `demos/meta/*`
 
-### 5. Help (`mcp__rye__help`)
-
-**Purpose:** Get help and usage guidance
-
-```
-Request:
-{
-  "topic": "overview" | "search" | "load" | "execute" | "sign" | "directives" | "tools" | "knowledge"
-}
-
-Response:
-{
-  "status": "help",
-  "topic": "search",
-  "content": "..."
-}
-```
-
 ## Server Startup
 
 ```bash
@@ -199,7 +180,7 @@ python -m rye.server
 
 **Process:**
 1. Initialize RYE server
-2. Register 5 MCP tools
+2. Register 4 MCP tools
 3. Start listening for LLM requests
 
 That's it. No scanning. No registry building.
@@ -209,12 +190,11 @@ That's it. No scanning. No registry building.
 ```
 Server Startup
     │
-    └─→ Register 5 MCP tools
+    └─→ Register 4 MCP tools
         ├─→ mcp__rye__search
         ├─→ mcp__rye__load
         ├─→ mcp__rye__execute
-        ├─→ mcp__rye__sign
-        └─→ mcp__rye__help
+        └─→ mcp__rye__sign
         
 That's it. No scanning. No registry building.
 Items are loaded on demand when LLM calls these tools.
@@ -239,11 +219,8 @@ LLM
         │   ├─→ Lilux primitive execution
         │   └─→ Result returned
         │
-        ├─→ mcp__rye__sign
-        │   └─→ Sign with credentials
-        │
-        └─→ mcp__rye__help
-            └─→ Return help text
+        └─→ mcp__rye__sign
+            └─→ Sign with credentials
                 │
                 └─→ JSON-RPC Response (MCP)
                     │
@@ -278,23 +255,21 @@ class RYEServer:
         self._start_server()
     
     def _register_mcp_tools(self):
-        """Register 5 universal MCP tools. That's all."""
+        """Register 4 universal MCP tools. That's all."""
         self.register_tool("mcp__rye__search", self.search)
         self.register_tool("mcp__rye__load", self.load)
         self.register_tool("mcp__rye__execute", self.execute)
         self.register_tool("mcp__rye__sign", self.sign)
-        self.register_tool("mcp__rye__help", self.help)
 ```
 
 ## Tool Names from LLM Perspective
 
-The LLM sees **exactly 5 tools** in the MCP tool listing:
+The LLM sees **exactly 4 tools** in the MCP tool listing:
 
 - `mcp__rye__search` - Search for items (directives, tools, knowledge)
 - `mcp__rye__load` - Load item content
 - `mcp__rye__execute` - Execute an item
 - `mcp__rye__sign` - Validate and sign an item
-- `mcp__rye__help` - Get usage guidance
 
 Everything else (actual tools, directives, knowledge) is accessed **through** these 5 tools.
 
@@ -346,4 +321,3 @@ LLM: "Check git status"
 - [[executor/overview]] - Executor architecture
 - [[categories/mcp]] - MCP tools in RYE
 - [[bundle/structure]] - Bundle organization
-

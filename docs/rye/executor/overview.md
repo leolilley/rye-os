@@ -303,7 +303,7 @@ All `.ai/tools/` contents are accessed through these 5 gateway tools—they are 
 | **load**      | Load tool content from `.ai/tools/`          |
 | **execute**   | Execute tools via executor chains            |
 | **sign**      | Sign tools with cryptographic validation     |
-| **help**      | Display tool documentation                   |
+
 
 ### Architecture
 

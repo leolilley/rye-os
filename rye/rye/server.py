@@ -1,11 +1,10 @@
 """MCP server for RYE OS.
 
-Exposes 5 universal tools:
+Exposes 4 universal tools:
 - mcp__rye__search
 - mcp__rye__load
 - mcp__rye__execute
 - mcp__rye__sign
-- mcp__rye__help
 """
 
 import asyncio
@@ -42,13 +41,11 @@ class RYEServer:
         from rye.tools.load import LoadTool
         from rye.tools.execute import ExecuteTool
         from rye.tools.sign import SignTool
-        from rye.tools.help import HelpTool
 
         self.search = SearchTool(self.user_space)
         self.load = LoadTool(self.user_space)
         self.execute = ExecuteTool(self.user_space)
         self.sign = SignTool(self.user_space)
-        self.help = HelpTool(self.user_space)
 
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
@@ -194,54 +191,6 @@ class RYEServer:
                         "required": ["item_type", "item_id", "project_path"],
                     },
                 ),
-                Tool(
-                    name="mcp__rye__help",
-                    description="Get help and usage guidance",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "topic": {
-                                "type": "string",
-                                "enum": [
-                                    "overview",
-                                    Action.SEARCH,
-                                    Action.LOAD,
-                                    Action.EXECUTE,
-                                    Action.SIGN,
-                                    "directives",
-                                    "tools",
-                                    "knowledge",
-                                ],
-                                "default": "overview",
-                            },
-                            "project_path": {"type": "string"},
-                        },
-                    },
-                ),
-                Tool(
-                    name="mcp__rye__help",
-                    description="Get help and usage guidance",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "topic": {
-                                "type": "string",
-                                "enum": [
-                                    "overview",
-                                    "search",
-                                    "load",
-                                    "execute",
-                                    "sign",
-                                    "directives",
-                                    "tools",
-                                    "knowledge",
-                                ],
-                                "default": "overview",
-                            },
-                            "project_path": {"type": "string"},
-                        },
-                    },
-                ),
             ]
 
         @self.server.call_tool()
@@ -256,8 +205,6 @@ class RYEServer:
                     result = await self.execute.handle(**arguments)
                 elif name == "mcp__rye__sign":
                     result = await self.sign.handle(**arguments)
-                elif name == "mcp__rye__help":
-                    result = await self.help.handle(**arguments)
                 else:
                     result = {"error": f"Unknown tool: {name}"}
 

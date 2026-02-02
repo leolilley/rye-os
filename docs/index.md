@@ -55,7 +55,7 @@ LLM/User
 - [Load](rye/mcp-tools/load.md) - Load content / copy between locations
 - [Execute](rye/mcp-tools/execute.md) - Run items (directives, tools, knowledge)
 - [Sign](rye/mcp-tools/sign.md) - Validate and sign items
-- [Help](rye/mcp-tools/help.md) - Get usage help
+
 
 ### Tool Categories
 

@@ -1,18 +1,18 @@
 # RYE MCP Tools Overview
 
-**Source:** RYE's 5 MCP tools that wrap executor
+**Source:** RYE's 4 MCP tools that wrap executor
 
 ---
 
 ## Overview
 
-RYE exposes exactly **5 MCP tools** that work with **3 item types**. This is the unified interface that LLMs interact with.
+RYE exposes exactly **4 MCP tools** that work with **3 item types**. This is the unified interface that LLMs interact with.
 
-The key insight: LLMs see only 5 tools, not dozens of individual operations. This simplifies the interface while maintaining full capability through the item type system.
+The key insight: LLMs see only 4 tools, not dozens of individual operations. This simplifies the interface while maintaining full capability through the item type system.
 
 ---
 
-## The 5 MCP Tools
+## The 4 MCP Tools
 
 | Tool | Purpose | Primary Use |
 |------|---------|-------------|
@@ -20,7 +20,6 @@ The key insight: LLMs see only 5 tools, not dozens of individual operations. Thi
 | `mcp__rye__load` | Load item content | Read-only inspection or copy between locations |
 | `mcp__rye__execute` | Execute an item | Run tools, parse directives, load knowledge |
 | `mcp__rye__sign` | Validate and sign item files | Add integrity hashes |
-| `mcp__rye__help` | Get usage guidance | Documentation, examples, item listings |
 
 ---
 
@@ -36,7 +35,7 @@ The key insight: LLMs see only 5 tools, not dozens of individual operations. Thi
 
 ## Key Architecture Points
 
-1. **LLM only sees 5 tools** — Not dozens of individual tools
+1. **LLM only sees 4 tools** — Not dozens of individual tools
 2. **On-demand loading** — Items are loaded when requested, not at startup
 3. **Unified interface** — Same 5 tools work with all 3 item types
 4. **No auto-discovery to MCP** — Tools in `.ai/tools/` are NOT exposed directly to MCP
@@ -169,34 +168,9 @@ mcp__rye__sign(
 
 ---
 
-### Help
-
-Get usage guidance and documentation.
-
-```python
-mcp__rye__help(
-    project_path="/path/to/project",
-    topic="architecture",       # Specific topic (optional)
-    item_type="tool"            # Specific item type (optional)
-)
-```
-
-**Available topics:**
-- `directive`, `tool`, `knowledge` — Item type documentation
-- `actions` — Available actions reference
-- `architecture` — Lilux/RYE architecture overview
-- `tool_spaces` — Tool spaces, precedence, and shadowing behavior
-
-**RYE Intelligence:**
-- Lists items with enriched metadata
-- Shows which space each item is from (project/user/system)
-- Provides usage examples
-
----
-
 ## Implementation Location
 
-The 5 MCP tools are implemented in the `rye/` package (Python code), NOT in `.ai/tools/`.
+The 4 MCP tools are implemented in the `rye/` package (Python code), NOT in `.ai/tools/`.
 
 ```
 rye/rye/
@@ -205,8 +179,7 @@ rye/rye/
 │   ├── search.py       # SearchTool class
 │   ├── load.py         # LoadTool class
 │   ├── execute.py      # ExecuteTool class
-│   ├── sign.py         # SignTool class
-│   └── help.py         # HelpTool class
+│   └── sign.py         # SignTool class
 └── handlers/           # Type-specific handlers (if needed)
 ```
 
@@ -214,7 +187,7 @@ rye/rye/
 
 ## Distinction from Data-Driven Tools
 
-| Aspect | 5 MCP Tools | Data-Driven Tools |
+| Aspect | 4 MCP Tools | Data-Driven Tools |
 |--------|-------------|-------------------|
 | **Location** | `rye/rye/tools/` (Python code) | `.ai/tools/` (data files) |
 | **Exposure** | Directly exposed to MCP | Accessed via `mcp__rye__execute` |
