@@ -56,12 +56,12 @@ Creator/maintainer identifier.
 <author>rye-team</author>
 ```
 
-### `<model>`
+### `<model>` (Optional)
 
 **Type:** element with required `tier` attribute and optional attributes  
-**Required:** Yes
+**Required:** No
 
-Specifies LLM model complexity tier for execution with fallback options.
+Specifies LLM model complexity tier for execution with fallback options. Only needed for directives that run on the Rye agent harness with model-specific execution.
 
 ```xml
 <model tier="orchestrator" fallback="general" id="model-custom-id">
@@ -81,11 +81,13 @@ Specifies LLM model complexity tier for execution with fallback options.
 
 **Text content:** Description of the directive's reasoning approach (1-2 sentences)
 
-### `<permissions>`
+### `<permissions>` (Optional)
 
 **Type:** element with permission rules  
 **Purpose:** Declares capabilities this directive requires  
-**Required:** Yes
+**Required:** No
+
+Only enforced when directives run on the Rye agent harness. Simple directives can omit this.
 
 ```xml
 <permissions>
@@ -128,11 +130,13 @@ Specifies LLM model complexity tier for execution with fallback options.
 <execute resource="tool" id="deploy-kubernetes" />
 ```
 
-### `<cost>`
+### `<cost>` (Optional)
 
 **Type:** element with budget tracking fields  
 **Purpose:** Resource usage tracking and budget management  
-**Required:** Yes
+**Required:** No
+
+Only enforced when directives run on the Rye agent harness with cost tracking enabled.
 
 ```xml
 <cost>
@@ -367,7 +371,46 @@ Specifies LLM model complexity tier for execution with fallback options.
 
 ---
 
-## Complete Example
+## Minimal Example (v1.0)
+
+```xml
+<directive name="deploy-staging" version="1.0.0">
+  <metadata>
+    <description>Deploy application to staging environment</description>
+    <category>workflows</category>
+    <author>devops-team</author>
+  </metadata>
+
+  <process>
+    <step name="build">
+      <description>Build application</description>
+      <action><![CDATA[
+npm run build
+      ]]></action>
+    </step>
+    <step name="deploy">
+      <description>Deploy to staging</description>
+      <action><![CDATA[
+npm run deploy:staging
+      ]]></action>
+    </step>
+  </process>
+
+  <success_criteria>
+    <criterion>Build completes successfully</criterion>
+    <criterion>Staging deployment is accessible</criterion>
+  </success_criteria>
+
+  <outputs>
+    <success>Deployed to staging successfully</success>
+    <failure>Deployment failed - check build logs</failure>
+  </outputs>
+</directive>
+```
+
+---
+
+## Complete Example (Advanced)
 
 ```xml
 <directive name="deploy-and-test" version="1.0.0">
@@ -447,15 +490,16 @@ Specifies LLM model complexity tier for execution with fallback options.
 ## Validation Rules
 
 1. **`name` and `version`** are required attributes on root element
-2. **`description`, `category`, `author`, `model`, `permissions`, `cost`** are required metadata fields
-3. **`version`** must be valid semantic version (X.Y.Z)
-4. **`model tier`** is user-defined string
-5. **`category`** is free-form string (must align with directory structure)
-6. **`permissions`** must have at least one permission element
-7. **`cost`** must have at least a `<context>` sub-element with `estimated_usage` and `turns` attributes
-8. **Permission paths** support glob patterns (e.g., `**/*.py`)
-9. **Relationship elements** must be direct children of `<context>`
-10. **Hook `<when>` expressions** evaluated against context variables
+2. **`description`, `category`, `author`** are required metadata fields
+3. **`model`, `permissions`, `cost`** are optional (only used by Rye agent harness)
+4. **`version`** must be valid semantic version (X.Y.Z)
+5. **`model tier`** is user-defined string (if model specified)
+6. **`category`** is free-form string (must align with directory structure)
+7. **`permissions`** must have at least one permission element (if specified)
+8. **`cost`** must have at least a `<context>` sub-element with `estimated_usage` and `turns` attributes (if specified)
+9. **Permission paths** support glob patterns (e.g., `**/*.py`)
+10. **Relationship elements** must be direct children of `<context>`
+11. **Hook `<when>` expressions** evaluated against context variables
 
 ---
 

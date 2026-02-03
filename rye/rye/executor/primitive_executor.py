@@ -23,9 +23,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from lilux.primitives.subprocess import SubprocessPrimitive, SubprocessResult
 from lilux.primitives.http_client import HttpClientPrimitive, HttpResult
+from lilux.primitives.integrity import compute_tool_integrity
 from lilux.runtime.env_resolver import EnvResolver
 
 from rye.executor.chain_validator import ChainValidator, ChainValidationResult
+from rye.executor.lockfile_resolver import LockfileResolver
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,11 @@ class PrimitiveExecutor:
 
         self.env_resolver = EnvResolver(project_path=self.project_path)
         self.chain_validator = ChainValidator()
+        self.lockfile_resolver = LockfileResolver(
+            project_path=self.project_path,
+            user_space=self.user_space,
+            system_space=self.system_space,
+        )
 
         # Primitive instances (lazy loaded)
         self._primitives: Dict[str, Any] = {}
@@ -119,6 +126,7 @@ class PrimitiveExecutor:
         item_id: str,
         parameters: Optional[Dict[str, Any]] = None,
         validate_chain: bool = True,
+        use_lockfile: bool = True,
     ) -> ExecutionResult:
         """Execute a tool by resolving its executor chain recursively.
 
@@ -126,6 +134,7 @@ class PrimitiveExecutor:
             item_id: Tool identifier (e.g., "git", "python_runtime")
             parameters: Runtime parameters for the tool
             validate_chain: Whether to validate chain before execution
+            use_lockfile: Whether to check/create lockfiles
 
         Returns:
             ExecutionResult with execution details
@@ -134,9 +143,42 @@ class PrimitiveExecutor:
 
         start_time = time.time()
         parameters = parameters or {}
+        lockfile_used = False
+        lockfile_created = False
 
         try:
-            # 1. Build the executor chain
+            # 1. Check for existing lockfile
+            version = None
+            if use_lockfile:
+                # Get version from tool metadata first
+                tool_path = self._resolve_tool_path(item_id, "project")
+                if tool_path:
+                    metadata = self._load_metadata_cached(tool_path[0])
+                    version = metadata.get("version", "0.0.0")
+
+                    lockfile = self.lockfile_resolver.get_lockfile(item_id, version)
+                    if lockfile:
+                        logger.debug(f"Using lockfile for {item_id}@{version}")
+                        lockfile_used = True
+                        # Verify integrity matches
+                        manifest = {
+                            "tool_type": metadata.get("tool_type"),
+                            "executor_id": metadata.get("executor_id"),
+                            "category": metadata.get("category", ""),
+                        }
+                        current_integrity = compute_tool_integrity(
+                            tool_id=item_id,
+                            version=version,
+                            manifest=manifest,
+                        )
+                        if lockfile.root.integrity != current_integrity:
+                            logger.warning(
+                                f"Lockfile integrity mismatch for {item_id}: "
+                                f"expected {lockfile.root.integrity}, got {current_integrity}"
+                            )
+                            lockfile_used = False
+
+            # 2. Build the executor chain
             chain = await self._build_chain(item_id)
 
             if not chain:
@@ -146,7 +188,7 @@ class PrimitiveExecutor:
                     duration_ms=(time.time() - start_time) * 1000,
                 )
 
-            # 2. Validate chain if requested
+            # 3. Validate chain if requested
             if validate_chain:
                 validation = self._validate_chain(chain)
                 if not validation.valid:
@@ -157,11 +199,42 @@ class PrimitiveExecutor:
                         duration_ms=(time.time() - start_time) * 1000,
                     )
 
-            # 3. Resolve environment through the chain
+            # 4. Resolve environment through the chain
             resolved_env = self._resolve_chain_env(chain)
 
-            # 4. Execute via the root primitive
+            # 5. Execute via the root primitive
             result = await self._execute_chain(chain, parameters, resolved_env)
+
+            # 6. Create lockfile if execution succeeded and none exists
+            if use_lockfile and result.get("success") and not lockfile_used and version:
+                try:
+                    root_element = chain[0]
+                    # Build manifest from chain element metadata
+                    manifest = {
+                        "tool_type": root_element.tool_type,
+                        "executor_id": root_element.executor_id,
+                        "category": str(root_element.path.parent.relative_to(
+                            self.project_path / ".ai" / "tools"
+                        )) if self.project_path else "",
+                    }
+                    integrity = compute_tool_integrity(
+                        tool_id=item_id,
+                        version=version,
+                        manifest=manifest,
+                    )
+                    resolved_chain = [self._chain_element_to_dict(e) for e in chain]
+
+                    new_lockfile = self.lockfile_resolver.create_lockfile(
+                        tool_id=item_id,
+                        version=version,
+                        integrity=integrity,
+                        resolved_chain=resolved_chain,
+                    )
+                    self.lockfile_resolver.save_lockfile(new_lockfile)
+                    lockfile_created = True
+                    logger.info(f"Created lockfile for {item_id}@{version}")
+                except Exception as e:
+                    logger.warning(f"Failed to create lockfile: {e}")
 
             duration_ms = (time.time() - start_time) * 1000
 
@@ -171,7 +244,11 @@ class PrimitiveExecutor:
                 error=result.get("error"),
                 duration_ms=duration_ms,
                 chain=[self._chain_element_to_dict(e) for e in chain],
-                metadata={"resolved_env_keys": list(resolved_env.keys())},
+                metadata={
+                    "resolved_env_keys": list(resolved_env.keys()),
+                    "lockfile_used": lockfile_used,
+                    "lockfile_created": lockfile_created,
+                },
             )
 
         except Exception as e:
@@ -501,10 +578,14 @@ class PrimitiveExecutor:
         parameters: Dict[str, Any],
         resolved_env: Dict[str, str],
     ) -> Dict[str, Any]:
-        """Execute via the root primitive in the chain.
+        """Execute via the root element in the chain.
+
+        Supports two execution modes:
+        1. Primitives (tool_type="primitive"): Route to Lilux primitive classes
+        2. Builtins (tool_type="builtin"): Import Python module and call execute()
 
         Args:
-            chain: Executor chain (last element is primitive)
+            chain: Executor chain (last element is primitive or builtin)
             parameters: Runtime parameters
             resolved_env: Resolved environment from chain
 
@@ -514,17 +595,29 @@ class PrimitiveExecutor:
         if not chain:
             return {"success": False, "error": "Empty chain"}
 
-        # Get the root primitive (last in chain)
-        primitive_element = chain[-1]
+        # Get the root element (last in chain)
+        root_element = chain[-1]
 
-        if primitive_element.executor_id is not None:
+        if root_element.executor_id is not None:
             return {
                 "success": False,
-                "error": f"Chain root is not a primitive: {primitive_element.item_id}",
+                "error": f"Chain root has executor_id: {root_element.item_id}",
             }
 
-        # Get or create primitive instance
-        primitive_name = primitive_element.item_id
+        # Build config from chain
+        config = self._build_execution_config(chain, resolved_env, parameters)
+
+        # Add executor context
+        config["project_path"] = str(self.project_path)
+        config["user_space"] = str(self.user_space)
+        config["system_space"] = str(self.system_space)
+
+        # Handle builtin tools (in-process Python execution)
+        if root_element.tool_type == "builtin":
+            return await self._execute_builtin(root_element, config, parameters)
+
+        # Handle primitives (Lilux primitive classes)
+        primitive_name = root_element.item_id
         primitive = self._get_primitive(primitive_name)
 
         if not primitive:
@@ -533,10 +626,7 @@ class PrimitiveExecutor:
                 "error": f"Unknown primitive: {primitive_name}",
             }
 
-        # Build config from chain
-        config = self._build_execution_config(chain, resolved_env, parameters)
-
-        # Execute
+        # Execute primitive
         try:
             result = await primitive.execute(config, parameters)
 
@@ -565,6 +655,71 @@ class PrimitiveExecutor:
                 return {"success": True, "data": result}
 
         except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def _execute_builtin(
+        self,
+        element: ChainElement,
+        config: Dict[str, Any],
+        parameters: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Execute a builtin tool by importing and calling its execute() function.
+
+        Builtin tools are Python modules with an async execute(config, params) function.
+        They run in-process and have access to the runtime environment.
+
+        Args:
+            element: ChainElement for the builtin tool
+            config: Execution config with project_path, user_space, system_space
+            parameters: Runtime parameters
+
+        Returns:
+            Execution result dict
+        """
+        import importlib.util
+
+        try:
+            # Load the module from file path
+            spec = importlib.util.spec_from_file_location(
+                element.item_id, element.path
+            )
+            if not spec or not spec.loader:
+                return {
+                    "success": False,
+                    "error": f"Failed to load builtin module: {element.path}",
+                }
+
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # Get the execute function
+            if not hasattr(module, "execute"):
+                return {
+                    "success": False,
+                    "error": f"Builtin tool missing execute() function: {element.item_id}",
+                }
+
+            execute_fn = getattr(module, "execute")
+
+            # Call execute (handle both sync and async)
+            import asyncio
+            if asyncio.iscoroutinefunction(execute_fn):
+                result = await execute_fn(config, parameters)
+            else:
+                result = execute_fn(config, parameters)
+
+            # Normalize result
+            if isinstance(result, dict):
+                return {
+                    "success": result.get("success", True),
+                    "data": result.get("data", result),
+                    "error": result.get("error"),
+                }
+            else:
+                return {"success": True, "data": result}
+
+        except Exception as e:
+            logger.exception(f"Builtin execution failed: {element.item_id}")
             return {"success": False, "error": str(e)}
 
     def _get_primitive(self, name: str) -> Optional[Any]:
@@ -601,6 +756,9 @@ class PrimitiveExecutor:
         for element in reversed(chain):
             if element.config:
                 config.update(element.config)
+
+        # Merge runtime parameters (highest priority - override chain config)
+        config.update(parameters)
 
         # Apply environment
         config["env"] = resolved_env

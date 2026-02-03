@@ -107,6 +107,25 @@ Common executors:
 - `node_runtime` - Node.js runtime
 - `docker` - Docker container execution
 
+### `__tool_description__` (Python/Node.js)
+
+**Type:** string  
+**Required:** Yes (for Python and Node.js tools)
+
+Required module-level variable for Python and Node.js tools. This is the official description used for tool discovery and registry. Different from docstring which documents implementation details.
+
+```python
+__tool_description__ = "Deploy service to Kubernetes cluster with rolling updates"
+```
+
+```javascript
+/**
+ * @description Deploy service to Kubernetes cluster with rolling updates
+ */
+```
+
+**Important:** `__tool_description__` is extracted as the `description` field during metadata extraction. The docstring (`__docstring__`) is available separately but not required.
+
 ---
 
 ## Optional Fields
@@ -377,6 +396,7 @@ __version__ = "1.0.1"
 __tool_type__ = "python"
 __executor_id__ = "python_runtime"
 __category__ = "utility"
+__tool_description__ = "Say hello to someone with a personalized greeting message"
 
 def main(name: str = "World") -> str:
     """
@@ -397,10 +417,13 @@ def main(name: str = "World") -> str:
 ```javascript
 // .ai/tools/utility/hello_node.js
 /**
+ * Say hello to someone with a personalized greeting message
+ * 
  * @version 1.0.0
  * @tool_type javascript
  * @executor_id node_runtime
  * @category utility
+ * @description Say hello to someone with a personalized greeting message
  */
 
 const yargs = require('yargs/yargs');
@@ -475,6 +498,7 @@ __tool_type__ = "runtime"
 __version__ = "1.0.0"
 __executor_id__ = "python"
 __category__ = "sinks"
+__tool_description__ = "Append streaming events to file in JSONL or plain text format"
 
 import json
 from pathlib import Path
@@ -513,6 +537,8 @@ class FileSink:
 ## Validation Rules
 
 1. **Required fields:** `tool_id`, `category`, `tool_type`, `version`, `description`, `executor_id`
+   - **Python/Node.js tools:** Must also define `__tool_description__` module variable (extracted as `description`)
+   - **YAML/JSON tools:** `description` field in metadata
 2. **`tool_id`** must be kebab-case alphanumeric
 3. **`category`** must match the file path relative to `tools/` directory
 4. **`version`** must be semantic version (X.Y.Z)

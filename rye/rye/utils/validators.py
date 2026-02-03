@@ -21,6 +21,8 @@ SNAKE_CASE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # Global cache: item_type -> validation schema
 _validation_schemas: Optional[Dict[str, Dict[str, Any]]] = None
+# Global cache: item_type -> extraction rules
+_extraction_rules: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 def _load_validation_schemas(
@@ -34,7 +36,7 @@ def _load_validation_schemas(
         if not extractors_dir.exists():
             continue
 
-        for file_path in extractors_dir.glob("*_extractor.py"):
+        for file_path in extractors_dir.rglob("*_extractor.py"):
             if file_path.name.startswith("_"):
                 continue
 
@@ -86,8 +88,110 @@ def get_validation_schema(
 
 def clear_validation_schemas_cache():
     """Clear the validation schemas cache."""
-    global _validation_schemas
+    global _validation_schemas, _extraction_rules
     _validation_schemas = None
+    _extraction_rules = None
+
+
+def _load_extraction_rules(
+    project_path: Optional[Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Load extraction rules from all extractors."""
+    rules = {}
+    search_paths = get_extractor_search_paths(project_path)
+
+    for extractors_dir in search_paths:
+        if not extractors_dir.exists():
+            continue
+
+        for file_path in extractors_dir.rglob("*_extractor.py"):
+            if file_path.name.startswith("_"):
+                continue
+
+            # Extract item type from filename (e.g., directive_extractor.py -> directive)
+            item_type = file_path.stem.replace("_extractor", "")
+
+            # Only set if not already set (precedence: project > user > system)
+            if item_type in rules:
+                continue
+
+            extraction_rules = _extract_rules_from_file(file_path)
+            if extraction_rules:
+                rules[item_type] = extraction_rules
+
+    logger.debug(f"Loaded extraction rules for: {list(rules.keys())}")
+    return rules
+
+
+def _extract_rules_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
+    """Extract EXTRACTION_RULES from an extractor file using AST."""
+    try:
+        content = file_path.read_text()
+        tree = ast.parse(content)
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name) and target.id == "EXTRACTION_RULES":
+                    if isinstance(node.value, ast.Dict):
+                        return ast.literal_eval(node.value)
+
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to extract rules from {file_path}: {e}")
+        return None
+
+
+def get_extraction_rules(
+    item_type: str, project_path: Optional[Path] = None
+) -> Optional[Dict[str, Any]]:
+    """Get extraction rules for an item type."""
+    global _extraction_rules
+
+    if _extraction_rules is None:
+        _extraction_rules = _load_extraction_rules(project_path)
+
+    return _extraction_rules.get(item_type)
+
+
+def apply_field_mapping(
+    item_type: str,
+    parsed_data: Dict[str, Any],
+    project_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Apply extraction rules to map parsed fields to standard field names.
+
+    Uses EXTRACTION_RULES from the item type's extractor to map
+    e.g., __version__ -> version, __tool_type__ -> tool_type.
+
+    Args:
+        item_type: "directive", "tool", or "knowledge"
+        parsed_data: Raw parsed data from parser
+        project_path: Project root path for loading extractors
+
+    Returns:
+        Parsed data with fields mapped to standard names
+    """
+    rules = get_extraction_rules(item_type, project_path)
+    if not rules:
+        return parsed_data
+
+    result = dict(parsed_data)
+
+    for standard_name, rule in rules.items():
+        if standard_name in result:
+            # Already has the standard name
+            continue
+
+        rule_type = rule.get("type")
+        if rule_type == "path":
+            # Map from source key to standard name
+            source_key = rule.get("key")
+            if source_key and source_key in result:
+                result[standard_name] = result[source_key]
+
+    return result
 
 
 def validate_field(
@@ -107,21 +211,27 @@ def validate_field(
     issues = []
     field_type = field_schema.get("type", "string")
     required = field_schema.get("required", False)
+    nullable = field_schema.get("nullable", False)
 
     # For match_path fields, empty string is valid if it matches the path category
     # So we check match_path before rejecting empty strings
     has_match_path = field_schema.get("match_path", False)
 
-    # Check required (but allow empty string for match_path fields - validated later)
-    if required and (value is None or value == []):
+    # Check required (but allow None for nullable fields, empty string for match_path)
+    if required and value is None and not nullable:
+        issues.append(f"Missing required field: {field_name}")
+        return issues
+    if required and value == [] and not nullable:
         issues.append(f"Missing required field: {field_name}")
         return issues
     if required and value == "" and not has_match_path:
         issues.append(f"Missing required field: {field_name}")
         return issues
 
-    # Skip further validation if value is empty/None and not required
-    if value is None or (value == "" and not has_match_path):
+    # Skip further validation if value is None (and nullable) or empty and not required
+    if value is None:
+        return issues
+    if value == "" and not has_match_path:
         return issues
 
     # Type validation

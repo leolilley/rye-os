@@ -1,4 +1,4 @@
-# rye:validated:2026-02-02T00:00:00Z:placeholder
+# rye:validated:2026-02-03T07:57:53Z:7a2b32682702d6b516757cf5b9faa82194f310ca77ea12e8e1994607c181b3a4
 """
 Knowledge Extractor
 
@@ -9,7 +9,10 @@ Parses frontmatter for title, tags, and other metadata.
 __version__ = "1.0.0"
 __tool_type__ = "extractor"
 __executor_id__ = None
-__category__ = "extractors"
+__category__ = "rye/core/extractors/knowledge"
+__tool_description__ = (
+    "Knowledge extractor - extracts metadata from YAML frontmatter in markdown files"
+)
 
 # File extensions this extractor handles
 EXTENSIONS = [".md"]
@@ -62,4 +65,3 @@ VALIDATION_SCHEMA = {
         },
     },
 }
-

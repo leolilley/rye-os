@@ -1,8 +1,16 @@
+# rye:validated:2026-02-03T07:57:49Z:b02b491a4400c6fd0380f6c42a203d2d32500b8a5b7b3ffe21948ffb51db2f68
 """Markdown XML parser for directives.
 
 Handles extraction of XML from markdown code fences and parsing
 with support for opaque sections (template, example, raw tags).
 """
+
+__version__ = "1.0.0"
+__tool_type__ = "parser"
+__category__ = "rye/core/parsers"
+__tool_description__ = (
+    "Markdown XML parser - extracts and parses XML from markdown code fences"
+)
 
 import re
 import xml.etree.ElementTree as ET
@@ -11,7 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 
 def parse(content: str) -> Dict[str, Any]:
     """Parse directive markdown with embedded XML.
-    
+
     Returns parsed directive data with all metadata.
     """
     # Extract XML from markdown fence
@@ -23,12 +31,12 @@ def parse(content: str) -> Dict[str, Any]:
             "data": {},
             "error": "No XML code block found",
         }
-    
+
     try:
         # Parse basic attributes first (before masking)
-        directive_match = re.match(r'<directive\s+([^>]*)>', xml_str)
+        directive_match = re.match(r"<directive\s+([^>]*)>", xml_str)
         result: Dict[str, Any] = {}
-        
+
         if directive_match:
             attrs_str = directive_match.group(1)
             # Extract name
@@ -39,10 +47,10 @@ def parse(content: str) -> Dict[str, Any]:
             version_match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', attrs_str)
             if version_match:
                 result["version"] = version_match.group(1)
-        
+
         # Mask opaque sections before parsing
         masked_xml, opaque_content = _mask_opaque_sections(xml_str)
-        
+
         # Parse XML
         try:
             root = ET.fromstring(masked_xml)
@@ -53,21 +61,21 @@ def parse(content: str) -> Dict[str, Any]:
                 "raw": content,
                 "error": f"Invalid XML: {e}",
             }
-        
+
         # Extract structured data
         _extract_from_xml(root, result)
-        
+
         # Reattach opaque content
         result["templates"] = opaque_content
         result["body"] = body
         result["raw"] = content
         result["content"] = xml_str
-        
+
         return result
-        
+
     except Exception as e:
         return {
-            "body": body if 'body' in locals() else content,
+            "body": body if "body" in locals() else content,
             "raw": content,
             "data": {},
             "error": str(e),
@@ -76,68 +84,70 @@ def parse(content: str) -> Dict[str, Any]:
 
 def _extract_xml_block(content: str) -> Tuple[Optional[str], str]:
     """Extract XML from markdown ```xml ... ``` block.
-    
+
     Returns (xml_content, body_before_fence) or (None, content).
     """
-    match = re.search(r'^```xml\s*$', content, re.MULTILINE)
+    match = re.search(r"^```xml\s*$", content, re.MULTILINE)
     if not match:
         return None, ""
-    
-    body = content[:match.start()].strip()
+
+    body = content[: match.start()].strip()
     start = match.end() + 1
-    
+
     # Find closing ```
-    close_match = re.search(r'^```\s*$', content[start:], re.MULTILINE)
+    close_match = re.search(r"^```\s*$", content[start:], re.MULTILINE)
     if close_match:
-        xml_content = content[start:start + close_match.start()].strip()
+        xml_content = content[start : start + close_match.start()].strip()
         return xml_content, body
-    
+
     return None, ""
 
 
 def _mask_opaque_sections(xml_str: str) -> Tuple[str, Dict[str, str]]:
     """Mask opaque tag sections before XML parsing.
-    
+
     Prevents parsing errors from template/example content.
     """
     opaque_tags = {"template", "example", "raw"}
     masked = xml_str
     opaque_content: Dict[str, str] = {}
     counter = 0
-    
+
     for tag in opaque_tags:
         # Find all <tag>...</tag> patterns
         pattern = f"<{tag}[^>]*>(.*?)</{tag}>"
         for match in re.finditer(pattern, masked, re.DOTALL):
             placeholder = f"__opaque_{tag}_{counter}__"
             opaque_content[placeholder] = match.group(1)
-            masked = masked.replace(match.group(0), f"<{tag} data-masked-id=\"{placeholder}\"></{tag}>")
+            masked = masked.replace(
+                match.group(0), f'<{tag} data-masked-id="{placeholder}"></{tag}>'
+            )
             counter += 1
-    
+
     return masked, opaque_content
 
 
 def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
     """Extract all metadata from parsed XML tree."""
-    
+
     # Extract description (can be at root or in metadata)
     desc_elem = root.find("description")
     if desc_elem is not None and desc_elem.text:
         result["description"] = desc_elem.text.strip()
-    
+
     # Extract metadata section
     metadata_elem = root.find("metadata")
     if metadata_elem is not None:
         for child in metadata_elem:
             tag = child.tag
-            
+
             # Handle model tag specially - extract attributes
             if tag == "model" or tag == "model_class":
                 model_data = dict(child.attrib)
                 if child.text:
                     model_data["content"] = child.text.strip()
                 result["model"] = model_data
-            
+
             # Handle permissions - parse nested permission elements
             elif tag == "permissions":
                 permissions = []
@@ -150,19 +160,19 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
                         perm_data["content"] = perm.text.strip()
                     permissions.append(perm_data)
                 result["permissions"] = permissions
-            
+
             # Simple text fields - include empty strings for category
             elif tag == "category":
                 result[tag] = (child.text or "").strip()
             elif child.text:
                 result[tag] = child.text.strip()
-        
+
         # Also check for description inside metadata if not found at root
         if "description" not in result:
             meta_desc = metadata_elem.find("description")
             if meta_desc is not None and meta_desc.text:
                 result["description"] = meta_desc.text.strip()
-    
+
     # Extract inputs
     inputs_elem = root.find("inputs")
     if inputs_elem is not None:
@@ -177,7 +187,7 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
             inputs.append(input_data)
         if inputs:
             result["inputs"] = inputs
-    
+
     # Extract process steps
     process_elem = root.find("process")
     if process_elem is not None:
@@ -191,7 +201,7 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
             steps.append(step_data)
         if steps:
             result["steps"] = steps
-    
+
     # Extract outputs
     outputs_elem = root.find("outputs")
     if outputs_elem is not None:

@@ -15,18 +15,17 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from rye.utils.resolvers import get_user_space
+from rye.constants import ItemType
 from rye.utils.metadata_manager import MetadataManager
 from rye.utils.parser_router import ParserRouter
 from rye.utils.path_utils import (
     extract_filename,
-    get_system_space,
     get_project_type_path,
-    get_user_type_path,
     get_system_type_path,
+    get_user_type_path,
 )
-from rye.utils.validators import validate_parsed_data
-from rye.constants import ItemType
+from rye.utils.resolvers import get_user_space
+from rye.utils.validators import apply_field_mapping, validate_parsed_data
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +38,53 @@ class SignTool:
         self.user_space = user_space or str(get_user_space())
         self.parser_router = ParserRouter()
 
+    def _is_glob_pattern(self, item_id: str) -> bool:
+        """Check if item_id is a glob pattern."""
+        return "*" in item_id or "?" in item_id
+
+    def _resolve_glob_items(
+        self, item_type: str, pattern: str, project_path: str, source: str
+    ) -> List[Path]:
+        """Resolve glob pattern to list of item file paths."""
+        type_dir = ItemType.TYPE_DIRS.get(item_type)
+        if not type_dir:
+            return []
+
+        if source == "project":
+            base_dir = get_project_type_path(Path(project_path), item_type)
+        elif source == "user":
+            base_dir = get_user_type_path(item_type)
+        elif source == "system":
+            base_dir = get_system_type_path(item_type)
+        else:
+            return []
+
+        if not base_dir.exists():
+            return []
+
+        # Determine file extension based on item type
+        extensions = {
+            ItemType.DIRECTIVE: ".md",
+            ItemType.TOOL: ".py",
+            ItemType.KNOWLEDGE: ".md",
+        }
+        ext = extensions.get(item_type, ".md")
+
+        # Resolve glob - pattern can be "demos/meta/*" or just "*"
+        if "/" in pattern:
+            # Pattern includes subdirectory
+            glob_pattern = f"{pattern}{ext}" if not pattern.endswith(ext) else pattern
+        else:
+            # Simple pattern like "*" - search recursively
+            glob_pattern = f"**/{pattern}{ext}" if pattern != "*" else f"**/*{ext}"
+
+        items = []
+        for path in base_dir.glob(glob_pattern):
+            if path.is_file():
+                items.append(path)
+
+        return items
+
     async def handle(self, **kwargs) -> Dict[str, Any]:
         """Handle sign request."""
         item_type: str = kwargs["item_type"]
@@ -49,6 +95,10 @@ class SignTool:
         logger.debug(f"Sign: item_type={item_type}, item_id={item_id}, source={source}")
 
         try:
+            # Check for batch signing (glob pattern)
+            if self._is_glob_pattern(item_id):
+                return await self._sign_batch(item_type, item_id, project_path, source)
+
             if item_type == ItemType.DIRECTIVE:
                 return await self._sign_directive(item_id, project_path, source)
             elif item_type == ItemType.TOOL:
@@ -61,6 +111,55 @@ class SignTool:
         except Exception as e:
             logger.error(f"Sign error: {e}")
             return {"status": "error", "error": str(e), "item_id": item_id}
+
+    async def _sign_batch(
+        self, item_type: str, pattern: str, project_path: str, source: str
+    ) -> Dict[str, Any]:
+        """Sign multiple items matching a glob pattern."""
+        items = self._resolve_glob_items(item_type, pattern, project_path, source)
+
+        if not items:
+            return {
+                "status": "error",
+                "error": f"No {item_type}s found matching pattern: {pattern}",
+                "searched_in": str(
+                    get_project_type_path(Path(project_path), item_type)
+                    if source == "project"
+                    else get_user_type_path(item_type)
+                ),
+            }
+
+        results: Dict[str, Any] = {"signed": [], "failed": [], "total": len(items)}
+
+        for file_path in items:
+            item_id = file_path.stem
+            try:
+                if item_type == ItemType.DIRECTIVE:
+                    result = await self._sign_directive(item_id, project_path, source)
+                elif item_type == ItemType.TOOL:
+                    result = await self._sign_tool(item_id, project_path, source)
+                elif item_type == ItemType.KNOWLEDGE:
+                    result = await self._sign_knowledge(item_id, project_path, source)
+                else:
+                    result = {"status": "error", "error": f"Unknown item type: {item_type}"}
+
+                if result.get("status") == "error":
+                    results["failed"].append({
+                        "item": item_id,
+                        "error": result.get("error"),
+                        "details": result.get("issues", [])[:2],
+                    })
+                else:
+                    results["signed"].append(item_id)
+            except Exception as e:
+                results["failed"].append({"item": item_id, "error": str(e)})
+
+        results["summary"] = f"Signed {len(results['signed'])}/{results['total']} items"
+        if results["failed"]:
+            results["summary"] += f", {len(results['failed'])} failed"
+        results["status"] = "completed"
+
+        return results
 
     async def _sign_directive(
         self, item_id: str, project_path: str, source: str
@@ -148,11 +247,27 @@ class SignTool:
                 "path": str(file_path),
             }
 
-        # For tools: name is derived from filename
-        filename = extract_filename(file_path)
-        parsed = {"name": filename}
+        # Parse tool file to extract metadata
+        parsed = self.parser_router.parse("python_ast", content)
+        if "error" in parsed:
+            return {
+                "status": "error",
+                "error": "Failed to parse tool file",
+                "details": parsed.get("error"),
+                "path": str(file_path),
+            }
 
-        # Schema-driven validation (minimal for tools)
+        # Add name from filename (required field derived from path)
+        parsed["name"] = extract_filename(file_path)
+
+        # Apply extraction rules to map dunder vars to standard field names
+        parsed = apply_field_mapping(
+            ItemType.TOOL,
+            parsed,
+            project_path=Path(project_path) if project_path else None,
+        )
+
+        # Schema-driven validation
         validation_result = validate_parsed_data(
             item_type=ItemType.TOOL,
             parsed_data=parsed,

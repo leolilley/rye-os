@@ -1,4 +1,4 @@
-# kiwi-mcp:validated:2026-02-02T00:00:00Z:placeholder
+# rye:validated:2026-02-03T07:29:34Z:e8a2ba838b943ab91df9e3996ff684dbe6a85982c3dbb4ad91ee1c0dba15a001
 """HTTP Client Primitive - Execute HTTP requests.
 
 Layer 1 primitive with __executor_id__ = None.
@@ -8,21 +8,36 @@ Routes directly to Lilux http_client primitive.
 __version__ = "1.0.0"
 __tool_type__ = "primitive"
 __executor_id__ = None
-__category__ = "primitives"
+__category__ = "rye/core/primitives"
+__tool_description__ = "HTTP client primitive - execute HTTP requests with configurable method, headers, and retry"
 
 CONFIG_SCHEMA = {
     "type": "object",
     "properties": {
-        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "default": "GET"},
-        "url": {"type": "string", "description": "Request URL (supports ${VAR} templating)"},
+        "method": {
+            "type": "string",
+            "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+            "default": "GET",
+        },
+        "url": {
+            "type": "string",
+            "description": "Request URL (supports ${VAR} templating)",
+        },
         "headers": {"type": "object", "description": "Request headers"},
         "body": {"type": "object", "description": "Request body (for POST/PUT/PATCH)"},
-        "timeout": {"type": "integer", "default": 30, "description": "Timeout in seconds"},
+        "timeout": {
+            "type": "integer",
+            "default": 30,
+            "description": "Timeout in seconds",
+        },
         "auth": {
             "type": "object",
             "properties": {
                 "type": {"type": "string", "enum": ["bearer", "api_key"]},
-                "token": {"type": "string", "description": "Bearer token (supports ${VAR})"},
+                "token": {
+                    "type": "string",
+                    "description": "Bearer token (supports ${VAR})",
+                },
                 "key": {"type": "string", "description": "API key (supports ${VAR})"},
                 "header": {"type": "string", "default": "X-API-Key"},
             },
@@ -31,7 +46,11 @@ CONFIG_SCHEMA = {
             "type": "object",
             "properties": {
                 "max_attempts": {"type": "integer", "default": 1},
-                "backoff": {"type": "string", "enum": ["exponential", "linear"], "default": "exponential"},
+                "backoff": {
+                    "type": "string",
+                    "enum": ["exponential", "linear"],
+                    "default": "exponential",
+                },
             },
         },
     },

@@ -1,4 +1,4 @@
-# rye:validated:2026-02-02T00:00:00Z:placeholder
+# rye:validated:2026-02-03T07:57:53Z:4d27a8c29a3971d7a04a0de441d1f90033802a5d03e6780073c22f73c4eeebdb
 """
 Directive Extractor
 
@@ -9,7 +9,10 @@ Defines extraction rules and validation schema for XML directives.
 __version__ = "1.0.0"
 __tool_type__ = "extractor"
 __executor_id__ = None
-__category__ = "extractors"
+__category__ = "rye/core/extractors/directive"
+__tool_description__ = (
+    "Directive extractor - extracts metadata from XML directive files"
+)
 
 # File extensions this extractor handles
 EXTENSIONS = [".md"]
@@ -67,13 +70,12 @@ VALIDATION_SCHEMA = {
             "type": "string",
         },
         "model": {
-            "required": True,
+            "required": False,
             "type": "object",
             "nested": {
                 "tier": {
-                    "required": True,
-                    "type": "enum",
-                    "values": ["fast", "balanced", "general", "reasoning", "expert", "orchestrator"],
+                    "required": False,
+                    "type": "string",
                 },
                 "fallback": {
                     "required": False,
@@ -91,7 +93,7 @@ VALIDATION_SCHEMA = {
             },
         },
         "permissions": {
-            "required": True,
+            "required": False,
             "type": "array",
             "item_type": "object",
             "item_required": ["tag", "attrs"],

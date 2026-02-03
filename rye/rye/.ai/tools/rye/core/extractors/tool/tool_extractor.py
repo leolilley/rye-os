@@ -1,4 +1,4 @@
-# rye:validated:2026-02-02T00:00:00Z:placeholder
+# rye:validated:2026-02-03T07:58:22Z:caf240a410b32b5338175079256c227e0a7d1f898eac102eda896ac2dba9c6b0
 """
 Tool Extractor
 
@@ -9,7 +9,8 @@ Handles Python tools with metadata in comments.
 __version__ = "1.0.0"
 __tool_type__ = "extractor"
 __executor_id__ = None
-__category__ = "extractors"
+__category__ = "rye/core/extractors/tool"
+__tool_description__ = "Extracts metadata from tool files (.py, .yaml, .json, etc)"
 
 # File extensions this extractor handles
 EXTENSIONS = [".py", ".yaml", ".yml", ".json", ".js", ".sh", ".toml"]
@@ -29,13 +30,13 @@ EXTRACTION_RULES = {
     "name": {"type": "filename"},
     "version": {"type": "path", "key": "__version__"},
     "category": {"type": "path", "key": "__category__"},
-    "description": {"type": "path", "key": "__docstring__"},
+    "description": {"type": "path", "key": "__tool_description__"},
+    "docstring": {"type": "path", "key": "__docstring__"},
     "tool_type": {"type": "path", "key": "__tool_type__"},
     "executor_id": {"type": "path", "key": "__executor_id__"},
 }
 
-# Validation schema - tools have minimal required fields
-# Name is derived from filename, category is optional in metadata
+# Validation schema - enforces required fields per tool-metadata.md spec
 VALIDATION_SCHEMA = {
     "fields": {
         "name": {
@@ -44,10 +45,26 @@ VALIDATION_SCHEMA = {
             "match_filename": True,
         },
         "category": {
-            "required": False,
+            "required": True,
             "type": "string",
             "match_path": True,
         },
+        "tool_type": {
+            "required": True,
+            "type": "string",
+        },
+        "version": {
+            "required": True,
+            "type": "semver",
+        },
+        "description": {
+            "required": True,
+            "type": "string",
+        },
+        "executor_id": {
+            "required": True,
+            "type": "string",
+            "nullable": True,
+        },
     },
 }
-
