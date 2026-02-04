@@ -243,10 +243,14 @@ async def _upsert_item(
         if item_type == "tool":
             item_data["tool_id"] = item_id
             item_data["tool_type"] = metadata.get("tool_type", "python")
+            item_data["visibility"] = metadata.get("visibility", "public")
         elif item_type == "knowledge":
-            item_data["zettel_id"] = item_id
             item_data["title"] = metadata.get("title", item_id)
             item_data["entry_type"] = metadata.get("entry_type", "reference")
+            item_data["visibility"] = metadata.get("visibility", "public")
+        else:
+            # directive
+            item_data["visibility"] = metadata.get("visibility", "public")
         
         create_result = supabase.table(table).insert(item_data).execute()
         item_uuid = create_result.data[0]["id"]
@@ -491,7 +495,7 @@ async def search_items(
         # Build query
         q = supabase.table(table).select("*, users(username)", count="exact")
         
-        # Text search on name and description
+        # Text search on name and description (consistent across all types now)
         q = q.or_(f"name.ilike.%{query}%,description.ilike.%{query}%")
         
         if category:
