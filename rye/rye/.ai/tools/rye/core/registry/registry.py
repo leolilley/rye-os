@@ -794,7 +794,7 @@ async def _login(params: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # Use device-auth edge function which creates session in DB then redirects to OAuth
-    auth_url = f"{config.base_url}/functions/v1/device-auth?{auth_params}"
+    auth_url = f"{config.auth_url}/functions/v1/device-auth?{auth_params}"
 
     # Save session for later polling
     expires_at = (datetime.now(timezone.utc).replace(microsecond=0)).isoformat()
