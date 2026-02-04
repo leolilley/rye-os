@@ -314,21 +314,24 @@ async def pull_item(
     table = "knowledge" if item_type == "knowledge" else f"{item_type}s"
     version_table = f"{item_type}_versions"
     
-    # Query item with versions
-    query = supabase.table(table).select(
-        f"*, {version_table}(*), users(username)"
-    ).eq("name", item_id)
+    # Query item first
+    item_result = supabase.table(table).select("*").eq("name", item_id).execute()
     
-    result = query.execute()
-    
-    if not result.data:
+    if not item_result.data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error": f"{item_type.title()} not found: {item_id}"},
         )
     
-    item = result.data[0]
-    versions = item.get(version_table, [])
+    item = item_result.data[0]
+    item_uuid = item["id"]
+    
+    # Query versions separately
+    versions_result = supabase.table(version_table).select("*").eq(
+        f"{item_type}_id", item_uuid
+    ).order("created_at", desc=True).execute()
+    
+    versions = versions_result.data or []
     
     if not versions:
         raise HTTPException(
@@ -348,8 +351,12 @@ async def pull_item(
         # Get latest (is_latest=true or most recent)
         target_version = next((v for v in versions if v.get("is_latest")), versions[0])
     
-    # Get author username
-    author_username = item.get("users", {}).get("username", "unknown")
+    # Get author username via separate query
+    author_username = "unknown"
+    if item.get("author_id"):
+        user_result = supabase.table("users").select("username").eq("id", item["author_id"]).execute()
+        if user_result.data:
+            author_username = user_result.data[0].get("username", "unknown")
     
     content = target_version["content"]
     
