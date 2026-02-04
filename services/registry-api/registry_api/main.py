@@ -374,12 +374,12 @@ async def pull_item(
 
 
 # =============================================================================
-# UNPUBLISH - Remove an item from the registry
+# DELETE - Remove an item from the registry
 # =============================================================================
 
 
-@app.delete("/v1/unpublish/{item_type}/{item_id}", response_model=UnpublishResponse)
-async def unpublish_item(
+@app.delete("/v1/delete/{item_type}/{item_id}")
+async def delete_item(
     item_type: str,
     item_id: str,
     version: str = None,
@@ -455,15 +455,83 @@ async def unpublish_item(
         # Delete the item
         supabase.table(table).delete().eq("id", item_uuid).execute()
     
-    logger.info(f"Unpublished {item_type}/{item_id} (v={version or 'all'}) by @{user.username}")
+    logger.info(f"Deleted {item_type}/{item_id} (v={version or 'all'}) by @{user.username}")
     
-    return UnpublishResponse(
-        status="unpublished",
-        item_type=item_type,
-        item_id=item_id,
-        version=version,
-        deleted_versions=deleted_versions,
-    )
+    return {
+        "status": "deleted",
+        "item_type": item_type,
+        "item_id": item_id,
+        "version": version,
+        "deleted_versions": deleted_versions,
+    }
+
+
+# =============================================================================
+# VISIBILITY - Set item visibility (publish/unpublish)
+# =============================================================================
+
+
+@app.post("/v1/visibility/{item_type}/{item_id}")
+async def set_visibility(
+    item_type: str,
+    item_id: str,
+    body: dict,
+    user: User = Depends(get_current_user),
+):
+    """Set item visibility (public/private/unlisted).
+    
+    Used by publish (visibility='public') and unpublish (visibility='private').
+    """
+    visibility = body.get("visibility")
+    if visibility not in ["public", "private", "unlisted"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Invalid visibility: {visibility}. Must be public, private, or unlisted."},
+        )
+    
+    if item_type not in ["directive", "tool", "knowledge"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Invalid item_type: {item_type}"},
+        )
+    
+    supabase = get_supabase()
+    
+    # Table names follow rye convention (knowledge is singular)
+    table = "knowledge" if item_type == "knowledge" else f"{item_type}s"
+    
+    # Find the item
+    result = supabase.table(table).select("id, author_id, visibility").eq("name", item_id).execute()
+    
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": f"{item_type.title()} not found: {item_id}"},
+        )
+    
+    item = result.data[0]
+    
+    # Check ownership
+    if item["author_id"] != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "You can only change visibility of your own items"},
+        )
+    
+    old_visibility = item.get("visibility", "private")
+    
+    # Update visibility
+    supabase.table(table).update({"visibility": visibility}).eq("id", item["id"]).execute()
+    
+    logger.info(f"Changed visibility {item_type}/{item_id}: {old_visibility} -> {visibility} by @{user.username}")
+    
+    return {
+        "status": "updated",
+        "item_type": item_type,
+        "item_id": item_id,
+        "visibility": visibility,
+        "previous_visibility": old_visibility,
+    }
 
 
 # =============================================================================

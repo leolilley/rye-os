@@ -93,8 +93,9 @@ ACTIONS = [
     "search",
     "pull",
     "push",
+    "delete",
+    "publish",
     "unpublish",
-    "set_visibility",
     # Keys
     "keys_generate",
     "keys_list",
@@ -465,18 +466,23 @@ async def execute(
                 visibility=params.get("visibility", "private"),
             )
             http_calls = 2  # push typically makes 2 HTTP requests (check + create)
-        elif action == "unpublish":
-            result = await _unpublish(
+        elif action == "delete":
+            result = await _delete(
                 item_type=params.get("item_type"),
                 item_id=params.get("item_id"),
                 version=params.get("version"),
             )
             http_calls = 1
-        elif action == "set_visibility":
-            result = await _set_visibility(
+        elif action == "publish":
+            result = await _publish(
                 item_type=params.get("item_type"),
                 item_id=params.get("item_id"),
-                visibility=params.get("visibility"),
+            )
+            http_calls = 1
+        elif action == "unpublish":
+            result = await _unpublish(
+                item_type=params.get("item_type"),
+                item_id=params.get("item_id"),
             )
             http_calls = 1
 
@@ -1442,94 +1448,23 @@ async def _push(
         return {"error": f"Push failed: {e}"}
 
 
-async def _set_visibility(
-    item_type: Optional[str],
-    item_id: Optional[str],
-    visibility: Optional[str],
-) -> Dict[str, Any]:
-    """Change item visibility."""
-    if not item_type or not item_id or not visibility:
-        return {
-            "error": "Required: item_type, item_id, visibility",
-            "usage": "set_visibility(item_type='directive', item_id='me/my', visibility='public')",
-        }
-
-    valid_visibilities = ["public", "private", "unlisted"]
-    if visibility not in valid_visibilities:
-        return {
-            "error": f"Invalid visibility: {visibility}",
-            "valid": valid_visibilities,
-        }
-
-    # Check auth - env var first, then keyring
-    env_token = _get_token_from_env()
-    if env_token:
-        token = env_token
-    else:
-        try:
-            from ..runtimes.auth import AuthenticationRequired, AuthStore
-
-            auth_store = AuthStore()  # Uses kernel default service_name="lilux"
-            token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:write")
-        except AuthenticationRequired:
-            return {
-                "error": "Authentication required",
-                "solution": "Run 'registry login' first",
-            }
-        except ImportError:
-            return {"error": "AuthStore not available"}
-
-    config = RegistryConfig.from_env()
-    http = RegistryHttpClient(config)
-
-    try:
-        table = f"{item_type}s"
-
-        # Update visibility via PATCH
-        result = await http.post(
-            f"/rest/v1/{table}?name=eq.{item_id}",
-            body={"visibility": visibility},
-            auth_token=token,
-            headers={"X-HTTP-Method-Override": "PATCH"},
-        )
-
-        await http.close()
-
-        if not result["success"]:
-            return {
-                "error": f"Failed to update visibility: {result['error']}",
-                "status_code": result["status_code"],
-            }
-
-        return {
-            "status": "updated",
-            "item_type": item_type,
-            "item_id": item_id,
-            "visibility": visibility,
-        }
-
-    except Exception as e:
-        await http.close()
-        return {"error": f"Set visibility failed: {e}"}
-
-
-async def _unpublish(
+async def _delete(
     item_type: Optional[str],
     item_id: Optional[str],
     version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Remove item from registry.
+    Delete item from registry.
 
     Args:
         item_type: "directive", "tool", or "knowledge"
         item_id: Item identifier (namespace/name format)
-        version: Specific version to unpublish (or None for all versions)
+        version: Specific version to delete (or None for all versions)
     """
     if not item_type or not item_id:
         return {
             "error": "Required: item_type, item_id",
-            "usage": "unpublish(item_type='directive', item_id='me/my')",
+            "usage": "delete(item_type='directive', item_id='me/my')",
         }
 
     if item_type not in ["directive", "tool", "knowledge"]:
@@ -1560,8 +1495,7 @@ async def _unpublish(
     http = RegistryHttpClient(config)
 
     try:
-        # Build unpublish URL
-        url = f"/v1/unpublish/{item_type}/{item_id}"
+        url = f"/v1/delete/{item_type}/{item_id}"
         if version:
             url += f"?version={version}"
 
@@ -1576,6 +1510,146 @@ async def _unpublish(
                     "status_code": result["status_code"],
                 }
             return {
+                "error": f"Delete failed: {result.get('error', 'Unknown error')}",
+                "status_code": result.get("status_code"),
+            }
+
+        return {
+            "status": "deleted",
+            "item_type": item_type,
+            "item_id": item_id,
+            "version": version or "all",
+        }
+
+    except Exception as e:
+        await http.close()
+        return {"error": f"Delete failed: {e}"}
+
+
+async def _publish(
+    item_type: Optional[str],
+    item_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Make item public (set visibility to 'public').
+
+    Args:
+        item_type: "directive", "tool", or "knowledge"
+        item_id: Item identifier (namespace/name format)
+    """
+    if not item_type or not item_id:
+        return {
+            "error": "Required: item_type, item_id",
+            "usage": "publish(item_type='directive', item_id='me/my')",
+        }
+
+    if item_type not in ["directive", "tool", "knowledge"]:
+        return {
+            "error": f"Invalid item_type: {item_type}",
+            "valid": ["directive", "tool", "knowledge"],
+        }
+
+    # Check auth
+    env_token = _get_token_from_env()
+    if env_token:
+        token = env_token
+    else:
+        try:
+            from ..runtimes.auth import AuthenticationRequired, AuthStore
+
+            auth_store = AuthStore()
+            token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:write")
+        except AuthenticationRequired:
+            return {
+                "error": "Authentication required",
+                "solution": "Run 'registry login' first",
+            }
+        except ImportError:
+            return {"error": "AuthStore not available"}
+
+    config = RegistryConfig.from_env()
+    http = RegistryHttpClient(config)
+
+    try:
+        result = await http.post(
+            f"/v1/visibility/{item_type}/{item_id}",
+            body={"visibility": "public"},
+            auth_token=token,
+        )
+        await http.close()
+
+        if not result["success"]:
+            return {
+                "error": f"Publish failed: {result.get('error', 'Unknown error')}",
+                "status_code": result.get("status_code"),
+            }
+
+        return {
+            "status": "published",
+            "item_type": item_type,
+            "item_id": item_id,
+            "visibility": "public",
+        }
+
+    except Exception as e:
+        await http.close()
+        return {"error": f"Publish failed: {e}"}
+
+
+async def _unpublish(
+    item_type: Optional[str],
+    item_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Make item private (set visibility to 'private').
+
+    Args:
+        item_type: "directive", "tool", or "knowledge"
+        item_id: Item identifier (namespace/name format)
+    """
+    if not item_type or not item_id:
+        return {
+            "error": "Required: item_type, item_id",
+            "usage": "unpublish(item_type='directive', item_id='me/my')",
+        }
+
+    if item_type not in ["directive", "tool", "knowledge"]:
+        return {
+            "error": f"Invalid item_type: {item_type}",
+            "valid": ["directive", "tool", "knowledge"],
+        }
+
+    # Check auth
+    env_token = _get_token_from_env()
+    if env_token:
+        token = env_token
+    else:
+        try:
+            from ..runtimes.auth import AuthenticationRequired, AuthStore
+
+            auth_store = AuthStore()
+            token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:write")
+        except AuthenticationRequired:
+            return {
+                "error": "Authentication required",
+                "solution": "Run 'registry login' first",
+            }
+        except ImportError:
+            return {"error": "AuthStore not available"}
+
+    config = RegistryConfig.from_env()
+    http = RegistryHttpClient(config)
+
+    try:
+        result = await http.post(
+            f"/v1/visibility/{item_type}/{item_id}",
+            body={"visibility": "private"},
+            auth_token=token,
+        )
+        await http.close()
+
+        if not result["success"]:
+            return {
                 "error": f"Unpublish failed: {result.get('error', 'Unknown error')}",
                 "status_code": result.get("status_code"),
             }
@@ -1584,7 +1658,7 @@ async def _unpublish(
             "status": "unpublished",
             "item_type": item_type,
             "item_id": item_id,
-            "version": version or "all",
+            "visibility": "private",
         }
 
     except Exception as e:
