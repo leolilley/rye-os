@@ -21,6 +21,7 @@ from rye.utils.path_utils import (
     get_system_type_path,
     get_user_type_path,
 )
+from rye.utils.extensions import get_tool_extensions
 from rye.utils.resolvers import get_system_space, get_user_space
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,12 @@ class ExecuteTool:
     def _find_item(
         self, project_path: str, item_type: str, item_id: str
     ) -> Optional[Path]:
-        """Find item file searching project > user > system."""
+        """Find item file by relative path ID searching project > user > system.
+        
+        Args:
+            item_id: Relative path from .ai/<type>/ without extension.
+                    e.g., "rye/core/registry/registry" -> .ai/tools/rye/core/registry/registry.py
+        """
         type_dir = ItemType.TYPE_DIRS.get(item_type)
         if not type_dir:
             return None
@@ -239,11 +245,18 @@ class ExecuteTool:
         search_bases.append(get_user_type_path(item_type))
         search_bases.append(get_system_type_path(item_type))
 
+        # Get extensions data-driven from extractors
+        if item_type == ItemType.TOOL:
+            extensions = get_tool_extensions(Path(project_path) if project_path else None)
+        else:
+            extensions = [".md"]
+
         for base in search_bases:
             if not base.exists():
                 continue
-            for file_path in base.rglob(f"{item_id}*"):
-                if file_path.is_file() and file_path.stem == item_id:
+            for ext in extensions:
+                file_path = base / f"{item_id}{ext}"
+                if file_path.is_file():
                     return file_path
 
         return None

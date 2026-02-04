@@ -30,6 +30,7 @@ from registry_api.models import (
     SearchResponse,
     SearchResultItem,
     SignatureInfo,
+    UnpublishResponse,
 )
 from registry_api.validation import (
     sign_with_registry,
@@ -216,8 +217,8 @@ async def _upsert_item(
     supabase = get_supabase()
     metadata = metadata or {}
     
-    # Table names follow rye convention
-    table = f"{item_type}s"
+    # Table names follow rye convention (knowledge is singular)
+    table = "knowledge" if item_type == "knowledge" else f"{item_type}s"
     version_table = f"{item_type}_versions"
     
     # Ensure user exists
@@ -305,8 +306,8 @@ async def pull_item(
     
     supabase = get_supabase()
     
-    # Table names follow rye convention
-    table = f"{item_type}s"
+    # Table names follow rye convention (knowledge is singular)
+    table = "knowledge" if item_type == "knowledge" else f"{item_type}s"
     version_table = f"{item_type}_versions"
     
     # Query item with versions
@@ -369,6 +370,99 @@ async def pull_item(
 
 
 # =============================================================================
+# UNPUBLISH - Remove an item from the registry
+# =============================================================================
+
+
+@app.delete("/v1/unpublish/{item_type}/{item_id}", response_model=UnpublishResponse)
+async def unpublish_item(
+    item_type: str,
+    item_id: str,
+    version: str = None,
+    user: User = Depends(get_current_user),
+):
+    """Remove an item from the registry.
+    
+    Only the author can unpublish their items.
+    If version is specified, only that version is deleted.
+    Otherwise, all versions and the item itself are deleted.
+    """
+    if item_type not in ["directive", "tool", "knowledge"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Invalid item_type: {item_type}"},
+        )
+    
+    supabase = get_supabase()
+    
+    # Table names follow rye convention (knowledge is singular)
+    table = "knowledge" if item_type == "knowledge" else f"{item_type}s"
+    version_table = f"{item_type}_versions"
+    
+    # Find the item
+    result = supabase.table(table).select("id, author_id").eq("name", item_id).execute()
+    
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": f"{item_type.title()} not found: {item_id}"},
+        )
+    
+    item = result.data[0]
+    
+    # Check ownership
+    if item["author_id"] != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "You can only unpublish your own items"},
+        )
+    
+    item_uuid = item["id"]
+    deleted_versions = 0
+    
+    if version:
+        # Delete specific version
+        del_result = supabase.table(version_table).delete().eq(
+            f"{item_type}_id", item_uuid
+        ).eq("version", version).execute()
+        deleted_versions = len(del_result.data) if del_result.data else 0
+        
+        if deleted_versions == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": f"Version {version} not found for {item_id}"},
+            )
+        
+        # Check if any versions remain
+        remaining = supabase.table(version_table).select("id").eq(
+            f"{item_type}_id", item_uuid
+        ).execute()
+        
+        if not remaining.data:
+            # No versions left, delete the item
+            supabase.table(table).delete().eq("id", item_uuid).execute()
+    else:
+        # Delete all versions
+        del_result = supabase.table(version_table).delete().eq(
+            f"{item_type}_id", item_uuid
+        ).execute()
+        deleted_versions = len(del_result.data) if del_result.data else 0
+        
+        # Delete the item
+        supabase.table(table).delete().eq("id", item_uuid).execute()
+    
+    logger.info(f"Unpublished {item_type}/{item_id} (v={version or 'all'}) by @{user.username}")
+    
+    return UnpublishResponse(
+        status="unpublished",
+        item_type=item_type,
+        item_id=item_id,
+        version=version,
+        deleted_versions=deleted_versions,
+    )
+
+
+# =============================================================================
 # SEARCH - Search registry items
 # =============================================================================
 
@@ -391,7 +485,8 @@ async def search_items(
     types_to_search = [item_type] if item_type else ["directive", "tool", "knowledge"]
     
     for itype in types_to_search:
-        table = f"{itype}s"
+        # knowledge table is singular, others are plural
+        table = "knowledge" if itype == "knowledge" else f"{itype}s"
         
         # Build query
         q = supabase.table(table).select("*, users(username)", count="exact")

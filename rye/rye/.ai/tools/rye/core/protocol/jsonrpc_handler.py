@@ -1,6 +1,6 @@
 # rye:validated:2026-02-03T07:29:34Z:5a7f27ee9c63d0fd174217b7a3b53298cafa087991839df0645aafdb34a78b6e
 __tool_type__ = "protocol_handler"
-__executor_id__ = "python_runtime"
+__executor_id__ = "rye/core/runtimes/python_runtime"
 __version__ = "1.0.0"
 __category__ = "rye/core/protocol"
 __tool_description__ = (

@@ -1,13 +1,13 @@
 # rye:validated:2026-02-03T07:29:34Z:a11dc38a3575acc300c9ab748ae152a3825f8527549336e119ec3236a1250147
 """Node.js Runtime - Execute JavaScript/TypeScript.
 
-Layer 2 runtime with __executor_id__ = "subprocess".
+Layer 2 runtime with __executor_id__ = "rye/core/primitives/subprocess".
 Resolves Node interpreter via ENV_CONFIG before delegating.
 """
 
 __version__ = "1.0.0"
 __tool_type__ = "runtime"
-__executor_id__ = "subprocess"
+__executor_id__ = "rye/core/primitives/subprocess"
 __category__ = "rye/core/runtimes"
 __tool_description__ = "Node.js runtime executor - runs JavaScript/TypeScript with Node interpreter resolution"
 

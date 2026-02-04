@@ -102,3 +102,13 @@ class HealthResponse(BaseModel):
     status: Literal["healthy"]
     version: str
     database: Literal["connected", "error"]
+
+
+class UnpublishResponse(BaseModel):
+    """Response for unpublish operation."""
+
+    status: Literal["unpublished"]
+    item_type: str
+    item_id: str
+    version: Optional[str] = None
+    deleted_versions: int = 0

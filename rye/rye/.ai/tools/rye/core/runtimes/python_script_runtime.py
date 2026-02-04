@@ -1,13 +1,13 @@
-# rye:validated:2026-02-03T07:29:34Z:6bf671b4c91149cf3ac10c49a472c0671cf93ee8a4fc28971105558c7f4baf99
+# rye:validated:2026-02-04T04:59:28Z:8a346aca072319716e7fdd4b9d86ef8d5e8aaa7bbaeeb3850dda1a68221c7b8b
 """Python Runtime - Execute Python scripts.
 
-Layer 2 runtime with __executor_id__ = "subprocess".
+Layer 2 runtime with __executor_id__ = "rye/core/primitives/subprocess".
 Resolves Python interpreter via ENV_CONFIG before delegating.
 """
 
 __version__ = "1.0.0"
 __tool_type__ = "runtime"
-__executor_id__ = "subprocess"
+__executor_id__ = "rye/core/primitives/subprocess"
 __category__ = "rye/core/runtimes"
 __tool_description__ = (
     "Python runtime executor - runs Python scripts with environment resolution"

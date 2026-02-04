@@ -28,6 +28,7 @@ from lilux.runtime.env_resolver import EnvResolver
 
 from rye.executor.chain_validator import ChainValidator, ChainValidationResult
 from rye.executor.lockfile_resolver import LockfileResolver
+from rye.utils.extensions import get_tool_extensions
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,10 @@ class PrimitiveExecutor:
         3. Tool (__executor_id__ = "python_runtime"): Delegate to runtime
     """
 
-    # Primitive name to Lilux primitive class mapping
+    # Primitive ID to Lilux primitive class mapping (full path IDs)
     PRIMITIVE_MAP = {
-        "subprocess": SubprocessPrimitive,
-        "http_client": HttpClientPrimitive,
+        "rye/core/primitives/subprocess": SubprocessPrimitive,
+        "rye/core/primitives/http_client": HttpClientPrimitive,
     }
 
     def __init__(
@@ -350,13 +351,14 @@ class PrimitiveExecutor:
     def _resolve_tool_path(
         self, item_id: str, current_space: str = "project"
     ) -> Optional[Tuple[Path, str]]:
-        """Resolve tool path using 3-tier space precedence.
+        """Resolve tool path by relative path ID using 3-tier space precedence.
 
         Resolution order: project > user > system
         Each space can shadow tools from lower-precedence spaces.
 
         Args:
-            item_id: Tool identifier
+            item_id: Relative path from .ai/tools/ without extension.
+                    e.g., "rye/core/registry/registry" -> .ai/tools/rye/core/registry/registry.py
             current_space: Current tool's space (affects resolution rules)
 
         Returns:
@@ -382,23 +384,17 @@ class PrimitiveExecutor:
                 (self.system_space / "tools", "system"),
             ]
 
-        extensions = [".py", ".yaml", ".yml"]
+        # Get extensions data-driven from extractors
+        extensions = get_tool_extensions(self.project_path)
 
         for base_path, space in search_order:
             if not base_path.exists():
                 continue
 
-            # Search in root
             for ext in extensions:
-                direct_path = base_path / f"{item_id}{ext}"
-                if direct_path.exists():
-                    return (direct_path, space)
-
-            # Search in subdirectories (rye/core/primitives/, etc.)
-            for ext in extensions:
-                for file_path in base_path.rglob(f"{item_id}{ext}"):
-                    if file_path.is_file() and file_path.stem == item_id:
-                        return (file_path, space)
+                file_path = base_path / f"{item_id}{ext}"
+                if file_path.is_file():
+                    return (file_path, space)
 
         return None
 
@@ -627,19 +623,40 @@ class PrimitiveExecutor:
             }
 
         # Execute primitive
+        # Merge tool execution context into parameters for {param} templating
+        enriched_params = {**parameters}
+        for key in ("tool_path", "project_path", "params_json", "action"):
+            if key in config:
+                enriched_params[key] = config[key]
+
         try:
-            result = await primitive.execute(config, parameters)
+            result = await primitive.execute(config, enriched_params)
 
             # Convert primitive result to dict
             if isinstance(result, SubprocessResult):
+                # Try to parse stdout as JSON (for tool_runner output)
+                error_msg = result.stderr if not result.success else None
+                parsed_data = None
+                
+                if result.stdout:
+                    try:
+                        import json
+                        parsed_data = json.loads(result.stdout)
+                        # Extract error from tool output if present
+                        if isinstance(parsed_data, dict):
+                            if not parsed_data.get("success", True) and not error_msg:
+                                error_msg = parsed_data.get("error", "")
+                    except json.JSONDecodeError:
+                        pass
+                
                 return {
-                    "success": result.success,
-                    "data": {
+                    "success": result.success and (parsed_data.get("success", True) if parsed_data else True),
+                    "data": parsed_data if parsed_data else {
                         "stdout": result.stdout,
                         "stderr": result.stderr,
                         "return_code": result.return_code,
                     },
-                    "error": result.stderr if not result.success else None,
+                    "error": error_msg,
                 }
             elif isinstance(result, HttpResult):
                 return {
@@ -750,6 +767,8 @@ class PrimitiveExecutor:
         Returns:
             Merged config dict for primitive execution
         """
+        import json
+
         config: Dict[str, Any] = {}
 
         # Merge configs from chain (primitive first, then overrides)
@@ -762,6 +781,20 @@ class PrimitiveExecutor:
 
         # Apply environment
         config["env"] = resolved_env
+
+        # Inject tool execution context for python_runtime
+        # chain[0] is the tool being executed
+        if chain:
+            tool_element = chain[0]
+            config["tool_path"] = str(tool_element.path)
+            config["project_path"] = str(self.project_path)
+
+            # Build params_json from parameters (excluding config keys)
+            tool_params = {
+                k: v for k, v in parameters.items()
+                if k not in ("command", "args", "cwd", "env", "timeout")
+            }
+            config["params_json"] = json.dumps(tool_params)
 
         # Template substitution for ${VAR} in config values
         config = self._template_config(config, resolved_env)

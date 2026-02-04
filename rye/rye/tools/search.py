@@ -477,7 +477,7 @@ class SearchTool:
 
             for file_path in search_dir.rglob("*"):
                 if file_path.is_file() and not file_path.name.startswith("_"):
-                    item = self._extract_metadata(file_path, opts.item_type)
+                    item = self._extract_metadata(file_path, opts.item_type, search_dir)
                     if not item:
                         continue
 
@@ -573,11 +573,22 @@ class SearchTool:
         return results
 
     def _extract_metadata(
-        self, file_path: Path, item_type: str
+        self, file_path: Path, item_type: str, search_dir: Path
     ) -> Optional[Dict[str, Any]]:
-        """Extract metadata from file."""
+        """Extract metadata from file.
+        
+        Args:
+            file_path: Absolute path to the file.
+            item_type: Type of item (directive, tool, knowledge).
+            search_dir: Base directory for this item type (e.g., .ai/tools/).
+                       Used to compute relative path ID.
+        """
         try:
             content = file_path.read_text(encoding="utf-8")
+            
+            # Compute relative path ID (without extension)
+            relative_path = file_path.relative_to(search_dir)
+            item_id = str(relative_path.with_suffix(""))
             name = file_path.stem
 
             path_str = str(file_path)
@@ -589,7 +600,7 @@ class SearchTool:
                 source = "project"
 
             metadata: Dict[str, Any] = {
-                "id": name,
+                "id": item_id,
                 "name": name,
                 "title": name,
                 "description": "",

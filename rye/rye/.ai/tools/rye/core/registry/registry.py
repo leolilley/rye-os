@@ -1,3 +1,4 @@
+# rye:validated:2026-02-04T04:37:25Z:d0191e7a046d494ab3a7ca79c32fd8ad1e419ac84e5b28a2cfc56f8f01305bec
 """
 Registry tool - auth, push/pull, publish, key management.
 
@@ -36,7 +37,7 @@ Actions:
 
 __version__ = "1.0.0"
 __tool_type__ = "python"
-__executor_id__ = "python_runtime"
+__executor_id__ = "rye/core/runtimes/python_tool_runtime"
 __category__ = "rye/core/registry"
 __tool_description__ = "Registry tool for auth, push/pull, publish, and key management"
 
@@ -84,6 +85,7 @@ ACTIONS = [
     # Auth
     "signup",
     "login",
+    "login_email",
     "login_poll",
     "logout",
     "whoami",
@@ -91,6 +93,7 @@ ACTIONS = [
     "search",
     "pull",
     "push",
+    "unpublish",
     "set_visibility",
     # Keys
     "keys_generate",
@@ -100,10 +103,18 @@ ACTIONS = [
 ]
 
 # Registry configuration from environment
-REGISTRY_URL = os.environ.get(
-    "RYE_REGISTRY_URL", "https://jvdgicalhvhaqtcalseq.supabase.co"
+# API service on Railway (handles push/pull/search)
+REGISTRY_API_URL = os.environ.get(
+    "RYE_REGISTRY_API_URL", "https://rye-os-production.up.railway.app"
 )
-REGISTRY_ANON_KEY = os.environ.get("RYE_REGISTRY_ANON_KEY", "")
+# Supabase for auth (device-auth flow)
+REGISTRY_AUTH_URL = os.environ.get(
+    "RYE_REGISTRY_AUTH_URL", "https://jvdgicalhvhaqtcalseq.supabase.co"
+)
+REGISTRY_ANON_KEY = os.environ.get(
+    "RYE_REGISTRY_ANON_KEY",
+    "sb_publishable_ZLeTVLX5wvbhyT5blq4gpg_67eWmaim"  # Default publishable key
+)
 
 # Auth configuration
 # Service key for keyring storage (kernel uses service_name="lilux" by default)
@@ -113,16 +124,13 @@ REGISTRY_TOKEN_ENV = "RYE_REGISTRY_TOKEN"
 
 
 def _get_rye_state_dir() -> Path:
-    """Get RYE state directory from kernel path service.
+    """Get RYE state directory.
 
-    Cross-platform:
-        - Linux: $XDG_STATE_HOME/rye/ → ~/.local/state/rye/
-        - macOS: ~/Library/Application Support/rye/
-        - Windows: %LOCALAPPDATA%/rye/
+    Uses rye's USER_SPACE env var or defaults to ~/.ai.
     """
-    from lilux.utils.path_service import get_rye_state_dir
+    from rye.utils.path_utils import get_user_space
 
-    return get_rye_state_dir()
+    return get_user_space()
 
 
 def _get_keys_dir() -> Path:
@@ -149,13 +157,15 @@ def _get_token_from_env() -> Optional[str]:
 class RegistryConfig:
     """Registry connection configuration."""
 
-    base_url: str
+    api_url: str  # Railway API for push/pull/search
+    auth_url: str  # Supabase for device-auth
     anon_key: str
 
     @classmethod
     def from_env(cls) -> "RegistryConfig":
         return cls(
-            base_url=REGISTRY_URL,
+            api_url=REGISTRY_API_URL,
+            auth_url=REGISTRY_AUTH_URL,
             anon_key=REGISTRY_ANON_KEY,
         )
 
@@ -175,10 +185,20 @@ class RegistryHttpClient:
     async def _get_http(self):
         """Lazy load http_client primitive."""
         if self._http is None:
-            from ..primitives.http_client import HttpClientPrimitive
+            from lilux.primitives.http_client import HttpClientPrimitive
 
             self._http = HttpClientPrimitive()
         return self._http
+
+    def _get_base_url(self, path: str) -> str:
+        """Get appropriate base URL based on path.
+        
+        Auth endpoints (/auth/*, /functions/*) go to Supabase.
+        API endpoints (/v1/*) go to Railway.
+        """
+        if path.startswith("/auth/") or path.startswith("/functions/"):
+            return self.config.auth_url
+        return self.config.api_url
 
     async def get(
         self,
@@ -188,6 +208,7 @@ class RegistryHttpClient:
     ) -> Dict:
         """Make GET request to registry API."""
         http = await self._get_http()
+        base_url = self._get_base_url(path)
 
         req_headers = {
             "apikey": self.config.anon_key,
@@ -200,7 +221,7 @@ class RegistryHttpClient:
 
         config = {
             "method": "GET",
-            "url": f"{self.config.base_url}{path}",
+            "url": f"{base_url}{path}",
             "headers": req_headers,
             "timeout": 30,
         }
@@ -222,6 +243,7 @@ class RegistryHttpClient:
     ) -> Dict:
         """Make POST request to registry API."""
         http = await self._get_http()
+        base_url = self._get_base_url(path)
 
         req_headers = {
             "apikey": self.config.anon_key,
@@ -234,9 +256,43 @@ class RegistryHttpClient:
 
         config = {
             "method": "POST",
-            "url": f"{self.config.base_url}{path}",
+            "url": f"{base_url}{path}",
             "headers": req_headers,
             "body": body,
+            "timeout": 30,
+        }
+
+        result = await http.execute(config, {})
+        return {
+            "success": result.success,
+            "status_code": result.status_code,
+            "body": result.body,
+            "error": result.error,
+        }
+
+    async def delete(
+        self,
+        path: str,
+        headers: Optional[Dict] = None,
+        auth_token: Optional[str] = None,
+    ) -> Dict:
+        """Make DELETE request to registry API."""
+        http = await self._get_http()
+        base_url = self._get_base_url(path)
+
+        req_headers = {
+            "apikey": self.config.anon_key,
+            "Content-Type": "application/json",
+        }
+        if auth_token:
+            req_headers["Authorization"] = f"Bearer {auth_token}"
+        if headers:
+            req_headers.update(headers)
+
+        config = {
+            "method": "DELETE",
+            "url": f"{base_url}{path}",
+            "headers": req_headers,
             "timeout": 30,
         }
 
@@ -372,6 +428,8 @@ async def execute(
             result = await _signup(params)
         elif action == "login":
             result = await _login(params)
+        elif action == "login_email":
+            result = await _login_email(params)
         elif action == "login_poll":
             result = await _login_poll(params)
         elif action == "logout":
@@ -407,6 +465,13 @@ async def execute(
                 visibility=params.get("visibility", "private"),
             )
             http_calls = 2  # push typically makes 2 HTTP requests (check + create)
+        elif action == "unpublish":
+            result = await _unpublish(
+                item_type=params.get("item_type"),
+                item_id=params.get("item_id"),
+                version=params.get("version"),
+            )
+            http_calls = 1
         elif action == "set_visibility":
             result = await _set_visibility(
                 item_type=params.get("item_type"),
@@ -615,6 +680,87 @@ async def _signup(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Signup failed: {e}"}
 
 
+async def _login_email(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Login with email/password directly (no OAuth).
+
+    Args:
+        email: User's email address (or set RYE_REGISTRY_EMAIL env var)
+        password: User's password (or set RYE_REGISTRY_PASSWORD env var)
+    """
+    email = params.get("email") or os.environ.get("RYE_REGISTRY_EMAIL")
+    password = params.get("password") or os.environ.get("RYE_REGISTRY_PASSWORD")
+
+    if not email or not password:
+        return {
+            "error": "Required: email and password",
+            "usage": "login_email(email='you@example.com', password='yourpass')",
+            "hint": "Or set RYE_REGISTRY_EMAIL and RYE_REGISTRY_PASSWORD env vars",
+        }
+
+    try:
+        from ..runtimes.auth import AuthStore
+    except ImportError:
+        return {"error": "AuthStore not available"}
+
+    config = RegistryConfig.from_env()
+    http = RegistryHttpClient(config)
+
+    try:
+        # Call Supabase Auth token endpoint
+        result = await http.post(
+            "/auth/v1/token?grant_type=password",
+            body={
+                "email": email,
+                "password": password,
+            },
+        )
+
+        await http.close()
+
+        if not result["success"]:
+            error_body = result.get("body", {})
+            error_msg = (
+                error_body.get("error_description")
+                or error_body.get("msg")
+                or error_body.get("error")
+                or result.get("error")
+                or "Unknown error"
+            )
+            return {
+                "error": f"Login failed: {error_msg}",
+                "status_code": result.get("status_code"),
+            }
+
+        body = result["body"]
+        access_token = body.get("access_token")
+        refresh_token = body.get("refresh_token")
+        expires_in = body.get("expires_in", 3600)
+
+        if not access_token:
+            return {"error": "No access token in response"}
+
+        # Store in keyring
+        auth_store = AuthStore()
+        auth_store.set_token(
+            service=REGISTRY_SERVICE,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=expires_in,
+            scopes=["registry:read", "registry:write"],
+        )
+
+        return {
+            "status": "authenticated",
+            "message": "Successfully logged in to Rye Registry",
+            "user": body.get("user", {}),
+        }
+
+    except Exception as e:
+        await http.close()
+        return {"error": f"Login failed: {e}"}
+
+
 async def _login(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Start device authorization flow.
@@ -683,11 +829,7 @@ async def _login(params: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
 
-    # Use Supabase's auth UI - redirect to login then back to device callback
-    auth_url = f"{config.base_url}/auth/v1/authorize?provider=github&redirect_to={config.base_url}/functions/v1/device-auth-callback?{auth_params}"
-
-    # For simpler approach, we'll use a custom edge function endpoint
-    # that handles the device auth flow
+    # Use device-auth edge function which creates session in DB then redirects to OAuth
     auth_url = f"{config.base_url}/functions/v1/device-auth?{auth_params}"
 
     # Save session for later polling
@@ -698,7 +840,16 @@ async def _login(params: Dict[str, Any]) -> Dict[str, Any]:
     open_browser = params.get("open_browser", True)
     if open_browser:
         try:
-            webbrowser.open(auth_url)
+            import subprocess
+            import shutil
+            
+            # Try xdg-open first (Linux), then open (macOS), then webbrowser
+            if shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", auth_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif shutil.which("open"):
+                subprocess.Popen(["open", auth_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                webbrowser.open(auth_url)
             browser_opened = True
         except Exception:
             browser_opened = False
@@ -1054,7 +1205,9 @@ async def _pull(
 
                     # Verify content hash
                     content_without_sig = strategy.remove_signature(content)
-                    computed_hash = hashlib.sha256(content_without_sig.encode()).hexdigest()
+                    computed_hash = hashlib.sha256(
+                        content_without_sig.encode()
+                    ).hexdigest()
 
                     if computed_hash != sig_info["hash"]:
                         return {
@@ -1073,7 +1226,10 @@ async def _pull(
 
             except ImportError:
                 # MetadataManager not available, skip verification
-                signature_info = {"verified": False, "reason": "MetadataManager not available"}
+                signature_info = {
+                    "verified": False,
+                    "reason": "MetadataManager not available",
+                }
 
         # Determine destination path
         dest = Path(dest_path)
@@ -1274,7 +1430,9 @@ async def _push(
             "version": version,
             "visibility": visibility,
             "content_hash": response_body.get("signature", {}).get("hash", ""),
-            "registry_username": response_body.get("signature", {}).get("registry_username"),
+            "registry_username": response_body.get("signature", {}).get(
+                "registry_username"
+            ),
             "size_bytes": len(signed_content.encode()),
             "local_updated": "signed_content" in response_body,
         }
@@ -1353,6 +1511,85 @@ async def _set_visibility(
     except Exception as e:
         await http.close()
         return {"error": f"Set visibility failed: {e}"}
+
+
+async def _unpublish(
+    item_type: Optional[str],
+    item_id: Optional[str],
+    version: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Remove item from registry.
+
+    Args:
+        item_type: "directive", "tool", or "knowledge"
+        item_id: Item identifier (namespace/name format)
+        version: Specific version to unpublish (or None for all versions)
+    """
+    if not item_type or not item_id:
+        return {
+            "error": "Required: item_type, item_id",
+            "usage": "unpublish(item_type='directive', item_id='me/my')",
+        }
+
+    if item_type not in ["directive", "tool", "knowledge"]:
+        return {
+            "error": f"Invalid item_type: {item_type}",
+            "valid": ["directive", "tool", "knowledge"],
+        }
+
+    # Check auth - env var first, then keyring
+    env_token = _get_token_from_env()
+    if env_token:
+        token = env_token
+    else:
+        try:
+            from ..runtimes.auth import AuthenticationRequired, AuthStore
+
+            auth_store = AuthStore()
+            token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:write")
+        except AuthenticationRequired:
+            return {
+                "error": "Authentication required",
+                "solution": "Run 'registry login' first",
+            }
+        except ImportError:
+            return {"error": "AuthStore not available"}
+
+    config = RegistryConfig.from_env()
+    http = RegistryHttpClient(config)
+
+    try:
+        # Build unpublish URL
+        url = f"/v1/unpublish/{item_type}/{item_id}"
+        if version:
+            url += f"?version={version}"
+
+        result = await http.delete(url, auth_token=token)
+        await http.close()
+
+        if not result["success"]:
+            error_body = result.get("body", {})
+            if isinstance(error_body, dict) and "error" in error_body:
+                return {
+                    "error": error_body["error"],
+                    "status_code": result["status_code"],
+                }
+            return {
+                "error": f"Unpublish failed: {result.get('error', 'Unknown error')}",
+                "status_code": result.get("status_code"),
+            }
+
+        return {
+            "status": "unpublished",
+            "item_type": item_type,
+            "item_id": item_id,
+            "version": version or "all",
+        }
+
+    except Exception as e:
+        await http.close()
+        return {"error": f"Unpublish failed: {e}"}
 
 
 # =============================================================================

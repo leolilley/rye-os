@@ -53,20 +53,25 @@ class DirectiveResolver:
 
         return paths
 
-    def resolve(self, directive_name: str) -> Optional[Path]:
-        """Find directive file in project > user > system order."""
+    def resolve(self, directive_id: str) -> Optional[Path]:
+        """Find directive file by relative path ID in project > user > system order.
+        
+        Args:
+            directive_id: Relative path from .ai/directives/ without extension.
+                         e.g., "core/build" -> .ai/directives/core/build.md
+        """
         for search_dir, _ in self.get_search_paths():
-            for file_path in search_dir.rglob(f"{directive_name}.md"):
-                if file_path.is_file():
-                    return file_path
+            file_path = search_dir / f"{directive_id}.md"
+            if file_path.is_file():
+                return file_path
         return None
 
-    def resolve_with_space(self, directive_name: str) -> Optional[Tuple[Path, str]]:
-        """Find directive and return (path, space) tuple."""
+    def resolve_with_space(self, directive_id: str) -> Optional[Tuple[Path, str]]:
+        """Find directive by relative path ID and return (path, space) tuple."""
         for search_dir, space in self.get_search_paths():
-            for file_path in search_dir.rglob(f"{directive_name}.md"):
-                if file_path.is_file():
-                    return (file_path, space)
+            file_path = search_dir / f"{directive_id}.md"
+            if file_path.is_file():
+                return (file_path, space)
         return None
 
 
@@ -99,26 +104,31 @@ class ToolResolver:
 
         return paths
 
-    def resolve(self, tool_name: str) -> Optional[Path]:
-        """Find tool file in project > user > system order."""
+    def resolve(self, tool_id: str) -> Optional[Path]:
+        """Find tool file by relative path ID in project > user > system order.
+        
+        Args:
+            tool_id: Relative path from .ai/tools/ without extension.
+                    e.g., "rye/core/registry/registry" -> .ai/tools/rye/core/registry/registry.py
+        """
         extensions = get_tool_extensions(self.project_path)
 
         for search_dir, _ in self.get_search_paths():
             for ext in extensions:
-                for file_path in search_dir.rglob(f"{tool_name}{ext}"):
-                    if file_path.is_file():
-                        return file_path
+                file_path = search_dir / f"{tool_id}{ext}"
+                if file_path.is_file():
+                    return file_path
         return None
 
-    def resolve_with_space(self, tool_name: str) -> Optional[Tuple[Path, str]]:
-        """Find tool and return (path, space) tuple."""
+    def resolve_with_space(self, tool_id: str) -> Optional[Tuple[Path, str]]:
+        """Find tool by relative path ID and return (path, space) tuple."""
         extensions = get_tool_extensions(self.project_path)
 
         for search_dir, space in self.get_search_paths():
             for ext in extensions:
-                for file_path in search_dir.rglob(f"{tool_name}{ext}"):
-                    if file_path.is_file():
-                        return (file_path, space)
+                file_path = search_dir / f"{tool_id}{ext}"
+                if file_path.is_file():
+                    return (file_path, space)
         return None
 
 
@@ -152,17 +162,22 @@ class KnowledgeResolver:
         return paths
 
     def resolve(self, entry_id: str) -> Optional[Path]:
-        """Find knowledge entry in project > user > system order."""
+        """Find knowledge entry by relative path ID in project > user > system order.
+        
+        Args:
+            entry_id: Relative path from .ai/knowledge/ without extension.
+                     e.g., "patterns/singleton" -> .ai/knowledge/patterns/singleton.md
+        """
         for search_dir, _ in self.get_search_paths():
-            for file_path in search_dir.rglob(f"{entry_id}.md"):
-                if file_path.is_file():
-                    return file_path
+            file_path = search_dir / f"{entry_id}.md"
+            if file_path.is_file():
+                return file_path
         return None
 
     def resolve_with_space(self, entry_id: str) -> Optional[Tuple[Path, str]]:
-        """Find knowledge entry and return (path, space) tuple."""
+        """Find knowledge entry by relative path ID and return (path, space) tuple."""
         for search_dir, space in self.get_search_paths():
-            for file_path in search_dir.rglob(f"{entry_id}.md"):
-                if file_path.is_file():
-                    return (file_path, space)
+            file_path = search_dir / f"{entry_id}.md"
+            if file_path.is_file():
+                return (file_path, space)
         return None

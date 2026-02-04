@@ -11,7 +11,7 @@ Usage:
 
 __tool_type__ = "python"
 __version__ = "1.0.0"
-__executor_id__ = "python_runtime"
+__executor_id__ = "rye/core/runtimes/python_runtime"
 __category__ = "rye/core/mcp"
 __tool_description__ = (
     "MCP call tool - execute a single tool call on an MCP server via Streamable HTTP"

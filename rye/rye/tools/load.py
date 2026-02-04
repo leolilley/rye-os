@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from rye.constants import ItemType
 from rye.utils.path_utils import get_project_type_path, get_system_type_path
+from rye.utils.extensions import get_tool_extensions
 from rye.utils.resolvers import get_user_space
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,12 @@ class LoadTool:
     def _find_item(
         self, project_path: str, source: str, item_type: str, item_id: str
     ) -> Optional[Path]:
-        """Find item file in specified source."""
+        """Find item file by relative path ID in specified source.
+        
+        Args:
+            item_id: Relative path from .ai/<type>/ without extension.
+                    e.g., "rye/core/registry/registry" -> .ai/tools/rye/core/registry/registry.py
+        """
         type_dir = ItemType.TYPE_DIRS.get(item_type)
         if not type_dir:
             return None
@@ -87,9 +93,15 @@ class LoadTool:
         if not base.exists():
             return None
 
-        # Search recursively for item
-        for file_path in base.rglob(f"{item_id}*"):
-            if file_path.is_file() and file_path.stem == item_id:
+        # Get extensions data-driven from extractors
+        if item_type == ItemType.TOOL:
+            extensions = get_tool_extensions(Path(project_path) if project_path else None)
+        else:
+            extensions = [".md"]
+
+        for ext in extensions:
+            file_path = base / f"{item_id}{ext}"
+            if file_path.is_file():
                 return file_path
 
         return None
