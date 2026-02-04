@@ -495,7 +495,8 @@ async def execute(
                 query=params.get("query"),
                 item_type=params.get("item_type"),
                 category=params.get("category"),
-                author=params.get("author"),
+                namespace=params.get("namespace"),
+                include_mine=params.get("include_mine", False),
                 limit=params.get("limit", 20),
             )
             http_calls = 1
@@ -1098,7 +1099,8 @@ async def _search(
     query: Optional[str],
     item_type: Optional[str] = None,
     category: Optional[str] = None,
-    author: Optional[str] = None,
+    namespace: Optional[str] = None,
+    include_mine: bool = False,
     limit: int = 20,
 ) -> Dict[str, Any]:
     """
@@ -1107,8 +1109,9 @@ async def _search(
     Args:
         query: Search query (searches name and description)
         item_type: Filter by type ("directive", "tool", or "knowledge")
-        category: Filter by category
-        author: Filter by author username
+        category: Filter by category prefix
+        namespace: Filter by namespace (owner)
+        include_mine: Include your own private items (requires auth)
         limit: Maximum results to return (default 20)
     """
     if not query:
@@ -1119,6 +1122,21 @@ async def _search(
 
     config = RegistryConfig.from_env()
     http = RegistryHttpClient(config)
+    
+    # Get auth token if include_mine is requested
+    token = None
+    if include_mine:
+        env_token = _get_token_from_env()
+        if env_token:
+            token = env_token
+        else:
+            try:
+                from ..runtimes.auth import AuthStore
+                auth_store = AuthStore()
+                if auth_store.is_authenticated(REGISTRY_SERVICE):
+                    token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:read")
+            except Exception:
+                pass  # Fall back to unauthenticated search
 
     try:
         # Build query params for Registry API
@@ -1127,10 +1145,12 @@ async def _search(
             url += f"&item_type={item_type}"
         if category:
             url += f"&category={category}"
-        if author:
-            url += f"&author={author}"
+        if namespace:
+            url += f"&namespace={namespace}"
+        if include_mine and token:
+            url += "&include_mine=true"
 
-        result = await http.get(url)
+        result = await http.get(url, auth_token=token)
         await http.close()
 
         if not result["success"]:
@@ -1148,7 +1168,8 @@ async def _search(
             "filters": {
                 "item_type": item_type,
                 "category": category,
-                "author": author,
+                "namespace": namespace,
+                "include_mine": include_mine and token is not None,
             },
         }
 

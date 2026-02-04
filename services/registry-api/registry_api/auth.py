@@ -16,6 +16,7 @@ from registry_api.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
+security_optional = HTTPBearer(auto_error=False)
 
 # Cache JWKS for 1 hour
 _jwks_cache: dict = {}
@@ -165,3 +166,20 @@ async def get_current_user(
             )
 
     return User(id=user_id, email=email, username=username)
+
+
+async def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional),
+    settings: Settings = Depends(get_settings),
+) -> Optional[User]:
+    """Extract user from JWT token if provided, otherwise return None.
+    
+    Used for endpoints that work for both authenticated and unauthenticated users.
+    """
+    if not credentials:
+        return None
+    
+    try:
+        return await get_current_user(credentials, settings)
+    except HTTPException:
+        return None

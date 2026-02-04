@@ -14,14 +14,14 @@ This FastAPI service handles registry push/pull operations with:
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Union
+from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
 from registry_api import __version__
-from registry_api.auth import User, get_current_user
+from registry_api.auth import User, get_current_user, get_current_user_optional
 from registry_api.config import Settings, get_settings
 from registry_api.models import (
     build_item_id,
@@ -580,10 +580,16 @@ async def search_items(
     item_type: str = None,
     namespace: str = None,
     category: str = None,
+    include_mine: bool = False,
     limit: int = 20,
     offset: int = 0,
+    user: Optional[User] = Depends(get_current_user_optional),
 ):
-    """Search for items in the registry."""
+    """Search for items in the registry.
+    
+    By default, only shows public items. If include_mine=true and authenticated,
+    also includes your own private items.
+    """
     supabase = get_supabase()
     results = []
     total = 0
@@ -604,8 +610,13 @@ async def search_items(
             if category:
                 q = q.ilike("category", f"{category}%")  # Prefix match for nested
             
-            # Only show public items in search
-            q = q.eq("visibility", "public")
+            # Visibility filter: public OR (include_mine AND owned by user)
+            if include_mine and user:
+                # Show public items OR user's own items (any visibility)
+                q = q.or_(f"visibility.eq.public,author_id.eq.{user.id}")
+            else:
+                # Only show public items
+                q = q.eq("visibility", "public")
             
             result = q.range(offset, offset + limit - 1).execute()
             
