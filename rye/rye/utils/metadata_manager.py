@@ -68,17 +68,22 @@ class DirectiveMetadataStrategy(MetadataStrategy):
 
     def extract_signature(self, file_content: str) -> Optional[Dict[str, str]]:
         """Extract signature from HTML comment at start of file."""
-        # Support both rye and legacy kiwi-mcp signatures
+        # Support rye, legacy kiwi-mcp, and registry signatures with optional |provider@username suffix
         sig_match = re.match(
-            r"^<!-- (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{64}) -->", file_content
+            r"^<!-- (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{64})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))? -->",
+            file_content,
         )
         if not sig_match:
             return None
 
-        return {
+        result = {
             "timestamp": sig_match.group(1),
             "hash": sig_match.group(2),
         }
+        if sig_match.group(3) and sig_match.group(4):
+            result["registry_provider"] = sig_match.group(3)
+            result["registry_username"] = sig_match.group(4)
+        return result
 
     def insert_signature(self, content: str, signature: str) -> str:
         """Insert signature at the beginning of content."""
@@ -151,22 +156,24 @@ class ToolMetadataStrategy(MetadataStrategy):
         sig_format = self._get_signature_format()
         prefix = re.escape(sig_format["prefix"])
 
+        # Pattern supports optional |provider@username suffix for registry signatures
         if sig_format.get("after_shebang", True):
-            # Pattern: optional shebang, then signature (support both rye and kiwi-mcp)
-            sig_pattern = rf"^(?:#!/[^\n]*\n)?{prefix} (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{{64}})"
+            sig_pattern = rf"^(?:#!/[^\n]*\n)?{prefix} (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{{64}})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))?"
         else:
-            sig_pattern = (
-                rf"^{prefix} (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{{64}})"
-            )
+            sig_pattern = rf"^{prefix} (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{{64}})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))?"
 
         sig_match = re.match(sig_pattern, file_content)
         if not sig_match:
             return None
 
-        return {
+        result = {
             "timestamp": sig_match.group(1),
             "hash": sig_match.group(2),
         }
+        if sig_match.group(3) and sig_match.group(4):
+            result["registry_provider"] = sig_match.group(3)
+            result["registry_username"] = sig_match.group(4)
+        return result
 
     def insert_signature(self, content: str, signature: str) -> str:
         """Insert signature after shebang (if present) or at start."""
@@ -217,16 +224,22 @@ class KnowledgeMetadataStrategy(MetadataStrategy):
 
     def extract_signature(self, file_content: str) -> Optional[Dict[str, str]]:
         """Extract signature from HTML comment at start of file."""
+        # Support rye, legacy kiwi-mcp, and registry signatures with optional |provider@username suffix
         sig_match = re.match(
-            r"^<!-- (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{64}) -->", file_content
+            r"^<!-- (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{64})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))? -->",
+            file_content,
         )
         if not sig_match:
             return None
 
-        return {
+        result = {
             "timestamp": sig_match.group(1),
             "hash": sig_match.group(2),
         }
+        if sig_match.group(3) and sig_match.group(4):
+            result["registry_provider"] = sig_match.group(3)
+            result["registry_username"] = sig_match.group(4)
+        return result
 
     def insert_signature(self, content: str, signature: str) -> str:
         """Insert signature at the beginning of content."""
