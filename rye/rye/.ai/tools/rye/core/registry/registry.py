@@ -505,7 +505,9 @@ async def execute(
                 item_type=params.get("item_type"),
                 item_id=params.get("item_id"),
                 version=params.get("version"),
-                dest_path=params.get("dest_path") or project_path,
+                location=params.get("location", "project"),
+                dest_path=params.get("dest_path"),
+                project_path=project_path,
                 verify=params.get("verify", True),
             )
             http_calls = 1  # pull makes HTTP requests
@@ -1182,7 +1184,9 @@ async def _pull(
     item_type: Optional[str],
     item_id: Optional[str],
     version: Optional[str],
-    dest_path: str,
+    location: str = "project",
+    dest_path: Optional[str] = None,
+    project_path: Optional[str] = None,
     verify: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -1193,7 +1197,9 @@ async def _pull(
         item_id: Item identifier (namespace/category/name format)
                  Example: "leolilley/core/bootstrap"
         version: Specific version (or "latest")
-        dest_path: Destination directory
+        location: Where to install - "project" (.ai/) or "user" (~/.ai/)
+        dest_path: Override destination path (optional)
+        project_path: Project root path (used when location="project")
         verify: Verify registry signature (default True)
     """
     if not item_type or not item_id:
@@ -1303,12 +1309,24 @@ async def _pull(
                     "reason": "MetadataManager not available",
                 }
 
-        # Determine destination path using category from item_id
-        dest = Path(dest_path)
-        if dest.is_dir():
-            # Build path like .ai/{item_type}s/{category}/{name}.ext
+        # Determine destination path
+        if dest_path:
+            # Explicit destination provided
+            dest = Path(dest_path)
+            if dest.is_dir():
+                ext = ".md" if item_type in ["directive", "knowledge"] else ".py"
+                dest = dest / f"{name}{ext}"
+        else:
+            # Use location to determine base directory
+            if location == "user":
+                base_dir = _get_rye_state_dir()
+            else:
+                # project (default)
+                base_dir = Path(project_path) / ".ai" if project_path else Path(".ai")
+            
+            # Build path like {base}/{item_type}s/{category}/{name}.ext
             ext = ".md" if item_type in ["directive", "knowledge"] else ".py"
-            dest = dest / ".ai" / f"{item_type}s" / category / f"{name}{ext}"
+            dest = base_dir / f"{item_type}s" / category / f"{name}{ext}"
 
         # Create directory and write content
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1322,6 +1340,7 @@ async def _pull(
             "category": category,
             "name": name,
             "version": item_version,
+            "location": location,
             "path": str(dest),
             "content_hash": signature_data.get("hash", ""),
             "author": author_username,
