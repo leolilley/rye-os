@@ -557,38 +557,38 @@ async def search_items(
     types_to_search = [item_type] if item_type else ["directive", "tool", "knowledge"]
     
     for itype in types_to_search:
-        # knowledge table is singular, others are plural
-        table = "knowledge" if itype == "knowledge" else f"{itype}s"
-        
-        # Build query
-        q = supabase.table(table).select("*, users(username)", count="exact")
-        
-        # Text search on name and description (consistent across all types now)
-        q = q.or_(f"name.ilike.%{query}%,description.ilike.%{query}%")
-        
-        if category:
-            q = q.eq("category", category)
-        
-        result = q.range(offset, offset + limit - 1).execute()
-        
-        for item in result.data:
-            # Handle users join (can be None if no FK or missing user)
-            users_data = item.get("users") or {}
-            author = users_data.get("username") if isinstance(users_data, dict) else None
+        try:
+            # knowledge table is singular, others are plural
+            table = "knowledge" if itype == "knowledge" else f"{itype}s"
             
-            results.append(SearchResultItem(
-                item_type=itype,
-                item_id=item.get("name") or item.get("tool_id") or item.get("zettel_id"),
-                name=item.get("name", ""),
-                description=item.get("description"),
-                version=item.get("latest_version", "0.0.0"),
-                author=author,
-                category=item.get("category"),
-                download_count=item.get("download_count", 0),
-                created_at=item.get("created_at"),
-            ))
-        
-        total += result.count or 0
+            # Build query - simple select without join for reliability
+            q = supabase.table(table).select("*", count="exact")
+            
+            # Text search on name and description (consistent across all types now)
+            q = q.or_(f"name.ilike.%{query}%,description.ilike.%{query}%")
+            
+            if category:
+                q = q.eq("category", category)
+            
+            result = q.range(offset, offset + limit - 1).execute()
+            
+            for item in result.data:
+                results.append(SearchResultItem(
+                    item_type=itype,
+                    item_id=item.get("name") or item.get("tool_id") or item.get("zettel_id"),
+                    name=item.get("name", ""),
+                    description=item.get("description"),
+                    version=item.get("latest_version") or "0.0.0",
+                    author=None,  # Skip author lookup for now
+                    category=item.get("category"),
+                    download_count=item.get("download_count") or 0,
+                    created_at=item.get("created_at"),
+                ))
+            
+            total += result.count or 0
+        except Exception as e:
+            logger.error(f"Search error for {itype}: {e}")
+            continue
     
     return SearchResponse(
         results=results[:limit],
