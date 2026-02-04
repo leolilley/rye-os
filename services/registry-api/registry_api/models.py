@@ -81,10 +81,10 @@ class SearchResultItem(BaseModel):
     name: str
     description: Optional[str] = None
     version: str
-    author: str
+    author: Optional[str] = None
     category: Optional[str] = None
     download_count: int = 0
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
 
 class SearchResponse(BaseModel):

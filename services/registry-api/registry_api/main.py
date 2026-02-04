@@ -572,13 +572,17 @@ async def search_items(
         result = q.range(offset, offset + limit - 1).execute()
         
         for item in result.data:
+            # Handle users join (can be None if no FK or missing user)
+            users_data = item.get("users") or {}
+            author = users_data.get("username") if isinstance(users_data, dict) else None
+            
             results.append(SearchResultItem(
                 item_type=itype,
                 item_id=item.get("name") or item.get("tool_id") or item.get("zettel_id"),
                 name=item.get("name", ""),
                 description=item.get("description"),
                 version=item.get("latest_version", "0.0.0"),
-                author=item.get("users", {}).get("username", "unknown"),
+                author=author,
                 category=item.get("category"),
                 download_count=item.get("download_count", 0),
                 created_at=item.get("created_at"),
