@@ -49,14 +49,17 @@ class IntegrityVerifier:
     Caches results keyed by (path, mtime, size).
     """
 
-    def __init__(self, cache_ttl: float = 300.0):
+    def __init__(self, cache_ttl: float = 300.0, max_cache_size: int = 1000):
         """Initialize verifier.
 
         Args:
             cache_ttl: Cache time-to-live in seconds (default: 5 minutes)
+            max_cache_size: Maximum number of cache entries (default: 1000)
         """
         self.cache_ttl = cache_ttl
+        self.max_cache_size = max_cache_size
         self._cache: Dict[str, CacheEntry] = {}
+        self._metrics = {"hits": 0, "misses": 0, "evictions": 0}
 
     def verify_tool(
         self,
@@ -241,6 +244,7 @@ class IntegrityVerifier:
         cache_key = str(path)
 
         if cache_key not in self._cache:
+            self._metrics["misses"] += 1
             return None
 
         entry = self._cache[cache_key]
@@ -248,6 +252,7 @@ class IntegrityVerifier:
         # Check TTL
         if time.time() - entry.timestamp > self.cache_ttl:
             del self._cache[cache_key]
+            self._metrics["misses"] += 1
             return None
 
         # Check if file changed (mtime + size)
@@ -255,15 +260,26 @@ class IntegrityVerifier:
             stat = path.stat()
             if stat.st_mtime != entry.mtime or stat.st_size != entry.size:
                 del self._cache[cache_key]
+                self._metrics["misses"] += 1
                 return None
         except OSError:
             del self._cache[cache_key]
+            self._metrics["misses"] += 1
             return None
 
+        self._metrics["hits"] += 1
         return entry.result
 
     def _cache_result(self, path: Path, result: VerificationResult) -> None:
-        """Cache verification result."""
+        """Cache verification result with eviction if cache full."""
+        # Evict oldest entry if cache is full
+        if len(self._cache) >= self.max_cache_size:
+            oldest_key = min(
+                self._cache.keys(), key=lambda k: self._cache[k].timestamp
+            )
+            del self._cache[oldest_key]
+            self._metrics["evictions"] += 1
+
         try:
             stat = path.stat()
             self._cache[str(path)] = CacheEntry(
@@ -346,3 +362,23 @@ class IntegrityVerifier:
     def clear_cache(self) -> None:
         """Clear all cached verification results."""
         self._cache.clear()
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics for monitoring.
+
+        Returns:
+            Dict with cache metrics including hit/miss ratio
+        """
+        total = self._metrics["hits"] + self._metrics["misses"]
+        hit_ratio = (
+            self._metrics["hits"] / total if total > 0 else 0.0
+        )
+
+        return {
+            "cache_size": len(self._cache),
+            "max_size": self.max_cache_size,
+            "hits": self._metrics["hits"],
+            "misses": self._metrics["misses"],
+            "evictions": self._metrics["evictions"],
+            "hit_ratio": hit_ratio,
+        }

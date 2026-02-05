@@ -33,6 +33,9 @@ from rye.utils.extensions import get_tool_extensions
 
 logger = logging.getLogger(__name__)
 
+# Maximum allowed chain depth to prevent infinite loops
+MAX_CHAIN_DEPTH = 10
+
 
 @dataclass
 class CacheEntry:
@@ -291,6 +294,13 @@ class PrimitiveExecutor:
         current_space = "project"  # Start resolution from project space
 
         while current_id:
+            # Detect chain depth limit
+            if len(chain) >= MAX_CHAIN_DEPTH:
+                raise ValueError(
+                    f"Chain too deep (max {MAX_CHAIN_DEPTH}): {item_id}. "
+                    "Possible circular dependency or excessive nesting."
+                )
+
             # Detect circular dependencies
             if current_id in visited:
                 raise ValueError(f"Circular dependency detected: {current_id}")

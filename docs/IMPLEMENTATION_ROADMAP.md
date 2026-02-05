@@ -688,6 +688,8 @@ async def _execute_builtin(self, element: ChainElement, config: Dict[str, Any], 
 - [ ] Memory limit enforced (test with large allocation)
 - [ ] Existing builtin tools work correctly
 
+**Status:** SKIPPED - Deferring sandbox implementation to future phase
+
 ---
 
 ### Task 2.4: Implement Atomic Lockfile Writes
@@ -773,6 +775,8 @@ atomic_write(path, json.dumps(data, indent=2))
 - [ ] Temp files cleaned up on failure
 - [ ] Works on both POSIX and Windows
 - [ ] Tests verify atomicity
+
+**Status:** SKIPPED - Lockfile writes already protected by Lilux primitives
 
 ---
 
@@ -932,11 +936,11 @@ return ok_response(data=parsed)
 
 #### Acceptance Criteria
 
-- [ ] All errors use standard format
-- [ ] Error codes are machine-readable
-- [ ] Suggestions help users fix issues
-- [ ] Retryable flag set appropriately
-- [ ] Documentation lists all error codes
+- [x] All errors use standard format
+- [x] Error codes are machine-readable
+- [x] Suggestions help users fix issues
+- [x] Retryable flag set appropriately
+- [x] Documentation lists all error codes
 
 ---
 
@@ -1020,10 +1024,10 @@ class IntegrityVerifier:
 
 #### Acceptance Criteria
 
-- [ ] Content hash verification works correctly
-- [ ] TTL expiration removes stale entries
-- [ ] Cache size limits prevent memory bloat
-- [ ] Metrics show hit/miss rates
+- [x] Content hash verification works correctly
+- [x] TTL expiration removes stale entries
+- [x] Cache size limits prevent memory bloat
+- [x] Metrics show hit/miss rates
 
 ---
 
@@ -1060,9 +1064,9 @@ async def _build_chain(
 
 #### Acceptance Criteria
 
-- [ ] Chains deeper than 10 levels raise error
-- [ ] Error message is helpful
-- [ ] Existing chains under limit work fine
+- [x] Chains deeper than 10 levels raise error
+- [x] Error message is helpful
+- [x] Existing chains under limit work fine
 
 ---
 
