@@ -1,10 +1,4 @@
-# kiwi-mcp:validated:2026-01-26T04:13:30Z:de139cf324562bfbc28d596b9ff346426a64f5916e7eae9a65662d8968e438f7
-# .ai/tools/threads/read_transcript.py
-__tool_type__ = "python"
-__version__ = "1.0.0"
-__executor_id__ = "python_runtime"
-__category__ = "threads"
-
+# rye:validated:2026-02-09T02:02:59Z:c453aec3150fc48569171150da332ea7fc65ee590ff9fc17d0522dcafc1d5258
 """
 Read Transcript Tool: Read another thread's conversation history.
 
@@ -13,6 +7,12 @@ Used for thread-to-thread intervention and annealing workflows.
 
 Permissions: Requires intervention.read capability to read other threads' transcripts.
 """
+
+__tool_type__ = "python"
+__version__ = "1.0.0"
+__executor_id__ = "rye/core/runtimes/python_runtime"
+__category__ = "rye/agent/threads"
+__tool_description__ = "Read another thread's conversation transcript"
 
 import json
 from pathlib import Path

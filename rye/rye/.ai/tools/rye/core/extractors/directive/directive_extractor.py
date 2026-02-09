@@ -96,7 +96,7 @@ VALIDATION_SCHEMA = {
             "required": False,
             "type": "array",
             "item_type": "object",
-            "item_required": ["tag", "attrs"],
+            "item_required": ["tag"],
         },
     },
 }

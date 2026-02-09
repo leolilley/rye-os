@@ -115,21 +115,18 @@ class CapabilityToken:
     def has_capability(self, capability: str) -> bool:
         """Check if token grants a specific capability.
         
-        Uses capability hierarchy - if token has 'rye.execute',
-        it implicitly has 'rye.search', 'rye.load', etc.
+        Uses prefix/glob matching and structural implication.
         """
-        expanded = expand_capabilities(self.caps)
-        return capability in expanded
+        return check_capability(self.caps, capability)
     
     def has_any_capability(self, capabilities: List[str]) -> bool:
         """Check if token grants any of the specified capabilities."""
-        expanded = expand_capabilities(self.caps)
-        return bool(expanded & set(capabilities))
+        return any(check_capability(self.caps, cap) for cap in capabilities)
     
     def has_all_capabilities(self, capabilities: List[str]) -> bool:
         """Check if token grants all of the specified capabilities."""
-        expanded = expand_capabilities(self.caps)
-        return set(capabilities).issubset(expanded)
+        all_ok, _ = check_all_capabilities(self.caps, capabilities)
+        return all_ok
     
     def get_expanded_capabilities(self) -> List[str]:
         """Get all capabilities including implied ones from hierarchy."""
@@ -354,190 +351,221 @@ def attenuate_token(
     )
 
 
-# Permission XML to capability conversion table
-PERMISSION_TO_CAPABILITY: Dict[tuple, str] = {
-    # (tag, resource, action) -> capability
-    
-    # Filesystem
-    ("read", "filesystem", None): "fs.read",
-    ("write", "filesystem", None): "fs.write",
-    ("execute", "filesystem", None): "fs.exec",
-    
-    # Thread spawning
-    ("execute", "spawn", "thread"): "spawn.thread",
-    
-    # Thread registry
-    ("execute", "registry", "write"): "registry.write",
-    ("execute", "registry", "read"): "registry.read",
-    
-    # RYE MCP - granular capabilities
-    ("execute", "rye", "execute"): "rye.execute",  # Run directives/tools
-    ("execute", "rye", "search"): "rye.search",    # Search for items
-    ("execute", "rye", "load"): "rye.load",        # Load/inspect items
-    ("execute", "rye", "sign"): "rye.sign",        # Sign items (privileged)
-    ("execute", "rye", "help"): "rye.help",        # Get help (low privilege)
-    ("execute", "rye", "*"): "rye.all",            # All MCP operations
-    
-    # Shell/process
-    ("execute", "shell", "*"): "process.exec",
-    ("execute", "shell", None): "process.exec",
-}
+# ---------------------------------------------------------------------------
+# Capability format: rye.{primary}.{item_type}.{specifics...}
+#   primary:   execute | search | load | sign
+#   item_type: tool | directive | knowledge
+#   specifics: item_id with / converted to .
+#
+# Examples:
+#   rye.execute.tool.rye.file-system.fs_write
+#   rye.execute.knowledge.rye-architecture
+#   rye.search.directive.*
+#   rye.execute.*  (can execute anything)
+#   rye.*  (god mode)
+# ---------------------------------------------------------------------------
 
-# Capability hierarchy - if you have a higher cap, you implicitly have lower ones
-CAPABILITY_HIERARCHY: Dict[str, List[str]] = {
-    # rye.all grants all rye capabilities
-    "rye.all": [
-        "rye.execute",
-        "rye.search",
-        "rye.load",
-        "rye.sign",
-        "rye.help",
-    ],
-    # rye.execute implies search/load/help (need to find things to execute)
-    "rye.execute": [
-        "rye.search",
-        "rye.load",
-        "rye.help",
-    ],
-    # fs.write implies fs.read
-    "fs.write": ["fs.read"],
+PRIMARY_TOOLS = ("execute", "search", "load", "sign")
+ITEM_TYPES = ("tool", "directive", "knowledge")
+
+PRIMARY_IMPLIES = {
+    "execute": ["search", "load"],
+    "sign": ["load"],
 }
 
 
-def expand_capabilities(caps: List[str]) -> Set[str]:
-    """Expand capabilities using the hierarchy.
-    
-    If a token has 'rye.execute', it implicitly has
-    'rye.search', 'rye.load', 'rye.help'.
-    
+def item_id_to_cap(primary: str, item_type: str, item_id: str) -> str:
+    """Convert item_id to capability string.
+
     Args:
-        caps: List of capability strings
-        
+        primary: Primary tool (execute, search, load, sign)
+        item_type: Item type (tool, directive, knowledge)
+        item_id: Item ID with / separators (e.g., "rye/file-system/fs_write")
+
     Returns:
-        Set of all capabilities (original + implied)
+        Capability string (e.g., "rye.execute.tool.rye.file-system.fs_write")
     """
-    expanded: Set[str] = set(caps)
-    
-    # Keep expanding until no new caps are added
+    segments = item_id.replace("/", ".")
+    return f"rye.{primary}.{item_type}.{segments}"
+
+
+def parse_capability(cap: str) -> Optional[Dict[str, Any]]:
+    """Parse a capability string into its components.
+
+    Returns dict with keys: primary, item_type, specifics, is_wildcard
+    Returns None if not a valid rye capability.
+    """
+    if not cap.startswith("rye."):
+        return None
+
+    parts = cap[4:].split(".", 2)  # After "rye."
+
+    if len(parts) == 0:
+        return None
+
+    # rye.* — god mode
+    if parts[0] == "*":
+        return {"primary": "*", "item_type": "*", "specifics": "*", "is_wildcard": True}
+
+    primary = parts[0]
+    if primary not in PRIMARY_TOOLS:
+        return None
+
+    if len(parts) == 1:
+        return {"primary": primary, "item_type": "*", "specifics": "*", "is_wildcard": True}
+
+    item_type = parts[1]
+    if item_type == "*":
+        return {"primary": primary, "item_type": "*", "specifics": "*", "is_wildcard": True}
+
+    if item_type not in ITEM_TYPES:
+        return None
+
+    if len(parts) == 2:
+        return {"primary": primary, "item_type": item_type, "specifics": "*", "is_wildcard": True}
+
+    specifics = parts[2]
+    is_wildcard = specifics.endswith("*")
+
+    return {"primary": primary, "item_type": item_type, "specifics": specifics, "is_wildcard": is_wildcard}
+
+
+def cap_matches(granted: str, required: str) -> bool:
+    """Check if a granted capability satisfies a required capability.
+
+    Uses prefix/glob matching:
+    - rye.* matches everything
+    - rye.execute.* matches rye.execute.tool.anything
+    - rye.execute.tool.* matches rye.execute.tool.rye.file-system.fs_write
+    - rye.execute.tool.rye.file-system.* matches rye.execute.tool.rye.file-system.fs_write
+    - Exact match always works
+    """
+    if granted == required:
+        return True
+
+    # Wildcard matching: strip trailing .* and check prefix
+    if granted.endswith(".*"):
+        prefix = granted[:-2]
+        return required.startswith(prefix + ".") or required == prefix
+
+    # Implicit wildcard: rye.execute (no trailing segments) implies rye.execute.*
+    g_parsed = parse_capability(granted)
+    r_parsed = parse_capability(required)
+    if not g_parsed or not r_parsed:
+        return False
+
+    if g_parsed["is_wildcard"] and g_parsed["specifics"] == "*":
+        if g_parsed["primary"] == "*":
+            return True
+        if g_parsed["primary"] == r_parsed["primary"]:
+            if g_parsed["item_type"] == "*":
+                return True
+            if g_parsed["item_type"] == r_parsed["item_type"]:
+                return True
+
+    return False
+
+
+def expand_capabilities(caps) -> Set[str]:
+    """Expand capabilities using structural implication.
+
+    rye.execute.* implies rye.search.* + rye.load.*
+    rye.sign.* implies rye.load.*
+
+    Also: rye.execute.tool.* implies rye.search.tool.* + rye.load.tool.*
+    (implication preserves item_type specificity)
+    """
+    expanded = set(caps)
+
     changed = True
     while changed:
         changed = False
         for cap in list(expanded):
-            if cap in CAPABILITY_HIERARCHY:
-                implied = set(CAPABILITY_HIERARCHY[cap])
-                new_caps = implied - expanded
-                if new_caps:
-                    expanded.update(new_caps)
+            parsed = parse_capability(cap)
+            if not parsed:
+                continue
+
+            primary = parsed["primary"]
+            item_type = parsed["item_type"]
+            specifics = parsed["specifics"]
+
+            # God mode implies everything
+            if primary == "*":
+                for p in PRIMARY_TOOLS:
+                    new_cap = f"rye.{p}.*"
+                    if new_cap not in expanded:
+                        expanded.add(new_cap)
+                        changed = True
+                continue
+
+            # Structural implication
+            implied_primaries = PRIMARY_IMPLIES.get(primary, [])
+            for implied_p in implied_primaries:
+                if item_type == "*":
+                    new_cap = f"rye.{implied_p}.*"
+                else:
+                    if specifics == "*":
+                        new_cap = f"rye.{implied_p}.{item_type}.*"
+                    else:
+                        new_cap = f"rye.{implied_p}.{item_type}.{specifics}"
+
+                if new_cap not in expanded:
+                    expanded.add(new_cap)
                     changed = True
-    
+
     return expanded
 
 
-def check_capability(granted_caps: List[str], required_cap: str) -> bool:
-    """Check if granted capabilities satisfy a required capability.
-    
-    Uses hierarchy expansion - if you have rye.execute,
-    you implicitly have rye.search, rye.load, etc.
-    
-    Args:
-        granted_caps: List of granted capability strings
-        required_cap: Required capability to check
-        
-    Returns:
-        True if required capability is satisfied
-    """
+def check_capability(granted_caps, required_cap: str) -> bool:
+    """Check if granted capabilities satisfy a required capability."""
     expanded = expand_capabilities(granted_caps)
-    return required_cap in expanded
+    for granted in expanded:
+        if cap_matches(granted, required_cap):
+            return True
+    return False
 
 
-def check_all_capabilities(granted_caps: List[str], required_caps: List[str]) -> tuple[bool, List[str]]:
+def check_all_capabilities(granted_caps, required_caps) -> Tuple[bool, List[str]]:
     """Check if all required capabilities are satisfied.
-    
-    Args:
-        granted_caps: List of granted capability strings
-        required_caps: List of required capabilities
-        
+
     Returns:
         Tuple of (all_satisfied, missing_caps)
     """
     expanded = expand_capabilities(granted_caps)
-    missing = [cap for cap in required_caps if cap not in expanded]
+    missing = []
+    for req in required_caps:
+        found = any(cap_matches(g, req) for g in expanded)
+        if not found:
+            missing.append(req)
     return (len(missing) == 0, missing)
 
 
-def permissions_to_caps(permissions: List[Dict[str, Any]]) -> List[str]:
-    """Convert directive permissions to capability list.
-    
-    Conversion rules:
-    - read resource="filesystem" → fs.read
-    - write resource="filesystem" → fs.write
-    - execute resource="tool" id="X" → tool.X
-    - execute resource="spawn" action="thread" → spawn.thread
-    - execute resource="registry" action="write" → registry.write
-    - execute resource="rye" action="execute" → rye.execute
-    - execute resource="rye" action="search" → rye.search
-    - execute resource="rye" action="load" → rye.load
-    - execute resource="rye" action="sign" → rye.sign
-    - execute resource="rye" action="help" → rye.help
-    
-    Args:
-        permissions: List of permission dicts with 'tag' and 'attrs' keys
-        
-    Returns:
-        List of capability strings
+def get_primary_tools_for_caps(caps) -> Set[str]:
+    """Determine which primary tools (execute/search/load/sign) are needed.
+
+    Parses each capability, extracts the primary tool name.
+    Returns set of primary tool names.
     """
-    caps: Set[str] = set()
-    
-    for perm in permissions:
-        tag = perm.get("tag", "")
-        attrs = perm.get("attrs", {})
-        resource = attrs.get("resource", "")
-        action = attrs.get("action")
-        
-        # Try exact match first
-        key = (tag, resource, action)
-        if key in PERMISSION_TO_CAPABILITY:
-            caps.add(PERMISSION_TO_CAPABILITY[key])
+    expanded = expand_capabilities(caps)
+    primaries: Set[str] = set()
+    for cap in expanded:
+        parsed = parse_capability(cap)
+        if not parsed:
             continue
-        
-        # Try without action
-        key_no_action = (tag, resource, None)
-        if key_no_action in PERMISSION_TO_CAPABILITY:
-            caps.add(PERMISSION_TO_CAPABILITY[key_no_action])
-            continue
-        
-        # Handle tool-specific permissions: execute resource="tool" id="X" → tool.X
-        if tag == "execute" and resource == "tool":
-            tool_id = attrs.get("id")
-            if tool_id:
-                caps.add(f"tool.{tool_id}")
-            continue
-        
-        # Handle generic resource permissions
-        if tag == "read" and resource:
-            caps.add(f"{resource}.read")
-        elif tag == "write" and resource:
-            caps.add(f"{resource}.write")
-        elif tag == "execute" and resource:
-            if action:
-                caps.add(f"{resource}.{action}")
-            else:
-                caps.add(f"{resource}.execute")
-    
-    return sorted(caps)
+        if parsed["primary"] == "*":
+            primaries.update(PRIMARY_TOOLS)
+        else:
+            primaries.add(parsed["primary"])
+    return primaries
 
 
-# System capability prefixes (cannot be overridden)
-SYSTEM_PREFIXES = [
-    "rye.execute", "rye.search", "rye.load", "rye.sign",
-    "rye.fs.", "rye.net.", "rye.db.", "rye.git.", "rye.process.",
-    "rye.agent.", "rye.registry.",
-]
+# System capability prefix (cannot be overridden by projects)
+SYSTEM_PREFIXES = ["rye."]
 
 
 def is_system_capability(cap: str) -> bool:
     """Check if capability is a system primitive (cannot be overridden)."""
-    return any(cap.startswith(prefix) or cap == prefix.rstrip('.') for prefix in SYSTEM_PREFIXES)
+    return any(cap.startswith(prefix) for prefix in SYSTEM_PREFIXES)
 
 
 def load_capabilities(project_path: Path) -> Tuple[Dict[Tuple, str], Dict[str, List[str]]]:

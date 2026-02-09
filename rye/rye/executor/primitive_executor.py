@@ -214,13 +214,11 @@ class PrimitiveExecutor:
             if use_lockfile and result.get("success") and not lockfile_used and version:
                 try:
                     root_element = chain[0]
-                    # Build manifest from chain element metadata
+                    root_meta = self._load_metadata_cached(root_element.path)
                     manifest = {
                         "tool_type": root_element.tool_type,
                         "executor_id": root_element.executor_id,
-                        "category": str(root_element.path.parent.relative_to(
-                            self.project_path / ".ai" / "tools"
-                        )) if self.project_path else "",
+                        "category": root_meta.get("category", "") or "",
                     }
                     integrity = compute_tool_integrity(
                         tool_id=item_id,
@@ -468,6 +466,8 @@ class PrimitiveExecutor:
                                 metadata["executor_id"] = node.value.value
                             elif name == "__category__":
                                 metadata["category"] = node.value.value
+                            elif name == "__tool_description__":
+                                metadata["tool_description"] = node.value.value
 
                         # Dict assignments (CONFIG_SCHEMA, ENV_CONFIG, CONFIG)
                         elif isinstance(node.value, ast.Dict):
@@ -813,6 +813,15 @@ class PrimitiveExecutor:
         # Template substitution for ${VAR} in config values
         config = self._template_config(config, resolved_env)
 
+        # Strip unresolved single-placeholder values from body
+        # (optional provider fields like tools that weren't supplied)
+        if isinstance(config.get("body"), dict):
+            import re
+            config["body"] = {
+                k: v for k, v in config["body"].items()
+                if not (isinstance(v, str) and re.match(r'^\{\w+\}$', v.strip()))
+            }
+
         return config
 
     def _template_config(
@@ -853,13 +862,25 @@ class PrimitiveExecutor:
             return value
 
         def substitute_params(value: Any, params: Dict[str, Any]) -> Any:
-            """Substitute {param} with config values."""
+            """Substitute {param} with config values, preserving types for single placeholders.
+
+            When a value is exactly "{param}" (the entire string is one placeholder),
+            the original typed value is returned (int, list, dict, etc.).
+            When a value contains mixed text like "prefix-{param}", str() is used.
+            """
             if isinstance(value, str):
+                stripped = value.strip()
+                single_match = re.match(r'^\{(\w+)\}$', stripped)
+                if single_match:
+                    param_name = single_match.group(1)
+                    if param_name in params:
+                        return params[param_name]
+                    return value
                 def replace_param(match: re.Match[str]) -> str:
                     param_name = match.group(1)
                     if param_name in params:
                         return str(params[param_name])
-                    return match.group(0)  # Leave unchanged
+                    return match.group(0)
                 return re.sub(r"\{([^}]+)\}", replace_param, value)
             elif isinstance(value, dict):
                 return {k: substitute_params(v, params) for k, v in value.items()}

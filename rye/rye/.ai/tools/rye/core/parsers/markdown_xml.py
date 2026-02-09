@@ -161,6 +161,38 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
                     permissions.append(perm_data)
                 result["permissions"] = permissions
 
+            elif tag == "limits":
+                limits = {}
+                for limit_child in child:
+                    if limit_child.text:
+                        val = limit_child.text.strip()
+                        try:
+                            if '.' in val:
+                                limits[limit_child.tag] = float(val)
+                            else:
+                                limits[limit_child.tag] = int(val)
+                        except ValueError:
+                            limits[limit_child.tag] = val
+                result["limits"] = limits
+
+            elif tag == "hooks":
+                hooks = []
+                for hook in child:
+                    hook_data = dict(hook.attrib)
+                    if hook.text:
+                        hook_data["content"] = hook.text.strip()
+                    for hook_child in hook:
+                        if hook_child.tag == "inputs":
+                            inputs = {}
+                            for inp in hook_child:
+                                if inp.text:
+                                    inputs[inp.get("name", inp.tag)] = inp.text.strip()
+                            hook_data["inputs"] = inputs
+                        elif hook_child.text:
+                            hook_data[hook_child.tag] = hook_child.text.strip()
+                    hooks.append(hook_data)
+                result["hooks"] = hooks
+
             # Simple text fields - include empty strings for category
             elif tag == "category":
                 result[tag] = (child.text or "").strip()

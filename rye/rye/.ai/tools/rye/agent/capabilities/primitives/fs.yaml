@@ -1,12 +1,15 @@
 name: fs
-version: "1.0.0"
-description: "Filesystem capabilities"
+version: "2.0.0"
+description: "Filesystem tool capabilities"
 
-permissions:
-  - pattern: ["read", "filesystem", ""]
-    capability: "rye.fs.read"
-  - pattern: ["write", "filesystem", ""]
-    capability: "rye.fs.write"
+capabilities:
+  - "rye.execute.tool.rye.file-system.fs_read"
+  - "rye.execute.tool.rye.file-system.fs_write"
 
+aliases:
+  fs_read: "rye.execute.tool.rye.file-system.fs_read"
+  fs_write: "rye.execute.tool.rye.file-system.fs_write"
+
+permissions: []
 hierarchy:
-  rye.fs.write: [rye.fs.read]
+  rye.execute.tool.rye.file-system.fs_write: ["rye.execute.tool.rye.file-system.fs_read"]

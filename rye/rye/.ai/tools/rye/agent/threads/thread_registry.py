@@ -1,10 +1,4 @@
-# kiwi-mcp:validated:2026-01-26T03:02:16Z:b10c107ada970b76c8ff3d280e02bd64159acedebcc4852480a123c3235a1fa4
-# .ai/tools/threads/thread_registry.py
-__tool_type__ = "python"
-__version__ = "1.0.0"
-__executor_id__ = "python_runtime"
-__category__ = "threads"
-
+# rye:validated:2026-02-09T02:02:59Z:32f951145b6386aa3a282ec05692621f6e4b83ed9d94f9f84363a3b37456a478
 """
 Thread Registry: SQLite-based persistence for thread state and events.
 
@@ -15,6 +9,12 @@ for human-readable logs.
 This is a privileged harness tool - directives cannot call it directly;
 only safety_harness can use it.
 """
+
+__tool_type__ = "python"
+__version__ = "1.0.0"
+__executor_id__ = "rye/core/runtimes/python_runtime"
+__category__ = "rye/agent/threads"
+__tool_description__ = "SQLite-based thread state and event persistence"
 
 import json
 import sqlite3

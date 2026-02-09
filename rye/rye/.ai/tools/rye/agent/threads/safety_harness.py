@@ -36,14 +36,13 @@ try:
     import importlib.util
     from pathlib import Path
     
-    _tokens_path = Path(__file__).parent.parent.parent / "capabilities" / "tokens" / "capability_tokens.py"
+    _tokens_path = Path(__file__).parent.parent / "capabilities" / "tokens" / "capability_tokens.py"
     _spec = importlib.util.spec_from_file_location("capability_tokens", _tokens_path)
     _tokens_module = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_tokens_module)
     
     CapabilityToken = _tokens_module.CapabilityToken
     attenuate_token = _tokens_module.attenuate_token
-    permissions_to_caps = _tokens_module.permissions_to_caps
     expand_capabilities = _tokens_module.expand_capabilities
     check_all_capabilities = _tokens_module.check_all_capabilities
     CAPABILITY_SYSTEM_AVAILABLE = True
@@ -160,14 +159,23 @@ class SafetyHarness:
         return normalized
     
     def _compute_required_caps(self) -> List[str]:
-        """Compute required capabilities from permission declarations."""
+        """Extract required capabilities from permission declarations.
+        
+        Permissions use <cap> tags: <cap>rye.execute.tool.*</cap>
+        """
         if not CAPABILITY_SYSTEM_AVAILABLE:
             return []
         
         if not self.required_permissions:
             return []
         
-        return permissions_to_caps(self.required_permissions)
+        caps = []
+        for perm in self.required_permissions:
+            if perm.get("tag") == "cap":
+                content = perm.get("content", "")
+                if content:
+                    caps.append(content)
+        return caps
     
     def _load_pricing(self) -> Dict:
         """Load pricing data from YAML file."""
@@ -567,8 +575,13 @@ class SafetyHarness:
         if not self.parent_token:
             return None
         
-        # Convert child permissions to capabilities
-        child_caps = permissions_to_caps(child_permissions) if child_permissions else []
+        child_caps = []
+        if child_permissions:
+            for perm in child_permissions:
+                if perm.get("tag") == "cap":
+                    content = perm.get("content", "")
+                    if content:
+                        child_caps.append(content)
         
         if hasattr(self.parent_token, 'caps'):
             # It's a CapabilityToken object

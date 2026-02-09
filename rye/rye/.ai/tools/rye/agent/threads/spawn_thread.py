@@ -1,5 +1,4 @@
-# kiwi-mcp:validated:2026-01-27T00:00:00Z:0000000000000000000000000000000000000000000000000000000000000000
-# .ai/tools/threads/spawn_thread.py
+# rye:validated:2026-02-09T02:02:59Z:675b943dbfd63635e5923702022e8d86e5fd31cc5bdb78636031a4bc14520bb5
 """
 Thread Spawner Tool
 
@@ -12,8 +11,9 @@ The actual thread execution logic is provided by the caller (safety_harness, etc
 
 __tool_type__ = "python"
 __version__ = "1.0.0"
-__executor_id__ = "python_runtime"
-__category__ = "threads"
+__executor_id__ = "rye/core/runtimes/python_runtime"
+__category__ = "rye/agent/threads"
+__tool_description__ = "Spawn OS-level threads with ID validation and registry"
 
 import re
 import threading

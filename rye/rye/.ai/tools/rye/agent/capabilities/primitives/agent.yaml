@@ -1,12 +1,11 @@
 name: agent
-version: "1.0.0"
+version: "2.0.0"
 description: "Agent thread capabilities"
 
-permissions:
-  - pattern: ["execute", "agent", "thread.spawn"]
-    capability: "rye.agent.thread.spawn"
-  - pattern: ["execute", "agent", "thread.read"]
-    capability: "rye.agent.thread.read"
+capabilities:
+  - "rye.execute.tool.rye.agent.threads.spawn_thread"
+  - "rye.execute.tool.rye.agent.threads.read_transcript"
+  - "rye.execute.tool.rye.agent.threads.thread_registry"
 
+permissions: []
 hierarchy: {}
-# Note: No wildcard hierarchy. Thread capabilities are independent.
