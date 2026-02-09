@@ -1,0 +1,14 @@
+name: registry
+version: "1.0.0"
+description: "Registry capabilities"
+
+permissions:
+  - pattern: ["execute", "registry", "push"]
+    capability: "rye.registry.push"
+  - pattern: ["execute", "registry", "pull"]
+    capability: "rye.registry.pull"
+  - pattern: ["execute", "registry", "auth"]
+    capability: "rye.registry.auth"
+
+hierarchy:
+  rye.registry.push: [rye.registry.pull]

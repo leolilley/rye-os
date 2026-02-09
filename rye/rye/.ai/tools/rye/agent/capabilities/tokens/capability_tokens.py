@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Try to import cryptography for Ed25519 signing
 try:
@@ -525,3 +525,119 @@ def permissions_to_caps(permissions: List[Dict[str, Any]]) -> List[str]:
                 caps.add(f"{resource}.execute")
     
     return sorted(caps)
+
+
+# System capability prefixes (cannot be overridden)
+SYSTEM_PREFIXES = [
+    "rye.execute", "rye.search", "rye.load", "rye.sign",
+    "rye.fs.", "rye.net.", "rye.db.", "rye.git.", "rye.process.",
+    "rye.agent.", "rye.registry.",
+]
+
+
+def is_system_capability(cap: str) -> bool:
+    """Check if capability is a system primitive (cannot be overridden)."""
+    return any(cap.startswith(prefix) or cap == prefix.rstrip('.') for prefix in SYSTEM_PREFIXES)
+
+
+def load_capabilities(project_path: Path) -> Tuple[Dict[Tuple, str], Dict[str, List[str]]]:
+    """
+    Load capability definitions from YAML files.
+    
+    Search order: system → user → project (project overrides)
+    
+    Override protection: System capabilities can only be defined in rye-os space.
+    Projects can only ADD capabilities under rye.mcp.<name>.* namespace.
+    
+    Args:
+        project_path: Path to project root
+        
+    Returns:
+        Tuple of (permissions_map, hierarchy_map)
+        - permissions_map: {(action, resource, target): capability_string}
+        - hierarchy_map: {parent_cap: [child_caps]}
+    """
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError("PyYAML is required for capability loading")
+    
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    permissions = {}  # {pattern_tuple: capability_string}
+    hierarchy = {}    # {parent: [children]}
+    
+    # Determine search paths
+    # From: rye/.ai/tools/rye/agent/capabilities/tokens/capability_tokens.py
+    # To: rye/.ai/tools/rye/agent/
+    tokens_dir = Path(__file__).parent  # tokens/
+    caps_dir = tokens_dir.parent  # capabilities/
+    agent_dir = caps_dir.parent  # agent/
+    system_caps_dir = agent_dir / "capabilities" / "primitives"
+    
+    project_caps_dir = project_path / ".ai" / "tools" / "agent" / "capabilities"
+    
+    search_order = [
+        (system_caps_dir, True),      # System space (can define system capabilities)
+        (project_caps_dir, False),    # Project space (can only define mcp.* capabilities)
+    ]
+    
+    for caps_dir, is_system_space in search_order:
+        if not caps_dir.exists():
+            continue
+            
+        for yaml_file in sorted(caps_dir.glob("*.yaml")):
+            try:
+                data = yaml.safe_load(yaml_file.read_text())
+                if not data:
+                    continue
+                
+                # Merge permissions
+                for perm in data.get("permissions", []):
+                    pattern = tuple(perm.get("pattern", []))
+                    cap = perm.get("capability")
+                    
+                    if not pattern or not cap:
+                        continue
+                    
+                    # Override protection: Block non-system from defining system capabilities
+                    if not is_system_space and is_system_capability(cap):
+                        logger.warning(
+                            f"BLOCKED: {yaml_file.name} tried to define system capability '{cap}' "
+                            f"(only rye-os can define rye.* capabilities)"
+                        )
+                        continue
+                    
+                    # Block override of existing system capabilities from user space
+                    if not is_system_space and pattern in permissions:
+                        existing_cap = permissions[pattern]
+                        if is_system_capability(existing_cap):
+                            logger.warning(
+                                f"BLOCKED: {yaml_file.name} tried to override system capability "
+                                f"pattern {pattern} (was '{existing_cap}')"
+                            )
+                            continue
+                    
+                    permissions[pattern] = cap
+                
+                # Merge hierarchy (only from system space for system capabilities)
+                for parent, children in data.get("hierarchy", {}).items():
+                    if not is_system_space and is_system_capability(parent):
+                        logger.warning(
+                            f"BLOCKED: {yaml_file.name} tried to define hierarchy for system capability '{parent}'"
+                        )
+                        continue
+                    
+                    if parent in hierarchy:
+                        # Merge, keeping unique children
+                        existing = set(hierarchy[parent])
+                        existing.update(children)
+                        hierarchy[parent] = sorted(existing)
+                    else:
+                        hierarchy[parent] = children
+                        
+            except Exception as e:
+                logger.warning(f"Failed to load capabilities from {yaml_file}: {e}")
+    
+    return permissions, hierarchy

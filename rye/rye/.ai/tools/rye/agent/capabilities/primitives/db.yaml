@@ -1,0 +1,12 @@
+name: db
+version: "1.0.0"
+description: "Database capabilities"
+
+permissions:
+  - pattern: ["execute", "db", "query"]
+    capability: "rye.db.query"
+  - pattern: ["execute", "db", "write"]
+    capability: "rye.db.write"
+
+hierarchy:
+  rye.db.write: [rye.db.query]

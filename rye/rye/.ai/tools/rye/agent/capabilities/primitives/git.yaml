@@ -1,0 +1,15 @@
+name: git
+version: "1.0.0"
+description: "Git capabilities"
+
+permissions:
+  - pattern: ["execute", "git", "read"]
+    capability: "rye.git.read"
+  - pattern: ["execute", "git", "push"]
+    capability: "rye.git.push"
+  - pattern: ["execute", "git", "pull"]
+    capability: "rye.git.pull"
+
+hierarchy:
+  rye.git.push: [rye.git.read]
+  rye.git.pull: [rye.git.read]

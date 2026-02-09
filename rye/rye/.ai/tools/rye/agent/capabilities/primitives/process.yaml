@@ -1,0 +1,9 @@
+name: process
+version: "1.0.0"
+description: "Process/shell capabilities"
+
+permissions:
+  - pattern: ["execute", "process", "exec"]
+    capability: "rye.process.exec"
+
+hierarchy: {}

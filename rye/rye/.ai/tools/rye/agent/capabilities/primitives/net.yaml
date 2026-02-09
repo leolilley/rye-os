@@ -1,0 +1,12 @@
+name: net
+version: "1.0.0"
+description: "Network capabilities"
+
+permissions:
+  - pattern: ["execute", "net", "call"]
+    capability: "rye.net.call"
+  - pattern: ["execute", "net", "spawn"]
+    capability: "rye.net.spawn"
+
+hierarchy:
+  rye.net.spawn: [rye.net.call]

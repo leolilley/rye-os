@@ -1,0 +1,15 @@
+name: primary
+version: "1.0.0"
+description: "Primary rye MCP operations (execute, search, load, sign)"
+
+permissions:
+  - pattern: ["execute", "rye", "execute"]
+    capability: "rye.execute"
+  - pattern: ["execute", "rye", "search"]
+    capability: "rye.search"
+  - pattern: ["execute", "rye", "load"]
+    capability: "rye.load"
+  - pattern: ["execute", "rye", "sign"]
+    capability: "rye.sign"
+
+hierarchy: {}

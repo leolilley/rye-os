@@ -1,0 +1,12 @@
+name: fs
+version: "1.0.0"
+description: "Filesystem capabilities"
+
+permissions:
+  - pattern: ["read", "filesystem", ""]
+    capability: "rye.fs.read"
+  - pattern: ["write", "filesystem", ""]
+    capability: "rye.fs.write"
+
+hierarchy:
+  rye.fs.write: [rye.fs.read]
