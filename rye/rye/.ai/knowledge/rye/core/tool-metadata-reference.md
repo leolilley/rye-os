@@ -429,7 +429,6 @@ const argv = yargs(hideBin(process.argv))
     description: 'Name to greet',
     default: 'World'
   })
-  .help()
   .argv;
 
 function main() {

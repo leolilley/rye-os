@@ -70,8 +70,7 @@ For Claude Desktop, add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "rye": {
-      "command": "rye",
-      "args": ["serve"]
+      "command": "rye"
     }
   }
 }
@@ -91,10 +90,10 @@ Prompt your agent:
 
 Your agent will:
 
-1. Call `mcp__rye__search` with your query
+1. Call `search` with your query
 2. Receive matching results from the registry
-3. Call `mcp__rye__load` to pull the directive into your project
-4. Call `mcp__rye__execute` with the PR details
+3. Call `load` to pull the directive into your project
+4. Call `execute` with the PR details
 
 The directive is now in your project (`.ai/directives/`) and can be reused without searching again.
 
@@ -146,7 +145,7 @@ Verify application is responding at https://app.example.com
 </directive>
 ```
 
-**Mandatory fields:**
+**Required fields:**
 
 - `name` and `version` (root attributes)
 - `description`, `category`, `author` (in `<metadata>`)
@@ -154,7 +153,15 @@ Verify application is responding at https://app.example.com
 - `<success_criteria>` with one or more `<criterion>` elements
 - `<outputs>` with one or more `<output>` elements
 
-For advanced features (model tiers, permissions, cost tracking), see `create_advanced_directive`.
+**Optional advanced fields** (required for agent thread execution):
+
+- `<model>` - Model tier, fallback, and parallel execution settings
+- `<permissions>` - Resource access declarations (required for agent threads)
+- `<cost>` - Resource usage tracking and budget management
+- `<context>` - Relationships, dependencies, and related files
+- `<hooks>` - Conditional actions for events and deviations
+
+For advanced features including hooks, context relationships, and model tiers, see `create_advanced_directive`.
 
 ### Creating Tools
 
@@ -184,7 +191,7 @@ def main(**kwargs):
 Use the MCP execute tool to register tools:
 
 ```
-Call mcp__rye__execute with:
+Call execute with:
 - item_type: "tool"
 - action: "create"
 - item_id: "deploy-service"
@@ -236,14 +243,62 @@ The registry is a centralized store of shared directives, tools, and knowledge. 
 - **Versioning**: Track changes and updates
 - **Community**: Share improvements back
 
-When you search from your agent, results from the registry appear alongside your local items.
+When you search from your agent, results from the local registry appear alongside your local items.
+
+## Agent Tool and Thread Spawning
+
+Rye OS includes an advanced **Agent Tool** that enables recursive AI agents with tight control through metadata:
+
+### The Agent Tool
+
+The agent tool (`.ai/tools/rye/agent/`) provides:
+
+- **Thread Spawning**: Create parallel AI threads that can run directives independently
+- **MCP Integration**: Spawned agents receive the same Rye MCP tools, enabling full recursion
+- **Safety Harness**: Built into the agent tool with thread validation and isolation
+- **Resource Control**: Managed through directive metadata (permissions, cost, model tiers)
+
+### Spawning Agent Threads
+
+Use the agent tool to spawn parallel AI threads:
+
+```bash
+# Spawn a thread for a specific task
+rye_execute(
+  item_type="tool",
+  item_id="rye/agent/threads/spawn_thread",
+  parameters={
+    "thread_id": "research-analysis",
+    "directive_name": "analyze-market-trends",
+    "project_path": "/path/to/project"
+  }
+)
+```
+
+### Recursive Agent Architecture
+
+1. **Main Agent** receives a task and searches for appropriate directives
+2. **Spawned Threads** get their own Rye MCP client access
+3. **Thread Control** through metadata:
+   - `<permissions>`: Limited to thread-specific resources
+   - `<cost>`: Budget tracking per thread
+   - `<model>`: Tier selection for thread reasoning complexity
+   - `<context>`: Thread relationships and dependencies
+
+### Thread Registry
+
+Agent threads are automatically registered and can be:
+
+- Monitored via `read_transcript`
+- Controlled via `thread_registry`
+- Terminated individually with validation
 
 ### Publishing to the Registry
 
 Use the MCP execute tool to publish items:
 
 ```
-Call mcp__rye__execute with:
+Call execute with:
 - item_type: "directive"
 - action: "publish"
 - item_id: "code_review"
@@ -256,20 +311,97 @@ Rye enforces permissions at multiple levels:
 
 1. **MCP Protocol**: Controls what the external agent can access
 2. **Directive Permissions**: Declared in the directive's `<permissions>` section
-3. **Runtime Scoping**: Each tool runs with only the permissions it needs
+3. **Thread Isolation**: Each spawned agent thread operates with its own permission set
+4. **Runtime Scoping**: Each tool runs with only the permissions it needs
 
-Permission declarations use XML elements:
+### Permission Declarations
+
+Permissions follow a hierarchical structure under `<permissions>` root. Each permission type (execute, search, load, sign) can contain specific resource types and capabilities. Each permission level can independently access tools, directives, or knowledge.
 
 ```xml
 <permissions>
-  <read resource="filesystem" path="**/*" />
-  <write resource="filesystem" path="tests/**" />
-  <execute resource="shell" action="pytest" />
-  <execute resource="rye" action="search" />
+  <execute>
+    <tool>rye.file-system.fs_write</tool>
+    <tool>rye.agent.*</tool>
+  </execute>
+
+  <search>*</search>
+
+  <load>
+    <tool>rye.shell.*</tool>
+    <directive>workflow/*</directive>
+  </load>
+
+  <sign>*</sign>
 </permissions>
 ```
 
-This layered approach ensures that even if a directive from the registry is malicious, it can only access resources its permissions allow.
+**Permission hierarchy**:
+
+- God mode: `<permissions>*</permissions>` - unlimited access to everything
+- Execute only: `<permissions><execute>*</execute></permissions>` - can execute anything but cannot search, load, or sign
+- Search only: `<permissions><search>*</search></permissions>` - can search for any item but cannot execute
+- Partial access: List specific tools or patterns per permission type
+
+**Common patterns**:
+
+```xml
+<!-- File system access only -->
+<permissions>
+  <execute>
+    <tool>rye.file-system.*</tool>
+  </execute>
+</permissions>
+
+<!-- Full execute access -->
+<permissions>
+  <execute>*</execute>
+</permissions>
+
+<!-- Search everything -->
+<permissions>
+  <search>*</search>
+</permissions>
+
+<!-- Full access to execute, search, and load -->
+<permissions>
+  <execute>*</execute>
+  <search>*</search>
+  <load>*</load>
+</permissions>
+
+<!-- Custom access for each permission type -->
+<permissions>
+  <execute>
+    <tool>rye.file-system.*</tool>
+    <tool>rye.agent.threads.spawn_thread</tool>
+  </execute>
+  <search>
+    <directive>analysis/*</directive>
+    <tool>rye.registry.*</tool>
+  </search>
+  <load>
+    <tool>rye.*</tool>
+  </load>
+  <sign>
+    <tool>scripts.*</tool>
+  </sign>
+</permissions>
+```
+
+See [permission-format-change.md](docs/permission-format-change.md) for detailed migration guide.
+
+### Thread Safety and Control
+
+The agent tool provides built-in safety features:
+
+- **Thread Validation**: Thread ID sanitization and uniqueness checking
+- **Resource Scoping**: Each thread gets its own permission context
+- **Budget Tracking**: Individual cost limits per spawned thread
+- **Termination Control**: Safe thread termination with cleanup
+- **Registry Integration**: Thread state tracking and management
+
+This layered approach ensures that even if a directive from the registry is malicious or spawns threads, all operations are contained within their declared permission boundaries.
 
 ## Project Structure
 
@@ -301,10 +433,215 @@ Instead of starting from scratch in each agent environment, you build up a libra
 
 ## Examples
 
-- **Research Pipeline**: A directive that spawns parallel agents to analyze multiple sources, extracts key findings, and synthesizes a report
-- **Code Review System**: Automated PR review checking security, performance, and style
-- **Data Processing Pipeline**: Extract, transform, validate, and load data with provenance tracking
-- **Content Factory**: Research, outline, draft, edit, and publish with multi-stage approval
+### Threaded Research Pipeline
+
+A directive that spawns parallel agent threads to analyze multiple sources, extracts key findings, and synthesizes a report with full recursion.
+
+### Multi-Agent Code Review
+
+Spawn specialized agent threads for:
+
+- Security analysis with dedicated permissions
+- Performance optimization with cost limits
+- Style compliance with specific model tiers
+- Auto-comment generation with output templates
+
+### Distributed Data Processing
+
+Extract, transform, validate, and load data across multiple agent threads with provenance tracking and individual resource controls.
+
+### Content Factory Pipeline
+
+Sequential spawning of specialized agent threads:
+
+- Research agents with broad access
+- Outline agents with structural validation
+- Draft agents with style constraints
+- Edit agents with limited scope
+- Approval agents with elevated permissions
+
+## Agent Thread Examples
+
+### Parallel Code Analysis with Scoped Permissions
+
+```xml
+<directive name="parallel-code-analysis" version="1.0.0">
+  <metadata>
+    <description>Analyze code in parallel across multiple dimensions with isolated thread permissions</description>
+    <category>analysis</category>
+    <author>team</author>
+
+    <model tier="orchestrator" parallel="true">
+      Spawn parallel agents for comprehensive analysis
+    </model>
+
+    <permissions>
+      <execute>
+        <tool>rye.agent.threads.spawn_thread</tool>
+        <tool>rye.agent.threads.thread_registry</tool>
+        <tool>rye.agent.threads.read_transcript</tool>
+      </execute>
+    </permissions>
+
+    <cost>
+      <context estimated_usage="high" turns="10" spawn_threshold="3">
+        50000
+      </context>
+    </cost>
+  </metadata>
+
+  <process>
+    <step name="spawn-security-analysis">
+      <description>Spawn security-focused thread with scoped permissions</description>
+      <action><![CDATA[
+        Spawn agent thread with:
+        - Thread ID: security-analysis
+        - Directive: security-vulnerability-scanner
+        - Limited permissions to source code only
+        - Cost tracking within budget
+      ]]></action>
+    </step>
+
+    <step name="spawn-performance-analysis">
+      <description>Spawn performance-focused thread</description>
+      <action><![CDATA[
+        Spawn agent thread with:
+        - Thread ID: performance-analysis
+        - Directive: code-performance-optimizer
+        - Read access to tests and benchmarks
+        - Different model tier for performance reasoning
+      ]]></action>
+    </step>
+
+    <step name="coordinate-results">
+      <description>Wait for all threads and synthesize results</description>
+      <action><![CDATA[
+        Load transcript from all spawned threads
+        Cross-reference findings between threads
+        Generate unified analysis report
+      ]]></action>
+    </step>
+  </process>
+</directive>
+```
+
+### God Mode Thread
+
+```xml
+<directive name="root-directive" version="1.0.0">
+  <metadata>
+    <description>Root directive with unlimited access for recursive operations</description>
+    <category>meta</category>
+    <author>system</author>
+
+    <model tier="orchestrator">
+      Highest level directive with god-mode access
+    </model>
+
+    <permissions>*</permissions>
+
+    <cost>
+      <context estimated_usage="high" turns="20" spawn_threshold="5">
+        100000
+      </context>
+    </cost>
+  </metadata>
+
+  <process>
+    <!-- Content here... -->
+  </process>
+</directive>
+```
+
+### Execute-Only Thread
+
+```xml
+<directive name="executor-thread" version="1.0.0">
+  <metadata>
+    <description>Thread with execute permissions only (cannot search or load)</description>
+    <category>executor</category>
+    <author>system</author>
+
+    <model tier="general">
+      Execute directives but cannot search or load
+    </model>
+
+    <permissions><execute>*</execute></permissions>
+
+    <cost>
+      <context estimated_usage="medium" turns="10" spawn_threshold="2">
+        20000
+      </context>
+    </cost>
+  </metadata>
+
+  <process>
+    <!-- Content here... -->
+  </process>
+</directive>
+```
+
+### Search-Only Thread
+
+```xml
+<directive name="searcher-thread" version="1.0.0">
+  <metadata>
+    <description>Thread can search for anything but cannot execute</description>
+    <category>searcher</category>
+    <author>system</author>
+
+    <model tier="general">
+      Search for directives and tools but cannot execute
+    </model>
+
+    <permissions><search>*</search></permissions>
+
+    <cost>
+      <context estimated_usage="low" turns="3" spawn_threshold="1">
+        5000
+      </context>
+    </cost>
+  </metadata>
+
+  <process>
+    <!-- Content here... -->
+  </process>
+</directive>
+```
+
+### File System Only Thread
+
+```xml
+<directive name="file-processor" version="1.0.0">
+  <metadata>
+    <description>Process files with limited file system access</description>
+    <category>file-system</category>
+    <author>developer</author>
+
+    <model tier="general">
+      Standard processing with file operations only
+    </model>
+
+    <permissions>
+      <execute>
+        <tool>rye.file-system.fs_read</tool>
+        <tool>rye.file-system.fs_write</tool>
+        <tool>rye.file-system.fs_exists</tool>
+      </execute>
+    </permissions>
+
+    <cost>
+      <context estimated_usage="medium" turns="5" spawn_threshold="2">
+        10000
+      </context>
+    </cost>
+  </metadata>
+
+  <process>
+    <!-- Content here... -->
+  </process>
+</directive>
+```
 
 ## License
 

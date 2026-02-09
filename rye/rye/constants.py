@@ -28,6 +28,5 @@ class Action:
     SIGN = "sign"
     LOAD = "load"
     EXECUTE = "execute"
-    HELP = "help"
 
-    ALL = [SEARCH, SIGN, LOAD, EXECUTE, HELP]
+    ALL = [SEARCH, SIGN, LOAD, EXECUTE]
