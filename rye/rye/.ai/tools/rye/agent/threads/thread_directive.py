@@ -471,9 +471,9 @@ def _build_tool_result_message(tool_results: List[Dict], provider_config: Dict) 
 
 
 def _strip_rye_signature(text: str) -> str:
-    """Strip rye:validated signature comments from directive body."""
+    """Strip rye:signed/rye:validated signature comments from directive body."""
     import re
-    return re.sub(r'<!--\s*rye:validated:[^>]*-->\s*', '', text).strip()
+    return re.sub(r'<!--\s*rye:(?:validated|signed):[^>]*-->\s*', '', text).strip()
 
 
 def _resolve_input_refs(value: str, inputs: Optional[Dict]) -> str:
@@ -1323,13 +1323,20 @@ async def handle_hook_result(
 async def _load_directive(name: str, project_path: Path) -> Optional[Dict]:
     try:
         from rye.handlers.directive.handler import DirectiveHandler
+        from rye.utils.integrity import verify_item, IntegrityError
+        from rye.constants import ItemType
+
         handler = DirectiveHandler(str(project_path))
         file_path = handler.resolve(name)
-        if file_path:
-            result = handler.parse(file_path)
-            return result
-        else:
+        if not file_path:
             return None
+
+        verify_item(file_path, ItemType.DIRECTIVE, project_path=project_path)
+        result = handler.parse(file_path)
+        return result
+    except IntegrityError as e:
+        logger.error(f"Integrity check failed for directive {name}: {e}")
+        return None
     except Exception as e:
         logger.error(f"Failed to load directive {name}: {e}")
         return None

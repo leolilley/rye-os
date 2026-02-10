@@ -9,6 +9,7 @@ from rye.constants import ItemType
 from rye.utils.path_utils import get_project_type_path, get_system_type_path
 from rye.utils.extensions import get_tool_extensions
 from rye.utils.resolvers import get_user_space
+from rye.utils.integrity import verify_item
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ class LoadTool:
                     "item_type": item_type,
                     "item_id": item_id,
                 }
+
+            verify_item(
+                source_path, item_type,
+                project_path=Path(project_path) if project_path else None,
+            )
 
             content = source_path.read_text(encoding="utf-8")
             metadata = self._extract_metadata(source_path, content)

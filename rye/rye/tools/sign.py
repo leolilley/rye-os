@@ -43,6 +43,21 @@ class SignTool:
         """Check if item_id is a glob pattern."""
         return "*" in item_id or "?" in item_id
 
+    def _get_batch_base_dir(
+        self, item_type: str, project_path: str, source: str
+    ) -> Optional[Path]:
+        """Get the base directory for computing relative path IDs."""
+        type_dir = ItemType.TYPE_DIRS.get(item_type)
+        if not type_dir:
+            return None
+        if source == "project":
+            return get_project_type_path(Path(project_path), item_type)
+        elif source == "user":
+            return get_user_type_path(item_type)
+        elif source == "system":
+            return get_system_type_path(item_type)
+        return None
+
     def _resolve_glob_items(
         self, item_type: str, pattern: str, project_path: str, source: str
     ) -> List[Path]:
@@ -63,28 +78,31 @@ class SignTool:
         if not base_dir.exists():
             return []
 
-        # Determine file extension based on item type
-        extensions = {
-            ItemType.DIRECTIVE: ".md",
-            ItemType.TOOL: ".py",
-            ItemType.KNOWLEDGE: ".md",
-        }
-        ext = extensions.get(item_type, ".md")
-
-        # Resolve glob - pattern can be "demos/meta/*" or just "*"
-        if "/" in pattern:
-            # Pattern includes subdirectory
-            glob_pattern = f"{pattern}{ext}" if not pattern.endswith(ext) else pattern
+        if item_type == ItemType.TOOL:
+            tool_extensions = get_tool_extensions(
+                Path(project_path) if project_path else None
+            )
+            items = []
+            for tool_ext in tool_extensions:
+                if "/" in pattern:
+                    glob_pattern = f"{pattern}{tool_ext}" if not pattern.endswith(tool_ext) else pattern
+                else:
+                    glob_pattern = f"**/{pattern}{tool_ext}" if pattern != "*" else f"**/*{tool_ext}"
+                for path in base_dir.glob(glob_pattern):
+                    if path.is_file():
+                        items.append(path)
+            return items
         else:
-            # Simple pattern like "*" - search recursively
-            glob_pattern = f"**/{pattern}{ext}" if pattern != "*" else f"**/*{ext}"
-
-        items = []
-        for path in base_dir.glob(glob_pattern):
-            if path.is_file():
-                items.append(path)
-
-        return items
+            ext = ".md"
+            if "/" in pattern:
+                glob_pattern = f"{pattern}{ext}" if not pattern.endswith(ext) else pattern
+            else:
+                glob_pattern = f"**/{pattern}{ext}" if pattern != "*" else f"**/*{ext}"
+            items = []
+            for path in base_dir.glob(glob_pattern):
+                if path.is_file():
+                    items.append(path)
+            return items
 
     async def handle(self, **kwargs) -> Dict[str, Any]:
         """Handle sign request."""
@@ -132,8 +150,12 @@ class SignTool:
 
         results: Dict[str, Any] = {"signed": [], "failed": [], "total": len(items)}
 
+        base_dir = self._get_batch_base_dir(item_type, project_path, source)
         for file_path in items:
-            item_id = file_path.stem
+            if base_dir:
+                item_id = str(file_path.relative_to(base_dir).with_suffix(""))
+            else:
+                item_id = file_path.stem
             try:
                 if item_type == ItemType.DIRECTIVE:
                     result = await self._sign_directive(item_id, project_path, source)

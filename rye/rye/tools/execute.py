@@ -22,6 +22,7 @@ from rye.utils.path_utils import (
     get_system_type_path,
     get_user_type_path,
 )
+from rye.utils.integrity import verify_item, IntegrityError
 from rye.utils.resolvers import get_system_space, get_user_space
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,8 @@ class ExecuteTool:
         file_path = self._find_item(project_path, ItemType.DIRECTIVE, item_id)
         if not file_path:
             return {"status": "error", "error": f"Directive not found: {item_id}"}
+
+        verify_item(file_path, ItemType.DIRECTIVE, project_path=Path(project_path) if project_path else None)
 
         content = file_path.read_text(encoding="utf-8")
         parsed = self.parser_router.parse("markdown_xml", content)
@@ -210,6 +213,8 @@ class ExecuteTool:
         file_path = self._find_item(project_path, ItemType.KNOWLEDGE, item_id)
         if not file_path:
             return {"status": "error", "error": f"Knowledge entry not found: {item_id}"}
+
+        verify_item(file_path, ItemType.KNOWLEDGE, project_path=Path(project_path) if project_path else None)
 
         content = file_path.read_text(encoding="utf-8")
         parsed = self.parser_router.parse("markdown_frontmatter", content)

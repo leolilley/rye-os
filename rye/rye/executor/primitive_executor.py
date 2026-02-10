@@ -24,12 +24,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from lilux.primitives.subprocess import SubprocessPrimitive, SubprocessResult
 from lilux.primitives.http_client import HttpClientPrimitive, HttpResult
-from lilux.primitives.integrity import compute_tool_integrity
 from lilux.runtime.env_resolver import EnvResolver
 
 from rye.executor.chain_validator import ChainValidator, ChainValidationResult
 from rye.executor.lockfile_resolver import LockfileResolver
 from rye.utils.extensions import get_tool_extensions
+from rye.utils.integrity import verify_item, IntegrityError
+from rye.utils.metadata_manager import MetadataManager
+from rye.constants import ItemType
 
 logger = logging.getLogger(__name__)
 
@@ -165,23 +167,21 @@ class PrimitiveExecutor:
                     if lockfile:
                         logger.debug(f"Using lockfile for {item_id}@{version}")
                         lockfile_used = True
-                        # Verify integrity matches
-                        manifest = {
-                            "tool_type": metadata.get("tool_type"),
-                            "executor_id": metadata.get("executor_id"),
-                            "category": metadata.get("category", ""),
-                        }
-                        current_integrity = compute_tool_integrity(
-                            tool_id=item_id,
-                            version=version,
-                            manifest=manifest,
+                        content = tool_path[0].read_text(encoding="utf-8")
+                        current_integrity = MetadataManager.compute_hash(
+                            ItemType.TOOL, content,
+                            file_path=tool_path[0],
+                            project_path=self.project_path,
                         )
                         if lockfile.root.integrity != current_integrity:
-                            logger.warning(
-                                f"Lockfile integrity mismatch for {item_id}: "
-                                f"expected {lockfile.root.integrity}, got {current_integrity}"
+                            return ExecutionResult(
+                                success=False,
+                                error=(
+                                    f"Lockfile integrity mismatch for {item_id}. "
+                                    f"Re-sign and delete stale lockfile."
+                                ),
+                                duration_ms=(time.time() - start_time) * 1000,
                             )
-                            lockfile_used = False
 
             # 2. Build the executor chain
             chain = await self._build_chain(item_id)
@@ -193,7 +193,14 @@ class PrimitiveExecutor:
                     duration_ms=(time.time() - start_time) * 1000,
                 )
 
-            # 3. Validate chain if requested
+            # 3. Verify integrity of every chain element
+            for element in chain:
+                verify_item(
+                    element.path, ItemType.TOOL,
+                    project_path=self.project_path,
+                )
+
+            # 4. Validate chain if requested
             if validate_chain:
                 validation = self._validate_chain(chain)
                 if not validation.valid:
@@ -204,26 +211,21 @@ class PrimitiveExecutor:
                         duration_ms=(time.time() - start_time) * 1000,
                     )
 
-            # 4. Resolve environment through the chain
+            # 5. Resolve environment through the chain
             resolved_env = self._resolve_chain_env(chain)
 
-            # 5. Execute via the root primitive
+            # 6. Execute via the root primitive
             result = await self._execute_chain(chain, parameters, resolved_env)
 
-            # 6. Create lockfile if execution succeeded and none exists
+            # 7. Create lockfile if execution succeeded and none exists
             if use_lockfile and result.get("success") and not lockfile_used and version:
                 try:
                     root_element = chain[0]
-                    root_meta = self._load_metadata_cached(root_element.path)
-                    manifest = {
-                        "tool_type": root_element.tool_type,
-                        "executor_id": root_element.executor_id,
-                        "category": root_meta.get("category", "") or "",
-                    }
-                    integrity = compute_tool_integrity(
-                        tool_id=item_id,
-                        version=version,
-                        manifest=manifest,
+                    root_content = root_element.path.read_text(encoding="utf-8")
+                    integrity = MetadataManager.compute_hash(
+                        ItemType.TOOL, root_content,
+                        file_path=root_element.path,
+                        project_path=self.project_path,
                     )
                     resolved_chain = [self._chain_element_to_dict(e) for e in chain]
 

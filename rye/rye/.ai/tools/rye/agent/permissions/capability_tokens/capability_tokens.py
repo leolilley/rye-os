@@ -28,8 +28,12 @@ except ImportError:
     CRYPTOGRAPHY_AVAILABLE = False
 
 
-# Default key paths
-DEFAULT_KEY_DIR = Path.home() / ".rye" / "keys"
+# Default key paths — unified under USER_SPACE (~/.ai/keys/)
+try:
+    from rye.utils.path_utils import get_user_space
+    DEFAULT_KEY_DIR = get_user_space() / "keys"
+except ImportError:
+    DEFAULT_KEY_DIR = Path.home() / ".ai" / "keys"
 PRIVATE_KEY_FILE = "private_key.pem"
 PUBLIC_KEY_FILE = "public_key.pem"
 

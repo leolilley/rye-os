@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lilux.primitives.lockfile import Lockfile, LockfileRoot, LockfileManager
-from lilux.primitives.integrity import compute_tool_integrity
 
 from rye.utils.path_utils import get_user_space, get_system_space, ensure_parent_directory
 

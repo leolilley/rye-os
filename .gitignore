@@ -96,7 +96,6 @@ pip-delete-this-directory.txt
 ## Local development
 local/
 scratch/
-test_*.py
 debug_*.py
 
 ## Backup files

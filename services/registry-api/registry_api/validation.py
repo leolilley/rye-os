@@ -8,12 +8,15 @@ The rye package provides:
 - MetadataManager: Signature handling per item type
 - validators: Schema-driven validation using extractors
 - constants: ItemType definitions and mappings
+
+Signature format: rye:signed:TIMESTAMP:CONTENT_HASH:ED25519_SIG:PUBKEY_FP
+Registry appends provenance: |rye-registry@username
 """
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-# Import directly from rye package - single source of truth
 from rye.constants import ItemType
 from rye.utils.metadata_manager import (
     MetadataManager,
@@ -25,7 +28,6 @@ from rye.utils.validators import apply_field_mapping, validate_parsed_data
 
 logger = logging.getLogger(__name__)
 
-# Parser router instance (reused across requests)
 _parser_router: Optional[ParserRouter] = None
 
 
@@ -37,8 +39,6 @@ def get_parser_router() -> ParserRouter:
     return _parser_router
 
 
-# Item type to parser type mapping
-# This follows the extractor pattern - each item type has a parser
 PARSER_TYPES = {
     ItemType.DIRECTIVE: "markdown_xml",
     ItemType.TOOL: "python_ast",
@@ -47,11 +47,7 @@ PARSER_TYPES = {
 
 
 def strip_signature(content: str, item_type: str) -> str:
-    """Remove existing signature from content.
-
-    Uses MetadataManager.get_strategy() which handles item-type-specific
-    signature formats (HTML comments for directives/knowledge, line comments for tools).
-    """
+    """Remove existing signature from content."""
     strategy = MetadataManager.get_strategy(item_type)
     return strategy.remove_signature(content)
 
@@ -61,29 +57,13 @@ def validate_content(
     item_type: str,
     item_id: str,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Validate content using rye validators.
-
-    Uses the same validation pipeline as the client-side sign tool:
-    1. Parse with ParserRouter (data-driven)
-    2. Apply field mapping from extractors
-    3. Validate against VALIDATION_SCHEMA from extractors
-
-    Args:
-        content: File content (signature already stripped)
-        item_type: Type of item (directive, tool, knowledge)
-        item_id: Item identifier (used for name validation)
-
-    Returns:
-        Tuple of (is_valid, result_dict)
-        result_dict contains either parsed_data or issues list
-    """
+    """Validate content using rye validators."""
     parser_router = get_parser_router()
     parser_type = PARSER_TYPES.get(item_type)
 
     if not parser_type:
         return False, {"issues": [f"Unknown item type: {item_type}"]}
 
-    # Parse content using data-driven parser
     try:
         parsed = parser_router.parse(parser_type, content)
     except Exception as e:
@@ -93,18 +73,15 @@ def validate_content(
     if "error" in parsed:
         return False, {"issues": [f"Parse error: {parsed['error']}"]}
 
-    # For tools, add name from item_id (matches client behavior)
     if item_type == ItemType.TOOL:
         parsed["name"] = item_id
 
-    # Apply field mapping from extractors (e.g., __version__ -> version)
     parsed = apply_field_mapping(item_type, parsed)
 
-    # Validate using VALIDATION_SCHEMA from extractors
     validation_result = validate_parsed_data(
         item_type=item_type,
         parsed_data=parsed,
-        file_path=None,  # No file path on server
+        file_path=None,
         location="registry",
         project_path=None,
     )
@@ -123,10 +100,13 @@ def sign_with_registry(
     item_type: str,
     username: str,
 ) -> Tuple[str, Dict[str, str]]:
-    """Sign content with registry provenance.
+    """Sign content with registry Ed25519 key and provenance.
 
-    Adds the |registry@username suffix that can only be added server-side.
-    Uses MetadataManager for item-type-specific signature formatting.
+    The registry server has its own Ed25519 keypair. On push, the server
+    strips the client's signature, re-signs with the registry key, and
+    appends |rye-registry@username provenance.
+
+    Key directory from REGISTRY_KEY_DIR env var (default: /etc/rye-registry/keys).
 
     Args:
         content: Content to sign (should have any existing signature stripped)
@@ -135,40 +115,76 @@ def sign_with_registry(
 
     Returns:
         Tuple of (signed_content, signature_info)
-        signature_info contains timestamp, hash, registry_username
     """
-    # Use rye's hash/timestamp functions for consistency
-    content_hash = compute_content_hash(content)
+    import os
+
+    from lilux.primitives.signing import (
+        ensure_keypair,
+        sign_hash,
+        compute_key_fingerprint,
+    )
+
+    strategy = MetadataManager.get_strategy(item_type)
+    content_for_hash = strategy.extract_content_for_hash(content)
+    content_hash = compute_content_hash(content_for_hash)
     timestamp = generate_timestamp()
 
-    # Get strategy for this item type
-    strategy = MetadataManager.get_strategy(item_type)
+    registry_key_dir = Path(os.environ.get(
+        "REGISTRY_KEY_DIR", "/etc/rye-registry/keys"
+    ))
 
-    # Format the base signature using MetadataManager
-    base_signature = strategy.format_signature(timestamp, content_hash)
+    private_pem, public_pem = ensure_keypair(registry_key_dir)
+    ed25519_sig = sign_hash(content_hash, private_pem)
+    pubkey_fp = compute_key_fingerprint(public_pem)
 
-    # Inject registry suffix into the signature
-    # For HTML comments: "<!-- rye:validated:T:H -->" -> "<!-- rye:validated:T:H|rye-registry@user -->"
-    # For line comments: "# rye:validated:T:H\n" -> "# rye:validated:T:H|rye-registry@user\n"
+    base_signature = strategy.format_signature(
+        timestamp, content_hash, ed25519_sig, pubkey_fp
+    )
+
     if base_signature.endswith(" -->\n"):
         registry_signature = base_signature.replace(
             " -->", f"|rye-registry@{username} -->"
         )
     elif base_signature.endswith("\n"):
-        registry_signature = base_signature.rstrip("\n") + f"|rye-registry@{username}\n"
+        registry_signature = (
+            base_signature.rstrip("\n") + f"|rye-registry@{username}\n"
+        )
     else:
         registry_signature = base_signature + f"|rye-registry@{username}"
 
-    # Insert signature into content
     signed_content = strategy.insert_signature(content, registry_signature)
 
     signature_info = {
         "timestamp": timestamp,
         "hash": content_hash,
+        "ed25519_sig": ed25519_sig,
+        "pubkey_fp": pubkey_fp,
         "registry_username": username,
     }
 
     return signed_content, signature_info
+
+
+def get_registry_public_key() -> Optional[bytes]:
+    """Get the registry's public key for the /v1/public-key endpoint.
+
+    Key directory from REGISTRY_KEY_DIR env var (default: /etc/rye-registry/keys).
+
+    Returns:
+        Public key PEM bytes, or None
+    """
+    import os
+    from lilux.primitives.signing import ensure_keypair
+
+    registry_key_dir = Path(os.environ.get(
+        "REGISTRY_KEY_DIR", "/etc/rye-registry/keys"
+    ))
+
+    try:
+        _, public_pem = ensure_keypair(registry_key_dir)
+        return public_pem
+    except Exception:
+        return None
 
 
 def verify_registry_signature(
@@ -176,7 +192,7 @@ def verify_registry_signature(
     item_type: str,
     expected_author: str,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, str]]]:
-    """Verify a registry signature on pulled content.
+    """Verify a registry Ed25519 signature on pulled content.
 
     Args:
         content: Content with registry signature
@@ -188,17 +204,14 @@ def verify_registry_signature(
     """
     strategy = MetadataManager.get_strategy(item_type)
 
-    # Extract signature using MetadataManager
     sig_info = strategy.extract_signature(content)
     if not sig_info:
         return False, "No signature found", None
 
-    # Verify it's a registry signature
     registry_username = sig_info.get("registry_username")
     if not registry_username:
         return False, "Not a registry signature (missing |registry@username)", sig_info
 
-    # Verify username matches expected author
     if registry_username != expected_author:
         return (
             False,
@@ -206,11 +219,31 @@ def verify_registry_signature(
             sig_info,
         )
 
-    # Verify content hash
     content_without_sig = strategy.remove_signature(content)
     computed_hash = compute_content_hash(content_without_sig)
 
     if computed_hash != sig_info["hash"]:
         return False, "Content integrity check failed: hash mismatch", sig_info
+
+    ed25519_sig = sig_info.get("ed25519_sig")
+    pubkey_fp = sig_info.get("pubkey_fp")
+    if not ed25519_sig or not pubkey_fp:
+        return False, "Missing Ed25519 signature fields", sig_info
+
+    from lilux.primitives.signing import verify_signature
+    from rye.utils.trust_store import TrustStore
+
+    trust_store = TrustStore()
+    public_key_pem = trust_store.get_registry_key()
+
+    if public_key_pem is None:
+        return False, "Registry key not pinned. Pull again to TOFU-pin.", sig_info
+
+    from lilux.primitives.signing import compute_key_fingerprint
+    if compute_key_fingerprint(public_key_pem) != pubkey_fp:
+        return False, "Registry key fingerprint mismatch", sig_info
+
+    if not verify_signature(sig_info["hash"], ed25519_sig, public_key_pem):
+        return False, "Ed25519 signature verification failed", sig_info
 
     return True, None, sig_info

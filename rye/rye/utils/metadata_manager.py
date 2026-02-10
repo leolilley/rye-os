@@ -4,10 +4,14 @@ Centralized Metadata Management
 Provides unified interface for signing and hashing operations
 across directives, tools, and knowledge entries.
 
+Signature format: rye:signed:TIMESTAMP:CONTENT_HASH:ED25519_SIG:PUBKEY_FP
+All signatures include Ed25519. Old rye:validated: format is rejected.
+
 Note: Parsing is delegated to parser_router which uses data-driven parsers.
 """
 
 import hashlib
+import logging
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -16,6 +20,19 @@ from typing import Any, Dict, Optional
 
 from rye.utils.signature_formats import get_signature_format
 from rye.constants import ItemType
+
+logger = logging.getLogger(__name__)
+
+# Regex components for the new rye:signed format
+# rye:signed:TIMESTAMP:CONTENT_HASH:ED25519_SIG:PUBKEY_FP
+# Optional registry provenance suffix: |provider@username
+_SIGNED_FIELDS = (
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"  # TIMESTAMP (ISO 8601)
+    r":([a-f0-9]{64})"  # CONTENT_HASH
+    r":([A-Za-z0-9_-]+={0,2})"  # ED25519_SIG (base64url)
+    r":([a-f0-9]{16})"  # PUBKEY_FP
+    r"(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))?"  # optional |provider@username
+)
 
 
 def compute_content_hash(content: str) -> str:
@@ -36,7 +53,10 @@ class MetadataStrategy(ABC):
         """Extract the content portion that should be hashed."""
 
     @abstractmethod
-    def format_signature(self, timestamp: str, hash: str) -> str:
+    def format_signature(
+        self, timestamp: str, content_hash: str,
+        ed25519_sig: str = "", pubkey_fp: str = "",
+    ) -> str:
         """Format signature according to item type."""
 
     @abstractmethod
@@ -55,57 +75,59 @@ class MetadataStrategy(ABC):
 class DirectiveMetadataStrategy(MetadataStrategy):
     """Strategy for directive metadata operations (XML in markdown)."""
 
+    _SIGNED_RE = re.compile(
+        r"^<!-- rye:signed:" + _SIGNED_FIELDS + r" -->"
+    )
+    _REMOVE_RE = re.compile(
+        r"^<!-- (?:rye|kiwi-mcp):(?:validated|signed):[^>]+-->\n"
+    )
+
     def extract_content_for_hash(self, file_content: str) -> str:
-        """Extract XML directive from markdown for hashing."""
         xml_content = self._extract_xml_from_content(file_content)
         if not xml_content:
             raise ValueError("No XML directive found in content")
         return xml_content
 
-    def format_signature(self, timestamp: str, hash: str) -> str:
-        """Format signature as HTML comment."""
-        return f"<!-- rye:validated:{timestamp}:{hash} -->\n"
+    def format_signature(
+        self, timestamp: str, content_hash: str,
+        ed25519_sig: str = "", pubkey_fp: str = "",
+    ) -> str:
+        return (
+            f"<!-- rye:signed:{timestamp}:{content_hash}"
+            f":{ed25519_sig}:{pubkey_fp} -->\n"
+        )
 
     def extract_signature(self, file_content: str) -> Optional[Dict[str, str]]:
-        """Extract signature from HTML comment at start of file."""
-        # Support rye, legacy kiwi-mcp, and registry signatures with optional |provider@username suffix
-        sig_match = re.match(
-            r"^<!-- (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{64})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))? -->",
-            file_content,
-        )
+        sig_match = self._SIGNED_RE.match(file_content)
         if not sig_match:
             return None
-
-        result = {
+        result: Dict[str, str] = {
             "timestamp": sig_match.group(1),
             "hash": sig_match.group(2),
+            "ed25519_sig": sig_match.group(3),
+            "pubkey_fp": sig_match.group(4),
         }
-        if sig_match.group(3) and sig_match.group(4):
-            result["registry_provider"] = sig_match.group(3)
-            result["registry_username"] = sig_match.group(4)
+        if sig_match.group(5) and sig_match.group(6):
+            result["registry_provider"] = sig_match.group(5)
+            result["registry_username"] = sig_match.group(6)
         return result
 
     def insert_signature(self, content: str, signature: str) -> str:
-        """Insert signature at the beginning of content."""
         content_clean = self.remove_signature(content)
         return signature + content_clean
 
     def remove_signature(self, content: str) -> str:
-        """Remove signature HTML comment from start of file."""
-        return re.sub(r"^<!-- (?:rye|kiwi-mcp):validated:[^>]+-->\n", "", content)
+        return self._REMOVE_RE.sub("", content)
 
     def _extract_xml_from_content(self, content: str) -> Optional[str]:
-        """Extract XML directive from markdown content."""
         start_match = re.search(r"<directive[^>]*>", content)
         if not start_match:
             return None
-
         start_idx = start_match.start()
         end_tag = "</directive>"
         end_idx = content.rfind(end_tag)
         if end_idx == -1 or end_idx < start_idx:
             return None
-
         return content[start_idx : end_idx + len(end_tag)].strip()
 
 
@@ -115,68 +137,63 @@ class ToolMetadataStrategy(MetadataStrategy):
     def __init__(
         self, file_path: Optional[Path] = None, project_path: Optional[Path] = None
     ):
-        """
-        Initialize tool metadata strategy.
-
-        Args:
-            file_path: Path to the tool file (for determining signature format)
-            project_path: Optional project path for extractor discovery
-        """
         self.file_path = file_path
         self.project_path = project_path
         self._sig_format = None
 
     def _get_signature_format(self) -> Dict[str, Any]:
-        """Get signature format for the tool file."""
         if self._sig_format is None:
             if self.file_path:
                 self._sig_format = get_signature_format(
                     self.file_path, self.project_path
                 )
             else:
-                # Default to Python-style if no file path provided
                 self._sig_format = {"prefix": "#", "after_shebang": True}
         return self._sig_format
 
     def extract_content_for_hash(self, file_content: str) -> str:
-        """Extract tool content for hashing (without signature)."""
         content_without_sig = self.remove_signature(file_content)
-        # Also remove shebang if present (for consistent hashing)
         content_without_sig = re.sub(r"^#!/[^\n]*\n", "", content_without_sig)
         return content_without_sig
 
-    def format_signature(self, timestamp: str, hash: str) -> str:
-        """Format signature using file-type-specific comment syntax."""
+    def format_signature(
+        self, timestamp: str, content_hash: str,
+        ed25519_sig: str = "", pubkey_fp: str = "",
+    ) -> str:
         sig_format = self._get_signature_format()
         prefix = sig_format["prefix"]
-        return f"{prefix} rye:validated:{timestamp}:{hash}\n"
+        return (
+            f"{prefix} rye:signed:{timestamp}:{content_hash}"
+            f":{ed25519_sig}:{pubkey_fp}\n"
+        )
 
     def extract_signature(self, file_content: str) -> Optional[Dict[str, str]]:
-        """Extract signature using file-type-specific pattern."""
         sig_format = self._get_signature_format()
         prefix = re.escape(sig_format["prefix"])
 
-        # Pattern supports optional |provider@username suffix for registry signatures
         if sig_format.get("after_shebang", True):
-            sig_pattern = rf"^(?:#!/[^\n]*\n)?{prefix} (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{{64}})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))?"
+            sig_pattern = (
+                rf"^(?:#!/[^\n]*\n)?{prefix} rye:signed:" + _SIGNED_FIELDS
+            )
         else:
-            sig_pattern = rf"^{prefix} (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{{64}})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))?"
+            sig_pattern = rf"^{prefix} rye:signed:" + _SIGNED_FIELDS
 
         sig_match = re.match(sig_pattern, file_content)
         if not sig_match:
             return None
 
-        result = {
+        result: Dict[str, str] = {
             "timestamp": sig_match.group(1),
             "hash": sig_match.group(2),
+            "ed25519_sig": sig_match.group(3),
+            "pubkey_fp": sig_match.group(4),
         }
-        if sig_match.group(3) and sig_match.group(4):
-            result["registry_provider"] = sig_match.group(3)
-            result["registry_username"] = sig_match.group(4)
+        if sig_match.group(5) and sig_match.group(6):
+            result["registry_provider"] = sig_match.group(5)
+            result["registry_username"] = sig_match.group(6)
         return result
 
     def insert_signature(self, content: str, signature: str) -> str:
-        """Insert signature after shebang (if present) or at start."""
         sig_format = self._get_signature_format()
         content_clean = self.remove_signature(content)
 
@@ -187,12 +204,11 @@ class ToolMetadataStrategy(MetadataStrategy):
             return signature + content_clean
 
     def remove_signature(self, content: str) -> str:
-        """Remove signature using file-type-specific pattern."""
         sig_format = self._get_signature_format()
         prefix = re.escape(sig_format["prefix"])
 
         content_without_shebang = re.sub(r"^#!/[^\n]*\n", "", content)
-        sig_pattern = rf"^{prefix} (?:rye|kiwi-mcp):validated:[^\n]+\n"
+        sig_pattern = rf"^{prefix} (?:rye|kiwi-mcp):(?:validated|signed):[^\n]+\n"
         content_without_sig = re.sub(sig_pattern, "", content_without_shebang)
 
         shebang_match = re.match(r"^(#!/[^\n]*\n)", content)
@@ -204,8 +220,14 @@ class ToolMetadataStrategy(MetadataStrategy):
 class KnowledgeMetadataStrategy(MetadataStrategy):
     """Strategy for knowledge metadata operations (signature at top like directives)."""
 
+    _SIGNED_RE = re.compile(
+        r"^<!-- rye:signed:" + _SIGNED_FIELDS + r" -->"
+    )
+    _REMOVE_RE = re.compile(
+        r"^<!-- (?:rye|kiwi-mcp):(?:validated|signed):[^>]+-->\n"
+    )
+
     def extract_content_for_hash(self, file_content: str) -> str:
-        """Extract content portion (after signature and frontmatter) for hashing."""
         content_without_sig = self.remove_signature(file_content)
 
         if not content_without_sig.startswith("---"):
@@ -218,37 +240,36 @@ class KnowledgeMetadataStrategy(MetadataStrategy):
         entry_content = content_without_sig[end_idx + 3 :].strip()
         return entry_content
 
-    def format_signature(self, timestamp: str, hash: str) -> str:
-        """Format signature as HTML comment at top of file."""
-        return f"<!-- rye:validated:{timestamp}:{hash} -->\n"
+    def format_signature(
+        self, timestamp: str, content_hash: str,
+        ed25519_sig: str = "", pubkey_fp: str = "",
+    ) -> str:
+        return (
+            f"<!-- rye:signed:{timestamp}:{content_hash}"
+            f":{ed25519_sig}:{pubkey_fp} -->\n"
+        )
 
     def extract_signature(self, file_content: str) -> Optional[Dict[str, str]]:
-        """Extract signature from HTML comment at start of file."""
-        # Support rye, legacy kiwi-mcp, and registry signatures with optional |provider@username suffix
-        sig_match = re.match(
-            r"^<!-- (?:rye|kiwi-mcp):validated:(.*?):([a-f0-9]{64})(?:\|([a-zA-Z0-9_-]+)@([a-zA-Z0-9_-]+))? -->",
-            file_content,
-        )
+        sig_match = self._SIGNED_RE.match(file_content)
         if not sig_match:
             return None
-
-        result = {
+        result: Dict[str, str] = {
             "timestamp": sig_match.group(1),
             "hash": sig_match.group(2),
+            "ed25519_sig": sig_match.group(3),
+            "pubkey_fp": sig_match.group(4),
         }
-        if sig_match.group(3) and sig_match.group(4):
-            result["registry_provider"] = sig_match.group(3)
-            result["registry_username"] = sig_match.group(4)
+        if sig_match.group(5) and sig_match.group(6):
+            result["registry_provider"] = sig_match.group(5)
+            result["registry_username"] = sig_match.group(6)
         return result
 
     def insert_signature(self, content: str, signature: str) -> str:
-        """Insert signature at the beginning of content."""
         content_clean = self.remove_signature(content)
         return signature + content_clean
 
     def remove_signature(self, content: str) -> str:
-        """Remove signature HTML comment from start of file."""
-        return re.sub(r"^<!-- (?:rye|kiwi-mcp):validated:[^>]+-->\n", "", content)
+        return self._REMOVE_RE.sub("", content)
 
 
 class MetadataManager:
@@ -261,7 +282,6 @@ class MetadataManager:
         file_path: Optional[Path] = None,
         project_path: Optional[Path] = None,
     ) -> MetadataStrategy:
-        """Get metadata strategy for item type."""
         if item_type == ItemType.DIRECTIVE:
             return DirectiveMetadataStrategy()
         elif item_type == ItemType.TOOL:
@@ -281,7 +301,6 @@ class MetadataManager:
         file_path: Optional[Path] = None,
         project_path: Optional[Path] = None,
     ) -> str:
-        """Compute hash of content using appropriate strategy."""
         strategy = cls.get_strategy(
             item_type, file_path=file_path, project_path=project_path
         )
@@ -296,14 +315,36 @@ class MetadataManager:
         file_path: Optional[Path] = None,
         project_path: Optional[Path] = None,
     ) -> str:
-        """Create signature for content."""
+        """Create Ed25519 signature for content.
+
+        Auto-generates keypair on first use. Auto-trusts own public key.
+        """
         strategy = cls.get_strategy(
             item_type, file_path=file_path, project_path=project_path
         )
         content_for_hash = strategy.extract_content_for_hash(file_content)
         content_hash = compute_content_hash(content_for_hash)
         timestamp = generate_timestamp()
-        return strategy.format_signature(timestamp, content_hash)
+
+        from rye.utils.path_utils import get_user_space
+        from lilux.primitives.signing import (
+            ensure_keypair,
+            sign_hash,
+            compute_key_fingerprint,
+        )
+        from rye.utils.trust_store import TrustStore
+
+        key_dir = get_user_space() / "keys"
+        private_pem, public_pem = ensure_keypair(key_dir)
+
+        ed25519_sig = sign_hash(content_hash, private_pem)
+        pubkey_fp = compute_key_fingerprint(public_pem)
+
+        trust_store = TrustStore()
+        if not trust_store.is_trusted(pubkey_fp):
+            trust_store.add_key(public_pem, label="self")
+
+        return strategy.format_signature(timestamp, content_hash, ed25519_sig, pubkey_fp)
 
     @classmethod
     def create_signature_from_hash(
@@ -313,12 +354,31 @@ class MetadataManager:
         file_path: Optional[Path] = None,
         project_path: Optional[Path] = None,
     ) -> str:
-        """Create signature using a precomputed integrity hash."""
+        """Create Ed25519 signature using a precomputed integrity hash."""
         strategy = cls.get_strategy(
             item_type, file_path=file_path, project_path=project_path
         )
         timestamp = generate_timestamp()
-        return strategy.format_signature(timestamp, content_hash)
+
+        from rye.utils.path_utils import get_user_space
+        from lilux.primitives.signing import (
+            ensure_keypair,
+            sign_hash,
+            compute_key_fingerprint,
+        )
+        from rye.utils.trust_store import TrustStore
+
+        key_dir = get_user_space() / "keys"
+        private_pem, public_pem = ensure_keypair(key_dir)
+
+        ed25519_sig = sign_hash(content_hash, private_pem)
+        pubkey_fp = compute_key_fingerprint(public_pem)
+
+        trust_store = TrustStore()
+        if not trust_store.is_trusted(pubkey_fp):
+            trust_store.add_key(public_pem, label="self")
+
+        return strategy.format_signature(timestamp, content_hash, ed25519_sig, pubkey_fp)
 
     @classmethod
     def sign_content(
@@ -328,7 +388,7 @@ class MetadataManager:
         file_path: Optional[Path] = None,
         project_path: Optional[Path] = None,
     ) -> str:
-        """Add signature to content."""
+        """Add Ed25519 signature to content."""
         strategy = cls.get_strategy(
             item_type, file_path=file_path, project_path=project_path
         )
@@ -346,7 +406,7 @@ class MetadataManager:
         file_path: Optional[Path] = None,
         project_path: Optional[Path] = None,
     ) -> str:
-        """Add signature to content using a precomputed integrity hash."""
+        """Add Ed25519 signature to content using a precomputed integrity hash."""
         strategy = cls.get_strategy(
             item_type, file_path=file_path, project_path=project_path
         )

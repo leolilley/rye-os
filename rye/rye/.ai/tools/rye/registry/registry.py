@@ -1264,11 +1264,13 @@ async def _pull(
         item_version = body.get("version", "")
         signature_data = body.get("signature", {})
 
-        # Verify registry signature locally if enabled
+        # Verify registry Ed25519 signature locally if enabled
         signature_info = None
         if verify and content:
             try:
                 from rye.utils.metadata_manager import MetadataManager
+                from lilux.primitives.signing import verify_signature, compute_key_fingerprint
+                from rye.utils.trust_store import TrustStore
 
                 strategy = MetadataManager.get_strategy(item_type)
                 sig_info = strategy.extract_signature(content)
@@ -1279,10 +1281,14 @@ async def _pull(
                         "hint": "Content may be corrupted or from an older registry version",
                     }
 
-                # Verify it's a registry signature
+                if not sig_info.get("ed25519_sig"):
+                    return {
+                        "error": "Legacy signature format rejected",
+                        "hint": "Registry content must use Ed25519 rye:signed: format",
+                    }
+
                 registry_username = sig_info.get("registry_username")
                 if registry_username:
-                    # Verify username matches author from API
                     if author_username and registry_username != author_username:
                         return {
                             "error": "Signature username mismatch",
@@ -1291,18 +1297,40 @@ async def _pull(
                             "hint": "Content may have been tampered with",
                         }
 
-                    # Verify content hash
-                    content_without_sig = strategy.remove_signature(content)
-                    computed_hash = hashlib.sha256(
-                        content_without_sig.encode()
-                    ).hexdigest()
+                content_without_sig = strategy.remove_signature(content)
+                content_for_hash = strategy.extract_content_for_hash(content)
+                computed_hash = hashlib.sha256(content_for_hash.encode()).hexdigest()
 
-                    if computed_hash != sig_info["hash"]:
+                if computed_hash != sig_info["hash"]:
+                    return {
+                        "error": "Content integrity check failed",
+                        "expected_hash": sig_info["hash"],
+                        "computed_hash": computed_hash,
+                        "hint": "Content was modified after signing",
+                    }
+
+                trust_store = TrustStore()
+                pubkey_fp = sig_info["pubkey_fp"]
+                registry_key = trust_store.get_registry_key()
+
+                if registry_key is None:
+                    # TOFU: fetch and pin registry key on first pull
+                    try:
+                        key_url = f"{REGISTRY_API_URL}/v1/public-key"
+                        import urllib.request
+                        req = urllib.request.Request(key_url)
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            registry_key = resp.read()
+                        trust_store.pin_registry_key(registry_key)
+                        logger.info("Pinned registry public key (TOFU)")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch registry key: {e}")
+
+                if registry_key:
+                    if not verify_signature(sig_info["hash"], sig_info["ed25519_sig"], registry_key):
                         return {
-                            "error": "Content integrity check failed",
-                            "expected_hash": sig_info["hash"],
-                            "computed_hash": computed_hash,
-                            "hint": "Content was modified after signing",
+                            "error": "Ed25519 signature verification failed",
+                            "hint": "Registry content signature is invalid",
                         }
 
                 signature_info = {
@@ -1310,13 +1338,13 @@ async def _pull(
                     "registry_username": registry_username,
                     "timestamp": sig_info.get("timestamp"),
                     "hash": sig_info.get("hash"),
+                    "pubkey_fp": sig_info.get("pubkey_fp"),
                 }
 
             except ImportError:
-                # MetadataManager not available, skip verification
                 signature_info = {
                     "verified": False,
-                    "reason": "MetadataManager not available",
+                    "reason": "Signing dependencies not available",
                 }
 
         # Determine destination path

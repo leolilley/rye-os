@@ -38,6 +38,7 @@ from registry_api.models import (
     VisibilityResponse,
 )
 from registry_api.validation import (
+    get_registry_public_key,
     sign_with_registry,
     strip_signature,
     validate_content,
@@ -148,6 +149,25 @@ async def health_check():
         version=__version__,
         database=db_status,
     )
+
+
+# =============================================================================
+# PUBLIC KEY - Expose registry Ed25519 public key for TOFU pinning
+# =============================================================================
+
+
+@app.get("/v1/public-key")
+async def get_public_key():
+    """Return the registry's Ed25519 public key for client-side TOFU pinning."""
+    from fastapi.responses import Response
+
+    public_key = get_registry_public_key()
+    if public_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Registry keypair not available",
+        )
+    return Response(content=public_key, media_type="application/x-pem-file")
 
 
 # =============================================================================

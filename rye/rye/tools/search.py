@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from rye.utils.resolvers import get_user_space
 from rye.constants import ItemType
 from rye.utils.path_utils import get_system_space
+from rye.utils.integrity import verify_item, IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -617,6 +618,17 @@ class SearchTool:
                 metadata.update(self._extract_tool_meta(content))
             elif item_type == ItemType.KNOWLEDGE:
                 metadata.update(self._extract_knowledge_meta(content))
+
+            try:
+                integrity_hash = verify_item(file_path, item_type)
+                metadata["signed"] = True
+                metadata["integrity"] = integrity_hash
+            except IntegrityError:
+                metadata["signed"] = False
+                metadata["integrity"] = None
+            except Exception:
+                metadata["signed"] = False
+                metadata["integrity"] = None
 
             return metadata
         except Exception as e:

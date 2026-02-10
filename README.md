@@ -6,35 +6,34 @@
 
 **The last MCP your agent will ever need.**
 
-**RYE** (RYE Your Execution) is an MCP (Model Context Protocol) server that treats AI workflows, tools, and knowledge as structured data. Not code. Not prompts. Data.
+Built on **Lilux**, a microkernel providing pure execution primitives, RYE solves the core interoperability failure in AI: **workflows, tools, and context are trapped inside individual projects and agents**. Every environment understands _what_ to do (“scrape a website”), but the _how_ — the steps, tools, and learned knowledge — is locked away, forcing agents to awkwardly read other projects or relearn and rebuild everything from scratch.
 
-Built on **Lilux**—a microkernel providing pure execution primitives—RYE solves the fundamental interoperability problem in AI: **workflows, tools and context are trapped in projects, disconnected across agents**. While Claude Desktop, Cursor, Windsurf, and others can all understand "run a security scan," the workflow that defines _how_ to scan—the tools, the steps, the knowledge—is locked in each environment. You rebuild it for every project. You can't modify it centrally. You can't share it across your team.
+RYE breaks that loop. Agents can discover, pull, and execute workflows directly from a shared local or online registry, reuse existing tools without manual setup, and operate across projects without human glue code.
 
-**RYE fixes this.**
-
-One security scan workflow. Used across all agents. Modified in one place. Instantly available everywhere.
+**Your agent becomes self-sufficient.**
 
 ---
 
 ## The Problem: Fragmentation
 
-AI agents are powerful, but workflows are scattered. Every project rebuilds the same security scan. Every team reinvents the same deployment pipeline. Workflows live in one environment, stuck there.
+AI agents are powerful, but they're trapped. When your agent starts a new project, it has two choices: ask you to copy over workflows, or rebuild everything from scratch. Neither scales.
 
-- **No portability**: Your security scan in Project A doesn't exist in Project B
-- **No consistency**: Each project implements "security scan" differently
-- **No sharing**: Your team's best practices never leave the repo where they were born
-- **No discoverability**: You rebuild what already exists somewhere else
+- **No self-service**: Your agent can't pull the web scraper it used yesterday.
+- **No portability**: Workflows that exist in Project A are invisible to Project B.
+- **No consistency**: Every project reinvents the same tools because agents can't share.
+- **No discoverability**: Your agent rebuilds what already exists because it can't search.
 
-**Solve once, solve everywhere.** This is RYE's promise.
+**RYE empowers your agent to solve this itself.** Search the registry. Load workflows. Share tools. Execute. All self managed.
 
 ---
 
 ## The Physics of AI Prompting
 
-> _"Once you understand the physics, then you can play the game. RYE aims to be the maintainer of physics."_
+> _"Once you understand the physics, then you can play the game. RYE aims to be the maintainer of those physics."_
 
 Every AI system has the same underlying mechanics:
 
+- Prompts need to be understood
 - Tools need to be discovered and executed
 - Workflows need to be orchestrated
 - Permissions need to be enforced
@@ -49,21 +48,22 @@ RYE encodes these fundamentals as **data**, not implementation. The physics are 
 
 RYE treats three types of items as structured data:
 
-### 1. Directives (XML Workflows)
+### 1. Directives (XML Workflows in Markdown Files)
 
 Declarative workflows stored as XML-embedded markdown:
 
 ```xml
-<directive name="security_scan" version="1.0.0">
+<directive name="web_scraper" version="1.0.0">
   <metadata>
-    <description>Scan codebase for vulnerabilities</description>
-    <category>security</category>
+    <description>Extract data from websites</description>
+    <category>automation</category>
   </metadata>
 
   <process>
-    <step name="analyze">
-      <execute item_type="tool" item_id="security/analyzer">
-        <param name="target" value="src/" />
+    <step name="fetch">
+      <execute item_type="tool" item_id="web/scraper">
+        <param name="url" value="${inputs.target_url}" />
+        <param name="selector" value="${inputs.selector}" />
       </execute>
     </step>
   </process>
@@ -77,15 +77,16 @@ Python, JavaScript, YAML, or Bash scripts with metadata headers:
 ```python
 __version__ = "1.0.0"
 __executor_id__ = "python_runtime"
-__tool_type__ = "security"
+__tool_type__ = "automation"
 
 async def main(**kwargs):
-    target = kwargs.get('target')
-    # Analysis logic
-    return {"vulnerabilities": []}
+    url = kwargs.get('url')
+    selector = kwargs.get('selector')
+    # Scraping logic
+    return {"data": []}
 ```
 
-### 3. Knowledge (Patterns)
+### 3. Knowledge (Patterns, Findings, etc)
 
 Structured learnings with YAML frontmatter:
 
@@ -113,31 +114,32 @@ All three live in your project's `.ai/` directory:
 └── knowledge/      # Patterns & learnings
 ```
 
-### Content Integrity: Everything Has a Hash
+### Content Integrity: Ed25519 Signed Everything
 
-Every directive, tool, and knowledge item is cryptographically signed:
+Every directive, tool, and knowledge item carries an Ed25519 signature. Unsigned items are rejected — no execution, no loading, no bypass.
 
 ```markdown
-<!-- rye:validated:2026-02-10T02:00:00Z:a1b2c3d4... -->
+<!-- rye:signed:2026-02-11T00:00:00Z:a1b2c3d4...:base64url_sig:0a3f9b2c1d4e5f67 -->
 
 # Directive Name
 ```
 
-**Why this matters:**
+**Signature format:** `rye:signed:TIMESTAMP:CONTENT_HASH:ED25519_SIG:PUBKEY_FP`
 
-1. **Verifiability**: You know exactly what code is running
-2. **Tamper Detection**: Any modification invalidates the signature
-3. **Reproducibility**: Same content always produces same hash
-4. **Trust**: Registry items are signed by their authors + registry
+**What each field provides:**
+
+1. **Tamper detection**: SHA256 content hash recomputed and compared on every use
+2. **Provenance**: Ed25519 signature binds content to a specific keypair
+3. **Trust**: Signing key must exist in the local trust store (`{USER_SPACE}/.ai/trusted_keys/`)
+4. **Registry attestation**: Registry re-signs on push, appending `|provider@username`
 
 **How it works:**
 
-- SHA256 hash of canonical JSON (sorted keys, no whitespace)
-- Signatures embedded in file headers
-- Validation before every execution
-- Registry adds provenance: `|registry@username`
-
-This means when you pull a directive from the registry, you can verify it hasn't been modified since signing. When your agent executes a tool, it validates the hash matches the expected value. Content is addressed by its hash—tamper-proof and verifiable.
+- Keypair auto-generated on first sign (`{USER_SPACE}/.ai/keys/`)
+- Own public key auto-trusted — self-signed items verify locally with no setup
+- Registry public key pinned on first pull (Trust On First Use)
+- Every tool in the execution chain is verified before running
+- Old `rye:validated:` format rejected entirely
 
 ---
 
@@ -170,7 +172,7 @@ Makes HTTP requests with retry logic:
 RYE builds a recursive chain for every tool execution:
 
 ```
-Your Tool (e.g., security/analyzer.py)
+Your Tool (e.g., web/scraper.py)
     ↓ __executor_id__ = "python_runtime"
 Python Runtime
     ↓ __executor_id__ = "subprocess"
@@ -191,12 +193,12 @@ Every resolved chain generates a lockfile:
 {
   "lockfile_version": 1,
   "root": {
-    "tool_id": "security/analyzer",
+    "tool_id": "web/scraper",
     "version": "1.0.0",
     "integrity": "sha256:a1b2c3..."
   },
   "resolved_chain": [
-    { "tool_id": "security/analyzer", "integrity": "sha256:a1b2c3..." },
+    { "tool_id": "web/scraper", "integrity": "sha256:a1b2c3..." },
     { "tool_id": "python_runtime", "integrity": "sha256:d4e5f6..." },
     { "tool_id": "subprocess", "integrity": "sha256:g7h8i9..." }
   ]
@@ -216,19 +218,19 @@ Lockfiles are stored in `USER_SPACE/.ai/lockfiles/` and committed to version con
 
 ## Universal MCP Discovery
 
-RYE doesn't just provide tools—it **absorbs other MCP servers** and turns them into data-driven tools.
+RYE doesn't just provide tools—it **absorbs other MCP servers** and turns them into data-driven tools that your agent can discover and use on its own.
 
-Connect to any MCP server (stdio, HTTP, or SSE), discover its tools, and instantly use them through RYE's unified interface:
+**Your agent connects to MCP servers itself.** No manual configuration. No copying endpoints. Your agent discovers tools and starts using them immediately:
 
-**Execute directives via natural language:**
+**Your agent says:**
 
 ```
-"rye discover mcp server https://api.context7.com/mcp"
-"rye list mcp servers"
-"rye execute mcp context7 search for authentication patterns"
+"discover mcp server https://api.context7.com/mcp"
+"list mcp servers"
+"execute mcp context7 search for authentication patterns"
 ```
 
-These natural language commands map to tool calls through your llm:
+**Your agent executes these as tool calls:**
 
 | You Say                      | RYE Tool Call                                                               |
 | ---------------------------- | --------------------------------------------------------------------------- |
@@ -299,48 +301,50 @@ This means RYE becomes a **universal MCP client**. One connection point. Every M
 
 ---
 
-## The Registry: Shared Intelligence
+## The Registry: Your Agent's Toolbox
 
-The registry is a centralized, cryptographically-signed store:
+The registry is a centralized, cryptographically-signed store that your agent can access directly:
 
-- **Discovery**: Find solutions others have built
-- **Validation**: Items are SHA256-hashed and signed
-- **Versioning**: Track changes and updates
-- **Sharing**: Push your workflows, pull others
+- **Self-service discovery**: Your agent finds solutions without asking you
+- **On-demand pulling**: Your agent downloads workflows it needs, when it needs them
+- **Validation**: Items are Ed25519-signed and verified against a local trust store
+- **Sharing**: Push your workflows, pull others—programmatically
 
 Identity model: `namespace/category/name`
 
-The registry is just another data-driven tool with actions:
+The registry is just another data-driven tool your agent can invoke:
 
-**Via natural language:**
+**Your agent says:**
 
 ```
-"Search the registry for security scanner directive"
-"Pull leolilley/security/scanner from registry"
-"Push my security/scanner tool to registry"
+"Search the registry for web scraper directive"
+"Pull acme/web/scraper from registry"
+"Push my web/scraper tool to registry"
 ```
 
-**These map to registry tool calls:**
+**These become tool calls your agent executes:**
 
-| You Say                 | RYE Tool Call                                                                            |
+| Agent Says              | RYE Tool Call                                                                            |
 | ----------------------- | ---------------------------------------------------------------------------------------- |
 | `search registry for X` | `execute(item_type="tool", item_id="rye/registry/registry", action="search", query=X)`   |
 | `pull X from registry`  | `execute(item_type="tool", item_id="rye/registry/registry", action="pull", item_id=X)`   |
 | `push X to registry`    | `execute(item_type="tool", item_id="rye/registry/registry", action="push", item_path=X)` |
 
-**Example: Searching the registry**
+**Example: Your agent searching for a scraper**
 
 ```json
 {
   "item_type": "tool",
   "item_id": "rye/registry/registry",
   "action": "search",
-  "query": "security scanner",
+  "query": "web scraper",
   "item_type": "directive"
 }
 ```
 
-ECDH encryption for auth. Server-side validation. Local integrity verification.
+No more waiting for you to set up tools. Your agent helps itself.
+
+Ed25519 signatures for provenance. Server-side validation. Local integrity verification via trust store.
 
 ---
 
@@ -351,12 +355,12 @@ RYE doesn't just orchestrate—it **runs agents inside the MCP**.
 Spawn isolated LLM threads with scoped permissions:
 
 ```xml
-<directive name="parallel_analysis" version="1.0.0">
+<directive name="parallel_scraping" version="1.0.0">
   <metadata>
-    <description>Run security analysis in parallel using spawned threads</description>
-    <category>security</category>
+    <description>Run web scraping in parallel using spawned threads</description>
+    <category>automation</category>
     <author>rye</author>
-    <model tier="haiku" id="claude-3-5-haiku-20241022">Fast analysis with fallback</model>
+    <model tier="haiku" id="claude-3-5-haiku-20241022">Fast scraping with fallback</model>
     <limits max_turns="8" max_tokens="4096" />
     <permissions>
       <execute>
@@ -364,7 +368,7 @@ Spawn isolated LLM threads with scoped permissions:
         <tool>rye.file-system.fs_read</tool>
       </execute>
       <search>
-        <directive>security/*</directive>
+        <directive>web/*</directive>
       </search>
       <load>
         <directive>*</directive>
@@ -393,10 +397,10 @@ Spawn isolated LLM threads with scoped permissions:
   </metadata>
 
   <process>
-    <step name="spawn_security">
+    <step name="spawn_scraper">
       <execute item_type="tool" item_id="rye.agent.threads.spawn_thread">
-        <param name="thread_id" value="security-check" />
-        <param name="directive_name" value="security_scanner" />
+        <param name="thread_id" value="scraping-worker" />
+        <param name="directive_name" value="web/scraper" />
       </execute>
     </step>
   </process>
@@ -445,10 +449,10 @@ Permissions are declared hierarchically in directive XML:
 <permissions>
   <execute>
     <tool>rye.file-system.fs_read</tool>
-    <tool>security/*</tool>
+    <tool>web/*</tool>
   </execute>
   <search>
-    <directive>workflows/*</directive>
+    <directive>automation/*</directive>
   </search>
   <load>
     <tool>rye.shell.*</tool>
@@ -459,8 +463,8 @@ Permissions are declared hierarchically in directive XML:
 When a directive runs, its permissions are converted to capability strings:
 
 - `rye.execute.tool.rye.file-system.fs_read`
-- `rye.execute.tool.security.*`
-- `rye.search.directive.workflows.*`
+- `rye.execute.tool.web.*`
+- `rye.search.directive.automation.*`
 - `rye.load.tool.rye.shell.*`
 
 ### Runtime Enforcement
@@ -472,10 +476,10 @@ These capabilities become a **CapabilityToken** for the thread:
 cap_token = CapabilityToken(
     capabilities={
         "rye.execute.tool.rye.file-system.fs_read",
-        "rye.execute.tool.security.*",
-        "rye.search.directive.workflows.*"
+        "rye.execute.tool.web.*",
+        "rye.search.directive.automation.*"
     },
-    thread_id="security-check"
+    thread_id="scraping-worker"
 )
 
 # Every tool call validates against the token
@@ -492,11 +496,12 @@ Each spawned agent gets its own capability token derived from its directive's pe
 
 ### Integrity Verification
 
-SHA256 hashes with canonical JSON serialization:
+Ed25519 signatures are enforced at every boundary:
 
-- Deterministic hashing (sorted keys, no whitespace)
-- Signature verification on registry pull
-- Content tampering detection
+- Directive verified before thread execution
+- Every tool in the execution chain verified before running
+- Registry items verified against TOFU-pinned registry key on pull
+- Unsigned or tampered items rejected with `IntegrityError`
 
 ---
 
@@ -511,37 +516,40 @@ Traditional agent SDKs (like LangChain, OpenAI Assistants, CrewAI) provide:
 
 **RYE is different.**
 
-| Aspect                  | Traditional SDKs         | RYE                                      |
-| ----------------------- | ------------------------ | ---------------------------------------- |
-| **Workflow Definition** | Code with decorators     | XML data files                           |
-| **Tool Discovery**      | Import and register      | Filesystem scan                          |
-| **Execution**           | Direct function calls    | Chain-based primitive resolution         |
-| **Security**            | Runtime policy filtering | Capability tokens + declared permissions |
-| **Portability**         | Locked to framework      | Works in any MCP environment             |
-| **Sharing**             | Package registries       | Cryptographically-signed data registry   |
-| **Extensibility**       | Write code + rebuild     | Drop file in `.ai/tools/`                |
+| Aspect                  | Traditional SDKs             | RYE                                                |
+| ----------------------- | ---------------------------- | -------------------------------------------------- |
+| **Workflow Definition** | Code with decorators         | XML data files                                     |
+| **Tool Discovery**      | Import and register manually | Agent pulls from registry automatically            |
+| **Execution**           | Direct function calls        | Chain-based primitive resolution                   |
+| **Security**            | Runtime policy filtering     | Ed25519 signatures + capability tokens             |
+| **Portability**         | Locked to framework          | Works in any MCP environment                       |
+| **Sharing**             | Package registries           | Agent-accessible cryptographically-signed registry |
+| **Extensibility**       | Write code + rebuild         | Agent drops files into `.ai/tools/`                |
+| **Agent Autonomy**      | Agent waits for setup        | Agent self-serves workflows                        |
 
 ### The Key Difference
 
 **Traditional SDK**: Tools are TypeScript/Python functions registered at runtime. Security is layered policy filtering. Execution is direct.
 
-**RYE**: Tools are data files with metadata headers. Security is capability-based with explicit permissions declared in XML. Execution builds a layered chain (tool → runtime → primitive) validated before running.
+**RYE**: Tools are data files with metadata headers. Security is Ed25519 signatures for integrity plus capability tokens for permission scoping. Execution builds a layered chain (tool → runtime → primitive) where every element is cryptographically verified before running.
 
-### Why It Matters
+### Why It Matters: Agent Empowerment
 
-With traditional SDKs, building an agent means:
+**With traditional SDKs**, your agent is dependent on you:
 
-1. Writing framework-specific code
-2. Managing complex policy configurations
-3. Rebuilding for every change
-4. Locking yourself into one ecosystem
+1. You write framework-specific code
+2. You manage complex policy configurations
+3. You rebuild for every change
+4. You manually copy workflows between projects
+5. Your agent waits helplessly when it needs new tools
 
-With RYE:
+**With RYE**, your agent becomes self-sufficient:
 
-1. Write XML workflows and executable tools
-2. Declare permissions explicitly
-3. Drop files to add functionality
-4. Use the same workflows in Claude Desktop, Cursor, Windsurf, or any MCP client
+1. **Your agent** discovers workflows in the registry
+2. **Your agent** pulls tools it needs on demand
+3. **Your agent** shares workflows with your team programmatically
+4. **Your agent** uses the same capabilities across Claude Desktop, Cursor, Windsurf, or any MCP client
+5. **Your agent** solves its own fragmentation problems
 
 ### Deployment: HTTP Server vs. Agent Runtime
 
@@ -554,13 +562,13 @@ Traditional SDKs require embedding their agent runtime into your application:
 from crewai import Agent, Task, Crew
 
 agent = Agent(
-    role='Security Analyst',
-    goal='Scan codebase for vulnerabilities',
-    tools=[security_scanner_tool]  # Must import/register tools
+    role='Web Scraping Specialist',
+    goal='Extract data from websites',
+    tools=[web_scraper_tool]  # Must import/register tools manually
 )
 
 task = Task(
-    description='Scan src/ for vulnerabilities',
+    description='Scrape product data from target website',
     agent=agent
 )
 
@@ -586,13 +594,13 @@ from rye.server import rye_mcp_server
 
 app = FastAPI()
 
-@app.post("/api/security/scan")
-async def security_scan(repo_url: str):
-    # Spawn a directive thread via MCP
+@app.post("/api/web/scrape")
+async def web_scrape(url: str, selector: str):
+    # Spawn a directive thread via MCP—your agent pulls this workflow
     result = await rye_mcp_server.execute(
         item_type="directive",
-        item_id="security/scan",
-        inputs={"repo_url": repo_url}
+        item_id="web/scraper",
+        inputs={"url": url, "selector": selector}
     )
     return result
 
@@ -641,7 +649,7 @@ kind: ConfigMap
 metadata:
   name: workflow-directives
 data:
-  security/scan.md: |
+  web/scraper.md: |
     <!-- directive content -->
   deployment/pipeline.md: |
     <!-- directive content -->
@@ -694,13 +702,14 @@ If AI is the lever, this is the fulcrum.
 
 RYE doesn't just run tools—it captures the fundamental physics of AI execution as data. Once you encode workflows, tools, and knowledge as structured data, they become:
 
+- **Autonomous**: Agents self-serve workflows from the registry
 - **Portable**: Works in any MCP environment
 - **Composable**: Chain directives together
-- **Verifiable**: Cryptographic signatures
+- **Verifiable**: Ed25519 signatures with trust store
 - **Shareable**: Registry-based distribution
 - **Secure**: Capability-based permissions
 
-This is the future of AI architecture. Once you see it, you can't unsee it.
+This is the future of AI architecture. Once you see it, you can't go back.
 
 ---
 

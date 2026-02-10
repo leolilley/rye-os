@@ -6,15 +6,10 @@ Loads signature format configuration from extractor tools across 3-tier space.
 
 import ast
 import logging
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from rye.utils.path_utils import (
-    get_user_space,
-    get_system_space,
-    get_extractor_search_paths,
-)
+from rye.utils.path_utils import get_extractor_search_paths
 
 logger = logging.getLogger(__name__)
 
