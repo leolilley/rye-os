@@ -564,15 +564,15 @@ Ed25519 signatures are enforced at every boundary:
 
 ### Honest Comparison
 
-| Aspect | Traditional SDKs | RYE | Trade-off |
-|--------|------------------|-----|-----------|
-| **Maturity** | Battle-tested, 2+ years production | Experimental, active development | Stability vs Innovation |
-| **Ecosystem** | 2000+ integrations, rich community | MCP-based, emerging | Breadth vs Protocol focus |
-| **Discovery Model** | Package registries (human searches) | Agent-searchable registry | Manual import vs Autonomous discovery |
-| **Portability** | Python/JS runtime | Any MCP client | Language lock-in vs Protocol lock-in |
-| **Security Model** | Runtime policies + package signing | Ed25519 + capabilities | Implicit vs Explicit |
-| **Agent Autonomy** | Human configures tools | Agent discovers & loads | Manual vs Autonomous |
-| **Observability** | LangSmith, W&B, mature tooling | Deterministic tool calls, traceable chains | Rich dashboards vs Data transparency |
+| Aspect              | Traditional SDKs                    | RYE                                        | Trade-off                             |
+| ------------------- | ----------------------------------- | ------------------------------------------ | ------------------------------------- |
+| **Maturity**        | Battle-tested, 2+ years production  | Experimental, active development           | Stability vs Innovation               |
+| **Ecosystem**       | 2000+ integrations, rich community  | MCP-based, emerging                        | Breadth vs Protocol focus             |
+| **Discovery Model** | Package registries (human searches) | Agent-searchable registry                  | Manual import vs Autonomous discovery |
+| **Portability**     | Python/JS runtime                   | Any MCP client                             | Language lock-in vs Protocol lock-in  |
+| **Security Model**  | Runtime policies + package signing  | Ed25519 + capabilities                     | Implicit vs Explicit                  |
+| **Agent Autonomy**  | Human configures tools              | Agent discovers & loads                    | Manual vs Autonomous                  |
+| **Observability**   | LangSmith, W&B, mature tooling      | Deterministic tool calls, traceable chains | Rich dashboards vs Data transparency  |
 
 ### What Each Does Best
 
@@ -595,6 +595,7 @@ Ed25519 signatures are enforced at every boundary:
 ### Specific Use Cases
 
 **Traditional SDKs are great when:**
+
 - Building a chatbot with LangSmith observability and production monitoring
 - Integrating with 50+ data sources using pre-built LangChain connectors
 - You need TypeScript type safety for your React frontend
@@ -602,6 +603,7 @@ Ed25519 signatures are enforced at every boundary:
 - You're deploying to production and need battle-tested reliability
 
 **RYE is great when:**
+
 - You're building workflows across Cursor, Claude Desktop, and Windsurf
 - Your agent needs to self-serve tools without you manually copying them between projects
 - You want cryptographic proof of workflow provenance
@@ -635,13 +637,14 @@ LangChain for building. RYE for sharing. They're complementary.
 
 ### Important Caveat
 
-**Agent autonomy requires infrastructure**: RYE must be installed and the registry must be accessible for agents to self-serve workflows. In environments without RYE, workflows must still be manually set up. Traditional SDKs don't require infrastructure beyond the language runtime.
+**Agent autonomy requires infrastructure**: RYE must be installed and the registry must be accessible for agents to self-serve workflows. In environments without RYE, workflows must still be manually set up. Traditional SDKs only require the language runtime and package manager, both of which are typically already present in development environments.
 
 ### Deployment Options
 
 Both traditional SDKs and RYE support stateless HTTP deployment:
 
 **LangChain with LangServe:**
+
 ```python
 from fastapi import FastAPI
 from langserve import add_routes
@@ -651,6 +654,7 @@ add_routes(app, chain, path="/scrape")  # Stateless HTTP endpoint
 ```
 
 **RYE with MCP wrapper:**
+
 ```python
 from fastapi import FastAPI
 from rye.server import rye_mcp_server
@@ -667,10 +671,11 @@ async def scrape(url: str, selector: str):
 ```
 
 Both are:
+
 - Stateless ✓
 - Scalable ✓
 - Observable ✓
-- Hot-swappable (with proper setup) ✓
+- Hot-swappable: LangChain (with dynamic loading), RYE (via ConfigMap/registry) ✓
 
 The difference is in workflow management: LangChain workflows live in code repositories. RYE workflows live in a searchable, agent-accessible registry.
 
@@ -716,6 +721,7 @@ Update workflows by updating the ConfigMap. No container rebuilds. No downtime.
 ### Why XML for Directives?
 
 XML provides:
+
 - **Schema validation** for workflow structure
 - **Clear parameter typing** and explicit nesting
 - **Standardized parsing** across languages
