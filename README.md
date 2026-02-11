@@ -568,7 +568,7 @@ Ed25519 signatures are enforced at every boundary:
 |--------|------------------|-----|-----------|
 | **Maturity** | Battle-tested, 2+ years production | Experimental, active development | Stability vs Innovation |
 | **Ecosystem** | 2000+ integrations, rich community | MCP-based, emerging | Breadth vs Protocol focus |
-| **Workflow Portability** | Package managers (pip, npm) | Agent-searchable registry | Human UX vs Agent UX |
+| **Discovery Model** | Package registries (human searches) | Agent-searchable registry | Manual import vs Autonomous discovery |
 | **Portability** | Python/JS runtime | Any MCP client | Language lock-in vs Protocol lock-in |
 | **Security Model** | Runtime policies + package signing | Ed25519 + capabilities | Implicit vs Explicit |
 | **Agent Autonomy** | Human configures tools | Agent discovers & loads | Manual vs Autonomous |
@@ -592,32 +592,50 @@ Ed25519 signatures are enforced at every boundary:
 - **Explicit provenance** - cryptographic signatures for trust without central authority
 - **Agent autonomy** - your agent pulls what it needs without manual setup
 
+### Specific Use Cases
+
+**Traditional SDKs are great when:**
+- Building a chatbot with LangSmith observability and production monitoring
+- Integrating with 50+ data sources using pre-built LangChain connectors
+- You need TypeScript type safety for your React frontend
+- You want Stack Overflow answers and community support when things break
+- You're deploying to production and need battle-tested reliability
+
+**RYE is great when:**
+- You're building workflows across Cursor, Claude Desktop, and Windsurf
+- Your agent needs to self-serve tools without you manually copying them between projects
+- You want cryptographic proof of workflow provenance
+- You're working in MCP-native environments
+- You need the same capabilities available regardless of which AI tool you're using
+
+### MCP Dependency
+
+RYE is built on MCP, which is an emerging protocol with growing but still limited adoption:
+
+- **✓ Future-proof** as MCP adoption grows (Cursor, Claude Desktop, Windsurf all support it)
+- **✓ Cross-client compatibility** - works across any MCP-compliant environment
+- **✗ Limited to MCP environments** vs LangChain's broader compatibility
+- **✗ Smaller ecosystem** than established SDKs
+
+As MCP matures, this trade-off shifts in RYE's favor. For now, it means RYE works best in environments where MCP is already adopted.
+
 ### The Real Problem RYE Solves
 
-Traditional SDKs treat workflows as code to be written, packaged, and imported. This works great for developers building applications, but creates friction when:
+**Real scenario:** You build a web scraper in Cursor for Project A. Next week, you start Project B in Claude Desktop. Your agent can't access the scraper from Project A—it's trapped in that project's code. You copy-paste the code, adjust imports, debug environment differences. A month later, you update the scraper in Project A. Now Project B is out of sync.
 
-1. **Your agent starts a new project** - it can't import the web scraper from yesterday's project
-2. **You switch tools** - workflows in Cursor don't transfer to Claude Desktop
-3. **Your agent needs a new capability** - it waits for you to copy or rebuild instead of self-serving
+Traditional SDKs handle this with package managers, which work great—if a human is doing the importing. But your agent can't `pip install` the scraper it wrote last week. It can't search npm for "that authentication pattern we used before." It rebuilds from scratch every time.
 
 RYE treats workflows as **discoverable, cryptographically-signed data that agents can search, pull, and execute** without human intervention.
 
 ### You Can Use Both
 
-```python
-# Build your chain with LangChain
-from langchain import OpenAI, LLMChain, PromptTemplate
-
-template = """Extract data from {url} using selector {selector}"""
-prompt = PromptTemplate(template=template, input_variables=["url", "selector"])
-llm = OpenAI()
-chain = LLMChain(llm=llm, prompt=prompt)
-
-# Expose via RYE for cross-project reuse
-# Save as .ai/tools/my_scraper.py with metadata headers
-```
+You can wrap LangChain chains as RYE tools by adding metadata headers and saving them in `.ai/tools/`. This lets you build with LangChain's mature ecosystem while exposing capabilities through RYE's agent-accessible registry.
 
 LangChain for building. RYE for sharing. They're complementary.
+
+### Important Caveat
+
+**Agent autonomy requires infrastructure**: RYE must be installed and the registry must be accessible for agents to self-serve workflows. In environments without RYE, workflows must still be manually set up. Traditional SDKs don't require infrastructure beyond the language runtime.
 
 ### Deployment Options
 
@@ -691,9 +709,19 @@ data:
 
 Update workflows by updating the ConfigMap. No container rebuilds. No downtime.
 
-**Traditional SDK**: Runtime is the agent. Stateful. Complex scaling.
+> **Deployment Difference**: Traditional SDKs package workflows with the application (update via redeployment). RYE keeps workflows as external data (update via ConfigMap/registry without rebuilding containers).
 
-**RYE**: Runtime is an HTTP API. Stateless. Simple scaling. Workflows are data.
+---
+
+### Why XML for Directives?
+
+XML provides:
+- **Schema validation** for workflow structure
+- **Clear parameter typing** and explicit nesting
+- **Standardized parsing** across languages
+- **Explicit declarations** that LLMs can generate reliably
+
+While more verbose than YAML, XML's rigidity ensures directives are machine-readable without ambiguity. This matters when your agent is generating and modifying workflows programmatically.
 
 ---
 
