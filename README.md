@@ -571,7 +571,7 @@ Ed25519 signatures are enforced at every boundary:
 
 ## RYE and Traditional Agent SDKs
 
-**Important**: RYE is not a replacement for LangChain, OpenAI Assistants, or CrewAI (although it can). It's a complementary layer that solves a specific problem those SDKs aren't designed for.
+**Important**: RYE is not a replacement for LangChain, OpenAI Assistants, or CrewAI (although it can and I believe it will). It's a complementary layer that solves a specific problem those SDKs aren't designed for.
 
 ### Honest Comparison
 
@@ -652,10 +652,12 @@ app = FastAPI()
 
 @app.post("/api/scrape")
 async def scrape(url: str, selector: str):
+    # Spawn an LLM thread to execute the directive
     return await rye_mcp_server.execute(
-        item_type="directive",
-        item_id="web/scraper",
-        inputs={"url": url, "selector": selector}
+        item_type="tool",
+        item_id="rye/agent/threads/thread_directive",
+        directive_name="web/scraper",
+        inputs={"target_url": url, "selector": selector}
     )
 ```
 
