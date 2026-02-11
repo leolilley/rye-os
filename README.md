@@ -44,6 +44,21 @@ RYE encodes these fundamentals as **data**, not implementation. The physics are 
 
 ---
 
+## The Primary MCP Tools
+
+RYE exposes just four primary tools that your agent uses to interact with the entire system:
+
+| Tool      | Purpose                                                    | Example                                                       |
+| --------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
+| `execute` | Run directives, tools, or knowledge items                  | `execute(item_type="tool", item_id="web/scraper", url="...")` |
+| `search`  | Discover items across your project, user space, and system | `search(item_type="directive", query="scraping")`             |
+| `load`    | Pull content from the registry or local stores             | `load(item_type="tool", item_id="acme/web/scraper")`          |
+| `sign`    | Cryptographically sign items with Ed25519                  | `sign(item_type="directive", item_id="web/scraper")`          |
+
+These four primitives compose everything your agent does. Search finds what's available, load pulls it in, sign establishes trust, and execute runs it.
+
+---
+
 ## Data-Driven Everything
 
 RYE treats three types of items as structured data:
@@ -218,9 +233,27 @@ Every resolved chain generates a lockfile:
     "integrity": "a1b2c3d4e5f6...64 hex chars"
   },
   "resolved_chain": [
-    { "item_id": "web/scraper", "space": "project", "tool_type": "python", "executor_id": "rye/core/runtimes/python_runtime", "integrity": "a1b2c3d4...64 hex chars" },
-    { "item_id": "rye/core/runtimes/python_runtime", "space": "system", "tool_type": "runtime", "executor_id": "rye/core/primitives/subprocess", "integrity": "e5f6a7b8...64 hex chars" },
-    { "item_id": "rye/core/primitives/subprocess", "space": "system", "tool_type": "primitive", "executor_id": null, "integrity": "c9d0e1f2...64 hex chars" }
+    {
+      "item_id": "web/scraper",
+      "space": "project",
+      "tool_type": "python",
+      "executor_id": "rye/core/runtimes/python_runtime",
+      "integrity": "a1b2c3d4...64 hex chars"
+    },
+    {
+      "item_id": "rye/core/runtimes/python_runtime",
+      "space": "system",
+      "tool_type": "runtime",
+      "executor_id": "rye/core/primitives/subprocess",
+      "integrity": "e5f6a7b8...64 hex chars"
+    },
+    {
+      "item_id": "rye/core/primitives/subprocess",
+      "space": "system",
+      "tool_type": "primitive",
+      "executor_id": null,
+      "integrity": "c9d0e1f2...64 hex chars"
+    }
   ]
 }
 ```
@@ -325,7 +358,7 @@ This means RYE becomes a **universal MCP client**. One connection point. Every M
 
 The registry is a centralized, cryptographically-signed store that your agent can access directly:
 
-- **Self-service discovery**: Your agent finds solutions without asking you
+- **Self-service discovery**: Your agent finds solutions itself
 - **On-demand pulling**: Your agent downloads workflows it needs, when it needs them
 - **Validation**: Items are Ed25519-signed and verified against a local trust store
 - **Sharing**: Push your workflows, pull others—programmatically
@@ -344,7 +377,7 @@ The registry is just another data-driven tool your agent can invoke:
 
 **These become tool calls your agent executes:**
 
-| Agent Says              | RYE Tool Call                                                                            |
+| You Prompt              | RYE Tool Call                                                                            |
 | ----------------------- | ---------------------------------------------------------------------------------------- |
 | `search registry for X` | `execute(item_type="tool", item_id="rye/registry/registry", action="search", query=X)`   |
 | `pull X from registry`  | `execute(item_type="tool", item_id="rye/registry/registry", action="pull", item_id=X)`   |
@@ -525,122 +558,103 @@ Ed25519 signatures are enforced at every boundary:
 
 ---
 
-## RYE vs Traditional Agent SDKs
+## RYE and Traditional Agent SDKs
 
-Traditional agent SDKs (like LangChain, OpenAI Assistants, CrewAI) provide:
+**Important**: RYE is not a replacement for LangChain, OpenAI Assistants, or CrewAI. It's a complementary layer that solves a specific problem those SDKs aren't designed for.
 
-- **Runtime-driven execution**: Imperative code with hardcoded logic
-- **Framework coupling**: Tools only work within that framework
-- **Implicit security**: Policy filtering baked into runtime
-- **Non-portable**: Workflows don't transfer across environments
+### Honest Comparison
 
-**RYE is different.**
+| Aspect | Traditional SDKs | RYE | Trade-off |
+|--------|------------------|-----|-----------|
+| **Maturity** | Battle-tested, 2+ years production | Experimental, active development | Stability vs Innovation |
+| **Ecosystem** | 2000+ integrations, rich community | MCP-based, emerging | Breadth vs Protocol focus |
+| **Workflow Portability** | Package managers (pip, npm) | Agent-searchable registry | Human UX vs Agent UX |
+| **Portability** | Python/JS runtime | Any MCP client | Language lock-in vs Protocol lock-in |
+| **Security Model** | Runtime policies + package signing | Ed25519 + capabilities | Implicit vs Explicit |
+| **Agent Autonomy** | Human configures tools | Agent discovers & loads | Manual vs Autonomous |
+| **Observability** | LangSmith, W&B, mature tooling | Deterministic tool calls, traceable chains | Rich dashboards vs Data transparency |
 
-| Aspect                  | Traditional SDKs             | RYE                                                |
-| ----------------------- | ---------------------------- | -------------------------------------------------- |
-| **Workflow Definition** | Code with decorators         | XML data files                                     |
-| **Tool Discovery**      | Import and register manually | Agent pulls from registry automatically            |
-| **Execution**           | Direct function calls        | Chain-based primitive resolution                   |
-| **Security**            | Runtime policy filtering     | Ed25519 signatures + capability tokens             |
-| **Portability**         | Locked to framework          | Works in any MCP environment                       |
-| **Sharing**             | Package registries           | Agent-accessible cryptographically-signed registry |
-| **Extensibility**       | Write code + rebuild         | Agent drops files into `.ai/tools/`                |
-| **Agent Autonomy**      | Agent waits for setup        | Agent self-serves workflows                        |
+### What Each Does Best
 
-### The Key Difference
+**Traditional SDKs excel at:**
 
-**Traditional SDK**: Tools are TypeScript/Python functions registered at runtime. Security is layered policy filtering. Execution is direct.
+- **Building agent applications** with mature frameworks
+- **Integration breadth** - thousands of pre-built connectors
+- **Developer experience** - debugging tools, IDE support, type safety
+- **Production hardening** - retry logic, rate limiting, error recovery
+- **Community support** - Stack Overflow, tutorials, consultants
 
-**RYE**: Tools are data files with metadata headers. Security is Ed25519 signatures for integrity plus capability tokens for permission scoping. Execution builds a layered chain (tool → runtime → primitive) where every element is cryptographically verified before running.
+**RYE excels at:**
 
-### Why It Matters: Agent Empowerment
+- **Sharing agent capabilities** across projects and environments
+- **Agent-native discovery** - workflows searchable and loadable by agents
+- **Cross-environment portability** - same directives in Claude Desktop, Cursor, or any MCP client
+- **Explicit provenance** - cryptographic signatures for trust without central authority
+- **Agent autonomy** - your agent pulls what it needs without manual setup
 
-**With traditional SDKs**, your agent is dependent on you:
+### The Real Problem RYE Solves
 
-1. You write framework-specific code
-2. You manage complex policy configurations
-3. You rebuild for every change
-4. You manually copy workflows between projects
-5. Your agent waits helplessly when it needs new tools
+Traditional SDKs treat workflows as code to be written, packaged, and imported. This works great for developers building applications, but creates friction when:
 
-**With RYE**, your agent becomes self-sufficient:
+1. **Your agent starts a new project** - it can't import the web scraper from yesterday's project
+2. **You switch tools** - workflows in Cursor don't transfer to Claude Desktop
+3. **Your agent needs a new capability** - it waits for you to copy or rebuild instead of self-serving
 
-1. **Your agent** discovers workflows in the registry
-2. **Your agent** pulls tools it needs on demand
-3. **Your agent** shares workflows with your team programmatically
-4. **Your agent** uses the same capabilities across Claude Desktop, Cursor, Windsurf, or any MCP client
-5. **Your agent** solves its own fragmentation problems
+RYE treats workflows as **discoverable, cryptographically-signed data that agents can search, pull, and execute** without human intervention.
 
-### Deployment: HTTP Server vs. Agent Runtime
-
-**Traditional SDK Deployment:**
-
-Traditional SDKs require embedding their agent runtime into your application:
+### You Can Use Both
 
 ```python
-# LangChain/CrewAI - Runtime coupled with your app
-from crewai import Agent, Task, Crew
+# Build your chain with LangChain
+from langchain import OpenAI, LLMChain, PromptTemplate
 
-agent = Agent(
-    role='Web Scraping Specialist',
-    goal='Extract data from websites',
-    tools=[web_scraper_tool]  # Must import/register tools manually
-)
+template = """Extract data from {url} using selector {selector}"""
+prompt = PromptTemplate(template=template, input_variables=["url", "selector"])
+llm = OpenAI()
+chain = LLMChain(llm=llm, prompt=prompt)
 
-task = Task(
-    description='Scrape product data from target website',
-    agent=agent
-)
-
-crew = Crew(agents=[agent], tasks=[task])
-result = crew.kickoff()  # Blocking, stateful runtime
+# Expose via RYE for cross-project reuse
+# Save as .ai/tools/my_scraper.py with metadata headers
 ```
 
-Problems:
+LangChain for building. RYE for sharing. They're complementary.
 
-- Runtime bloat in your application
-- Hard to scale horizontally
-- State management complexity
-- Must rebuild/redeploy to update workflows
+### Deployment Options
 
-**RYE Deployment:**
+Both traditional SDKs and RYE support stateless HTTP deployment:
 
-RYE workflows run via **deterministic tool calls**. Wrap the MCP in a simple HTTP server:
-
+**LangChain with LangServe:**
 ```python
-# http_server.py - Minimal FastAPI wrapper
+from fastapi import FastAPI
+from langserve import add_routes
+
+app = FastAPI()
+add_routes(app, chain, path="/scrape")  # Stateless HTTP endpoint
+```
+
+**RYE with MCP wrapper:**
+```python
 from fastapi import FastAPI
 from rye.server import rye_mcp_server
 
 app = FastAPI()
 
-@app.post("/api/web/scrape")
-async def web_scrape(url: str, selector: str):
-    # Spawn a directive thread via MCP—your agent pulls this workflow
-    result = await rye_mcp_server.execute(
+@app.post("/api/scrape")
+async def scrape(url: str, selector: str):
+    return await rye_mcp_server.execute(
         item_type="directive",
         item_id="web/scraper",
         inputs={"url": url, "selector": selector}
     )
-    return result
-
-@app.post("/api/deploy")
-async def deploy(environment: str, version: str):
-    result = await rye_mcp_server.execute(
-        item_type="directive",
-        item_id="deployment/pipeline",
-        inputs={"env": environment, "version": version}
-    )
-    return result
 ```
 
-**Advantages:**
+Both are:
+- Stateless ✓
+- Scalable ✓
+- Observable ✓
+- Hot-swappable (with proper setup) ✓
 
-1. **Stateless**: Each request spawns a fresh directive thread
-2. **Scalable**: Horizontal scaling with load balancers
-3. **Observable**: Each execution is a deterministic tool call with full traceability
-4. **Hot-swappable**: Update `.ai/directives/` files without redeploying
-5. **Language-agnostic**: HTTP API works with any client
+The difference is in workflow management: LangChain workflows live in code repositories. RYE workflows live in a searchable, agent-accessible registry.
 
 **Example: Kubernetes Deployment**
 
