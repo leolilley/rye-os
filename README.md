@@ -1,4 +1,4 @@
-> **EXPERIMENTAL**: This project is under active development. Features are subject to change.
+> **EXPERIMENTAL**: This project is under active development. Features may be unstable and are subject to change.
 
 # RYE OS
 
@@ -6,9 +6,9 @@
 
 **The last MCP your agent will ever need.**
 
-Built on **Lilux**, a microkernel providing pure execution primitives, RYE solves the core interoperability failure in AI: **workflows, tools, and context are trapped inside individual projects and agents**. Every environment understands _what_ to do (“scrape a website”), but the _how_ — the steps, tools, and learned knowledge — is locked away, forcing agents to awkwardly read other projects or relearn and rebuild everything from scratch.
+Built on **Lilux**, a microkernel providing pure execution primitives, RYE (RYE Your Execution) solves the core interoperability failure in AI: **workflows, tools, and context are trapped inside individual projects and agents**. Every environment understands _what_ to do (“scrape a website”), but the _how_ — the steps, tools, and learned knowledge — is locked away, forcing you to point your agent to other projects, copy over workflows and context manually or relearn and rebuild everything from scratch. This doesn't scale.
 
-RYE breaks that loop. Agents can discover, pull, and execute workflows directly from a shared local or online registry, reuse existing tools without manual setup, and operate across projects without human glue code.
+RYE breaks that loop. Agents can search, load, and execute across tools, workflows and knowledge from a shared local or online registry. Enabling full reuseability without manual setup and clean operations across project contexts.
 
 **Your agent becomes self-sufficient.**
 
@@ -16,14 +16,29 @@ RYE breaks that loop. Agents can discover, pull, and execute workflows directly 
 
 ## The Problem: Fragmentation
 
-AI agents are powerful, but they're trapped. When your agent starts work in a new project, you have two choices: copy over workflows and context manually, or rebuild everything from scratch. Neither scales.
+AI agents are powerful, but they're trapped.
 
 - **No self-service**: Your agent can't pull the web scraper it used yesterday.
 - **No portability**: Workflows that exist in Project A are invisible to Project B.
 - **No consistency**: Every project reinvents the same tools because agents can't share.
 - **No discoverability**: Your agent rebuilds what already exists because it can't search.
 
-**RYE empowers your agent to solve this itself.** Search the registry. Load workflows. Verify tools. Execute. All self managed.
+**RYE empowers your agent to solve this itself through MCP tooling.**
+
+---
+
+## The Primary MCP Tools
+
+RYE exposes just four primary tools that your agent uses to interact with the entire system:
+
+| Tool      | Purpose                                                    | Example                                                       |
+| --------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
+| `search`  | Discover items across your project, user space, and system | `search(item_type="directive", query="scraping")`             |
+| `load`    | Pull content from the registry or local stores             | `load(item_type="tool", item_id="acme/web/scraper")`          |
+| `sign`    | Cryptographically sign items with Ed25519                  | `sign(item_type="directive", item_id="web/scraper")`          |
+| `execute` | Run directives, tools, or knowledge items                  | `execute(item_type="tool", item_id="web/scraper", url="...")` |
+
+These four primitives compose everything your agent does. Search finds what's available, load pulls it in, sign establishes trust, and execute runs it.
 
 ---
 
@@ -41,21 +56,6 @@ Every AI system has the same underlying mechanics:
 - State needs to be managed
 
 RYE encodes these fundamentals as **data**, not implementation. The physics are consistent. Only the execution environment changes.
-
----
-
-## The Primary MCP Tools
-
-RYE exposes just four primary tools that your agent uses to interact with the entire system:
-
-| Tool      | Purpose                                                    | Example                                                       |
-| --------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
-| `execute` | Run directives, tools, or knowledge items                  | `execute(item_type="tool", item_id="web/scraper", url="...")` |
-| `search`  | Discover items across your project, user space, and system | `search(item_type="directive", query="scraping")`             |
-| `load`    | Pull content from the registry or local stores             | `load(item_type="tool", item_id="acme/web/scraper")`          |
-| `sign`    | Cryptographically sign items with Ed25519                  | `sign(item_type="directive", item_id="web/scraper")`          |
-
-These four primitives compose everything your agent does. Search finds what's available, load pulls it in, sign establishes trust, and execute runs it.
 
 ---
 
@@ -276,8 +276,6 @@ Every resolved chain generates a lockfile:
 - **Caching**: Skip resolution if lockfile matches
 - **Audit**: Complete execution trace
 
-Lockfiles are stored in `USER_SPACE/.ai/lockfiles/` and committed to version control. When you share your project, others get the exact same tool chain.
-
 ---
 
 ## Universal MCP Discovery
@@ -316,6 +314,34 @@ The LLM translates this to:
   "url": "https://api.context7.com/mcp"
 }
 ```
+
+**Execution Chain for MCP Tools**
+
+When you execute `mcp/context7/search`, the chain resolves based on transport:
+
+**HTTP Transport:**
+```
+mcp/context7/search (MCP tool YAML config)
+    ↓ __executor_id__ = "rye/core/runtimes/mcp_http_runtime"
+rye/core/runtimes/mcp_http_runtime (Layer 2 runtime)
+    ↓ __executor_id__ = "rye/core/primitives/subprocess"
+rye/core/primitives/subprocess (Layer 1 primitive)
+    ↓ executor_id = None
+Execute via Lilux
+```
+
+**stdio Transport:**
+```
+mcp/local-script/analyze (MCP tool YAML config)
+    ↓ __executor_id__ = "rye/core/runtimes/mcp_stdio_runtime"
+rye/core/runtimes/mcp_stdio_runtime (Layer 2 runtime)
+    ↓ __executor_id__ = "rye/core/primitives/subprocess"
+rye/core/primitives/subprocess (Layer 1 primitive)
+    ↓ executor_id = None
+Execute via Lilux
+```
+
+The MCP runtimes handle the transport-specific connection logic, then delegate to the subprocess primitive for actual execution.
 
 ### How It Works
 
@@ -652,7 +678,7 @@ app = FastAPI()
 
 @app.post("/api/scrape")
 async def scrape(url: str, selector: str):
-    # Spawn an LLM thread to execute the directive
+    # Create an LLM thread to execute the directive
     return await rye_mcp_server.execute(
         item_type="tool",
         item_id="rye/agent/threads/thread_directive",
