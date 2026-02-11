@@ -16,14 +16,14 @@ RYE breaks that loop. Agents can discover, pull, and execute workflows directly 
 
 ## The Problem: Fragmentation
 
-AI agents are powerful, but they're trapped. When your agent starts a new project, it has two choices: ask you to copy over workflows, or rebuild everything from scratch. Neither scales.
+AI agents are powerful, but they're trapped. When your agent starts work in a new project, you have two choices: copy over workflows and context manually, or rebuild everything from scratch. Neither scales.
 
 - **No self-service**: Your agent can't pull the web scraper it used yesterday.
 - **No portability**: Workflows that exist in Project A are invisible to Project B.
 - **No consistency**: Every project reinvents the same tools because agents can't share.
 - **No discoverability**: Your agent rebuilds what already exists because it can't search.
 
-**RYE empowers your agent to solve this itself.** Search the registry. Load workflows. Share tools. Execute. All self managed.
+**RYE empowers your agent to solve this itself.** Search the registry. Load workflows. Verify tools. Execute. All self managed.
 
 ---
 
@@ -59,7 +59,15 @@ Declarative workflows stored as XML-embedded markdown:
     <category>automation</category>
   </metadata>
 
+  <inputs>
+    <param name="target_url" type="string" required="true" />
+    <param name="selector" type="string" required="true" />
+  </inputs>
+
   <process>
+    <step name="load_knowledge">
+      <execute item_type="knowledge" item_id="patterns/scraping/web-scraping-best-practices" />
+    </step>
     <step name="fetch">
       <execute item_type="tool" item_id="web/scraper">
         <param name="url" value="${inputs.target_url}" />
@@ -67,6 +75,10 @@ Declarative workflows stored as XML-embedded markdown:
       </execute>
     </step>
   </process>
+
+  <outputs>
+    <param name="data" type="array" />
+  </outputs>
 </directive>
 ```
 
@@ -77,6 +89,7 @@ Python, JavaScript, YAML, or Bash scripts with metadata headers:
 ```python
 __version__ = "1.0.0"
 __executor_id__ = "python_runtime"
+__catergory__ = "web"
 __tool_type__ = "automation"
 
 async def main(**kwargs):
@@ -92,17 +105,24 @@ Structured learnings with YAML frontmatter:
 
 ```markdown
 ---
-id: python-async-patterns
-category: patterns/async
-tags: [python, async]
+id: web-scraping-best-practices
+category: patterns/scraping
+tags: [scraping, css-selectors, rate-limiting]
 ---
 
-# Python Async Best Practices
+# Web Scraping Best Practices
 
-## When to Use Async
+## CSS Selector Tips
 
-- I/O-bound operations
-- Network requests
+- Use specific class names over generic tags
+- Avoid brittle XPath expressions
+- Handle dynamic content with wait strategies
+
+## Rate Limiting
+
+- Respect robots.txt
+- Add delays between requests
+- Use exponential backoff on 429 responses
 ```
 
 All three live in your project's `.ai/` directory:
@@ -139,7 +159,6 @@ Every directive, tool, and knowledge item carries an Ed25519 signature. Unsigned
 - Own public key auto-trusted — self-signed items verify locally with no setup
 - Registry public key pinned on first pull (Trust On First Use)
 - Every tool in the execution chain is verified before running
-- Old `rye:validated:` format rejected entirely
 
 ---
 
@@ -192,15 +211,16 @@ Every resolved chain generates a lockfile:
 ```json
 {
   "lockfile_version": 1,
+  "generated_at": "2026-02-11T00:00:00+00:00",
   "root": {
     "tool_id": "web/scraper",
     "version": "1.0.0",
-    "integrity": "sha256:a1b2c3..."
+    "integrity": "a1b2c3d4e5f6...64 hex chars"
   },
   "resolved_chain": [
-    { "tool_id": "web/scraper", "integrity": "sha256:a1b2c3..." },
-    { "tool_id": "python_runtime", "integrity": "sha256:d4e5f6..." },
-    { "tool_id": "subprocess", "integrity": "sha256:g7h8i9..." }
+    { "item_id": "web/scraper", "space": "project", "tool_type": "python", "executor_id": "rye/core/runtimes/python_runtime", "integrity": "a1b2c3d4...64 hex chars" },
+    { "item_id": "rye/core/runtimes/python_runtime", "space": "system", "tool_type": "runtime", "executor_id": "rye/core/primitives/subprocess", "integrity": "e5f6a7b8...64 hex chars" },
+    { "item_id": "rye/core/primitives/subprocess", "space": "system", "tool_type": "primitive", "executor_id": null, "integrity": "c9d0e1f2...64 hex chars" }
   ]
 }
 ```
