@@ -1,4 +1,4 @@
-# rye:validated:2026-02-03T07:29:34Z:d025f534cf376e6de33335a810553225bdba675e4e6720530bc936ff54daaf34
+# rye:signed:2026-02-12T23:55:37Z:d025f534cf376e6de33335a810553225bdba675e4e6720530bc936ff54daaf34:RM0dMmzHM0A6VQNRiOSgC_v-cfmFqUBiYhkX70lGP2smNNEtGEhEUMPAWmcv0M_YAOhVDUr8AevtrPEemaltCg==:440443d0858f0199
 __tool_type__ = "runtime"
 __version__ = "1.0.0"
 __executor_id__ = "python"

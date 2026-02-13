@@ -1,0 +1,46 @@
+# rye:signed:2026-02-13T08:19:48Z:a982b79fba45a3648b2f21eda58b3135460ee14575f3a89aebc6e0c4a2bc1874:uQmdYGaOtQ1Y2JYkWWS8Zrv46uJDgOESKZ-pL9Vsw7lw7HvLVl69yGfJ-sN1RerSEg6Of1mlyUAzmtwcV97wAA==:440443d0858f0199
+__version__ = "1.0.0"
+__tool_type__ = "python"
+__executor_id__ = "rye/core/runtimes/python_function_runtime"
+__category__ = "rye/agent/threads/internal"
+__tool_description__ = "Emit transcript events"
+
+import json
+import time
+from pathlib import Path
+from typing import Dict
+
+CONFIG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "event_type": {"type": "string"},
+        "payload": {"type": "object", "default": {}},
+        "thread_id": {"type": "string"},
+    },
+    "required": ["event_type", "thread_id"],
+}
+
+
+def execute(params: Dict, project_path: str) -> Dict:
+    """Emit an event to the transcript files."""
+    event_type = params.get("event_type")
+    payload = params.get("payload", {})
+    thread_id = params.get("thread_id", "unknown")
+
+    thread_dir = Path(project_path) / ".ai" / "threads" / thread_id
+    thread_dir.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "timestamp": time.time(),
+        "thread_id": thread_id,
+        "event_type": event_type,
+        "payload": payload,
+    }
+
+    # Append to JSONL
+    jsonl_path = thread_dir / "transcript.jsonl"
+    with open(jsonl_path, "a") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+        f.flush()
+
+    return {"success": True, "event_type": event_type, "emitted": True}

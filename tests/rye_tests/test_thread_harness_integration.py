@@ -76,8 +76,8 @@ FULL_DIRECTIVE_XML = """\
     <author>test</author>
     <model tier="general">File writing</model>
     <limits>
-      <max_turns>5</max_turns>
-      <max_tokens>2000</max_tokens>
+      <turns>5</turns>
+      <tokens>2000</tokens>
     </limits>
     <permissions>
       <execute><tool>rye.file-system.*</tool></execute>
@@ -100,8 +100,8 @@ NO_PERMS_DIRECTIVE_XML = """\
     <author>test</author>
     <model tier="general">Test</model>
     <limits>
-      <max_turns>3</max_turns>
-      <max_tokens>1000</max_tokens>
+      <turns>3</turns>
+      <tokens>1000</tokens>
     </limits>
   </metadata>
   <process><step name="run">Do something</step></process>
@@ -115,8 +115,8 @@ EMPTY_PERMS_DIRECTIVE_XML = """\
     <author>test</author>
     <model tier="general">Test</model>
     <limits>
-      <max_turns>3</max_turns>
-      <max_tokens>1000</max_tokens>
+      <turns>3</turns>
+      <tokens>1000</tokens>
     </limits>
     <permissions />
   </metadata>
@@ -144,8 +144,8 @@ NO_MODEL_XML = """\
     <category />
     <author>test</author>
     <limits>
-      <max_turns>3</max_turns>
-      <max_tokens>1000</max_tokens>
+      <turns>3</turns>
+      <tokens>1000</tokens>
     </limits>
     <permissions />
   </metadata>
@@ -170,8 +170,8 @@ VALID_HOOKS_XML = """\
     <author>test</author>
     <model tier="general">Test</model>
     <limits>
-      <max_turns>5</max_turns>
-      <max_tokens>2000</max_tokens>
+      <turns>5</turns>
+      <tokens>2000</tokens>
     </limits>
     <permissions>
       <execute><tool>rye.file-system.fs_read</tool></execute>
@@ -194,8 +194,8 @@ HOOK_MISSING_EVENT_XML = """\
     <author>test</author>
     <model tier="general">Test</model>
     <limits>
-      <max_turns>5</max_turns>
-      <max_tokens>2000</max_tokens>
+      <turns>5</turns>
+      <tokens>2000</tokens>
     </limits>
     <permissions />
     <hooks>
@@ -215,8 +215,8 @@ HOOK_MISSING_DIRECTIVE_XML = """\
     <author>test</author>
     <model tier="general">Test</model>
     <limits>
-      <max_turns>5</max_turns>
-      <max_tokens>2000</max_tokens>
+      <turns>5</turns>
+      <tokens>2000</tokens>
     </limits>
     <permissions />
     <hooks>
@@ -236,8 +236,8 @@ HOOK_MISSING_BOTH_XML = """\
     <author>test</author>
     <model tier="general">Test</model>
     <limits>
-      <max_turns>5</max_turns>
-      <max_tokens>2000</max_tokens>
+      <turns>5</turns>
+      <tokens>2000</tokens>
     </limits>
     <permissions />
     <hooks>
@@ -275,7 +275,7 @@ class TestThreadSpawnIntegration:
         assert result["status"] == "ready"
         assert result["directive"]["name"] == "write_hello"
         assert result["model"]["tier"] == "general"
-        assert result["harness"]["limits"]["max_turns"] == 5
+        assert result["harness"]["limits"]["turns"] == 5
 
     async def test_permission_denied_without_write(self):
         """Token with only fs.read can't execute fs.write directive."""
@@ -341,7 +341,7 @@ class TestThreadSpawnIntegration:
         state = result["harness_state"]
         assert "cost" in state
         assert "limits" in state
-        assert state["limits"]["max_turns"] == 3
+        assert state["limits"]["turns"] == 3
 
     async def test_directive_not_found(self):
         """Non-existent directive returns clear error."""

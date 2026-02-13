@@ -1,7 +1,7 @@
 # rye:validated:2026-02-05T00:00:00Z:placeholder
 __tool_type__ = "python"
 __version__ = "1.3.0"
-__executor_id__ = "rye/core/runtimes/python_runtime"
+__executor_id__ = "rye/core/runtimes/python_script_runtime"
 __category__ = "rye/core/mcp"
 __tool_description__ = "MCP discover tool - discover tools from MCP servers via stdio, HTTP, or SSE transport"
 

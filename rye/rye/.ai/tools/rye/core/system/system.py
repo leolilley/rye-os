@@ -1,4 +1,4 @@
-# rye:validated:2026-02-03T07:29:34Z:ab9e781e14506e98545005346e93bc8e3b151d4efaabdd9a64cd61fab87c95ac
+# rye:signed:2026-02-13T08:15:15Z:651c6796287001b2e14c3fc55f0c6fc6fd514ac6a37cd7b69c5941d1435fbb94:3tp2FTQnSwxtGa8nW9ucWmg4-mUAx0Of6q3V6pwVlAZVSbAly2Sr9Ko3b6y_Kewc4fi08MnQWnIOVy35UBR9Cw==:440443d0858f0199
 """System information tool - exposes MCP runtime paths, time, and environment.
 
 Builtin tool that runs in-process to provide system information
@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 __version__ = "1.0.0"
-__tool_type__ = "builtin"
-__executor_id__ = None
+__tool_type__ = "python"
+__executor_id__ = "rye/core/runtimes/python_function_runtime"
 __category__ = "rye/core/system"
 __tool_description__ = (
     "System information tool - exposes MCP runtime paths, time, and environment"

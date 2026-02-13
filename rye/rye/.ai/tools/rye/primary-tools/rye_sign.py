@@ -1,3 +1,4 @@
+# rye:signed:2026-02-13T08:13:10Z:74d34ffaaf9830b59ca5fd54ef6f8cff0858034a1cf0c271cfd955820c18d76c:x9KBUC44Q-yYGzR4ULb6ctgLp4GNVfhYzb5h-smYUqyaZY6F59jt3rT-N3XDvJ9e-BFrlqvUXs85yIQqSQYfAA==:440443d0858f0199
 """Validate and sign a directive, tool, or knowledge item."""
 
 import argparse
@@ -8,7 +9,7 @@ from pathlib import Path
 
 __version__ = "1.0.0"
 __tool_type__ = "python"
-__executor_id__ = "rye/core/runtimes/python_runtime"
+__executor_id__ = "rye/core/runtimes/python_script_runtime"
 __category__ = "rye/primary-tools"
 __tool_description__ = "Validate and sign a directive, tool, or knowledge item"
 

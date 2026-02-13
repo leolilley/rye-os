@@ -1,3 +1,4 @@
+# rye:signed:2026-02-13T08:13:10Z:15d955f52cfd757c6868fc02c2be72571549645d8ea4db6f51c8fb2746e21f76:ScJzCBQW00gey0ZoOB3cjm9DsyHMRR_42yWiNahtX_yZl2ipoMG_pk81cRJrgeNtOpdF4RHuOu0xqqoOKVrdBw==:440443d0858f0199
 """Load item content for inspection."""
 
 import argparse
@@ -8,7 +9,7 @@ from pathlib import Path
 
 __version__ = "1.0.0"
 __tool_type__ = "python"
-__executor_id__ = "rye/core/runtimes/python_runtime"
+__executor_id__ = "rye/core/runtimes/python_script_runtime"
 __category__ = "rye/primary-tools"
 __tool_description__ = "Load a directive, tool, or knowledge item for inspection"
 

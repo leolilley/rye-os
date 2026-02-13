@@ -1,4 +1,4 @@
-# rye:validated:2026-02-03T07:57:49Z:9aee333a9aef43537e7132c0dd8c8be4f40e0832adf4bf410e736f2f81939546
+# rye:signed:2026-02-12T23:55:37Z:7c085e425b14b6cabcb7bca8abd13a037aa08a15105b736c38e2d952f0b6dfbc:EdRuoLsMYNy_WU_1TIGPCTE5VErOhxKvCbv8PHa1kVx8FzAxPxIhGyubTSiv6BaRp9YIqDzKKSfr7tGXp5R0Ag==:440443d0858f0199
 """Markdown frontmatter parser for knowledge entries.
 
 Extracts YAML frontmatter and separates it from body content.
@@ -11,8 +11,7 @@ __tool_description__ = (
     "Markdown frontmatter parser - extracts YAML frontmatter from markdown files"
 )
 
-import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def parse(content: str) -> Dict[str, Any]:

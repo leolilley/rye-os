@@ -9,9 +9,10 @@ Routes execution through PrimitiveExecutor for tools, which handles:
 """
 
 import logging
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from rye.constants import ItemType
 from rye.executor import ExecutionResult, PrimitiveExecutor
@@ -26,6 +27,43 @@ from rye.utils.integrity import verify_item, IntegrityError
 from rye.utils.resolvers import get_system_space, get_user_space
 
 logger = logging.getLogger(__name__)
+
+# {input:key}         — required, kept as-is if missing
+# {input:key?}        — optional, empty string if missing
+# {input:key:default}  — fallback to default if missing
+_INPUT_REF = re.compile(r"\{input:(\w+)(\?|:[^}]*)?\}")
+
+
+def _resolve_input_refs(value: str, inputs: Dict[str, Any]) -> str:
+    """Resolve {input:name} placeholders in a string."""
+
+    def _replace(m: re.Match) -> str:
+        key = m.group(1)
+        modifier = m.group(2)
+        if key in inputs:
+            return str(inputs[key])
+        if modifier == "?":
+            return ""
+        if modifier and modifier.startswith(":"):
+            return modifier[1:]
+        return m.group(0)
+
+    return _INPUT_REF.sub(_replace, value)
+
+
+def _interpolate_parsed(parsed: Dict[str, Any], inputs: Dict[str, Any]) -> None:
+    """Interpolate {input:name} refs in body, actions, and content fields."""
+    for key in ("body", "content"):
+        if isinstance(parsed.get(key), str):
+            parsed[key] = _resolve_input_refs(parsed[key], inputs)
+
+    for action in parsed.get("actions", []):
+        for k, v in list(action.items()):
+            if isinstance(v, str):
+                action[k] = _resolve_input_refs(v, inputs)
+        for pk, pv in list(action.get("params", {}).items()):
+            if isinstance(pv, str):
+                action["params"][pk] = _resolve_input_refs(pv, inputs)
 
 
 class ExecuteTool:
@@ -96,7 +134,7 @@ class ExecuteTool:
     async def _run_directive(
         self, item_id: str, project_path: str, parameters: Dict[str, Any], dry_run: bool
     ) -> Dict[str, Any]:
-        """Run a directive - parse and return for agent to follow."""
+        """Run a directive - parse, validate inputs, interpolate, and return."""
         file_path = self._find_item(project_path, ItemType.DIRECTIVE, item_id)
         if not file_path:
             return {"status": "error", "error": f"Directive not found: {item_id}"}
@@ -109,11 +147,32 @@ class ExecuteTool:
         if "error" in parsed:
             return {"status": "error", "error": parsed.get("error"), "item_id": item_id}
 
+        # Validate required inputs
+        inputs = parameters.get("inputs", parameters)
+        declared_inputs: List[Dict] = parsed.get("inputs", [])
+        missing = [
+            inp["name"]
+            for inp in declared_inputs
+            if inp.get("required") and inp["name"] not in inputs
+        ]
+        if missing:
+            return {
+                "status": "error",
+                "error": f"Missing required inputs: {', '.join(missing)}",
+                "item_id": item_id,
+                "declared_inputs": declared_inputs,
+            }
+
+        # Interpolate {input:name} placeholders in body and actions
+        if inputs:
+            _interpolate_parsed(parsed, inputs)
+
         result = {
             "status": "success",
             "type": ItemType.DIRECTIVE,
             "item_id": item_id,
             "data": parsed,
+            "inputs": inputs,
             "instructions": "Execute the directive as specified now.",
         }
 
@@ -183,13 +242,16 @@ class ExecuteTool:
                 },
             }
         else:
-            return {
+            resp = {
                 "status": "error",
                 "error": result.error,
                 "item_id": item_id,
                 "chain": result.chain,
                 "metadata": {"duration_ms": result.duration_ms},
             }
+            if result.data is not None:
+                resp["data"] = result.data
+            return resp
 
     def _get_executor(self, project_path: str) -> PrimitiveExecutor:
         """Get or create PrimitiveExecutor for project.

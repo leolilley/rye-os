@@ -1,0 +1,41 @@
+# rye:signed:2026-02-13T08:13:00Z:2617bda7b52a4e924eafb79767a752ab470606cc6398f5e60c4af09cd926d798:DX57av3VViQen1o4vdjX7Cd3yV6zQkq9rpyPwwmwyLv60TRigoeZ8o_4CQwIrFeCQ2QjbaqaZ3pbejX4tKxkCQ==:440443d0858f0199
+version: "1.0.0"
+tool_type: runtime
+executor_id: rye/core/primitives/subprocess
+category: rye/core/runtimes
+description: "Python script runtime - runs Python scripts that manage their own __main__ entry point"
+
+env_config:
+  interpreter:
+    type: venv_python
+    venv_path: .venv
+    var: RYE_PYTHON
+    fallback: python3
+  env:
+    PYTHONUNBUFFERED: "1"
+    PROJECT_VENV_PYTHON: "${RYE_PYTHON}"
+
+config:
+  command: "${RYE_PYTHON}"
+  args:
+    - "{tool_path}"
+    - "--params"
+    - "{params_json}"
+    - "--project-path"
+    - "{project_path}"
+  timeout: 300
+
+config_schema:
+  type: object
+  properties:
+    script:
+      type: string
+      description: Python script path or inline code
+    args:
+      type: array
+      items:
+        type: string
+      description: Script arguments
+    module:
+      type: string
+      description: "Module to run with -m flag"

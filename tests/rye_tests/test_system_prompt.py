@@ -464,7 +464,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="3" />
+    <limits turns="3" />
     <permissions><execute>*</execute></permissions>
   </metadata>
   <process>
@@ -498,7 +498,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="3" />
+    <limits turns="3" />
     <permissions><execute>*</execute></permissions>
   </metadata>
   <process>
@@ -525,7 +525,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="3" />
+    <limits turns="3" />
     <permissions><search>*</search></permissions>
   </metadata>
   <process>
@@ -549,7 +549,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="3" />
+    <limits turns="3" />
     <permissions><load>*</load></permissions>
   </metadata>
   <process>
@@ -572,7 +572,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="3" />
+    <limits turns="3" />
     <permissions><sign>*</sign></permissions>
   </metadata>
   <process>
@@ -595,7 +595,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="5" />
+    <limits turns="5" />
     <permissions><execute>*</execute></permissions>
   </metadata>
   <process>
@@ -625,7 +625,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="5" />
+    <limits turns="5" />
     <permissions><execute>*</execute><search>*</search></permissions>
   </metadata>
   <process>
@@ -653,7 +653,7 @@ class TestParserExecuteTags:
   <metadata>
     <description>Test</description>
     <model tier="haiku" />
-    <limits max_turns="3" />
+    <limits turns="3" />
     <permissions />
   </metadata>
   <process>

@@ -86,8 +86,8 @@ default:
     <author>test</author>
     <model tier="general">File reading</model>
     <limits>
-      <max_turns>3</max_turns>
-      <max_tokens>1000</max_tokens>
+      <turns>3</turns>
+      <tokens>1000</tokens>
     </limits>
     <permissions>
       <execute><tool>rye.file-system.fs_read</tool></execute>
@@ -114,8 +114,8 @@ default:
     <author>test</author>
     <model tier="general">File writing</model>
     <limits>
-      <max_turns>5</max_turns>
-      <max_tokens>2000</max_tokens>
+      <turns>5</turns>
+      <tokens>2000</tokens>
     </limits>
     <permissions>
       <execute><tool>rye.file-system.*</tool></execute>
@@ -143,8 +143,8 @@ default:
     <author>test</author>
     <model tier="orchestrator">Thread spawning</model>
     <limits>
-      <max_turns>10</max_turns>
-      <max_tokens>5000</max_tokens>
+      <turns>10</turns>
+      <tokens>5000</tokens>
       <max_spawns>2</max_spawns>
     </limits>
     <permissions>
@@ -176,8 +176,8 @@ default:
     <author>test</author>
     <model tier="general">New permissions</model>
     <limits>
-      <max_turns>3</max_turns>
-      <max_tokens>1000</max_tokens>
+      <turns>3</turns>
+      <tokens>1000</tokens>
     </limits>
     <permissions>
       <execute>
@@ -207,8 +207,8 @@ default:
     <author>test</author>
     <model tier="general">No permissions</model>
     <limits>
-      <max_turns>2</max_turns>
-      <max_tokens>500</max_tokens>
+      <turns>2</turns>
+      <tokens>500</tokens>
     </limits>
   </metadata>
   <inputs>
@@ -522,7 +522,7 @@ class TestSafetyHarnessBasic:
     def test_initial_status(self, temp_project):
         harness = SafetyHarness(
             project_path=temp_project,
-            limits={"max_turns": 5, "max_tokens": 1000},
+            limits={"turns": 5, "tokens": 1000},
             directive_name="test_directive",
             directive_inputs={"message": "hello"},
         )
@@ -535,7 +535,7 @@ class TestSafetyHarnessBasic:
     def test_cost_tracking(self, temp_project):
         harness = SafetyHarness(
             project_path=temp_project,
-            limits={"max_turns": 10},
+            limits={"turns": 10},
             directive_name="test",
         )
         
@@ -550,7 +550,7 @@ class TestSafetyHarnessBasic:
     def test_state_serialization(self, temp_project):
         harness = SafetyHarness(
             project_path=temp_project,
-            limits={"max_turns": 5},
+            limits={"turns": 5},
             directive_name="test",
         )
         harness.cost.turns = 2
@@ -561,7 +561,7 @@ class TestSafetyHarnessBasic:
         
         assert restored.cost.turns == 2
         assert restored.cost.tokens == 300
-        assert restored.limits.get("max_turns") == 5
+        assert restored.limits.get("turns") == 5
 
 
 class TestSafetyHarnessLimits:

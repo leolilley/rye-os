@@ -1,4 +1,4 @@
-# rye:validated:2026-02-03T07:57:49Z:b02b491a4400c6fd0380f6c42a203d2d32500b8a5b7b3ffe21948ffb51db2f68
+# rye:signed:2026-02-12T23:55:37Z:ddf86da8d0be6d8a7c8b0f7689073a0252ce11059429e1d6d92361d6c6babb06:OLXPcEFMh2AaDFKifSws58QZ3KEo9_RIyyHiedNJMHTcJLoST8EXTNa2o5zi6PdJDLsZ5h0aXQrMS80xEYoqAg==:440443d0858f0199
 """Markdown XML parser for directives.
 
 Handles extraction of XML from markdown code fences and parsing
@@ -15,6 +15,10 @@ __tool_description__ = (
 import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, Optional, Tuple
+
+from rye.constants import Action
+
+PRIMARY_ACTIONS = frozenset(Action.ALL)
 
 
 def parse(content: str) -> Dict[str, Any]:
@@ -150,14 +154,13 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
 
             # Handle permissions - parse nested permission elements
             elif tag == "permissions":
-                PRIMARY_NAMES = {"execute", "search", "load", "sign"}
                 permissions = []
                 perm_text = (child.text or "").strip()
                 if perm_text == "*" and len(child) == 0:
                     permissions.append({"tag": "cap", "content": "rye.*"})
                 else:
                     for perm in child:
-                        if perm.tag not in PRIMARY_NAMES:
+                        if perm.tag not in PRIMARY_ACTIONS:
                             continue
                         inner_text = (perm.text or "").strip()
                         if inner_text == "*" and len(perm) == 0:
@@ -221,6 +224,7 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
             input_data = {
                 "name": inp.get("name", ""),
                 "type": inp.get("type", "string"),
+                "required": inp.get("required", "false").lower() == "true",
             }
             if inp.text:
                 input_data["description"] = inp.text.strip()
@@ -228,53 +232,34 @@ def _extract_from_xml(root: ET.Element, result: Dict[str, Any]) -> None:
         if inputs:
             result["inputs"] = inputs
 
-    # Extract process steps (with optional <execute>/<spawn> actions)
-    process_elem = root.find("process")
-    if process_elem is not None:
-        steps = []
-        for step in process_elem.findall("step"):
-            step_data = {
-                "name": step.get("name", ""),
-            }
-            desc_el = step.find("description")
-            if desc_el is not None and desc_el.text:
-                step_data["description"] = desc_el.text.strip()
-            elif step.text and step.text.strip():
-                step_data["description"] = step.text.strip()
+    # Extract actions (execute/search/load/sign tool calls) from anywhere
+    # in the directive tree, excluding metadata internals (where the same
+    # tag names are used declaratively for permissions).
+    _metadata_elems: set = set()
+    if metadata_elem is not None:
+        _metadata_elems.add(metadata_elem)
+        for _m in metadata_elem.iter():
+            _metadata_elems.add(_m)
 
-            action_tags = {"execute", "search", "load", "sign"}
-            actions = []
-            for child in step:
-                if child.tag not in action_tags:
-                    continue
-                if child.tag == "execute":
-                    action = {
-                        "primary": "execute",
-                        "item_type": child.get("item_type", "tool"),
-                        "item_id": child.get("item_id", ""),
-                    }
-                    if child.get("id"):
-                        action["id"] = child.get("id")
-                else:
-                    action = {"primary": child.tag}
-                    action.update(child.attrib)
-                params = {}
-                for param in child.findall("param"):
-                    pname = param.get("name", "")
-                    pval = param.get("value", "")
-                    if not pval and param.text:
-                        pval = param.text.strip()
-                    if pname:
-                        params[pname] = pval
-                if params:
-                    action["params"] = params
-                actions.append(action)
-
-            if actions:
-                step_data["actions"] = actions
-            steps.append(step_data)
-        if steps:
-            result["steps"] = steps
+    actions = []
+    for elem in root.iter():
+        if elem.tag not in PRIMARY_ACTIONS or elem in _metadata_elems:
+            continue
+        action = {"primary": elem.tag}
+        action.update(elem.attrib)
+        params = {}
+        for param in elem.findall("param"):
+            pname = param.get("name", "")
+            pval = param.get("value", "")
+            if not pval and param.text:
+                pval = param.text.strip()
+            if pname:
+                params[pname] = pval
+        if params:
+            action["params"] = params
+        actions.append(action)
+    if actions:
+        result["actions"] = actions
 
     # Extract outputs
     outputs_elem = root.find("outputs")

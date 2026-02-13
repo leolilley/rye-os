@@ -636,12 +636,10 @@ class PrimitiveExecutor:
     ) -> Dict[str, Any]:
         """Execute via the root element in the chain.
 
-        Supports two execution modes:
-        1. Primitives (tool_type="primitive"): Route to Lilux primitive classes
-        2. Builtins (tool_type="builtin"): Import Python module and call execute()
+        Routes to Lilux primitive classes (tool_type="primitive").
 
         Args:
-            chain: Executor chain (last element is primitive or builtin)
+            chain: Executor chain (last element is primitive)
             parameters: Runtime parameters
             resolved_env: Resolved environment from chain
 
@@ -667,10 +665,6 @@ class PrimitiveExecutor:
         config["project_path"] = str(self.project_path)
         config["user_space"] = str(self.user_space)
         config["system_space"] = str(self.system_space)
-
-        # Handle builtin tools (in-process Python execution)
-        if root_element.tool_type == "builtin":
-            return await self._execute_builtin(root_element, config, parameters)
 
         # Handle primitives (Lilux primitive classes)
         primitive_name = root_element.item_id
@@ -731,71 +725,6 @@ class PrimitiveExecutor:
                 return {"success": True, "data": result}
 
         except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    async def _execute_builtin(
-        self,
-        element: ChainElement,
-        config: Dict[str, Any],
-        parameters: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Execute a builtin tool by importing and calling its execute() function.
-
-        Builtin tools are Python modules with an async execute(config, params) function.
-        They run in-process and have access to the runtime environment.
-
-        Args:
-            element: ChainElement for the builtin tool
-            config: Execution config with project_path, user_space, system_space
-            parameters: Runtime parameters
-
-        Returns:
-            Execution result dict
-        """
-        import importlib.util
-
-        try:
-            # Load the module from file path
-            spec = importlib.util.spec_from_file_location(
-                element.item_id, element.path
-            )
-            if not spec or not spec.loader:
-                return {
-                    "success": False,
-                    "error": f"Failed to load builtin module: {element.path}",
-                }
-
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            # Get the execute function
-            if not hasattr(module, "execute"):
-                return {
-                    "success": False,
-                    "error": f"Builtin tool missing execute() function: {element.item_id}",
-                }
-
-            execute_fn = getattr(module, "execute")
-
-            # Call execute (handle both sync and async)
-            import asyncio
-            if asyncio.iscoroutinefunction(execute_fn):
-                result = await execute_fn(config, parameters)
-            else:
-                result = execute_fn(config, parameters)
-
-            # Normalize result
-            if isinstance(result, dict):
-                return {
-                    "success": result.get("success", True),
-                    "data": result.get("data", result),
-                    "error": result.get("error"),
-                }
-            else:
-                return {"success": True, "data": result}
-
-        except Exception as e:
-            logger.exception(f"Builtin execution failed: {element.item_id}")
             return {"success": False, "error": str(e)}
 
     def _get_primitive(self, name: str) -> Optional[Any]:

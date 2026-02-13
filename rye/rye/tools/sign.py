@@ -270,15 +270,26 @@ class SignTool:
                 "path": str(file_path),
             }
 
-        # Parse tool file to extract metadata
-        parsed = self.parser_router.parse("python_ast", content)
-        if "error" in parsed:
-            return {
-                "status": "error",
-                "error": "Failed to parse tool file",
-                "details": parsed.get("error"),
-                "path": str(file_path),
-            }
+        # Parse tool file to extract metadata — route by extension
+        if file_path.suffix in (".yaml", ".yml"):
+            parsed = self.parser_router.parse("yaml", content)
+            if "error" in parsed:
+                return {
+                    "status": "error",
+                    "error": "Failed to parse tool file",
+                    "details": parsed.get("error"),
+                    "path": str(file_path),
+                }
+            parsed = parsed.get("data", parsed)
+        else:
+            parsed = self.parser_router.parse("python_ast", content)
+            if "error" in parsed:
+                return {
+                    "status": "error",
+                    "error": "Failed to parse tool file",
+                    "details": parsed.get("error"),
+                    "path": str(file_path),
+                }
 
         # Add name from filename (required field derived from path)
         parsed["name"] = extract_filename(file_path)

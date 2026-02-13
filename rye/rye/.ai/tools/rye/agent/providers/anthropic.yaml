@@ -1,0 +1,135 @@
+# rye:signed:2026-02-13T07:29:16Z:e82c37374aaa02251d38bba2bfb8de956a301e294fd6feb4a1453bfedd06871f:Md2NIFKzoQgKvCtK3mm_srm0gp8KcBPSwt-ZnAZMii3IcEPsCAKtnxRPUfGyVzYziDjZ_QX4FZlTD7v_Ad2cCQ==:440443d0858f0199
+tool_id: anthropic
+tool_type: http
+version: "1.1.0"
+description: "Anthropic Messages API — system default provider for thread execution"
+executor_id: rye/core/primitives/http_client
+category: rye/agent/providers
+
+requires:
+  - net.call
+
+tier_mapping:
+  fast: "claude-3-5-haiku-20241022"
+  haiku: "claude-3-5-haiku-20241022"
+  sonnet: "claude-3-5-sonnet-20241022"
+  opus: "claude-3-opus-20240229"
+  high: "claude-3-5-sonnet-20241022"
+  max: "claude-3-opus-20240229"
+
+# Per-million-token pricing (USD)
+pricing:
+  claude-3-5-haiku-20241022:
+    input: 1.00
+    output: 5.00
+  claude-3-5-sonnet-20241022:
+    input: 3.00
+    output: 15.00
+  claude-sonnet-4-20250514:
+    input: 3.00
+    output: 15.00
+  claude-3-opus-20240229:
+    input: 15.00
+    output: 75.00
+
+env_config:
+  env:
+    ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
+config:
+  method: POST
+  url: "https://api.anthropic.com/v1/messages"
+
+  auth:
+    type: api_key
+    key: "${ANTHROPIC_API_KEY}"
+    header: x-api-key
+
+  headers:
+    Content-Type: application/json
+    anthropic-version: "2023-06-01"
+
+  body:
+    model: "{model}"
+    max_tokens: "{max_tokens}"
+    system: "{system_prompt}"
+    messages: "{messages}"
+    tools: "{tools}"
+
+  timeout: 120
+
+  retry:
+    max_attempts: 2
+    backoff: exponential
+
+prompts:
+  system_template: |
+    You are Rye, an automated directive execution agent.
+    You accomplish tasks by calling tools via the Anthropic tool_use API.
+
+    RULES
+    - You MUST call tools using the tool_use content block. This is non-negotiable.
+    - NEVER write tool calls as text, XML, JSON, or code blocks in your response.
+    - NEVER fabricate or imagine tool results. Wait for the actual result after each call.
+    - Follow the directive steps in order. If a step requires an action, call the appropriate tool.
+    - When the directive is complete, respond with a brief summary. Do not call any more tools.
+    - If you cannot complete a step, explain why in plain text.
+
+    TOOLS
+    You have access to these tools: {tool_names}
+
+    Each tool is called by name with a JSON object as input matching its schema.
+    The tool definitions and their input schemas are provided in the API request.
+
+    DIRECTIVE
+    Name: {directive_name}
+    Description: {directive_description}
+    {directive_steps}
+    {directive_inputs}
+
+parameters:
+  - name: model
+    type: string
+    required: true
+    default: "claude-3-5-haiku-20241022"
+  - name: tokens
+    type: integer
+    required: true
+    default: 1024
+  - name: system_prompt
+    type: string
+    required: false
+    default: ""
+  - name: messages
+    type: array
+    required: true
+    description: "Array of {role, content} message objects"
+  - name: tools
+    type: array
+    required: false
+    default: []
+    description: "Array of tool definitions for function calling"
+
+tool_use:
+  tool_definition:
+    name: "{name}"
+    description: "{description}"
+    input_schema: "{schema}"
+
+  response:
+    stop_reason_field: stop_reason
+    stop_reason_tool_use: tool_use
+    content_field: content
+    text_block_type: text
+    text_field: text
+    tool_use_block_type: tool_use
+    tool_use_id_field: id
+    tool_use_name_field: name
+    tool_use_input_field: input
+
+  tool_result:
+    role: user
+    block_type: tool_result
+    id_field: tool_use_id
+    content_field: content
+    error_field: is_error

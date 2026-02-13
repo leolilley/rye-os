@@ -56,7 +56,7 @@ def _load_signature_formats(
         if not extractors_dir.exists():
             continue
 
-        for file_path in extractors_dir.glob("*_extractor.py"):
+        for file_path in list(extractors_dir.glob("*_extractor.yaml")) + list(extractors_dir.glob("*_extractor.py")):
             if file_path.name.startswith("_"):
                 continue
 
@@ -78,7 +78,22 @@ def _load_signature_formats(
 
 
 def _extract_format_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
-    """Extract EXTENSIONS and SIGNATURE_FORMAT from an extractor file using AST."""
+    """Extract EXTENSIONS and SIGNATURE_FORMAT from an extractor file."""
+    if file_path.suffix in (".yaml", ".yml"):
+        import yaml
+        try:
+            data = yaml.safe_load(file_path.read_text())
+            if not data:
+                return None
+            result = {
+                "extensions": data.get("extensions", []),
+                "signature_format": data.get("signature_format"),
+            }
+            return result if result["extensions"] else None
+        except Exception as e:
+            logger.warning(f"Failed to load YAML format from {file_path}: {e}")
+            return None
+
     try:
         content = file_path.read_text()
         tree = ast.parse(content)

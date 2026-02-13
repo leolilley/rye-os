@@ -72,7 +72,7 @@ def _load_extractor_data(
         if not extractors_dir.exists():
             continue
 
-        for file_path in extractors_dir.glob("**/*_extractor.py"):
+        for file_path in list(extractors_dir.glob("**/*_extractor.yaml")) + list(extractors_dir.glob("**/*_extractor.py")):
             if file_path.name.startswith("_"):
                 continue
 
@@ -81,30 +81,42 @@ def _load_extractor_data(
                 continue
 
             try:
-                content = file_path.read_text()
-                tree = ast.parse(content)
-
-                for node in tree.body:
-                    if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                if file_path.suffix in (".yaml", ".yml"):
+                    import yaml
+                    data = yaml.safe_load(file_path.read_text())
+                    if not data:
                         continue
-                    target = node.targets[0]
-                    if not isinstance(target, ast.Name):
-                        continue
+                    if "search_fields" in data:
+                        search_fields[item_type_name] = data["search_fields"]
+                    if "extraction_rules" in data:
+                        extraction_rules[item_type_name] = data["extraction_rules"]
+                    if "parser" in data:
+                        parser_names[item_type_name] = data["parser"]
+                else:
+                    content = file_path.read_text()
+                    tree = ast.parse(content)
 
-                    if target.id == "SEARCH_FIELDS" and isinstance(
-                        node.value, ast.Dict
-                    ):
-                        search_fields[item_type_name] = ast.literal_eval(node.value)
+                    for node in tree.body:
+                        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                            continue
+                        target = node.targets[0]
+                        if not isinstance(target, ast.Name):
+                            continue
 
-                    elif target.id == "EXTRACTION_RULES" and isinstance(
-                        node.value, ast.Dict
-                    ):
-                        extraction_rules[item_type_name] = ast.literal_eval(node.value)
+                        if target.id == "SEARCH_FIELDS" and isinstance(
+                            node.value, ast.Dict
+                        ):
+                            search_fields[item_type_name] = ast.literal_eval(node.value)
 
-                    elif target.id == "PARSER" and isinstance(
-                        node.value, ast.Constant
-                    ):
-                        parser_names[item_type_name] = node.value.value
+                        elif target.id == "EXTRACTION_RULES" and isinstance(
+                            node.value, ast.Dict
+                        ):
+                            extraction_rules[item_type_name] = ast.literal_eval(node.value)
+
+                        elif target.id == "PARSER" and isinstance(
+                            node.value, ast.Constant
+                        ):
+                            parser_names[item_type_name] = node.value.value
 
             except Exception as e:
                 logger.warning(

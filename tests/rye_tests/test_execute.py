@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from rye.tools.execute import ExecuteTool
+from rye.tools.execute import ExecuteTool, _resolve_input_refs, _interpolate_parsed
 
 
 @pytest.fixture
@@ -164,3 +164,73 @@ class TestExecuteTool:
 
         # Unknown primitive returns error (mytool is not subprocess/http_client)
         assert result["status"] == "error"
+
+
+class TestResolveInputRefs:
+    """Unit tests for {input:key} interpolation."""
+
+    def test_basic_resolve(self):
+        assert _resolve_input_refs("{input:name}", {"name": "alice"}) == "alice"
+
+    def test_missing_kept_as_is(self):
+        assert _resolve_input_refs("{input:name}", {}) == "{input:name}"
+
+    def test_optional_missing_empty(self):
+        assert _resolve_input_refs("{input:name?}", {}) == ""
+
+    def test_optional_present_resolves(self):
+        assert _resolve_input_refs("{input:name?}", {"name": "alice"}) == "alice"
+
+    def test_default_missing_uses_fallback(self):
+        assert _resolve_input_refs("{input:mode:verbose}", {}) == "verbose"
+
+    def test_default_present_resolves(self):
+        assert _resolve_input_refs("{input:mode:verbose}", {"mode": "quiet"}) == "quiet"
+
+    def test_mixed_in_sentence(self):
+        result = _resolve_input_refs(
+            "Write {input:topic} to {input:path} ({input:mode:overview}){input:suffix?}",
+            {"topic": "rust", "path": "/tmp/out"},
+        )
+        assert result == "Write rust to /tmp/out (overview)"
+
+    def test_no_placeholders_passthrough(self):
+        assert _resolve_input_refs("plain text", {"x": "y"}) == "plain text"
+
+
+class TestInterpolateParsed:
+    """Unit tests for _interpolate_parsed on directive data dicts."""
+
+    def test_interpolates_body(self):
+        parsed = {"body": "Research {input:topic}"}
+        _interpolate_parsed(parsed, {"topic": "rust"})
+        assert parsed["body"] == "Research rust"
+
+    def test_interpolates_action_params(self):
+        parsed = {
+            "actions": [
+                {
+                    "primary": "execute",
+                    "item_type": "tool",
+                    "item_id": "fs_write",
+                    "params": {"path": "{input:out}", "content": "{input:data?}"},
+                }
+            ]
+        }
+        _interpolate_parsed(parsed, {"out": "/tmp/x"})
+        assert parsed["actions"][0]["params"]["path"] == "/tmp/x"
+        assert parsed["actions"][0]["params"]["content"] == ""
+
+    def test_interpolates_action_attributes(self):
+        parsed = {
+            "actions": [
+                {"primary": "search", "query": "{input:q}", "item_type": "knowledge"}
+            ]
+        }
+        _interpolate_parsed(parsed, {"q": "patterns"})
+        assert parsed["actions"][0]["query"] == "patterns"
+
+    def test_no_actions_no_error(self):
+        parsed = {"body": "hello"}
+        _interpolate_parsed(parsed, {"x": "y"})
+        assert parsed["body"] == "hello"

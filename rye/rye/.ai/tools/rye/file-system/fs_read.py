@@ -1,4 +1,4 @@
-# rye:validated:2026-02-09T12:00:00Z:placeholder
+# rye:signed:2026-02-13T08:13:10Z:9808bd15c3667496b7b829cd67b2347aa303c4ea35fed70a0d4972edb6d71361:4hBKxXiRnqNMQU3k9gN-wEa16n-2QtG41fi5kjsqvReCLVQwrPomwp0z_8K9pxsIFOaMibv-zia3rymo7n_gAQ==:440443d0858f0199
 """Read a file from the project workspace."""
 
 import argparse
@@ -8,7 +8,7 @@ from pathlib import Path
 
 __version__ = "1.0.0"
 __tool_type__ = "python"
-__executor_id__ = "rye/core/runtimes/python_runtime"
+__executor_id__ = "rye/core/runtimes/python_script_runtime"
 __category__ = "rye/file-system"
 __tool_description__ = "Read a file from the project workspace"
 

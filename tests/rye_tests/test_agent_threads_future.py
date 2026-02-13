@@ -266,7 +266,7 @@ class TestHarnessStatePersistence:
             "cost": {"turns": 3, "tokens": 12500, "spend": 0.0234,
                      "input_tokens": 10000, "output_tokens": 2500,
                      "spawns": 0, "duration_seconds": 45.2},
-            "limits": {"max_turns": 20, "max_tokens": 100000},
+            "limits": {"turns": 20, "tokens": 100000},
             "hooks": [],
             "required_caps": ["fs.read", "fs.write"],
         }
@@ -281,7 +281,7 @@ class TestHarnessStatePersistence:
         assert restored["directive"] == "planner"
         assert restored["cost"]["turns"] == 3
         assert restored["cost"]["spend"] == 0.0234
-        assert restored["limits"]["max_turns"] == 20
+        assert restored["limits"]["turns"] == 20
 
     def test_state_cost_accumulates_across_turns(self, thread_dir):
         """Cost in state.json should reflect cumulative totals."""

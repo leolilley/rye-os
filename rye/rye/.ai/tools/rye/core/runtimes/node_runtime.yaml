@@ -1,0 +1,32 @@
+# rye:signed:2026-02-12T23:55:37Z:41ac1b6ee7d5437660e06b02add27eded70f8420990ca822c82406462c38560d:7w8on10GuUzewAPvlbNkRColZgsD0wcTqunyu4xbYPXJqGm914jfRGwpF5REYyyoaestehpz_XRti2Mqrr_nCw==:440443d0858f0199
+version: "1.0.0"
+tool_type: runtime
+executor_id: rye/core/primitives/subprocess
+category: rye/core/runtimes
+description: "Node.js runtime executor - runs JavaScript/TypeScript with Node interpreter resolution"
+
+env_config:
+  interpreter:
+    type: node_modules
+    search_paths: [node_modules/.bin]
+    var: RYE_NODE
+    fallback: node
+  env:
+    NODE_ENV: development
+
+config:
+  command: "${RYE_NODE}"
+  args: []
+  timeout: 300
+
+config_schema:
+  type: object
+  properties:
+    script:
+      type: string
+      description: JavaScript file path
+    args:
+      type: array
+      items:
+        type: string
+      description: Script arguments

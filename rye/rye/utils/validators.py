@@ -30,8 +30,6 @@ _validation_schemas: Optional[Dict[str, Dict[str, Any]]] = None
 _extraction_rules: Optional[Dict[str, Dict[str, Any]]] = None
 
 
-
-
 def _load_validation_schemas(
     project_path: Optional[Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
@@ -43,11 +41,13 @@ def _load_validation_schemas(
         if not extractors_dir.exists():
             continue
 
-        for file_path in extractors_dir.rglob("*_extractor.py"):
+        for file_path in list(extractors_dir.rglob("*_extractor.yaml")) + list(
+            extractors_dir.rglob("*_extractor.py")
+        ):
             if file_path.name.startswith("_"):
                 continue
 
-            # Extract item type from filename (e.g., directive_extractor.py -> directive)
+            # Extract item type from filename (e.g., directive_extractor.yaml -> directive)
             item_type = file_path.stem.replace("_extractor", "")
 
             # Only set if not already set (precedence: project > user > system)
@@ -63,9 +63,19 @@ def _load_validation_schemas(
 
 
 def _extract_schema_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
-    """Extract VALIDATION_SCHEMA from an extractor file using AST with fallback."""
+    """Extract VALIDATION_SCHEMA from an extractor file."""
+    if file_path.suffix in (".yaml", ".yml"):
+        import yaml
+
+        try:
+            data = yaml.safe_load(file_path.read_text())
+            return data.get("validation_schema") if data else None
+        except Exception as e:
+            logger.warning(f"Failed to load YAML schema from {file_path}: {e}")
+            return None
+
     content = file_path.read_text()
-    
+
     # Try AST parsing first
     try:
         tree = ast.parse(content)
@@ -88,7 +98,7 @@ def _extract_schema_regex(content: str) -> Optional[Dict[str, Any]]:
     """Fallback regex-based schema extraction for malformed files."""
     # Look for VALIDATION_SCHEMA = {...}
     # Match simple dict patterns with optional nesting
-    match = re.search(r'VALIDATION_SCHEMA\s*=\s*\{', content)
+    match = re.search(r"VALIDATION_SCHEMA\s*=\s*\{", content)
     if match:
         try:
             # Extract from the match position to end of content
@@ -96,12 +106,12 @@ def _extract_schema_regex(content: str) -> Optional[Dict[str, Any]]:
             # Try to find matching closing brace with basic nesting
             brace_count = 0
             for i, char in enumerate(content[start:]):
-                if char == '{':
+                if char == "{":
                     brace_count += 1
-                elif char == '}':
+                elif char == "}":
                     brace_count -= 1
                     if brace_count == 0:
-                        schema_str = content[start:start + i + 1]
+                        schema_str = content[start : start + i + 1]
                         return ast.literal_eval(schema_str)
         except Exception:
             pass
@@ -140,11 +150,13 @@ def _load_extraction_rules(
         if not extractors_dir.exists():
             continue
 
-        for file_path in extractors_dir.rglob("*_extractor.py"):
+        for file_path in list(extractors_dir.rglob("*_extractor.yaml")) + list(
+            extractors_dir.rglob("*_extractor.py")
+        ):
             if file_path.name.startswith("_"):
                 continue
 
-            # Extract item type from filename (e.g., directive_extractor.py -> directive)
+            # Extract item type from filename (e.g., directive_extractor.yaml -> directive)
             item_type = file_path.stem.replace("_extractor", "")
 
             # Only set if not already set (precedence: project > user > system)
@@ -160,9 +172,19 @@ def _load_extraction_rules(
 
 
 def _extract_rules_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
-    """Extract EXTRACTION_RULES from an extractor file using AST with fallback."""
+    """Extract EXTRACTION_RULES from an extractor file."""
+    if file_path.suffix in (".yaml", ".yml"):
+        import yaml
+
+        try:
+            data = yaml.safe_load(file_path.read_text())
+            return data.get("extraction_rules") if data else None
+        except Exception as e:
+            logger.warning(f"Failed to load YAML rules from {file_path}: {e}")
+            return None
+
     content = file_path.read_text()
-    
+
     # Try AST parsing first
     try:
         tree = ast.parse(content)
@@ -184,7 +206,7 @@ def _extract_rules_from_file(file_path: Path) -> Optional[Dict[str, Any]]:
 def _extract_rules_regex(content: str) -> Optional[Dict[str, Any]]:
     """Fallback regex-based rules extraction for malformed files."""
     # Look for EXTRACTION_RULES = {...}
-    match = re.search(r'EXTRACTION_RULES\s*=\s*\{', content)
+    match = re.search(r"EXTRACTION_RULES\s*=\s*\{", content)
     if match:
         try:
             # Extract from the match position to end of content
@@ -192,12 +214,12 @@ def _extract_rules_regex(content: str) -> Optional[Dict[str, Any]]:
             # Try to find matching closing brace with basic nesting
             brace_count = 0
             for i, char in enumerate(content[start:]):
-                if char == '{':
+                if char == "{":
                     brace_count += 1
-                elif char == '}':
+                elif char == "}":
                     brace_count -= 1
                     if brace_count == 0:
-                        rules_str = content[start:start + i + 1]
+                        rules_str = content[start : start + i + 1]
                         return ast.literal_eval(rules_str)
         except Exception:
             pass
@@ -312,6 +334,38 @@ def validate_field(
                 f"(lowercase letters, numbers, underscores, starting with letter), got '{value}'"
             )
 
+    elif field_type == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            issues.append(
+                f"Field '{field_name}' must be an integer, got {type(value).__name__}"
+            )
+        else:
+            minimum = field_schema.get("minimum")
+            maximum = field_schema.get("maximum")
+            if minimum is not None and value < minimum:
+                issues.append(f"Field '{field_name}' must be >= {minimum}, got {value}")
+            if maximum is not None and value > maximum:
+                issues.append(f"Field '{field_name}' must be <= {maximum}, got {value}")
+
+    elif field_type == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            issues.append(
+                f"Field '{field_name}' must be a number, got {type(value).__name__}"
+            )
+        else:
+            minimum = field_schema.get("minimum")
+            maximum = field_schema.get("maximum")
+            if minimum is not None and value < minimum:
+                issues.append(f"Field '{field_name}' must be >= {minimum}, got {value}")
+            if maximum is not None and value > maximum:
+                issues.append(f"Field '{field_name}' must be <= {maximum}, got {value}")
+
+    elif field_type == "boolean":
+        if not isinstance(value, bool):
+            issues.append(
+                f"Field '{field_name}' must be a boolean, got {type(value).__name__}"
+            )
+
     elif field_type == "semver":
         if not isinstance(value, str):
             issues.append(
@@ -417,7 +471,9 @@ def validate_parsed_data(
 
     schema = get_validation_schema(item_type, project_path)
     if not schema:
-        raise ValueError(f"Extractor not found for tool type: {item_type}. Extractors should be packaged with their tools.")
+        raise ValueError(
+            f"Extractor not found for tool type: {item_type}. Extractors should be packaged with their tools."
+        )
 
     fields_schema = schema.get("fields", {})
 

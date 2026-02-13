@@ -1,4 +1,4 @@
-# rye:validated:2026-02-09T12:00:00Z:placeholder
+# rye:signed:2026-02-13T08:13:10Z:731d7d64c6b9447abc503e559b791b2a5edeb256b15d358360b78bb555bd7e38:LgQgLRB5lT0ArWIayTzbKSBp0rMr5ZMAVTJ29QNhJgEvcsbMQzcjuTSCsTuPDXpDelXPIssa8qGkPnHpGKPrCA==:440443d0858f0199
 """Write content to a file in the project workspace."""
 
 import argparse
@@ -8,7 +8,7 @@ from pathlib import Path
 
 __version__ = "1.0.0"
 __tool_type__ = "python"
-__executor_id__ = "rye/core/runtimes/python_runtime"
+__executor_id__ = "rye/core/runtimes/python_script_runtime"
 __category__ = "rye/file-system"
 __tool_description__ = "Write content to a file in the project workspace"
 

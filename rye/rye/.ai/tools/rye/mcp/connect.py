@@ -15,7 +15,7 @@ Usage (direct):
 
 __tool_type__ = "python"
 __version__ = "2.0.0"
-__executor_id__ = "rye/core/runtimes/python_runtime"
+__executor_id__ = "rye/core/runtimes/python_script_runtime"
 __category__ = "rye/core/mcp"
 __tool_description__ = (
     "MCP connect tool - execute tool calls on MCP servers via HTTP or stdio"
