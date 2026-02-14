@@ -71,6 +71,8 @@ class ChainElement:
     env_config: Optional[Dict[str, Any]] = None
     config_schema: Optional[Dict[str, Any]] = None
     config: Optional[Dict[str, Any]] = None
+    anchor_config: Optional[Dict[str, Any]] = None
+    verify_deps_config: Optional[Dict[str, Any]] = None
 
 
 class PrimitiveExecutor:
@@ -243,8 +245,35 @@ class PrimitiveExecutor:
                         duration_ms=(time.time() - start_time) * 1000,
                     )
 
+            # 4.5 Anchor + verify_deps
+            anchor_cfg = None
+            for element in chain:
+                if element.anchor_config:
+                    anchor_cfg = element.anchor_config
+                    break
+
+            anchor_ctx = self._compute_anchor_context(chain)
+            anchor_active = False
+
+            if anchor_cfg and self._anchor_applies(anchor_cfg, chain[0].path.parent):
+                anchor_active = True
+                anchor_path = self._resolve_anchor_path(anchor_cfg, anchor_ctx)
+                anchor_ctx["anchor_path"] = str(anchor_path)
+
+                # Verify all dependencies BEFORE spawn
+                self._verify_tool_dependencies(chain, anchor_path)
+
             # 5. Resolve environment through the chain
             resolved_env = self._resolve_chain_env(chain)
+
+            # 5.5 Apply anchor env mutations
+            if anchor_active:
+                self._apply_anchor_env(anchor_cfg, resolved_env, anchor_ctx)
+
+            # 5.6 Apply anchor cwd if configured
+            if anchor_active and anchor_cfg.get("cwd"):
+                cwd = self._template_string(anchor_cfg["cwd"], anchor_ctx)
+                parameters = {**(parameters or {}), "cwd": cwd}
 
             # 6. Execute via the root primitive
             result = await self._execute_chain(chain, parameters, resolved_env)
@@ -267,7 +296,7 @@ class PrimitiveExecutor:
                         integrity=integrity,
                         resolved_chain=resolved_chain,
                     )
-                    self.lockfile_resolver.save_lockfile(new_lockfile)
+                    self.lockfile_resolver.save_lockfile(new_lockfile, space=chain[0].space)
                     lockfile_created = True
                     logger.info(f"Created lockfile for {item_id}@{version}")
                 except Exception as e:
@@ -359,6 +388,8 @@ class PrimitiveExecutor:
                 env_config=metadata.get("env_config"),
                 config_schema=metadata.get("config_schema"),
                 config=metadata.get("config"),
+                anchor_config=metadata.get("anchor"),
+                verify_deps_config=metadata.get("verify_deps"),
             )
             chain.append(element)
 
@@ -568,6 +599,8 @@ class PrimitiveExecutor:
                 "config_schema": data.get("config_schema"),
                 "env_config": data.get("env_config"),
                 "config": data.get("config"),
+                "anchor": data.get("anchor"),
+                "verify_deps": data.get("verify_deps"),
             }
         except Exception:
             return {}
@@ -877,6 +910,149 @@ class PrimitiveExecutor:
             result = new_result
 
         return result
+
+    def _compute_anchor_context(self, chain: List[ChainElement]) -> Dict[str, str]:
+        """Compute template variables for anchor resolution."""
+        tool_element = chain[0]
+        tool_dir = tool_element.path.parent
+
+        # Resolve runtime_lib from the anchor config's lib field
+        runtime_lib = ""
+        for element in chain:
+            if element.anchor_config and element.anchor_config.get("lib"):
+                runtime_lib = str(element.path.parent / element.anchor_config["lib"])
+                break
+
+        return {
+            "tool_path": str(tool_element.path),
+            "tool_dir": str(tool_dir),
+            "tool_parent": str(tool_dir.parent),
+            "anchor_path": str(tool_dir),  # default, overridden by _resolve_anchor_path
+            "runtime_lib": runtime_lib,
+            "project_path": str(self.project_path),
+            "user_space": str(self.user_space),
+            "system_space": str(self.system_space),
+        }
+
+    def _anchor_applies(self, anchor_cfg: Dict[str, Any], tool_dir: Path) -> bool:
+        """Decide whether anchor setup should activate."""
+        mode = anchor_cfg.get("mode", "auto")
+        if mode == "never" or not anchor_cfg.get("enabled", False):
+            return False
+        if mode == "always":
+            return True
+        # mode == "auto": check for marker files
+        markers = anchor_cfg.get("markers_any", [])
+        return any((tool_dir / marker).exists() for marker in markers)
+
+    def _resolve_anchor_path(self, anchor_cfg: Dict[str, Any], ctx: Dict[str, str]) -> Path:
+        """Resolve the anchor root directory from config."""
+        root = anchor_cfg.get("root", "tool_dir")
+        if root == "tool_dir":
+            return Path(ctx["tool_dir"])
+        elif root == "tool_parent":
+            return Path(ctx["tool_parent"])
+        elif root == "project_path":
+            return Path(ctx["project_path"])
+        return Path(ctx["tool_dir"])
+
+    def _apply_anchor_env(
+        self,
+        anchor_cfg: Dict[str, Any],
+        resolved_env: Dict[str, str],
+        ctx: Dict[str, str],
+    ) -> None:
+        """Mutate resolved_env with anchor path additions.
+
+        Prepends/appends to path-like env vars using os.pathsep.
+        Modifies resolved_env in place.
+        """
+        import os as _os
+
+        env_paths = anchor_cfg.get("env_paths", {})
+        for var_name, mutations in env_paths.items():
+            existing = resolved_env.get(var_name, _os.environ.get(var_name, ""))
+            parts = [p for p in existing.split(_os.pathsep) if p] if existing else []
+
+            for path_template in reversed(mutations.get("prepend", [])):
+                resolved = self._template_string(path_template, ctx)
+                if resolved and resolved not in parts:
+                    parts.insert(0, resolved)
+
+            for path_template in mutations.get("append", []):
+                resolved = self._template_string(path_template, ctx)
+                if resolved and resolved not in parts:
+                    parts.append(resolved)
+
+            resolved_env[var_name] = _os.pathsep.join(parts)
+
+    def _template_string(self, template: str, ctx: Dict[str, str]) -> str:
+        """Substitute {var} placeholders in a template string."""
+        import re
+        def replace(match):
+            key = match.group(1)
+            return ctx.get(key, match.group(0))
+        return re.sub(r"\{(\w+)\}", replace, template)
+
+    def _verify_tool_dependencies(self, chain: List[ChainElement], anchor_path: Path) -> None:
+        """Verify all files in the tool's dependency scope before execution.
+
+        Walks the anchor directory tree, verifying every file matching
+        configured extensions via verify_item(). Runs BEFORE subprocess spawn.
+
+        Raises IntegrityError if any file fails verification.
+        """
+        import os as _os
+
+        # Find verify_deps config from chain (runtime element)
+        verify_cfg = None
+        for element in chain:
+            if element.verify_deps_config:
+                verify_cfg = element.verify_deps_config
+                break
+
+        if not verify_cfg or not verify_cfg.get("enabled", False):
+            return
+
+        extensions = set(verify_cfg.get("extensions", []))
+        exclude_dirs = set(verify_cfg.get("exclude_dirs", [
+            "__pycache__", ".venv", "node_modules", ".git",
+        ]))
+        recursive = verify_cfg.get("recursive", True)
+
+        # Determine base path from scope
+        scope = verify_cfg.get("scope", "anchor")
+        if scope == "tool_file":
+            return  # Only the entry point — already verified in chain
+        elif scope == "tool_siblings":
+            base = chain[0].path.parent
+            recursive = False
+        elif scope == "tool_dir":
+            base = chain[0].path.parent
+        else:  # "anchor"
+            base = anchor_path
+
+        base = base.resolve()
+
+        for dirpath, dirnames, filenames in _os.walk(base, followlinks=False):
+            # Prune excluded directories
+            dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
+
+            if not recursive and Path(dirpath) != base:
+                dirnames.clear()
+                continue
+
+            for filename in filenames:
+                filepath = Path(dirpath) / filename
+                if filepath.suffix not in extensions:
+                    continue
+
+                # Guard against symlink escapes
+                real = filepath.resolve()
+                if not str(real).startswith(str(base)):
+                    raise IntegrityError(f"Symlink escape: {filepath} resolves to {real}")
+
+                verify_item(filepath, ItemType.TOOL, project_path=self.project_path)
 
     def _get_user_space(self) -> Path:
         """Get user space path."""

@@ -43,6 +43,7 @@ class Lockfile:
     root: LockfileRoot
     resolved_chain: List[Any]
     registry: Optional[Dict[str, Any]] = None
+    verified_deps: Optional[Dict[str, Any]] = None
 
 
 class LockfileManager:
@@ -100,6 +101,7 @@ class LockfileManager:
                 root=root,
                 resolved_chain=data["resolved_chain"],
                 registry=data.get("registry"),
+                verified_deps=data.get("verified_deps"),
             )
             return lockfile
         except (KeyError, TypeError) as e:
@@ -130,6 +132,7 @@ class LockfileManager:
             "root": asdict(lockfile.root),
             "resolved_chain": lockfile.resolved_chain,
             "registry": lockfile.registry,
+            "verified_deps": lockfile.verified_deps,
         }
 
         # This will raise FileNotFoundError if parent doesn't exist

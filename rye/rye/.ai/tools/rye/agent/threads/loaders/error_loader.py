@@ -1,4 +1,8 @@
+# rye:signed:2026-02-14T00:28:39Z:59f4d4f333e6272d96ab87f5b59884bdeef10e2d501770b54ac176a2c54ec962:ek-W7iSYwLCus3O57QTaG8JFzh4asXA2LWOMsxBKt-bjLJXnd14QRvc-P0AnMT3vd0wUnC62sZUQ4v5kqpG0Ag==:440443d0858f0199
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/loaders"
+__tool_description__ = "Error classification loader"
 
 from pathlib import Path
 from typing import Any, Dict, Optional

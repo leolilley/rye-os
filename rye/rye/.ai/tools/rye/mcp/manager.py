@@ -1,4 +1,4 @@
-# rye:validated:2026-02-04T23:40:35Z:2dc018235a9a5a090561246388739b578ae574f69868ae8ed27eb22beeca6be7
+# rye:signed:2026-02-14T00:37:49Z:e71a355be345819e45a05fc0ff939f18511ddaf79dc21940091f4f236b8aa690:o5vgi5NYI1G-47ezUY9fhD2qS-3TSOJtAKFKikCjC60AdYWx1B70743QBRknxrbdLQjlvBw2bgeqjGq6aPdACA==:440443d0858f0199
 """
 MCP Manager Tool
 
@@ -15,7 +15,7 @@ Usage:
 __tool_type__ = "python"
 __version__ = "1.0.0"
 __executor_id__ = "rye/core/runtimes/python_script_runtime"
-__category__ = "rye/core/mcp"
+__category__ = "rye/mcp"
 __tool_description__ = "MCP manager - add, list, refresh, and remove MCP server configurations"
 
 import asyncio

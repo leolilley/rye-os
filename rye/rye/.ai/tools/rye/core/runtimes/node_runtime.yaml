@@ -1,4 +1,4 @@
-# rye:signed:2026-02-12T23:55:37Z:41ac1b6ee7d5437660e06b02add27eded70f8420990ca822c82406462c38560d:7w8on10GuUzewAPvlbNkRColZgsD0wcTqunyu4xbYPXJqGm914jfRGwpF5REYyyoaestehpz_XRti2Mqrr_nCw==:440443d0858f0199
+# rye:signed:2026-02-14T00:21:41Z:ce3a986c11f15628cc236308529634d66da409a6f48538599fdf3bbdea66271c:9viOkEidwaGaOIyVKs1_VC5VYe61mJMLQJIY1HnYKxqjHLCDzqk6R6KLCRhMXN2xtpYqMGOPpYaXyGRa6RBDDg==:440443d0858f0199
 version: "1.0.0"
 tool_type: runtime
 executor_id: rye/core/primitives/subprocess
@@ -13,6 +13,24 @@ env_config:
     fallback: node
   env:
     NODE_ENV: development
+
+anchor:
+  enabled: true
+  mode: auto
+  markers_any: ["package.json"]
+  root: tool_dir
+  lib: lib/node
+  cwd: "{anchor_path}"
+  env_paths:
+    NODE_PATH:
+      prepend: ["{anchor_path}", "{anchor_path}/node_modules"]
+
+verify_deps:
+  enabled: true
+  scope: anchor
+  recursive: true
+  extensions: [".js", ".ts", ".mjs", ".cjs", ".json", ".yaml", ".yml"]
+  exclude_dirs: ["node_modules", "__pycache__", ".git", "dist", "build"]
 
 config:
   command: "${RYE_NODE}"

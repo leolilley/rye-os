@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:37:49Z:a39c488a467219bbfd51f7d3ce4b85f0e702bfa24424982363c74af0181ad9d8:K_boy0fet_ZXqzQNZ7LFZJTzO_q-O27IhilU1r-1LrYOGaAUWxLYnC8PbiVnPjyclUX1Oz_dqeG5sUzPdi7ZBg==:440443d0858f0199
 # PROTECTED: Core RYE tool - do not override
 """
 Capability Token System
@@ -5,6 +6,11 @@ Capability Token System
 Provides capability tokens for permission enforcement in the safety harness.
 Tokens are signed using Ed25519 for cryptographic verification.
 """
+
+__tool_type__ = "python"
+__version__ = "1.0.0"
+__category__ = "rye/agent/permissions/capability_tokens"
+__tool_description__ = "Capability token management"
 
 import base64
 import hashlib

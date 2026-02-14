@@ -2,21 +2,24 @@
 
 Three-tier architecture:
     - System: site-packages/rye/.ai/lockfiles/ (bundled, read-only, lowest precedence)
-    - User: ~/.ai/lockfiles/ (default, read-write, medium precedence)
+    - User: {USER_SPACE}/.ai/lockfiles/ (default, read-write, medium precedence)
     - Project: {project}/lockfiles/ (opt-in, read-write, highest precedence)
 
 The orchestrator resolves all paths and passes explicit paths to Lilux.
 Lilux never does path discovery or precedence logic.
 """
 
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from lilux.primitives.lockfile import Lockfile, LockfileRoot, LockfileManager
+from lilux.primitives.lockfile import Lockfile, LockfileManager, LockfileRoot
 
-from rye.utils.path_utils import get_user_space, get_system_space, ensure_parent_directory
+from rye.utils.path_utils import (
+    ensure_parent_directory,
+    get_system_space,
+    get_user_space,
+)
 
 
 class LockfileResolver:
@@ -31,7 +34,6 @@ class LockfileResolver:
         project_path: Optional[Path] = None,
         user_space: Optional[Path] = None,
         system_space: Optional[Path] = None,
-        scope: str = "user",
     ):
         """Initialize lockfile resolver.
 
@@ -39,10 +41,8 @@ class LockfileResolver:
             project_path: Project root directory
             user_space: User space directory (~/.ai/)
             system_space: System space (site-packages/rye/.ai/)
-            scope: Write scope - "user" (default) or "project"
         """
         self.project_path = Path(project_path) if project_path else None
-        self.scope = scope
 
         # Resolve user space
         if user_space:
@@ -73,7 +73,7 @@ class LockfileResolver:
     def project_dir(self) -> Optional[Path]:
         """Get project lockfile directory (only if project_path set)."""
         if self.project_path:
-            return self.project_path / "lockfiles"
+            return self.project_path / ".ai" / "lockfiles"
         return None
 
     def get_lockfile(self, tool_id: str, version: str) -> Optional[Lockfile]:
@@ -97,11 +97,12 @@ class LockfileResolver:
                 return None
         return None
 
-    def save_lockfile(self, lockfile: Lockfile) -> Path:
-        """Save lockfile to appropriate location based on scope.
+    def save_lockfile(self, lockfile: Lockfile, space: str = "project") -> Path:
+        """Save lockfile to appropriate location based on resolved tool space.
 
         Args:
             lockfile: Lockfile to save
+            space: Space where the root tool was resolved ("project", "user", "system")
 
         Returns:
             Path where lockfile was saved
@@ -109,11 +110,9 @@ class LockfileResolver:
         path = self._resolve_write_path(
             lockfile.root.tool_id,
             lockfile.root.version,
+            space,
         )
-
-        # Ensure parent directory exists
         ensure_parent_directory(path)
-
         return self.manager.save(lockfile, path)
 
     def create_lockfile(
@@ -123,6 +122,7 @@ class LockfileResolver:
         integrity: str,
         resolved_chain: List[Dict[str, Any]],
         registry: Optional[Dict[str, Any]] = None,
+        verified_deps: Optional[Dict[str, Any]] = None,
     ) -> Lockfile:
         """Create a new lockfile for a resolved chain.
 
@@ -132,6 +132,7 @@ class LockfileResolver:
             integrity: Tool integrity hash
             resolved_chain: List of resolved chain elements
             registry: Optional registry metadata
+            verified_deps: Optional dependency verification hashes
 
         Returns:
             New Lockfile object (not yet saved)
@@ -148,6 +149,7 @@ class LockfileResolver:
             root=root,
             resolved_chain=resolved_chain,
             registry=registry,
+            verified_deps=verified_deps,
         )
 
     def exists(self, tool_id: str, version: str) -> bool:
@@ -250,13 +252,20 @@ class LockfileResolver:
 
         return None
 
-    def _resolve_write_path(self, tool_id: str, version: str) -> Path:
-        """Determine write location from scope."""
+    def _resolve_write_path(
+        self, tool_id: str, version: str, space: str = "project"
+    ) -> Path:
+        """Determine write location from resolved space.
+
+        If a project_path is configured, lockfiles always write to the project
+        directory — the execution context determines where lockfiles live, not
+        the tool's source space.  System space is read-only so system tools
+        running inside a project should cache their lockfiles there.
+        """
         name = self._lockfile_name(tool_id, version)
-
-        if self.scope == "project" and self.project_dir:
+        if self.project_dir:
             return self.project_dir / name
-
+        # No project context — fall back to user space
         return self.user_dir / name
 
     def _lockfile_name(self, tool_id: str, version: str) -> str:

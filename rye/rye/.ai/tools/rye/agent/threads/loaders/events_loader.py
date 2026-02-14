@@ -1,4 +1,8 @@
+# rye:signed:2026-02-14T00:28:39Z:a472ee58b99fc092578be36a5d917691253d359b248d46a64cbb9a5b20293555:vWu1B3WgoWIaFOJjlOD0VfEUahCpBpURCAw8xlAUdylDPDGgXHP13w1OheQJyA-VBEp_FVq1NxNII_OMpezEBA==:440443d0858f0199
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/loaders"
+__tool_description__ = "Events configuration loader"
 
 from pathlib import Path
 from typing import Any, Dict, Optional

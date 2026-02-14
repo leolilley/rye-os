@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:28:39Z:ba0b44dda7516a05c248ea742131fe8a21b8d95700c3d20717a1f9759cc8af29:c-LudslAgM3_UDhQU02qXQdqC_aD5wy-F-9mW1TkA-RxcJDZ66rHRcf8fRUFp61gKEPW85EZDZTmPJEjEMLaBQ==:440443d0858f0199
 """
 http_provider.py: ProviderAdapter that dispatches through the tool execution chain.
 
@@ -11,6 +12,9 @@ This adapter only handles:
 """
 
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/adapters"
+__tool_description__ = "HTTP provider adapter for LLM API calls"
 
 import logging
 from typing import Any, Dict, List, Optional

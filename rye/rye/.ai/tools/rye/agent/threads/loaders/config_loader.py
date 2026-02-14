@@ -1,4 +1,8 @@
+# rye:signed:2026-02-14T00:28:39Z:a56cffed2d25142f1f418b5b5dacfad0c8be297df57ad07cbdab3e9d002b600b:Da90Hqu3doLvaWQRuvSOUW_esHAHzvVUl746fCwknsMLGqx0b9Q_JWlwZDr6JbNQrhBxB0hkjqTRpSUSsgx7Bg==:440443d0858f0199
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/loaders"
+__tool_description__ = "Thread configuration loader"
 
 from pathlib import Path
 from typing import Any, Dict, Optional

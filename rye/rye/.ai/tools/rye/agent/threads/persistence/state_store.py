@@ -1,8 +1,14 @@
+# rye:signed:2026-02-14T00:28:39Z:3d53fd9f83fd3dda1f445c36d10ad6c1433f94e195710ba765dec21f0075d48e:jU6NFTQZJlNQVCUinX2GaoEyOWUnXMML5H9oxrMJv-vzTDYUov_f3-K7zldPKaDHmL5LEty_w82g3RSsMpvmCA==:440443d0858f0199
 """
 persistence/state_store.py: Atomic thread state persistence
 
 Persists thread state to state.json in .ai/threads/
 """
+
+__version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/persistence"
+__tool_description__ = "Thread state persistence store"
 
 import json
 from datetime import datetime

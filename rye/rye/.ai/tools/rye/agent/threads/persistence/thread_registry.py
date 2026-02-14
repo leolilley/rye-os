@@ -1,4 +1,8 @@
+# rye:signed:2026-02-14T00:28:39Z:7e7b5cc34e99f632ef7a8a9a26185e832a24aaef302aae218817d76743bc5760:9hSxrBnXzH9EW6b13hE7yl_HONnhuiK8H1shLloPaDJLmN7sCMcI3oqez45tGKLB9xSLXQOIdtayWHxpArxTBQ==:440443d0858f0199
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/persistence"
+__tool_description__ = "Thread registry for tracking active threads"
 
 import sqlite3
 from datetime import datetime

@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:44:49Z:a66665d3ef686944009e1f734239a587a19e1c90c5f3fd587bf2641ef7722b27:bd7edlp-lw2R_emQRzZUmd3QYeirMX0EXxPHZYCDHwMUHV530d7jzg16_yH3lE7pZ3fla_zHkG1-Bj4JZfMjAg==:440443d0858f0199
 """
 Registry tool - auth and item management for Rye Registry.
 
@@ -38,7 +39,7 @@ Actions:
 __version__ = "1.1.0"
 __tool_type__ = "python"
 __executor_id__ = "rye/core/runtimes/python_script_runtime"
-__category__ = "rye/core/registry"
+__category__ = "rye/registry"
 __tool_description__ = "Registry tool for auth and item management"
 
 import asyncio
@@ -106,6 +107,9 @@ ACTIONS = [
     "delete",
     "publish",
     "unpublish",
+    # Bundles
+    "push_bundle",
+    "pull_bundle",
 ]
 
 # Registry configuration from environment
@@ -548,6 +552,22 @@ async def execute(
             result = await _unpublish(
                 item_type=params.get("item_type"),
                 item_id=params.get("item_id"),
+            )
+            http_calls = 1
+
+        # Bundle actions
+        elif action == "push_bundle":
+            result = await _push_bundle(
+                bundle_id=params.get("bundle_id"),
+                version=params.get("version"),
+                project_path=project_path,
+            )
+            http_calls = 1
+        elif action == "pull_bundle":
+            result = await _pull_bundle(
+                bundle_id=params.get("bundle_id"),
+                version=params.get("version"),
+                project_path=project_path,
             )
             http_calls = 1
         else:
@@ -1819,6 +1839,314 @@ async def _unpublish(
     except Exception as e:
         await http.close()
         return {"error": f"Unpublish failed: {e}"}
+
+
+# =============================================================================
+# BUNDLE ACTIONS
+# =============================================================================
+
+
+async def _push_bundle(
+    bundle_id: Optional[str] = None,
+    version: Optional[str] = None,
+    project_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Upload a bundle to the registry.
+
+    Reads manifest from .ai/bundles/{bundle_id}/manifest.yaml, verifies
+    integrity of all listed files, then pushes the bundle to the registry.
+
+    Args:
+        bundle_id: Bundle identifier
+        version: Version string (optional, defaults to manifest version)
+        project_path: Project root path
+    """
+    if not bundle_id:
+        return {
+            "error": "Required: bundle_id",
+            "usage": "push_bundle(bundle_id='my-bundle', version='1.0.0')",
+        }
+
+    base_dir = Path(project_path) / ".ai" if project_path else Path(".ai")
+    bundle_dir = base_dir / "bundles" / bundle_id
+    manifest_path = bundle_dir / "manifest.yaml"
+
+    if not manifest_path.exists():
+        return {
+            "error": f"Manifest not found: {manifest_path}",
+            "hint": f"Expected manifest at .ai/bundles/{bundle_id}/manifest.yaml",
+        }
+
+    # Load and parse manifest
+    import yaml
+
+    manifest_content = manifest_path.read_text()
+    try:
+        manifest = yaml.safe_load(manifest_content)
+    except yaml.YAMLError as e:
+        return {"error": f"Invalid manifest YAML: {e}"}
+
+    if not isinstance(manifest, dict) or "files" not in manifest:
+        return {
+            "error": "Manifest must contain a 'files' key",
+            "hint": "manifest.yaml should have a top-level 'files' key (dict or list)",
+        }
+
+    # Verify manifest signature
+    try:
+        from rye.utils.integrity import verify_item, IntegrityError
+
+        verify_item(manifest_path, "tool", project_path=Path(project_path) if project_path else None)
+    except IntegrityError as e:
+        return {
+            "error": f"Manifest signature verification failed: {e}",
+            "hint": "Sign the manifest with the sign tool before pushing",
+        }
+    except ImportError:
+        pass  # Integrity module not available, skip verification
+
+    # Read and verify each file
+    files: Dict[str, Dict[str, Any]] = {}
+    file_entries = manifest.get("files", {})
+    if isinstance(file_entries, dict):
+        file_iter = list(file_entries.items())
+    else:
+        # Fallback for list format
+        file_iter = [(e if isinstance(e, str) else e.get("path", ""), e if isinstance(e, dict) else {}) for e in file_entries]
+
+    for rel_path, meta in file_iter:
+        expected_sha = meta.get("sha256") if isinstance(meta, dict) else None
+
+        # rel_path is relative to project root (e.g. ".ai/tools/..."), not to .ai/
+        proj_root = Path(project_path) if project_path else Path(".")
+        file_path = proj_root / rel_path
+        if not file_path.exists():
+            return {
+                "error": f"Bundle file not found: {rel_path}",
+                "expected_at": str(file_path),
+            }
+
+        content = file_path.read_text()
+        computed_sha = hashlib.sha256(content.encode()).hexdigest()
+
+        if expected_sha and computed_sha != expected_sha:
+            return {
+                "error": f"SHA256 mismatch for {rel_path}",
+                "expected": expected_sha,
+                "computed": computed_sha,
+            }
+
+        # Check if file has an inline signature
+        inline_signed = "rye:signed:" in content or "rye:validated:" in content
+
+        files[rel_path] = {
+            "content": content,
+            "sha256": computed_sha,
+            "inline_signed": inline_signed,
+        }
+
+    # Auth check
+    env_token = _get_token_from_env()
+    if env_token:
+        token = env_token
+    else:
+        try:
+            from lilux.runtime.auth import AuthenticationRequired, AuthStore
+
+            auth_store = AuthStore()
+            token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:write")
+        except AuthenticationRequired:
+            return {
+                "error": "Authentication required",
+                "solution": "Run 'registry login' first",
+            }
+        except ImportError:
+            return {"error": "AuthStore not available"}
+
+    # Push to registry
+    config = RegistryConfig.from_env()
+    http = RegistryHttpClient(config)
+
+    try:
+        result = await http.post(
+            "/v1/bundle/push",
+            body={
+                "bundle_id": bundle_id,
+                "version": version,
+                "manifest": manifest_content,
+                "files": files,
+            },
+            auth_token=token,
+        )
+        await http.close()
+
+        if not result["success"]:
+            error_body = result.get("body", {})
+            if isinstance(error_body, dict) and "error" in error_body:
+                return {
+                    "error": error_body["error"],
+                    "status_code": result["status_code"],
+                }
+            return {
+                "error": f"Push bundle failed: {result.get('error', 'Unknown error')}",
+                "status_code": result.get("status_code"),
+            }
+
+        return {
+            "status": "pushed",
+            "bundle_id": bundle_id,
+            "version": version,
+            "file_count": len(files),
+        }
+
+    except Exception as e:
+        await http.close()
+        return {"error": f"Push bundle failed: {e}"}
+
+
+async def _pull_bundle(
+    bundle_id: Optional[str] = None,
+    version: Optional[str] = None,
+    project_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Download a bundle from the registry.
+
+    Fetches manifest and all files, writes them under .ai/, then verifies
+    manifest signature and file integrity.
+
+    Args:
+        bundle_id: Bundle identifier
+        version: Specific version (optional)
+        project_path: Project root path
+    """
+    if not bundle_id:
+        return {
+            "error": "Required: bundle_id",
+            "usage": "pull_bundle(bundle_id='my-bundle')",
+        }
+
+    # Auth check
+    env_token = _get_token_from_env()
+    if env_token:
+        token = env_token
+    else:
+        try:
+            from lilux.runtime.auth import AuthenticationRequired, AuthStore
+
+            auth_store = AuthStore()
+            token = await auth_store.get_token(REGISTRY_SERVICE, scope="registry:read")
+        except AuthenticationRequired:
+            return {
+                "error": "Authentication required",
+                "solution": "Run 'registry login' first",
+            }
+        except ImportError:
+            return {"error": "AuthStore not available"}
+
+    # Pull from registry
+    config = RegistryConfig.from_env()
+    http = RegistryHttpClient(config)
+
+    try:
+        url = f"/v1/bundle/pull/{bundle_id}"
+        if version:
+            url += f"?version={version}"
+
+        result = await http.get(url, auth_token=token)
+        await http.close()
+
+        if not result["success"]:
+            error_body = result.get("body", {})
+            if isinstance(error_body, dict) and "error" in error_body:
+                return {
+                    "error": error_body["error"],
+                    "status_code": result["status_code"],
+                }
+            return {
+                "error": f"Pull bundle failed: {result.get('error', 'Unknown error')}",
+                "status_code": result.get("status_code"),
+            }
+
+        body = result.get("body", {})
+        manifest_content = body.get("manifest", "")
+        bundle_files = body.get("files", {})
+        pulled_version = body.get("version", version)
+
+        base_dir = Path(project_path) / ".ai" if project_path else Path(".ai")
+
+        # Write manifest
+        bundle_dir = base_dir / "bundles" / bundle_id
+        ensure_directory(bundle_dir)
+        manifest_path = bundle_dir / "manifest.yaml"
+        manifest_path.write_text(manifest_content)
+
+        # Write each file (rel_path is relative to project root, e.g. ".ai/tools/...")
+        proj_root = Path(project_path) if project_path else Path(".")
+        files_written: List[str] = []
+        for rel_path, file_data in bundle_files.items():
+            content = file_data.get("content", "") if isinstance(file_data, dict) else file_data
+            dest = proj_root / rel_path
+            ensure_directory(dest.parent)
+            dest.write_text(content)
+            files_written.append(rel_path)
+
+        # Verify manifest signature after writing
+        try:
+            from rye.utils.integrity import verify_item, IntegrityError
+
+            verify_item(manifest_path, "tool", project_path=Path(project_path) if project_path else None)
+        except IntegrityError as e:
+            return {
+                "error": f"Manifest signature verification failed after pull: {e}",
+                "hint": "Bundle manifest from registry has invalid signature",
+                "files_written": files_written,
+            }
+        except ImportError:
+            pass  # Integrity module not available, skip verification
+
+        # Verify each file's SHA256 against manifest entries
+        import yaml
+
+        try:
+            manifest = yaml.safe_load(manifest_content)
+        except yaml.YAMLError:
+            manifest = {}
+
+        if isinstance(manifest, dict) and "files" in manifest:
+            file_entries = manifest["files"]
+            if isinstance(file_entries, dict):
+                file_iter = list(file_entries.items())
+            else:
+                # Fallback for list format
+                file_iter = [(e if isinstance(e, str) else e.get("path", ""), e if isinstance(e, dict) else {}) for e in file_entries]
+
+            for rel_path, meta in file_iter:
+                expected_sha = meta.get("sha256") if isinstance(meta, dict) else None
+                if expected_sha and rel_path:
+                    file_path = proj_root / rel_path
+                    if file_path.exists():
+                        computed_sha = hashlib.sha256(file_path.read_text().encode()).hexdigest()
+                        if computed_sha != expected_sha:
+                            return {
+                                "error": f"SHA256 mismatch for {rel_path}",
+                                "expected": expected_sha,
+                                "computed": computed_sha,
+                                "files_written": files_written,
+                            }
+
+        return {
+            "status": "pulled",
+            "bundle_id": bundle_id,
+            "version": pulled_version,
+            "file_count": len(files_written),
+            "files_written": files_written,
+        }
+
+    except Exception as e:
+        await http.close()
+        return {"error": f"Pull bundle failed: {e}"}
 
 
 # CLI entry point for subprocess execution

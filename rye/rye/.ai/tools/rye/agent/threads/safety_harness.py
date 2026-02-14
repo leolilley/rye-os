@@ -1,4 +1,4 @@
-# rye:signed:2026-02-13T08:39:42Z:f9e7fae0296a38adbae823dd8f0f271059c2aa28f74fdcb7e1018afbe436e665:gOBx8KkSDVIHEzILzWSVaB77pU5GC0CNN7uXeiF9sUEkYAl6MlfE0_UOCgMrJcPgoV5CIA6CD1asMvwJae5vDA==:440443d0858f0199
+# rye:signed:2026-02-14T00:28:39Z:a955f55110db1ae610c881724d0f8fb493faf77b6318fb8f875c90da50a80e3b:QeYZ7Xn7E9oYjHASlM7H67dwHkj7HqatBgSNF-IfQd2gYQxx0ifgzpSNW33ehUNpcSij0KvMO5ybQd92a0DMBg==:440443d0858f0199
 """
 safety_harness.py: Thread safety harness — limits, hooks, cancellation, permissions
 """
@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from rye.utils.python_loader import load_module
+from module_loader import load_module
 
 _ANCHOR = Path(__file__).parent
 

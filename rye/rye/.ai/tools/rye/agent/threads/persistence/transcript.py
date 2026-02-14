@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:28:39Z:542f03f548d29464800e9bbd69d0499950d600f2e085f655cbe75a4634a3aa53:TbCgo_ZshG5u2BB2MMilorPFJCd9LajBobkS-l40eR6V6dpISNA0w7e5bW1equyZ-MNXl7VIVArVlzVkxc8OBQ==:440443d0858f0199
 """
 persistence/transcript.py: Thread execution transcript (JSONL)
 
@@ -7,6 +8,9 @@ as newline-delimited JSON for crash resilience.
 """
 
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/persistence"
+__tool_description__ = "Thread transcript JSONL persistence"
 
 import json
 import time

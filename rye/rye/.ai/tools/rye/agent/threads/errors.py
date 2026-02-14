@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:28:39Z:cffcbf912650e9fd3625747c494896be6fdae262eb97e1394fdde4c9b21dfb07:IvKgDuJlqP9oAXSYvSA6m1YMwAiLEtGo56HVa2hcON-_PFyNCsLnsjpAnCSRaqnmT9RNhXtSWKB9bwactyz3Bg==:440443d0858f0199
 """
 errors.py: Typed exceptions for the thread system.
 
@@ -6,6 +7,9 @@ None/False/empty dicts. Classified by error_classification.yaml.
 """
 
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads"
+__tool_description__ = "Typed exceptions for the thread system"
 
 
 class ThreadSystemError(Exception):

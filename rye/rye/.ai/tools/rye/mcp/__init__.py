@@ -1,13 +1,10 @@
-# rye:validated:2026-02-05T00:00:00Z:placeholder
-"""MCP - connect to any MCP server.
+# rye:signed:2026-02-14T00:37:49Z:cfc22b8545a6389adf74b2195fab2aa6d0e1fa4976bde3a41d90f948a51f11b0:JXEILjOzgPZhIfswYs-7LBMNXOUO-s_FpPIbOrDFwjMauZc8VQJ27vE_ZgcyFu5Pg646ZltgNwe9SDAwri9HAQ==:440443d0858f0199
+"""MCP tools package."""
 
-Core MCP tools for discovering and calling external MCP servers.
-
-Tools:
-- connect.py: Call MCP tools (HTTP or stdio)
-- discover.py: Discover tools from MCP servers
-- manager.py: Add/list/refresh/remove MCP servers
-"""
+__version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/mcp"
+__tool_description__ = "MCP tools package"
 
 from .connect import call_http, call_stdio, execute_with_server_config
 from .discover import execute as discover_mcp_tools

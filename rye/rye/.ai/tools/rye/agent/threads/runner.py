@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:28:39Z:e03fd03b94cf119b5cef6f44297004c683eb5d3f3efb4925f4c4e00f00988a92:bzfYA-QGiL1EKIuOM1GLJrjzu722SUmDJxgOCo15wgUZRYCUjyY6UJM5PN4QTvjMYJ374uZvJG89HrqA5ahJCg==:440443d0858f0199
 """
 runner.py: Core LLM loop for thread execution
 
@@ -20,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from rye.utils.python_loader import load_module
+from module_loader import load_module
 
 _ANCHOR = Path(__file__).parent
 
@@ -220,12 +221,21 @@ async def run(
                     continue
 
                 resolved_id = tool_id_map.get(tool_call["name"], tool_call["name"])
+                dispatch_params = dict(tool_call["input"])
+
+                # Auto-inject parent context for child thread spawns
+                if resolved_id == "rye/agent/threads/thread_directive":
+                    dispatch_params.setdefault("parent_thread_id", thread_id)
+                    dispatch_params.setdefault("parent_depth", orchestrator.get_depth(thread_id))
+                    dispatch_params.setdefault("parent_limits", harness.limits)
+                    dispatch_params.setdefault("parent_capabilities", harness._capabilities)
+
                 result = await dispatcher.dispatch(
                     {
                         "primary": "execute",
                         "item_type": "tool",
                         "item_id": resolved_id,
-                        "params": tool_call["input"],
+                        "params": dispatch_params,
                     },
                     thread_context=thread_ctx,
                 )

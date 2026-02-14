@@ -1,4 +1,4 @@
-# rye:signed:2026-02-13T08:53:28Z:609c1df565ec1ef6fbbdee4866a61acace55d061d92f19ede30294fbd61acd5d:9T8sXuQGVZDy5-gJnt7NpH3V_iIGjgqHlf0J-oeH4IGAX6Zu4ilHPig_Jfs7SKEhcPWLXoWxaqXLp1NnWCwECQ==:440443d0858f0199
+# rye:signed:2026-02-14T00:28:39Z:775cbc66b3e1def2e8e22f0ca423b9dd7b47364f04528042b05b8390eb9da381:YqgGNuzDn1QLBNNJMKWYn0jNy1d97dQV6P3bobRpd9cWdhUyBEy0AAZksGDB3BBY22OPgfEpDDaACT2cySorDg==:440443d0858f0199
 __version__ = "1.0.0"
 __tool_type__ = "python"
 __executor_id__ = "rye/core/runtimes/python_function_runtime"
@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import asyncio
 from pathlib import Path
 
-from rye.utils.python_loader import load_module
+from module_loader import load_module
 
 _ANCHOR = Path(__file__).parent
 

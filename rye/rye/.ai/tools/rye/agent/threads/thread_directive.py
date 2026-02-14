@@ -1,4 +1,4 @@
-# rye:signed:2026-02-13T08:53:28Z:c8cf01e244dd669aee9bbe091e3618b0322840efa5fc8708d429cecc181b68df:AUlQ4rOq60-Nutdp8w69efP5B9t-vuN_i7Qakp_0fkAapMPDVqXnizj6DCArTOn8UaUcaHL6RquohDvMAo-6CA==:440443d0858f0199
+# rye:signed:2026-02-14T00:28:39Z:43298b65ef5614023b37be19f23423c82d8d3d0ef473901fdaa6aa0646f4fec7:AXBja0PigzHdSpJMrmuiXPGwm71sX4MNtzaNkZaihHOZD1DKtaI15hI5sPwvQFzPHw_rE3IoVXqjD0yyLuJoAw==:440443d0858f0199
 __version__ = "1.0.0"
 __tool_type__ = "python"
 __executor_id__ = "rye/core/runtimes/python_script_runtime"
@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from rye.utils.python_loader import load_module
+from module_loader import load_module
 
 _ANCHOR = Path(__file__).parent
 

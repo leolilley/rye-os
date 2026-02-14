@@ -1,4 +1,8 @@
+# rye:signed:2026-02-14T00:28:39Z:ff669979264178fb019454d75c8a959175cdd382c398cf06c85599556799a0d8:8F8AkwDjbJ7ZquaAax5LILHIbuIc3MoPGIbUKcOjIOEfssPiuPkSk2pWiqQt4lUOj_fAZeQSotPsSC1_WH1RAw==:440443d0858f0199
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/loaders"
+__tool_description__ = "Resilience configuration loader"
 
 from pathlib import Path
 from typing import Any, Dict, Optional

@@ -1,4 +1,8 @@
+# rye:signed:2026-02-14T00:28:39Z:9c3668a8d59a0815cf82e5476f02f85d8ca5cdd6c4aea52b18b082e24666cbfa:k65MwQ0_NRwqiLFzgnB6LBL3S75sxjc4WOKDwEc3QeLk2exC92wXPeniZbhMaffV-K5WzbeP_BZ2BUV4iBFEAQ==:440443d0858f0199
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/persistence"
+__tool_description__ = "Budget ledger for thread cost tracking"
 
 import sqlite3
 from datetime import datetime

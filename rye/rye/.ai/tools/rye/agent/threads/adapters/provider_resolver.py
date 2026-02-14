@@ -1,3 +1,4 @@
+# rye:signed:2026-02-14T00:28:39Z:10cc0e40ab9681828bb58275746b2516b3d3f423e3cd68e50f47f71a24c659b7:X68qqaIq0tGND_FS0b9dJig1-aPhyo8yAFQsfz-RXIpsG0XlewwiGs5c2OGDeGUo6mjYwOxVRFl7op2Aq5weAA==:440443d0858f0199
 """
 provider_resolver.py: Resolve model/tier to a concrete provider adapter.
 
@@ -6,6 +7,9 @@ No hardcoded provider — if no config matches, raises ProviderNotFoundError.
 """
 
 __version__ = "1.0.0"
+__tool_type__ = "python"
+__category__ = "rye/agent/threads/adapters"
+__tool_description__ = "Provider resolver for thread execution"
 
 import logging
 from pathlib import Path
