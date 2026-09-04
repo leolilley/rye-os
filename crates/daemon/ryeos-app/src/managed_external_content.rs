@@ -910,7 +910,7 @@ mod tests {
             let declarations: Vec<ryeos_engine::external_content::ExternalContentDeclaration> =
                 serde_json::from_value(worker["external_content"].clone()).unwrap();
 
-            for node_profile in ["full", "full-sandbox"] {
+            for node_profile in ["full"] {
                 let profile_path = repository
                     .join("bundles/.ai/node/init/profiles")
                     .join(format!("{node_profile}.yaml"));
@@ -1014,6 +1014,7 @@ mod tests {
             digest: Some("c".repeat(64)),
             exclude: Vec::new(),
             metadata_hint: None,
+            mount_root: ryeos_engine::external_content::ExternalContentMountRoot::Project,
             mount: "bin/runtime".to_owned(),
         }]
     }

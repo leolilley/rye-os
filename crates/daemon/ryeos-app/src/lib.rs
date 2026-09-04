@@ -33,6 +33,7 @@ pub mod federated_follow;
 pub mod handler_context;
 pub mod handler_error;
 pub mod hosted_operation;
+pub mod hosted_candidate_result;
 pub mod identity;
 pub mod ignore;
 #[path = "io/mod.rs"]

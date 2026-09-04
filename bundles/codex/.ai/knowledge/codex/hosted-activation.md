@@ -87,7 +87,7 @@ knowledge bundle.
      max_total_backlog_bytes: 67108864
    ```
 
-   A fresh `hosted-workflow`, `full`, or `full-sandbox` installation selects a
+   A fresh `hosted-workflow` or `full` installation selects a
    publisher-signed init profile containing these values and publishes one
    complete node-signed generation under `<system>/.ai/node/policies/`.
    `external_content.yaml` and `persistent_sessions.yaml` are mandatory
@@ -120,7 +120,7 @@ knowledge bundle.
    cache.
 
    `config:codex/environments/default` uses the closed
-   `ryeos.worker_environment.v3` contract. Its `executable_search` contributes
+   `ryeos.worker_environment.v4` contract. Its `executable_search` contributes
    only the exact activated command-tool tree to `PATH`. Its independent
    `process_environment` map may contribute bounded literals, paths inside an
    explicitly named activated realization, or directories below the
@@ -129,9 +129,23 @@ knowledge bundle.
    placement. The complete retained map is limited to 32 entries and 4096
    serialized bytes. Values are never inherited from the daemon, read from the Codex
    credential home, or encoded as authored absolute paths. The pinned base
-   environment currently leaves `process_environment` empty; a separately
-   promoted development environment must name its own exact toolchain content
-   and cache bindings rather than borrowing tools from the container image.
+   environment currently leaves `process_environment` empty and its required-
+   nullable `workload_client` field is `null`. A separately promoted
+   development environment must name its exact restricted RyeOS client
+   realization and finite execution request. Toolchain/dependency content
+   remains owned by each requested child tool rather than being borrowed from
+   the container image or added to the outer Codex process.
+
+   The hosted Codex permission profile continues to deny general tmp access
+   but reopens only `/tmp/.ryeos-wc` as read-only. This is the fixed directory
+   for the random per-boot broker socket inside the outer RyeOS native
+   sandbox's private tmpfs. Lillux proves the broker is namespace PID 1 and
+   each accepted client is a non-init process visible in that namespace; the
+   client also proves its connected server is PID 1 so same-UID pathname
+   replacement cannot impersonate the broker. Installed qualification must
+   prove the pinned Codex sandbox can connect under this exact rule. Never
+   widen tmp access or relocate the endpoint into project content to make that
+   check pass.
 4. Keep the source operator private key at its operator endpoint and the
    hosted node's independent local operator private key at the hosted node.
    First admit the source node key on the target
@@ -271,12 +285,11 @@ home, so RyeOS atomically resets the mode-0400 compatibility seed before every
 worker generation and never treats workload-authored changes as retained
 policy. If the node enables a generic enforced isolation backend, RyeOS
 additionally overlays that file read-only, but hosted Codex does not require
-RyeOS's optional Bubblewrap isolation bundle or another RyeOS isolation
-backend. OpenAI's standalone package requires its own private
+the node to enable RyeOS isolation. OpenAI's standalone package requires its own private
 `codex-resources/bwrap` companion for restricted Linux command execution, so
 the activation selects that exact file with the Codex executable, code-mode
 host, Zsh, and `rg`. This is workload-owned pinned content: it does not select
-RyeOS's Bubblewrap isolation backend, discover a host `bwrap`, or acquire
+RyeOS's isolation backend, discover a host `bwrap`, or acquire
 BusyBox. Immutable CLI overrides fix login, credential
 store, built-in provider, empty MCP map, approval routing, permission profile,
 command network, shell environment, and disabled helpers for process life.

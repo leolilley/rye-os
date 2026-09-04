@@ -981,9 +981,10 @@ impl CheckedEngineGeneration<'_> {
         parameters: &Value,
         hints: &ExecutionHints,
         sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
+        filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
         self.engine
-            .build_plan_current(ctx, item, parameters, hints, sealed_content)
+            .build_plan_current(ctx, item, parameters, hints, sealed_content, filesystem_authority_ceiling)
     }
 
     /// Resolve independent canonical items concurrently while retaining this
@@ -3110,6 +3111,9 @@ impl Engine {
     /// Uses system-only kind schemas and system+user trust.
     /// `sealed_content`, when present, answers dependency verification for
     /// paths an admitted realization covers; live bytes answer the rest.
+    /// The filesystem ceiling includes composed-subject and parent admission
+    /// restrictions. Supply it before compilation: narrowing a completed plan
+    /// cannot erase host values already expanded by runtime templates.
     pub fn build_plan(
         &self,
         ctx: &PlanContext,
@@ -3117,9 +3121,10 @@ impl Engine {
         parameters: &Value,
         hints: &ExecutionHints,
         sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
+        filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
         self.checked_bundle_generation(|| {
-            self.build_plan_current(ctx, item, parameters, hints, sealed_content)
+            self.build_plan_current(ctx, item, parameters, hints, sealed_content, filesystem_authority_ceiling)
         })
     }
 
@@ -3130,6 +3135,7 @@ impl Engine {
         parameters: &Value,
         hints: &ExecutionHints,
         sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
+        filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
         crate::scope::check_execution_scope(&ctx.requested_by)?;
 
@@ -3161,6 +3167,7 @@ impl Engine {
             trust_store: &request_snapshot.trust_store,
             node_trust_store: &self.node_trust_store,
             host_env: &self.host_env,
+            filesystem_authority_ceiling,
             project_authority: None,
             sealed_content,
         })
@@ -3179,6 +3186,7 @@ impl Engine {
         parameters: &Value,
         hints: &ExecutionHints,
         sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
+        filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
         self.checked_bundle_generation(|| {
             crate::scope::check_execution_scope(&ctx.requested_by)?;
@@ -3204,6 +3212,7 @@ impl Engine {
                 trust_store: &request_snapshot.trust_store,
                 node_trust_store: &self.node_trust_store,
                 host_env: &self.host_env,
+                filesystem_authority_ceiling,
                 project_authority: None,
                 sealed_content,
             })
@@ -3223,6 +3232,7 @@ impl Engine {
         project_root: &Path,
         admitted: &AdmittedRequestAuthoritySnapshot,
         sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
+        filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
         self.checked_bundle_generation(|| {
             crate::scope::check_execution_scope(&ctx.requested_by)?;
@@ -3273,6 +3283,7 @@ impl Engine {
                 trust_store: &request_snapshot.trust_store,
                 node_trust_store: &self.node_trust_store,
                 host_env: &self.host_env,
+                filesystem_authority_ceiling,
                 project_authority: Some((project_root, project_content)),
                 sealed_content,
             })

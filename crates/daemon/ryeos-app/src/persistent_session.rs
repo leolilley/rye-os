@@ -5,9 +5,7 @@
 //! cancellation, readiness, reuse, idle retirement, and process teardown.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
-use std::os::fd::AsRawFd as _;
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -190,7 +188,7 @@ impl PersistentSessionContractEligibility {
 
 pub struct StartedPersistentSession {
     pub running: ryeos_engine::dispatch::RunningExecution,
-    pub socket: UnixStream,
+    pub socket: lillux::InheritedDuplexChannel,
     /// Descriptor-backed workspace/content leases owned for exactly the
     /// process lifetime. Their concrete types remain outside pool semantics.
     pub lifelines: Vec<Box<dyn Send + Sync>>,
@@ -213,7 +211,7 @@ struct BudgetedSessionFrame {
 
 struct SessionProcess {
     wire: PersistentSessionWireContract,
-    writer: Mutex<UnixStream>,
+    writer: Mutex<lillux::InheritedDuplexChannel>,
     reader: Mutex<Option<SessionChannel>>,
     pending: Mutex<HashMap<String, SyncSender<std::result::Result<BudgetedSessionFrame, String>>>>,
     observation_sender: Mutex<Option<SyncSender<BudgetedSessionFrame>>>,
@@ -237,7 +235,7 @@ struct SessionProcess {
 const MAX_PENDING_SESSION_REQUESTS: usize = 32;
 
 struct SessionChannel {
-    socket: UnixStream,
+    socket: lillux::InheritedDuplexChannel,
     reader: FrameReader,
 }
 
@@ -2741,7 +2739,7 @@ fn require_frame_identity(
 }
 
 fn write_frame(
-    stream: &mut UnixStream,
+    stream: &mut lillux::InheritedDuplexChannel,
     wire: &PersistentSessionWireContract,
     frame: &PersistentSessionFrame,
     deadline: Instant,
@@ -2749,23 +2747,9 @@ fn write_frame(
     let encoded = encode_frame(wire, frame)?;
     let mut written = 0;
     while written < encoded.len() {
-        // Use the descriptor operation directly. This protocol is admitted as
-        // an inherited byte-stream FD; it does not require socket-specific
-        // send authority, which may be deliberately absent in a sandbox.
-        // RyeOS binaries retain Rust's default ignored-SIGPIPE disposition, so
-        // a closed peer remains an ordinary EPIPE error.
-        let sent = unsafe {
-            libc::write(
-                stream.as_raw_fd(),
-                encoded[written..].as_ptr().cast(),
-                encoded.len() - written,
-            )
-        };
-        let outcome = if sent < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(sent as usize)
-        };
+        // The typed Lillux endpoint owns the underlying descriptor operation;
+        // persistent-session protocol code only reads and writes bytes.
+        let outcome = stream.write(&encoded[written..]);
         match outcome {
             Ok(0) => bail!("persistent-session channel closed while writing a frame"),
             Ok(count) => written += count,
@@ -3135,7 +3119,6 @@ mod tests {
         observation_sink: Option<PersistentSessionObservationSink>,
     ) -> Result<StartedPersistentSession> {
         use std::collections::HashMap;
-        use std::os::fd::{AsRawFd as _, OwnedFd};
 
         use ryeos_engine::contracts::{
             EffectivePrincipal, EngineContext, ExecutionDecorations, ExecutionPlan, LaunchMode,
@@ -3152,9 +3135,14 @@ mod tests {
         let isolation = Arc::new(ryeos_engine::isolation::IsolationRuntime::load(
             app_root.path(),
         )?);
-        let (daemon_socket, worker_socket) = UnixStream::pair()?;
-        let worker_file = Arc::new(std::fs::File::from(OwnedFd::from(worker_socket)));
-        let worker_fd = worker_file.as_raw_fd();
+        let (daemon_channel, worker_channel) = lillux::inherited_duplex_channel_pair()
+            .map_err(anyhow::Error::msg)?;
+        let daemon_socket = daemon_channel;
+        let target_channel = ryeos_engine::isolation::IsolationTargetChannelAuthority::new(
+            worker_channel,
+            0,
+            "RYEOS_SESSION_FD",
+        )?;
         let script = r#"
 import json, os, struct
 fd = int(os.environ['RYEOS_SESSION_FD'])
@@ -3213,7 +3201,7 @@ while True:
             verified_command: None,
             args: vec!["-S".into(), "-c".into(), script.into()],
             cwd: None,
-            env: HashMap::from([("RYEOS_SESSION_FD".to_owned(), worker_fd.to_string())]),
+            env: HashMap::new(),
             env_sources: HashMap::new(),
             stdin: None,
             timeout_secs: 30,
@@ -3233,6 +3221,10 @@ while True:
             entrypoint: PlanNodeId("spawn".to_owned()),
             capabilities: PlanCapabilities::default(),
             materialization_requirements: Vec::new(),
+            network_authority_ceiling:
+                ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             cache_key: "fixture".to_owned(),
             thread_kind: Some("worker".to_owned()),
             executor_chain: Vec::new(),
@@ -3263,10 +3255,10 @@ while True:
             isolation_verified_code: Vec::new(),
             isolation_verified_command: None,
             isolation_external_read_only_mounts: Vec::new(),
-            isolation_target_channel: None,
+            isolation_target_channels: vec![target_channel],
             isolation_workspace: None,
             subprocess_limits: None,
-            inherited_fds: vec![Arc::clone(&worker_file)],
+            inherited_fds: Vec::new(),
             thread_id: "session:fixture".to_owned(),
             chain_root_id: "session:fixture".to_owned(),
             current_site_id: "site:fixture".to_owned(),
@@ -3289,7 +3281,7 @@ while True:
         Ok(StartedPersistentSession {
             running,
             socket: daemon_socket,
-            lifelines: vec![Box::new(app_root), Box::new(worker_file)],
+            lifelines: vec![Box::new(app_root)],
             expected_boot_identity: None,
             observation_sink,
         })

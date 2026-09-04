@@ -4,11 +4,13 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use lillux::time::{Duration, MonotonicDeadline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+mod workload_client_broker;
 
 const WIRE_PROTOCOL: &str = "ryeos.structured-session";
 const WIRE_VERSION: u32 = 1;
@@ -85,7 +87,7 @@ struct PendingControl {
 struct PendingServerRequest {
     message: Value,
     request_digest: String,
-    expires_at: Instant,
+    expires_at: MonotonicDeadline,
 }
 
 struct ExpiredServerRequest {
@@ -96,7 +98,7 @@ struct ExpiredServerRequest {
 struct PendingObservationBatch {
     through_sequence: u64,
     digest: String,
-    deadline: Instant,
+    deadline: MonotonicDeadline,
 }
 
 type WorkloadCommandResult = (String, std::result::Result<Value, String>);
@@ -110,6 +112,8 @@ struct StructuredSessionProfile {
     workload_executable: String,
     workload_args: Vec<String>,
     workload_home_env: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    workload_client: Option<StructuredSessionWorkloadClient>,
     baseline_config: String,
     baseline_destination: String,
     portable_state: Option<ryeos_state::objects::PortableSessionStateContract>,
@@ -122,6 +126,22 @@ struct StructuredSessionProfile {
     #[serde(default)]
     ignored_notifications: BTreeMap<String, String>,
     server_requests: Vec<ServerRequestRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredSessionWorkloadClient {
+    endpoint_env: String,
+}
+
+fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Mechanical source of workload configuration authority. Immutable argv is
@@ -360,6 +380,15 @@ fn validate_structured_session_profile(profile: &StructuredSessionProfile) -> Re
     }
     ryeos_engine::protocol_vocabulary::validate_env_name(&profile.workload_home_env)
         .map_err(|error| anyhow!(error))?;
+    if let Some(workload_client) = &profile.workload_client {
+        ryeos_engine::protocol_vocabulary::validate_env_name(&workload_client.endpoint_env)
+            .map_err(|error| anyhow!(error))?;
+        if workload_client.endpoint_env
+            != ryeos_runtime::workload_client::WORKLOAD_CLIENT_ENDPOINT_ENV
+        {
+            bail!("structured-session workload-client endpoint environment is not current");
+        }
+    }
     if profile.configuration_authority != ConfigurationAuthority::ImmutableArgv {
         bail!("structured-session configuration authority is not immutable argv");
     }
@@ -654,7 +683,7 @@ fn run() -> Result<()> {
     }
     let profile: StructuredSessionProfile =
         serde_json::from_slice(&profile_bytes).context("decode structured-session profile")?;
-    if profile.schema_version != 1 {
+    if profile.schema_version != 2 {
         bail!("unsupported structured-session profile schema");
     }
     validate_structured_session_profile(&profile)?;
@@ -707,7 +736,7 @@ fn run() -> Result<()> {
     )?;
     let session_process_environment =
         optional_env(ryeos_state::objects::SESSION_PROCESS_ENVIRONMENT_ENV)?;
-    let (session_process_environment, mut environment_descriptors) =
+    let (mut session_process_environment, mut environment_descriptors) =
         resolve_session_process_environment(
             std::path::Path::new(&workspace),
             std::path::Path::new(&external_root),
@@ -716,6 +745,37 @@ fn run() -> Result<()> {
         )?;
     inherited_descriptors.append(&mut environment_descriptors);
     inherited_descriptors.append(&mut workload_handles);
+    let workload_client_broker = if std::env::var_os(
+        ryeos_runtime::workload_client::WORKLOAD_CLIENT_CHANNEL_ENV,
+    )
+    .is_some()
+    {
+        let workload_client = profile.workload_client.as_ref().ok_or_else(|| {
+            anyhow!("workload-client channel was supplied to a profile that did not admit it")
+        })?;
+        // SAFETY: the admitted target-channel plan gives this bridge unique
+        // ownership of the named connected descriptor. Lillux owns adoption
+        // and immediately prevents inheritance into the untrusted workload.
+        let channel = unsafe {
+            lillux::take_inherited_duplex_channel_from_env(
+                ryeos_runtime::workload_client::WORKLOAD_CLIENT_CHANNEL_ENV,
+            )
+            .map_err(anyhow::Error::msg)?
+        };
+        let broker = workload_client_broker::start(channel)?;
+        if session_process_environment
+            .insert(
+                workload_client.endpoint_env.clone(),
+                broker.endpoint().to_owned(),
+            )
+            .is_some()
+        {
+            bail!("workload-client endpoint collided with admitted process environment");
+        }
+        Some(broker)
+    } else {
+        None
+    };
     reset_compatibility_baseline_config(
         std::path::Path::new(&workload_home),
         &baseline_config,
@@ -758,6 +818,10 @@ fn run() -> Result<()> {
         &session_process_environment,
         inherited_descriptors,
     )?;
+    // Retain the broker owner for the complete workload lifetime. Its worker
+    // threads retain the listener and protected channel; this guard documents
+    // that their endpoint is scoped to this bridge boot.
+    let _workload_client_broker = workload_client_broker;
     app.initialize()?;
     protect_profile_home(std::path::Path::new(&workload_home))?;
     let mut workload_termination = Some(
@@ -859,7 +923,7 @@ fn run() -> Result<()> {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     pending_cancellation_protocol_error
                         .get_or_insert("RyeOS session reader disconnected during cancellation");
-                    thread::sleep(Duration::from_millis(50));
+                    lillux::time::sleep(Duration::from_millis(50));
                 }
             }
             continue;
@@ -917,13 +981,13 @@ fn run() -> Result<()> {
                 pending_observation = Some(PendingObservationBatch {
                     through_sequence,
                     digest,
-                    deadline: Instant::now() + Duration::from_secs(30),
+                    deadline: MonotonicDeadline::after(Duration::from_secs(30)),
                 });
             }
         }
         if pending_observation
             .as_ref()
-            .is_some_and(|pending| Instant::now() >= pending.deadline)
+            .is_some_and(|pending| pending.deadline.has_elapsed())
         {
             bail!("RyeOS did not durably acknowledge the observation batch");
         }
@@ -1113,6 +1177,7 @@ fn resolve_pinned_executable(
         bail!("workload realization id is ambiguous");
     }
     if realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
+        || realization.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
         || !lillux::valid_hash(&realization.manifest_hash)
         || realization.entry_count == 0
         || realization.total_bytes == 0
@@ -1194,6 +1259,7 @@ fn resolve_pinned_executable_search(
             .ok_or_else(|| anyhow!("executable search names an absent realization"))?;
         if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
             || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
+            || realization.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
         {
             bail!("executable search requires a pinned tree realization");
         }
@@ -1285,6 +1351,7 @@ fn resolve_session_process_environment(
                     })?;
                 if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
                     || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
+                    || realization.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
                 {
                     bail!("session process environment requires a pinned tree realization");
                 }
@@ -1819,11 +1886,10 @@ impl StructuredWorkload {
     }
 
     fn expire_server_requests(&mut self) -> Result<()> {
-        let now = Instant::now();
         let expired = self
             .server_requests
             .iter()
-            .filter(|(_, pending)| pending.expires_at <= now)
+            .filter(|(_, pending)| pending.expires_at.has_elapsed())
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in expired {
@@ -1874,7 +1940,7 @@ impl StructuredWorkload {
         if !self.outstanding.insert(key.clone()) {
             bail!("structured-session request id was reused");
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = MonotonicDeadline::after(timeout);
         loop {
             self.service_pending_controls()?;
             self.expire_server_requests()?;
@@ -1887,7 +1953,7 @@ impl StructuredWorkload {
             if let Some(reason) = self.fatal.as_deref() {
                 bail!("structured-session workload protocol is quarantined: {reason}");
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.remaining();
             if remaining.is_zero() {
                 self.outstanding.remove(&key);
                 bail!("structured-session workload request `{method}` timed out");
@@ -1987,7 +2053,7 @@ impl StructuredWorkload {
                         PendingServerRequest {
                             message: message.clone(),
                             request_digest: request_digest.clone(),
-                            expires_at: Instant::now() + APPROVAL_TTL,
+                            expires_at: MonotonicDeadline::after(APPROVAL_TTL),
                         },
                     )
                     .is_some()
@@ -2684,7 +2750,7 @@ mod tests {
         let workload_home = root.path().join("home");
         std::fs::create_dir(&workload_home).unwrap();
         let profile: StructuredSessionProfile = serde_json::from_value(json!({
-            "schema_version":1,
+            "schema_version":2,
             "configuration_authority":"immutable_argv",
             "workload_realization_id":"test-realization",
             "workload_executable":"sh",
@@ -2693,6 +2759,7 @@ mod tests {
                 "IFS= read -r request; printf '%s\\n' '{\"id\":\"approval-one\",\"method\":\"approval/request\",\"params\":{\"session\":\"session-one\",\"operation\":\"operation-one\",\"command\":\"true\"}}'; IFS= read -r decision; printf '%s\\n' '{\"id\":1,\"result\":{\"ok\":true}}'"
             ],
             "workload_home_env":"TEST_WORKLOAD_HOME",
+            "workload_client":null,
             "baseline_config":"baseline.conf",
             "baseline_destination":"config.toml",
             "portable_state":null,
@@ -2772,7 +2839,7 @@ mod tests {
         let (result_sender, results) = sync_channel(1);
         let observed_events = Arc::clone(&events);
         let controller = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = MonotonicDeadline::after(Duration::from_secs(2));
             loop {
                 if observed_events
                     .lock()
@@ -2799,8 +2866,8 @@ mod tests {
                         .unwrap();
                     return;
                 }
-                assert!(Instant::now() < deadline, "approval event was not surfaced");
-                thread::sleep(Duration::from_millis(1));
+                assert!(!deadline.has_elapsed(), "approval event was not surfaced");
+                lillux::time::sleep(Duration::from_millis(1));
             }
         });
         let mut workload = StructuredWorkload::start(
@@ -2880,7 +2947,7 @@ mod tests {
                     "params":{"session":"session-one","operation":"operation-new","command":"false"}
                 }),
                 request_digest: new_digest,
-                expires_at: Instant::now() + APPROVAL_TTL,
+                expires_at: MonotonicDeadline::after(APPROVAL_TTL),
             },
         );
         let late_old_decision = json!({
@@ -2980,6 +3047,7 @@ mod tests {
             "manifest_hash":"a".repeat(64),
             "entry_count":1,
             "total_bytes":7,
+            "mount_root": "project",
             "mount":"fixture-worker"
         }]))
         .unwrap();

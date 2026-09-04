@@ -110,6 +110,12 @@ pub struct ChainIntermediate {
 pub struct TemplateContext {
     pub tool_path: PathBuf,
     pub project_path: Option<PathBuf>,
+    /// Schema-validated invocation parameters. A signed runtime descriptor
+    /// may select scalar values into one command argument or environment
+    /// value through rye-expr/1. Keep this as data in the existing template
+    /// context: adding a tool-specific argv builder or command multiplexer
+    /// would create a second execution-description path.
+    pub params: Value,
     pub params_json: String,
     pub interpreter: Option<String>,
     /// Handler-owned runtime context roots such as `tool_dir` and
@@ -122,6 +128,7 @@ impl TemplateContext {
         Self {
             tool_path,
             project_path: None,
+            params: Value::Null,
             params_json: String::new(),
             interpreter: None,
             extra: HashMap::new(),
@@ -172,6 +179,7 @@ fn compile_runtime_template(
         "tool_dir",
         "tool_parent",
         "project_path",
+        "params",
         "params_json",
         "interpreter",
         "runtime_dir",
@@ -200,6 +208,10 @@ fn render_compiled_runtime_template(
     roots.insert(
         "tool_path".to_owned(),
         Value::String(ctx.tool_path.to_string_lossy().into_owned()),
+    );
+    roots.insert(
+        "params".to_owned(),
+        ctx.params.clone(),
     );
     roots.insert(
         "params_json".to_owned(),
@@ -583,6 +595,7 @@ pub fn compile_with_handlers(
     };
     ctx.template_ctx.project_path = project_root.map(|p| p.to_path_buf());
 
+    ctx.template_ctx.params = params.clone();
     ctx.template_ctx.params_json = params.to_string();
 
     // Seed always-present template tokens computed from the chain
@@ -756,6 +769,7 @@ pub fn compile_with_handlers(
     // resolved configuration remains an explicit tool input; non-root timeout
     // and cancellation values do not become caller parameters.
     let invocation_params = subprocess_invocation_params(ctx.original_params, &ctx.params);
+    ctx.template_ctx.params = invocation_params.clone();
     ctx.template_ctx.params_json = invocation_params.to_string();
 
     let node_trust_ref = ctx.node_trust_store;
@@ -780,6 +794,14 @@ pub fn compile_with_handlers(
     // material instead of PATH. Unqualified refs stay wrapper-local;
     // qualified refs (`bin:<bundle>/<name>`) resolve from a registered bundle
     // while keeping runtime authority on the wrapper item.
+    //
+    // `realization:<id>/<member>` deliberately remains symbolic here. The
+    // engine has no CAS or target-local binding authority. Daemon admission
+    // resolves it from this execution's finalized external-realization set,
+    // retains the exact manifest/member coordinate, and isolation overlays the
+    // already-open member descriptor inside the complete realization tree. Do
+    // not solve this by adding a deferred child environment to a parent launch
+    // preparer: an ordinary child owns this admission itself.
     let (cmd, verified_command) = if cmd_expanded.starts_with("bin:") {
         let resolved = crate::binary_resolver::resolve_runtime_binary_command_ref(
             &cmd_expanded,
@@ -809,6 +831,12 @@ pub fn compile_with_handlers(
             }),
         )
     } else {
+        crate::external_content::parse_realization_command_ref(&cmd_expanded).map_err(|error| {
+            EngineError::InvalidRuntimeConfig {
+                path: "config.command".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
         (cmd_expanded, None)
     };
 
@@ -950,6 +978,34 @@ mod tests {
         let ctx = TemplateContext::new(PathBuf::from("/tool.yaml"));
         let got = expand_env_value("${MY_HOST}-${tool_path}", &ctx, &host_env).unwrap();
         assert_eq!(got, "hello-/tool.yaml");
+    }
+
+    #[test]
+    fn validated_parameter_selects_one_runtime_argument_without_string_parsing() {
+        let mut ctx = TemplateContext::new(PathBuf::from("/tool.yaml"));
+        ctx.params = json!({"package":"ryeos-app"});
+        let argument = RuntimeArgument::Template("${params.package}".to_owned());
+
+        assert_eq!(
+            render_runtime_argument(argument, &ctx)
+                .unwrap()
+                .literal_value(),
+            Some("ryeos-app")
+        );
+    }
+
+    #[test]
+    fn runtime_parameter_template_remains_one_argument() {
+        let mut ctx = TemplateContext::new(PathBuf::from("/tool.yaml"));
+        ctx.params = json!({"package":"ryeos-app --workspace"});
+        let argument = RuntimeArgument::Template("${params.package}".to_owned());
+
+        assert_eq!(
+            render_runtime_argument(argument, &ctx)
+                .unwrap()
+                .literal_value(),
+            Some("ryeos-app --workspace")
+        );
     }
 
     #[test]

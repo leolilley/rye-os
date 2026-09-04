@@ -8,6 +8,7 @@ use clap::Parser;
 use tokio::net::{TcpListener, UnixListener};
 
 use ryeos_api::handlers::remote_reconcile_project_head::recover_durable_project_head_reconciliations;
+use ryeos_api::handlers::remote_pull_worker_result::recover_durable_worker_result_pulls;
 use ryeos_app::callback_token::CallbackCapabilityStore;
 use ryeos_app::command_service::CommandService;
 use ryeos_app::event_store_service::EventStoreService;
@@ -963,6 +964,18 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
                 tracing::warn!(
                     interrupted_sync_attempts,
                     "settled sync-job attempts interrupted by the previous daemon process"
+                );
+            }
+            let recovered_project_applies =
+                ryeos_api::handlers::project_apply_snapshot::recover_durable_project_snapshot_applies(
+                    &app_state,
+                )
+                .await
+                .context("recover interrupted project snapshot applies")?;
+            if recovered_project_applies != 0 {
+                tracing::warn!(
+                    recovered_project_applies,
+                    "recovered project snapshot applies before enabling dispatch"
                 );
             }
             let admission_store = app_state.state_store.clone();
@@ -1944,6 +1957,12 @@ async fn run_periodic_recovery(state: AppState) -> Result<()> {
             "initial remote project-head reconciliation failed; durable jobs remain retryable"
         );
     }
+    if let Err(error) = recover_durable_worker_result_pulls(&state).await {
+        tracing::error!(
+            error = %error,
+            "initial hosted worker-result pull recovery failed; durable jobs remain retryable"
+        );
+    }
     match state.threads.reconcile_remote_follow_terminal_deliveries() {
         Ok(reconciled) if reconciled != 0 => tracing::info!(
             reconciled,
@@ -2038,6 +2057,15 @@ async fn run_periodic_recovery_pass(state: &AppState) -> Result<()> {
         tracing::info!(
             recovered_project_heads,
             "periodic recovery completed remote project-head reconciliations"
+        );
+    }
+    let recovered_worker_results = recover_durable_worker_result_pulls(state)
+        .await
+        .context("periodic hosted worker-result pull recovery")?;
+    if recovered_worker_results != 0 {
+        tracing::info!(
+            recovered_worker_results,
+            "periodic recovery completed hosted worker-result pulls"
         );
     }
     let recovered_source_handoffs =

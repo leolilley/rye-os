@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+use std::io::{Read as _, Write as _};
+
 use lillux::{
     CooperativeChildTermination, OutputLimitExceeded, SubprocessLimits, SubprocessRequest,
     configure_subprocess_limits, is_alive, kill, run, run_inherited_stdio, sealed_executable_memfd,
@@ -29,6 +31,7 @@ fn sh(args: &[&str]) -> SubprocessRequest {
         timeout: 30.0,
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     }
 }
@@ -58,6 +61,43 @@ fn run_can_preserve_argv0_while_executing_another_path() {
 
     assert!(result.success, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "/project/.venv/bin/python");
+}
+
+#[test]
+fn typed_duplex_channel_is_installed_at_its_exact_child_descriptor() {
+    let (mut parent, child) = lillux::inherited_duplex_channel_pair().unwrap();
+    let mut request = sh(&["-c", "printf mapped >&9"]);
+    child
+        .bind_to_subprocess_request(&mut request, "RYEOS_TEST_CHANNEL_FD", 9)
+        .unwrap();
+    assert!(request.envs.contains(&(
+        "RYEOS_TEST_CHANNEL_FD".to_owned(),
+        "9".to_owned()
+    )));
+    let result = run(request);
+    assert!(result.success, "{}", result.stderr);
+    let mut message = String::new();
+    parent.read_to_string(&mut message).unwrap();
+    assert_eq!(message, "mapped");
+}
+
+#[test]
+fn typed_duplex_channel_can_replace_child_standard_input_as_full_duplex() {
+    let (mut parent, child) = lillux::inherited_duplex_channel_pair().unwrap();
+    parent.write_all(b"mapped-zero\n").unwrap();
+    let mut request = sh(&["-c", "read value; printf '%s' \"$value\" >&0"]);
+    child
+        .bind_to_subprocess_request(&mut request, "RYEOS_TEST_CHANNEL_FD", 0)
+        .unwrap();
+    assert!(request.envs.contains(&(
+        "RYEOS_TEST_CHANNEL_FD".to_owned(),
+        "0".to_owned()
+    )));
+    let result = run(request);
+    assert!(result.success, "{}", result.stderr);
+    let mut message = String::new();
+    parent.read_to_string(&mut message).unwrap();
+    assert_eq!(message, "mapped-zero");
 }
 
 #[test]
@@ -413,7 +453,7 @@ fn sealed_memfd_fails_closed_off_linux() {
 #[cfg(target_os = "linux")]
 fn supervised_launcher_protocol_shell(script: &str, timeout: f64) -> SubprocessRequest {
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     // Like the real isolation launch, the mock target inherits the retained
     // wrapper's Lillux-owned session/process group. The status PID identifies
     // the target for accounting, while the wrapper keeps the shared PGID owned.
@@ -530,7 +570,7 @@ fn reported_target_exit_still_cleans_up_same_group_descendants() {
 #[cfg(target_os = "linux")]
 fn malformed_launcher_status_fails_closed_and_kills_wrapper() {
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     let wrapper_script = format!("printf 'not-json\\n' >&{status_fd}; sleep 30");
     let mut request = sh(&["-c", &wrapper_script]);
     request.envs = path_env();
@@ -550,9 +590,9 @@ fn malformed_launcher_status_fails_closed_and_kills_wrapper() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn bubblewrap_namespace_identity_fields_are_accepted_but_remain_closed() {
+fn launcher_namespace_identity_fields_are_accepted_but_remain_closed() {
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     let wrapper_script = format!(
         "sleep 30 & target=$!; printf '{{\"child-pid\":%s,\"ipc-namespace\":1,\"mnt-namespace\":2,\"net-namespace\":3,\"uts-namespace\":4}}\\n' \"$target\" >&{status_fd}; wait \"$target\""
     );
@@ -561,11 +601,11 @@ fn bubblewrap_namespace_identity_fields_are_accepted_but_remain_closed() {
     request.inherited_fds.push(status.writer);
     request.supervised_status = Some(status.reader);
 
-    let running = spawn(request).expect("known Bubblewrap status fields must be accepted");
+    let running = spawn(request).expect("known launcher status fields must be accepted");
     running.abort();
 
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     let wrapper_script =
         format!("printf '{{\"child-pid\":123,\"unexpected-namespace\":1}}\\n' >&{status_fd}");
     let mut request = sh(&["-c", &wrapper_script]);
@@ -602,7 +642,7 @@ fn launcher_stderr_is_retained_when_status_closes_before_target_identity() {
 #[cfg(target_os = "linux")]
 fn duplicate_launcher_status_keys_fail_closed() {
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     let wrapper_script =
         format!("printf '%s\\n' '{{\"child-pid\":123,\"child-pid\":124}}' >&{status_fd}; sleep 30");
     let mut request = sh(&["-c", &wrapper_script]);
@@ -624,7 +664,7 @@ fn duplicate_launcher_status_keys_fail_closed() {
 #[cfg(target_os = "linux")]
 fn nested_duplicate_launcher_status_keys_fail_closed() {
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     let wrapper_script = format!(
         "printf '%s\\n' '{{\"refused\":{{\"code\":\"one\",\"code\":\"two\"}}}}' >&{status_fd}; sleep 30"
     );
@@ -647,7 +687,7 @@ fn nested_duplicate_launcher_status_keys_fail_closed() {
 #[cfg(target_os = "linux")]
 fn typed_launcher_refusal_is_retained_without_starting_a_target() {
     let status = supervised_launcher_status_pipe().expect("status pipe");
-    let status_fd = status.writer_fd();
+    let status_fd = status.writer_descriptor().unwrap() as i32;
     let wrapper_script = format!(
         "printf '%s\\n' '{{\"refused\":{{\"code\":\"launch_refused\",\"message\":\"policy refused\",\"details\":{{}}}}}}' >&{status_fd}"
     );

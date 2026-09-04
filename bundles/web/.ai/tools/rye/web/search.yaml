@@ -3,6 +3,7 @@ category: "rye/web"
 version: "1.0.0"
 tool_type: "subprocess"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Search the web and return ranked result titles, URLs, and snippets"
 
 config:

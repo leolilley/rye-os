@@ -73,10 +73,17 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // absence is durable and may never be normalized into verified callback
 // authority during recovery.
 // v22 carries the flat captured node-policy provenance contract. v23 binds
-// remote adoption to the exact target-node operator grant generation.
+// remote adoption to the exact target-node operator grant generation. v24
+// carries admitted-launch capsule v20, which distinguishes standalone command
+// bytes from an executable member overlaid into its complete realization.
+// v25 carries admitted-launch capsule v21 and its required kind-projected
+// per-execution network ceiling.
+// v26 carries required filesystem/network ceilings in direct and managed
+// plans, intersected before admission, and explicit realization mount roots
+// in admitted capsule v22. Predecessor authority is never reinterpreted.
 // Predecessor authority remains opaque history rather than being interpreted
 // as current launch authority.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 23;
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 26;
 
 /// Per-thread daemon-owned state directory.
 ///
@@ -381,7 +388,8 @@ impl OriginalPushedHeadRef {
             ExecutionProvenance::Projectless { .. }
             | ExecutionProvenance::RootLiveProject { .. }
             | ExecutionProvenance::ChildLiveProject { .. }
-            | ExecutionProvenance::ChildPinnedGeneration { .. } => None,
+            | ExecutionProvenance::ChildPinnedGeneration { .. }
+            | ExecutionProvenance::ChildImmutableWorkspaceInput { .. } => None,
         }
     }
 }

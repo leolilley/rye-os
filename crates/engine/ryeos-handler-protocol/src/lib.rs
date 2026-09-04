@@ -404,6 +404,12 @@ pub struct LaunchPrepareSuccess {
     /// under the signed policy below; handlers cannot supply resolution bytes,
     /// trust, executable identity, or realization claims.
     pub execution_dependencies: BTreeMap<String, LaunchExecutionDependencyRequestWire>,
+    // Do not add deferred/child execution contexts here. A launch preparer
+    // describes the program this managed runtime is admitting now. Later
+    // child dispatches are ordinary RyeOS executions with their own resolved
+    // effective program, external realizations, capsule, and isolation
+    // authority. Retaining those here would create a parallel child-admission
+    // authority inside the parent capsule.
     /// Exact non-executable bound items selected by the kind-owned preparer
     /// to contribute retained external realizations to named execution
     /// dependencies. The generic launch layer resolves only an already
@@ -584,6 +590,10 @@ pub struct ValidateLaunchPreparerConfigRequest {
     pub secret_policy: LaunchSecretPolicyDeclWire,
     pub required_runtime_data: Vec<String>,
     pub runtime_facts: BTreeMap<String, RuntimeFactDeclWire>,
+    // This wire type mirrors the launch contract for the managed runtime being
+    // prepared. Keep future-child program/environment authority out of this
+    // mirror as well as `LaunchPrepareSuccess`; a protocol mirror must not
+    // become an accidental second admission surface.
     pub execution_dependencies: LaunchExecutionDependencyPolicyWire,
     /// Signed ceiling for already-bound non-executable content selected by
     /// the preparer. Kind/space/trust remain owned by `ref_bindings` and are

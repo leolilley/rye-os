@@ -2,6 +2,7 @@
 category: "ryeos/core/runtimes/python"
 version: "1.1.0"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Python function runtime - calls execute(params, project_path) and serializes result to stdout"
 
 env_config:

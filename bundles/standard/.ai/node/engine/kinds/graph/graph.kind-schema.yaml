@@ -64,6 +64,7 @@ execution:
   external_content:
     realization_derived: effective_external_realizations
     allowed_roots: [project_files]
+    allowed_mount_roots: [project]
     max_declarations: 4
   effective_validator:
     handler: handler:ryeos/core/graph-effective-validator

@@ -43,6 +43,7 @@ mod routing;
 #[cfg(feature = "crash-qualification-test-support")]
 mod runtime_phase_cut;
 mod transport;
+mod workload_client;
 
 #[cfg(test)]
 pub(crate) use routing::dispatch;
@@ -294,7 +295,15 @@ pub(crate) async fn dispatch_runtime_method(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing thread_id on {method}"))?;
         state.thread_auth.validate(tat, thread_id)?;
-        None
+        let token = params
+            .get("callback_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing callback_token on {method}"))?;
+        Some(
+            state
+                .callback_tokens
+                .validate_token_and_thread(token, thread_id)?,
+        )
     } else if matches!(
         method,
         "runtime.poll_input"
@@ -381,6 +390,10 @@ pub(crate) async fn dispatch_runtime_method(
             .assert_launch_owner(&cap.thread_id, owner)?;
     }
 
+    if let Some(cap) = callback_cap.as_ref() {
+        cap.runtime_method_surface.authorize(method)?;
+    }
+
     enforce_runtime_callback_admission(method, params, state)?;
 
     // Strip transport-level fields before typed deserialization so
@@ -389,7 +402,7 @@ pub(crate) async fn dispatch_runtime_method(
     let clean_params = strip_transport_fields(params);
 
     match method {
-        "runtime.dispatch_action" => {
+        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD => {
             ryeos_executor::execution::runtime_dispatch::handle(params, state).await
         }
         "runtime.spawn_follow_child" => {
@@ -631,7 +644,7 @@ fn is_running_runtime_mutation(method: &str) -> bool {
         method,
         "runtime.append_event"
             | "runtime.append_events"
-            | "runtime.dispatch_action"
+            | ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD
             | "runtime.spawn_follow_child"
             | "runtime.request_continuation"
             | "runtime.author_item"
@@ -695,7 +708,7 @@ fn is_sensitive_runtime_read_method(method: &str) -> bool {
 fn is_thread_auth_method(method: &str) -> bool {
     matches!(
         method,
-        "runtime.dispatch_action" | "runtime.spawn_follow_child"
+        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD | "runtime.spawn_follow_child"
     )
 }
 
@@ -5297,6 +5310,51 @@ mod tests {
                 || err.message.contains("thread auth")
                 || err.message.contains("thread_auth"),
             "expected invalid-thread-auth error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_callback_method_surface_is_enforced_before_runtime_routing() {
+        let (_tmp, state) = setup_app_state();
+        create_running_test_thread(&state, "T-method-surface");
+        let cbt = generate_test_callback(
+            &state,
+            "T-method-surface",
+            std::path::PathBuf::from("/p"),
+            std::time::Duration::from_secs(300),
+            vec!["*".to_string()],
+            test_provenance(&state, "/p"),
+            "0".repeat(64),
+        );
+        assert!(
+            state
+                .callback_tokens
+                .restrict_runtime_methods(
+                    &cbt.token,
+                    ryeos_app::callback_token::CallbackRuntimeMethodSurface::exact(vec![
+                        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD.to_owned(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap()
+        );
+
+        let response = dispatch(
+            rpc(
+                "runtime.vault_get",
+                json!({
+                    "callback_token": cbt.token,
+                    "thread_id": "T-method-surface",
+                }),
+            ),
+            &state,
+        )
+        .await;
+        let error = rpc_err(&response);
+        assert!(
+            error
+                .message
+                .contains("does not authorize runtime method `runtime.vault_get`")
         );
     }
 

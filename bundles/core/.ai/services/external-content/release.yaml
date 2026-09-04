@@ -3,5 +3,5 @@ kind: service
 endpoint: external-content.release
 required_caps: ["ryeos.execute.service.external-content/release"]
 schema:
-  binding_id: string
+  binding_subject_id: string
 description: "Release a permanent external-content consumer binding for future launch admission"

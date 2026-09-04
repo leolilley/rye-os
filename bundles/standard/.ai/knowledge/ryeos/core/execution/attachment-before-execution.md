@@ -42,9 +42,8 @@ the other.
   attachment-required launch. RyeOS never silently falls back to a different
   process or execution mode.
 
-Bubblewrap is optional. No bundle name, backend name, helper binary, binary
-reference, PATH lookup, or package layout is foundational to durable process
-ownership.
+No bundle name, backend name, helper binary, binary reference, PATH lookup, or
+package layout is foundational to durable process ownership.
 
 ## Ownership split
 

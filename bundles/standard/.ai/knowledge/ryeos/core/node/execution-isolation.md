@@ -2,7 +2,7 @@
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.7.0"
+version: "1.8.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -20,9 +20,11 @@ variables cannot activate isolation or weaken its controls.
 The engine resolves typed isolation requirements against signed backend
 declarations and live inspected capabilities. It emits a strict backend-neutral
 plan; the selected adapter owns backend-specific inspection and launch
-compilation. RyeOS does not ship or select an isolation backend by default.
+compilation. Core ships the self-contained `linux-lillux` implementation as
+available signed data, but no ordinary init profile selects a backend or
+enables enforcement by default.
 
-Durable execution workspaces use the isolation-adapter v3 contract. RyeOS owns
+Durable execution workspaces use the isolation-adapter v4 contract. RyeOS owns
 one canonical private `project/` generation. Disabled/native execution creates
 no other workspace directory and uses Lillux descriptor-relative filesystem
 mechanics directly. Enforced execution additionally grants the selected signed
@@ -36,9 +38,14 @@ relative content-root name below its still-pinned opaque state authority. RyeOS
 opens that returned root without following links and verifies each regular
 file's mode, size, and content digest before admitting bytes to CAS. Thus
 publication remains backend-neutral without granting the adapter CAS or project
-HEAD authority. The v3/root-identity cut is runtime database epoch 11; older
+HEAD authority. The v4 contract additionally permits a self-contained adapter
+with no external artifact roles, requires an explicit PID-namespace choice,
+and carries a bounded, sorted collection of typed target channels. Predecessor
 workspace journals require the explicit runtime-history retirement ceremony and
-are never reinterpreted.
+are never reinterpreted. Each channel has one exact child descriptor and hidden
+environment binding in both disabled and enforced modes; fd 0 is a deliberate
+full-duplex primary channel, not a sentinel. Parent protocol code retains a
+typed Lillux byte-stream endpoint and never recovers a raw Unix socket.
 
 The engine also keeps node trust separate from project/request trust. The
 `node_trust_store` is loaded only from persistent node configuration and is the
@@ -61,6 +68,9 @@ The policy has two modes:
   retained filesystem bindings keeps the ordinary live project path. This input
   delivery is not a substitute for OS isolation: disabled mode still provides no
   confinement from other host paths visible to the process.
+  A signed captured-filesystem or isolated-network requirement refuses in
+  this mode. Execution-runtime-root realizations also refuse: only project-
+  root realizations support the private-copy input delivery described above.
 - `mode: enforce` applies the complete policy and refuses the launch if any
   requested control cannot be enforced.
 
@@ -163,6 +173,21 @@ Missing required sections, malformed YAML, invalid paths or wildcard forms,
 and unsupported values are errors even when disabled. Disabled mode skips
 backend availability and OS-confinement controls, not node-owned output caps.
 
+## Per-execution network ceiling
+
+The node policy remains the maximum network authority. A signed kind schema may
+also declare a mechanical composed-value projection whose closed result is
+`node_policy` or `isolated`. Plan compilation freezes that result into the
+serialized execution plan. Launch then intersects the plan ceiling with the
+independently admitted parent/engine ceiling; `isolated` is absorbing, so no
+later runtime, wrapper, provider, or caller can widen it.
+
+The Tool kind projects its optional `network_authority` field and deliberately
+declares `node_policy` as the omission result. Development build and test items
+author `isolated`; ordinary tools keep their existing node ceiling. Generic
+dispatch reads only the signed projection declaration and closed vocabulary—it
+does not branch on a tool name, compiler, worker, or provider.
+
 ## Generation admission
 
 Daemon bootstrap holds the node-wide bundle-registry mutation lock from its
@@ -255,6 +280,10 @@ serializes content-address checks, quota accounting, and publication, so
 concurrent launches cannot race the configured unique-file, per-file-byte, or
 aggregate-byte bounds. The default bounds are 4,096 artifacts, 64 MiB per
 artifact, and 256 MiB total. The backend capture consumes the same budget.
+Lillux owns its process-scoped flat generation, advisory lifetime/cleanup
+locks, host-clock/process naming, stale-generation collection, permissions,
+and exact descriptor-relative teardown; the engine owns only artifact meaning,
+hash verification, and policy quotas.
 
 Exact-byte authority applies to the verified entry file and any captured
 non-system executable. The surrounding project or bundle mirror remains a live
@@ -285,16 +314,16 @@ a strict typed plan and no ambient target environment. The request is stored in
 an immutable sealed anonymous file, and `TMPDIR` is normalized to `/tmp` in the
 target environment.
 
-The namespace uses a private root and new user, IPC, and UTS namespaces. An
-isolated network policy also creates a network namespace; host mode deliberately
-keeps host networking. RyeOS retains the host PID namespace because managed
-runtimes attach their PID to the daemon and host-side PGID cancellation and
-restart reconciliation must address the same process identifiers. The namespace
-contains an empty `/proc` directory rather than the host procfs: exposing the
-host mount would let a same-UID workload traverse another process's `root`,
-`cwd`, or `fd` links and bypass the selected filesystem surface. PID syscalls
-still use host identifiers, and the isolation does not claim PID or same-UID
-signal isolation.
+The native Lillux backend uses a private root and new user, mount, PID, IPC, and
+UTS namespaces. An isolated network plan also creates a network namespace; host
+mode deliberately keeps host networking. The sandbox target is PID 1 inside
+its namespace, while the adapter reports its exact host PID to daemon lifecycle
+ownership. The namespace contains an empty `/proc` directory rather than the
+host procfs: exposing the host mount would let a same-UID workload traverse
+another process's `root`, `cwd`, or `fd` links and bypass the selected
+filesystem surface. Ordinary signal syscalls remain available for sandbox
+descendants; namespace PID translation prevents them from naming host
+processes.
 
 Process attachment is orthogonal to this isolation mode. Every daemon-owned
 launch is created awaiting attachment, its exact target identity is persisted,
@@ -304,6 +333,13 @@ holds its actual target and reports that target's host PID through the strict
 isolation protocol. A supervised request without the requested target hold is
 rejected; there is no fallback to wrapper identity or direct execution.
 
+Workspace freeze uses the same ownership split. RyeOS retains the durable
+execution coordinate, while Lillux exclusively performs exact-group stop,
+procfs membership enumeration, birth verification, pidfd retention, resume or
+termination, and bounded settle waits. No workspace-freeze executor or daemon
+caller supplies raw signal numbers or treats a numeric PID/PGID as process
+authority.
+
 Lillux creates a new session before it executes the adapter, and the target
 inherits the retained wrapper's process group. The wrapper remains unreaped
 while Lillux terminates that group, which keeps the PGID reserved even if the
@@ -311,8 +347,8 @@ initial target exits while descendants are still running. Timeout,
 cancellation, output overflow, attachment failure, release failure, and wait
 failure all use that stable group ownership. A descendant that deliberately
 creates another session remains outside this local process-group guarantee;
-hostile hosted workers additionally use `cgroup.kill` at the outer worker
-boundary.
+hostile aggregate containment requires the separately delegated cgroup-v2 or
+VM boundary described below and is not claimed by this native backend.
 
 Offline tools that inherit terminal stdin/stdout/stderr use the same Lillux
 session, target-status, timeout, group-cleanup, and refusal contract. They do
@@ -411,8 +447,8 @@ environment, open-file, captured-output, and verified-artifact-limit posture.
 The published container runs the default disabled profile without extra
 capabilities. Enforce mode requires a separately installed selected signed
 backend bundle and every host facility needed by its declared capabilities.
-Setuid, setgid, and file-capability adapter or launcher artifacts are refused,
-and verified bytes execute from sealed private captures.
+Setuid, setgid, and file-capability adapter or external artifact executables are
+refused, and verified bytes execute from sealed private captures.
 The supported Docker profile adds `SYS_ADMIN` and uses unconfined seccomp and
 AppArmor profiles for the required namespace and mount operations. A
 purpose-built AppArmor profile may replace `apparmor=unconfined` when it grants
@@ -423,9 +459,10 @@ access, the target environment, and open file descriptors. It is not a virtual
 machine, does not defend against kernel vulnerabilities, and does not yet set
 CPU, memory, or per-isolation process quotas. Do not model a process quota with
 `RLIMIT_NPROC`: it is scoped to the daemon's real UID rather than one isolation.
-Host PIDs remain visible to syscalls, same-UID signal isolation is not claimed,
-and transitive imports, libraries, and assets remain live read-only rather than
-content-pinned.
+The native backend does not yet claim aggregate cgroup resource containment;
+requests for aggregate CPU, memory, or process ceilings fail closed until a
+typed delegated cgroup-v2 authority is carried into Lillux. Transitive imports,
+libraries, and assets remain live read-only unless separately content-pinned.
 Disabled means no OS isolation, not unverified execution; resolution, signature,
 authorization, and capability checks remain active.
 

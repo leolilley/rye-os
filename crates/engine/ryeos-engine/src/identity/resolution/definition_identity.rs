@@ -1342,6 +1342,7 @@ mod tests {
                 "manifest_hash": manifest.to_string().repeat(64),
                 "entry_count": 1,
                 "total_bytes": 1,
+                "mount_root": "project",
                 "mount": "vendor/sim"
             }])
         };
@@ -1421,6 +1422,7 @@ mod tests {
                 "manifest_hash": manifest.to_string().repeat(64),
                 "entry_count": 1,
                 "total_bytes": 1,
+                "mount_root": "project",
                 "mount": format!("vendor/{id}")
             })
         };

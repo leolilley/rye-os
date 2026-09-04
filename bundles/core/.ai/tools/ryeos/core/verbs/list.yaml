@@ -2,6 +2,7 @@
 # version: "1.0.0"
 category: "ryeos/core/verbs"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "List all known verbs and their aliases from installed bundles"
 
 config:

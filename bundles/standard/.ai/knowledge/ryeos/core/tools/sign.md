@@ -44,6 +44,7 @@ external_content:
       root: project_files
       path: data/training
     mode: pinned
+    mount_root: project
     mount: data/training
 ```
 

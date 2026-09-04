@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::ItemSpace;
 
 pub use ryeos_state::objects::{
+    ExternalContentMountRoot,
     EXTERNAL_CONTENT_MANIFEST_KIND, EXTERNAL_CONTENT_TREE_SCHEMA,
     EXTERNAL_REALIZATIONS_DERIVED_KEY, ExternalContentKind,
     ExternalContentManifestEntry as ManifestEntry, ExternalContentManifestEntryKind,
@@ -21,6 +22,41 @@ pub use ryeos_state::objects::{
 pub const MAX_DECLARATIONS_PER_ITEM: usize = 8;
 pub const MAX_EXCLUDES_PER_DECLARATION: usize = 32;
 pub const MAX_ENTRY_PATH_BYTES: usize = ryeos_state::objects::MAX_EXTERNAL_CONTENT_PATH_BYTES;
+
+/// Signed runtime-command selector for one executable member of an already
+/// admitted external realization. This is deliberately a selector rather
+/// than a pathname: daemon admission resolves it from the child's own exact
+/// realization set and records the manifest/member coordinate in the admitted
+/// direct-command closure before thread birth. After the complete tree is
+/// materialized, isolation retains the exact member descriptor and overlays
+/// it at that tree-relative path. It does not name a parent prepared-launch
+/// dependency and must never be resolved through host `PATH`.
+pub const REALIZATION_COMMAND_PREFIX: &str = "realization:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalRealizationCommandRef {
+    pub realization_id: String,
+    pub relative_path: String,
+}
+
+pub fn parse_realization_command_ref(
+    value: &str,
+) -> anyhow::Result<Option<ExternalRealizationCommandRef>> {
+    let Some(remainder) = value.strip_prefix(REALIZATION_COMMAND_PREFIX) else {
+        return Ok(None);
+    };
+    let (realization_id, relative_path) = remainder.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!(
+            "realization command must be `{REALIZATION_COMMAND_PREFIX}<id>/<relative-path>`"
+        )
+    })?;
+    validate_declaration_id(realization_id)?;
+    validate_relative_path("realization command member", relative_path)?;
+    Ok(Some(ExternalRealizationCommandRef {
+        realization_id: realization_id.to_owned(),
+        relative_path: relative_path.to_owned(),
+    }))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclaringAuthority<'a> {
@@ -119,6 +155,7 @@ pub struct ExternalContentDeclaration {
     pub exclude: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_hint: Option<String>,
+    pub mount_root: ExternalContentMountRoot,
     pub mount: String,
 }
 
@@ -249,7 +286,7 @@ fn validate_declaration_collection(
         if !ids.insert(declaration.id.as_str()) {
             anyhow::bail!("external content id `{}` is duplicated", declaration.id);
         }
-        if !mounts.insert(declaration.mount.as_str()) {
+        if !mounts.insert((declaration.mount_root, declaration.mount.as_str())) {
             anyhow::bail!(
                 "external content mount `{}` is duplicated",
                 declaration.mount
@@ -259,8 +296,8 @@ fn validate_declaration_collection(
     let mounts = mounts.into_iter().collect::<Vec<_>>();
     for (index, left) in mounts.iter().enumerate() {
         for right in mounts.iter().skip(index + 1) {
-            if path_contains(left, right) || path_contains(right, left) {
-                anyhow::bail!("external content mounts `{left}` and `{right}` overlap");
+            if left.0 == right.0 && (path_contains(left.1, right.1) || path_contains(right.1, left.1)) {
+                anyhow::bail!("external content mounts `{left:?}` and `{right:?}` overlap");
             }
         }
     }
@@ -313,6 +350,12 @@ fn validate_kind_contract(
         );
     }
     for declaration in declarations {
+        if !contract.allowed_mount_roots.contains(&declaration.mount_root) {
+            anyhow::bail!(
+                "external content `{}` names mount root {:?} which its signed kind does not permit",
+                declaration.id, declaration.mount_root,
+            );
+        }
         if let Some(locator) = &declaration.locator
             && !contract
                 .allowed_roots
@@ -347,6 +390,33 @@ pub fn declaring_authority(
             space.as_str()
         ),
     }
+}
+
+/// Identity of a fully resolved consumer immediately before external
+/// realizations are inserted into its effective view.
+///
+/// Project external-content bindings and launch admission both use this
+/// helper. Keeping the derivation here prevents either caller from inventing
+/// a parallel projection. A post-realization input is rejected because the
+/// resulting digest would recursively depend on the binding being selected.
+pub fn pre_external_realization_consumer_digest(
+    resolution: &crate::resolution::ResolutionOutput,
+) -> anyhow::Result<String> {
+    if resolution
+        .composed
+        .derived
+        .contains_key(EXTERNAL_REALIZATIONS_DERIVED_KEY)
+    {
+        anyhow::bail!(
+            "external-content consumer identity must be derived before realization admission"
+        );
+    }
+    resolution
+        .effective_definition_digest()
+        .map(|digest| digest.as_str().to_owned())
+        .map_err(|error| {
+            anyhow::anyhow!("derive pre-realization external-content consumer identity: {error}")
+        })
 }
 
 fn validate_relative_path(label: &str, value: &str) -> anyhow::Result<()> {
@@ -405,9 +475,25 @@ mod tests {
         crate::kind_registry::KindExternalContentDecl {
             realization_derived: EXTERNAL_REALIZATIONS_DERIVED_KEY.to_owned(),
             allowed_roots: roots.iter().map(|value| (*value).to_owned()).collect(),
+            allowed_mount_roots: vec![ExternalContentMountRoot::Project],
             max_declarations: max,
             large_content: None,
         }
+    }
+
+    #[test]
+    fn realization_command_ref_is_a_canonical_declaration_member_selector() {
+        let parsed = parse_realization_command_ref("realization:toolchain/bin/rustc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.realization_id, "toolchain");
+        assert_eq!(parsed.relative_path, "bin/rustc");
+        assert!(parse_realization_command_ref("/usr/bin/rustc")
+            .unwrap()
+            .is_none());
+        assert!(parse_realization_command_ref("realization:toolchain/../rustc").is_err());
+        assert!(parse_realization_command_ref("realization:toolchain").is_err());
+        assert!(parse_realization_command_ref("realization:/bin/rustc").is_err());
     }
 
     #[test]
@@ -448,6 +534,7 @@ mod tests {
             "kind": "tree",
             "locator": {"root": "node_files", "path": "fixture"},
             "mode": "captured",
+            "mount_root": "project",
             "mount": "fixture"
         }]});
         assert!(
@@ -461,6 +548,20 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mount_requires_explicit_signed_kind_permission() {
+        let mut value = serde_json::json!({"external_content": [{
+            "id": "platform", "kind": "tree", "mode": "pinned",
+            "digest": "a".repeat(64), "mount_root": "execution_runtime", "mount": "platform"
+        }]});
+        let mut policy = contract(&[], 1);
+        assert!(declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_err());
+        policy.allowed_mount_roots.push(ExternalContentMountRoot::ExecutionRuntime);
+        assert!(declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_ok());
+        value["external_content"][0].as_object_mut().unwrap().remove("mount_root");
+        assert!(declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_err());
+    }
+
+    #[test]
     fn empty_allowed_roots_accepts_only_locator_free_pins() {
         let digest = "a".repeat(64);
         let locator_free = serde_json::json!({"external_content": [{
@@ -468,6 +569,7 @@ mod tests {
             "kind": "file",
             "mode": "pinned",
             "digest": digest,
+            "mount_root": "project",
             "mount": "bin/fixture"
         }]});
         assert!(
@@ -485,6 +587,7 @@ mod tests {
             "locator": {"root": "bundle:fixture", "path": "bin/fixture"},
             "mode": "pinned",
             "digest": "a".repeat(64),
+            "mount_root": "project",
             "mount": "bin/fixture"
         }]});
         assert!(
@@ -505,6 +608,7 @@ mod tests {
             "locator": {"root": "project_files", "path": "vendor/fixture"},
             "mode": "pinned",
             "digest": "PENDING_FIXTURE_DIGEST",
+            "mount_root": "project",
             "mount": "vendor/fixture"
         }]});
         assert!(
@@ -524,6 +628,7 @@ mod tests {
             "kind": "tree",
             "locator": {"root": "project_files", "path": "vendor/fixture"},
             "mode": "pinned",
+            "mount_root": "project",
             "mount": "vendor/fixture"
         }]});
         assert!(

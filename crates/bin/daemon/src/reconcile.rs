@@ -1118,6 +1118,8 @@ async fn reconcile_active_threads_inner(
         }
         reconcile_dedicated_worker_startup(state).await?;
     }
+    let blocked_workspace_operations =
+        reconcile_runtime_workspace_operations_before_thread_recovery(state, mode)?;
     repair_detached_runtime_action_links(state)?;
     reconcile_accounting(state)?;
     let blocked_freezes = reconcile_execution_workspaces(state, mode)?;
@@ -1235,6 +1237,14 @@ async fn reconcile_active_threads_inner(
             tracing::error!(
                 thread_id = %thread.thread_id,
                 "thread remains quarantined until its journaled workspace freeze can be recovered"
+            );
+            continue;
+        }
+        if blocked_workspace_operations.contains(&thread.thread_id) {
+            tracing::error!(
+                thread_id = %thread.thread_id,
+                chain_root_id = %thread.chain_root_id,
+                "hosted root remains fenced until its durable workspace operation and exact child process settle"
             );
             continue;
         }
@@ -2075,10 +2085,75 @@ async fn reconcile_active_threads_inner(
         resume_intents = intents.len(),
         "reconciled orphaned threads"
     );
+    if mode == ActiveReconcileMode::Startup {
+        // Generic child reconciliation above owns thread/process settlement.
+        // Only dead-generation startup recovery may release an operation here:
+        // a live pass cannot distinguish a short pre-child/quiesced interval
+        // from an abandoned async handler and must not steal its process-group
+        // authority. A later startup pass may then resume the root without
+        // racing a current-daemon callback task.
+        for intent in state.state_store.runtime_action_intents()? {
+            if intent.workspace_operation.as_ref().is_some_and(|operation| {
+                operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
+            }) && state
+                .state_store
+                .settle_runtime_workspace_operation(&intent.operation_id)?
+            {
+                tracing::warn!(
+                    operation_id = %intent.operation_id,
+                    chain_root_id = %intent.chain_root_id,
+                    "released recovered shared-workspace operation after exact child settlement"
+                );
+            }
+        }
+    }
     Ok(ActiveThreadReconcileReport {
         active_thread_ids,
         resume_intents: intents,
     })
+}
+
+/// Fence every non-released shared-workspace operation before ordinary root
+/// recovery. Old hosted workers have already been killed by
+/// `reconcile_dedicated_worker_startup`; existing child links/process rows own
+/// descendant cleanup. Never add a parallel lease/child recovery table here.
+fn reconcile_runtime_workspace_operations_before_thread_recovery(
+    state: &AppState,
+    mode: ActiveReconcileMode,
+) -> Result<BTreeSet<String>> {
+    let mut blocked_roots = BTreeSet::new();
+    for intent in state.state_store.runtime_action_intents()? {
+        let Some(operation) = intent.workspace_operation.as_ref() else {
+            continue;
+        };
+        if operation.phase == ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released {
+            continue;
+        }
+        blocked_roots.insert(intent.first_caller_thread_id.clone());
+        if mode == ActiveReconcileMode::Live {
+            // The current-daemon callback task owns any exact stopped-process
+            // handle. Even an absent child is legal between reservation and
+            // launch, so a periodic pass has no authority to release this row.
+            continue;
+        }
+        if mode == ActiveReconcileMode::Startup
+            && let Some(child) = state.state_store.get_thread(&intent.child_thread_id)?
+            && !ryeos_app::state_store::is_terminal_status(&child.status)
+        {
+            let _ = ryeos_app::cascade::stop_thread_and_descendants(
+                state,
+                &intent.child_thread_id,
+                ryeos_app::cascade::CascadeMode::Hard,
+            )?;
+        }
+        if state
+            .state_store
+            .settle_runtime_workspace_operation(&intent.operation_id)?
+        {
+            blocked_roots.remove(&intent.first_caller_thread_id);
+        }
+    }
+    Ok(blocked_roots)
 }
 
 /// Staged hosted-worker startup recovery. Old workers stop before root replay
@@ -2371,6 +2446,14 @@ fn repair_detached_runtime_action_links(state: &AppState) -> Result<()> {
         if intent.mode != ryeos_app::runtime_db::RuntimeActionMode::Detached {
             continue;
         }
+        if intent.workspace_operation.as_ref().is_some_and(|operation| {
+            operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
+        }) {
+            // Workspace-operation recovery owns cancellation/settlement. The
+            // generic detached replay path must never relaunch a child while
+            // its parent root remains fenced by the same durable intent.
+            continue;
+        }
         if let Some(incompatible) = &intent.incompatible_launch_metadata {
             tracing::warn!(
                 operation_id = %intent.operation_id,
@@ -2575,22 +2658,13 @@ fn reconcile_execution_workspaces(
                 .is_some_and(|thread| matches!(thread.status.as_str(), "created" | "running"));
             if nonterminal_owner && !owner_was_replaced {
                 let identity = runtime_identity.as_ref().or(recorded_identity.as_ref());
-                let mut quiesced_members = Vec::new();
+                let mut quiesced_group = None;
                 if liveness == IdentityLiveness::Alive {
                     let identity = identity.expect("alive liveness implies process identity");
-                    let stopped = if ryeos_app::process::signal_exact_group(identity, libc::SIGSTOP)
-                        == ryeos_app::process::SignalResult::Delivered
-                    {
-                        ryeos_app::process::wait_for_exact_group_quiesced(
-                            identity,
-                            std::time::Duration::from_secs(2),
-                        )
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "exact process-group stop was not delivered"
-                        ))
-                    };
-                    let Ok(members) = stopped else {
+                    let Ok(authority) = ryeos_app::process::quiesce_exact_process_group(
+                        identity,
+                        lillux::time::Duration::from_secs(2),
+                    ) else {
                         if let Some(thread_id) = workspace.thread_id.as_ref() {
                             blocked_freezes.insert(thread_id.clone());
                         }
@@ -2600,7 +2674,7 @@ fn reconcile_execution_workspaces(
                         );
                         continue;
                     };
-                    quiesced_members = members;
+                    quiesced_group = Some(authority);
                 } else if liveness == IdentityLiveness::Unavailable {
                     if let Some(thread_id) = workspace.thread_id.as_ref() {
                         blocked_freezes.insert(thread_id.clone());
@@ -2615,11 +2689,10 @@ fn reconcile_execution_workspaces(
                     state, &workspace,
                 ) {
                     Ok(snapshot_hash) => {
-                        if !quiesced_members.is_empty() {
-                            ryeos_app::process::terminate_exact_processes(
-                                &quiesced_members,
-                                std::time::Duration::from_secs(2),
-                            )?;
+                        if let Some(authority) = quiesced_group.take() {
+                            authority
+                                .terminate(lillux::time::Duration::from_secs(2))
+                                .map_err(anyhow::Error::msg)?;
                         }
                         tracing::warn!(
                             workspace_id = %workspace.workspace_id,

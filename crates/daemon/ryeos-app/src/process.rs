@@ -623,120 +623,34 @@ pub fn signal_exact_group(identity: &ExecutionProcessIdentity, signal: i32) -> S
     }
 }
 
-/// After delivering `SIGSTOP`, prove that every member of the exact pinned
-/// process group has entered a stopped (or terminal zombie) state. Signal
-/// delivery alone is not a freeze barrier: a runnable member may not yet have
-/// observed the signal when workspace bytes are scanned.
-pub fn wait_for_exact_group_quiesced(
+/// Stop the exact execution group and retain a descriptor-pinned Lillux
+/// authority only after every live member has crossed the stop barrier.
+/// Application code supplies durable coordinates; Lillux exclusively owns
+/// procfs enumeration, pidfds, signals, clocks, and settle waits.
+pub fn quiesce_exact_process_group(
     identity: &ExecutionProcessIdentity,
-    timeout: Duration,
-) -> Result<Vec<ExecutionProcessIdentity>> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (identity, timeout);
-        anyhow::bail!("exact process-group quiescence is unavailable on this platform");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _pinned = pin_group_leader(identity)
-            .map_err(|error| anyhow::anyhow!("cannot pin execution group: {error:?}"))?;
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(std::time::Instant::now);
-        loop {
-            let mut members = Vec::new();
-            let mut observed_members = 0_usize;
-            let mut runnable = false;
-            for entry in std::fs::read_dir("/proc").context("enumerate process group")? {
-                let entry = entry?;
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|value| value.parse::<i64>().ok())
-                else {
-                    continue;
-                };
-                match read_process_stat(pid) {
-                    Ok(stat) if stat.pgrp == identity.pgid() => {
-                        observed_members += 1;
-                        if matches!(stat.state, 'T' | 't') {
-                            members.push(ExecutionProcessIdentity {
-                                schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
-                                boot_id: identity.boot_id.clone(),
-                                target_pid: pid,
-                                target_start_time_ticks: stat.start_time_ticks,
-                                group_leader_pid: identity.group_leader_pid,
-                                group_leader_start_time_ticks: identity
-                                    .group_leader_start_time_ticks,
-                            });
-                        }
-                        runnable |= !matches!(stat.state, 'T' | 't' | 'Z' | 'X');
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error).context("inspect process-group member"),
-                }
-            }
-            if observed_members > 0 && !runnable {
-                // Every nonterminal member remains stopped while this list is
-                // captured, so none can fork between the barrier proof and
-                // this identity snapshot. Terminal zombies need no later
-                // signal; stopped identities remain independently resumable
-                // if the group leader exits.
-                members.sort_by_key(|member| member.target_pid);
-                return Ok(members);
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "execution group {} did not reach a provable stopped state",
-                    identity.pgid()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-}
-
-/// Terminate a previously quiesced, descriptor-identified member set and
-/// prove every exact incarnation is gone. This remains safe after group-leader
-/// death because each signal is delivered through that member's own pidfd.
-pub fn terminate_exact_processes(
-    identities: &[ExecutionProcessIdentity],
-    timeout: Duration,
-) -> Result<()> {
-    for identity in identities {
-        match signal_exact_target(identity, libc::SIGKILL) {
-            SignalResult::Delivered | SignalResult::AlreadyDead | SignalResult::StaleIdentity => {}
-            outcome => anyhow::bail!(
-                "cannot terminate exact process {}: {}",
-                identity.target_pid,
-                outcome.as_str()
-            ),
-        }
-    }
-    let deadline = std::time::Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(std::time::Instant::now);
-    loop {
-        let mut live = Vec::new();
-        for identity in identities {
-            match execution_liveness(identity) {
-                IdentityLiveness::DeadOrStale => {}
-                IdentityLiveness::Alive => live.push(identity.target_pid),
-                IdentityLiveness::Unavailable => anyhow::bail!(
-                    "liveness became unavailable for exact process {}",
-                    identity.target_pid
-                ),
-            }
-        }
-        if live.is_empty() {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("exact processes did not terminate before timeout: {live:?}");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    timeout: lillux::time::Duration,
+) -> Result<lillux::QuiescedProcessGroup> {
+    validate_execution_process_identity_shape(identity)?;
+    let target_pid = u32::try_from(identity.target_pid)
+        .context("exact execution target PID is outside the Lillux coordinate range")?;
+    let target_start_time_ticks = u64::try_from(identity.target_start_time_ticks)
+        .context("exact execution target birth is outside the Lillux coordinate range")?;
+    let group_leader_pid = u32::try_from(identity.group_leader_pid)
+        .context("exact execution group leader is outside the Lillux coordinate range")?;
+    let group_leader_start_time_ticks = u64::try_from(identity.group_leader_start_time_ticks)
+        .context("exact execution group birth is outside the Lillux coordinate range")?;
+    lillux::quiesce_exact_process_group(
+        &lillux::ExactProcessIdentity {
+            boot_id: identity.boot_id.clone(),
+            target_pid,
+            target_start_time_ticks,
+            group_leader_pid,
+            group_leader_start_time_ticks,
+        },
+        timeout,
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 /// Whether the persisted target still names the exact live incarnation.

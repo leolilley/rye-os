@@ -3,6 +3,7 @@ version: "0.1.0"
 category: "ryeos/central-auth"
 name: "revoke-session"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 required_caps: ["ryeos.execute.tool.ryeos.central-auth.revoke-session"]
 description: "Revoke one session token."
 

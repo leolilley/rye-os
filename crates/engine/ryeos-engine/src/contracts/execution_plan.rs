@@ -199,14 +199,16 @@ pub struct EngineContext {
     pub isolation_node_trusted_keys_dir: Option<PathBuf>,
     pub isolation_verified_code: Vec<crate::isolation::IsolationVerifiedCode>,
     /// Exact already-open command authority for an admitted direct plan.
-    /// When present it must match the plan's serialized verified-command
-    /// identity; dispatch never reopens that command by pathname.
-    pub isolation_verified_command: Option<crate::isolation::IsolationDescriptorBoundCommand>,
+    /// It is either standalone immutable bytes or one member paired with its
+    /// complete pinned realization-tree authority. When present it must match
+    /// the plan's serialized verified-command identity; dispatch never reopens
+    /// that command by pathname.
+    pub isolation_verified_command: Option<crate::isolation::IsolationAdmittedCommand>,
     pub isolation_external_read_only_mounts: Vec<crate::isolation::IsolationReadOnlyMountAuthority>,
-    /// One daemon-created connected duplex channel with a signed target
-    /// environment binding. This is deliberately distinct from generic
-    /// inherited descriptors and cannot be supplied as a raw fd.
-    pub isolation_target_channel: Option<crate::isolation::IsolationTargetChannelAuthority>,
+    /// Daemon-created connected duplex channels with exact target-descriptor
+    /// and environment bindings. These are deliberately distinct from generic
+    /// inherited descriptors and cannot be supplied as raw file descriptors.
+    pub isolation_target_channels: Vec<crate::isolation::IsolationTargetChannelAuthority>,
     /// Explicit daemon-owned execution workspace used only by isolation.
     /// This does not change item-resolution authority or project semantics;
     /// it gives projectless admitted mechanics (for example a persistent
@@ -477,6 +479,13 @@ pub struct ExecutionPlan {
     pub entrypoint: PlanNodeId,
     pub capabilities: PlanCapabilities,
     pub materialization_requirements: Vec<MaterializationRequirement>,
+    /// Kind-schema-projected ceiling captured from the complete composed
+    /// subject. Launch intersects this with its independently admitted parent
+    /// ceiling; neither side can widen the other.
+    pub network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
+    /// Signed filesystem projection, frozen alongside networking. This is
+    /// required in serialized authority; predecessor plans are not reinterpreted.
+    pub filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     pub cache_key: String,
     /// Daemon supervision profile hint, derived from the root item's kind.
     #[serde(default)]

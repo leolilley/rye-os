@@ -109,6 +109,7 @@ pub(crate) fn run_handler_subprocess(
         timeout: timeout.as_secs_f64(),
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     };
 
@@ -135,7 +136,7 @@ pub(crate) fn run_handler_subprocess(
             verified_code: &verified_code,
             verified_command: Some(&verified_code[0]),
             external_read_only_mounts: &[],
-            target_channel: None,
+            target_channels: &[],
             item_ref: &canonical_ref,
             thread_id: "handler",
         },

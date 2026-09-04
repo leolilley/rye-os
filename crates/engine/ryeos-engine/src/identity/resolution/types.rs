@@ -1334,6 +1334,7 @@ mod tests {
                 "manifest_hash": "a".repeat(64),
                 "entry_count": 1,
                 "total_bytes": 5,
+                "mount_root": "project",
                 "mount": "vendor/sim"
             }]),
         );

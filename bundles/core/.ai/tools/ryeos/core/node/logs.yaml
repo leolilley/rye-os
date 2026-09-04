@@ -2,6 +2,7 @@
 category: "ryeos/core/node"
 name: "logs"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 required_caps: []
 description: "Tail the local node's trace events and startup stderr from the app root."
 

@@ -32,10 +32,11 @@ The current clean-cut execution formats include:
 - sealed root execution request schema 13;
 - thread snapshot schema 11;
 - project snapshot schema 5;
-- admitted launch capsule schema 18;
-- runtime launch metadata epoch 23;
+- admitted launch capsule schema 22;
+- persistent-session capsule schema 7;
+- runtime launch metadata epoch 26;
 - the standalone runtime project-authority envelope epoch 3; and
-- the owned runtime SQLite operator schema epoch 21 (encoded in the RyeOS
+- the owned runtime SQLite operator schema epoch 22 (encoded in the RyeOS
   `PRAGMA application_id` family).
 
 The numbers identify independently evolving contracts. A change to a nested
@@ -60,7 +61,7 @@ the exact current envelopes stored in its JSON columns. Normal open never
 migrates or normalizes a predecessor. Any mismatch leaves the file untouched
 and requires the explicit operator-confirmed thread-history/project-head reset.
 
-Runtime epoch 21 retains the epoch-8 hosted-worker substrate,
+Runtime epoch 22 retains the epoch-8 hosted-worker substrate,
 credential-generation fencing, command/approval contact ledgers, observation
 frontier with a cross-epoch cumulative event ceiling, candidate-disposition,
 and multi-epoch process-history contracts, the epoch-9 exact
@@ -109,18 +110,37 @@ admitted launch capsule schema 18, and launch metadata epoch 23. A remotely
 adopted invocation now seals the exact current target-node operator grant that
 authorized access to target-private project and credential state. That grant
 is placement authority and remains excluded from portable exact-program
-identity. No execution-history reader or migration for epochs 1 through 20
-remains. Epoch 21 also makes the handoff credential reservation the durable
+identity. Epoch 21 also makes the handoff credential reservation the durable
 owner of the exact target project-HEAD fence from target preparation through
 authoritative adoption. Every online project-HEAD writer, including compact
 GC, serializes with that reservation authority; predecessor reservation rows
-cannot authorize this contract. An explicit reset
+cannot authorize this contract.
+Epoch 22 extends that same runtime-action intent with the signed generic
+workspace-access class; exact placement-local worker boot, admitted grant and
+project-authority digests; a crash-recoverable phase barrier; and the exact
+immutable input generation selected under quiescence. It introduces no second
+workspace lease or child ledger: `execution_workspace` remains the physical
+workspace journal, while the runtime-action row remains the one operation and
+child identity. Predecessor rows cannot authorize this relationship.
+No execution-history reader or migration for epochs 1 through 21 remains.
+
+An explicit reset
 classifies ownership and ordering solely from the outer runtime application-ID
 family and epoch. Once the store is proven to be an intact, strictly older
 RyeOS RuntimeDb, every predecessor table, index, view, trigger, row, and
 embedded authority remains opaque and the complete schema is discarded. Reset
 must not compare a predecessor layout with the current table set or grow a
 historical schema allowlist.
+
+Admitted launch capsule schema 19 adds the generic target-bound process-
+environment contribution. Schema 20 distinguishes standalone retained
+command bytes from an executable member at its realization-relative location
+inside a complete pinned realization tree. Schema 21 requires the serialized
+execution plan to carry the signed kind-schema-projected per-execution network
+ceiling. Runtime launch metadata epochs 24 and 25 advance with those enclosing
+authority changes. Predecessor plans never acquire a realization layout or
+`node_policy` networking by omission; their outer epochs are classified before
+nested decoding and retained only as opaque history.
 
 OperationalDb is the only credential-profile authority carried through the
 cutover. Reset validates and captures its exact current records before

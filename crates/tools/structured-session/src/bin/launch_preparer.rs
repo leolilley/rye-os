@@ -28,6 +28,7 @@ struct ValidatedWorkerEnvironment {
     has_external_content: bool,
     executable_search: Vec<ExecutableSearchPathEntryWire>,
     process_environment: BTreeMap<String, AuthoredWorkerEnvironmentValue>,
+    workload_client: Option<ryeos_runtime::workload_client::WorkloadClientRequestContract>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,7 +110,12 @@ fn prepare(request: ryeos_handler_protocol::LaunchPrepareRequest) -> LaunchPrepa
                 )
             })?;
         let selection = validate_execution_config(&config)?;
-        let (worker_ref, content_dependencies, environment_contributions) = match selection {
+        let (
+            worker_ref,
+            content_dependencies,
+            environment_contributions,
+            workload_client_request,
+        ) = match selection {
             WorkerSelection::Direct(worker_ref) => {
                 if !request.ref_bindings.is_empty() {
                     return Err(wire_error(
@@ -117,7 +123,7 @@ fn prepare(request: ryeos_handler_protocol::LaunchPrepareRequest) -> LaunchPrepa
                         "direct worker execution cannot carry an environment binding",
                     ));
                 }
-                (worker_ref, BTreeMap::new(), BTreeMap::new())
+                (worker_ref, BTreeMap::new(), BTreeMap::new(), None)
             }
             WorkerSelection::Environment(binding_name) => {
                 if request.ref_bindings.len() != 1 {
@@ -181,10 +187,12 @@ fn prepare(request: ryeos_handler_protocol::LaunchPrepareRequest) -> LaunchPrepa
                         )])
                     })
                     .unwrap_or_default();
+                let workload_client_request = environment.workload_client;
                 (
                     environment.worker_ref,
                     content_dependencies,
                     environment_contributions,
+                    workload_client_request,
                 )
             }
         };
@@ -203,7 +211,14 @@ fn prepare(request: ryeos_handler_protocol::LaunchPrepareRequest) -> LaunchPrepa
         Ok(LaunchPrepareSuccess {
             runtime_data: BTreeMap::from([("worker_execution".to_owned(), effective_config)]),
             required_secrets: Vec::new(),
-            runtime_facts: BTreeMap::new(),
+            runtime_facts: workload_client_request
+                .map(|request| {
+                    BTreeMap::from([(
+                        ryeos_runtime::workload_client::WORKLOAD_CLIENT_REQUEST_FACT.to_owned(),
+                        serde_json::to_value(request).expect("validated request must serialize"),
+                    )])
+                })
+                .unwrap_or_default(),
             execution_dependencies: BTreeMap::from([(
                 DEPENDENCY_NAME.to_string(),
                 LaunchExecutionDependencyRequestWire {
@@ -250,7 +265,16 @@ fn validate(request: ValidateLaunchPreparerConfigRequest) -> ValidateLaunchPrepa
         && request.secret_policy.max_requirements == 0
         && request.secret_policy.allowed_names.is_empty()
         && request.required_runtime_data == ["worker_execution"]
-        && request.runtime_facts.is_empty()
+        && request.runtime_facts.len() == 1
+        && request
+            .runtime_facts
+            .get(ryeos_runtime::workload_client::WORKLOAD_CLIENT_REQUEST_FACT)
+            .is_some_and(|fact| {
+                !fact.required
+                    && fact.kind == ryeos_handler_protocol::RuntimeFactKindWire::Json
+                    && fact.max_bytes
+                        == ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_REQUEST_CONTRACT_BYTES
+            })
         && request.execution_dependencies.max_dependencies == 1
         && request.execution_dependencies.allowed_kinds == ["worker"]
         && request.execution_dependencies.allowed_spaces == [ItemSpaceWire::Bundle]
@@ -318,6 +342,7 @@ fn validate_execution_config(
         "required_terminal_publication",
         "max_lifetime_seconds",
         "recover_upstream_session",
+        "workload_client_delegation_caps",
     ];
     if object.len() != KEYS.len() || object.keys().any(|key| !KEYS.contains(&key.as_str())) {
         return Err(wire_error(
@@ -443,6 +468,35 @@ fn validate_execution_config(
             "worker execution must admit at least one route effect class",
         ));
     }
+    let workload_client_delegation_caps = object
+        .get("workload_client_delegation_caps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            wire_error(
+                "worker_execution_workload_client_delegation_invalid",
+                "worker execution workload-client delegation ceiling must be an array",
+            )
+        })?;
+    let mut previous_capability: Option<&str> = None;
+    if workload_client_delegation_caps.len() > 256 {
+        return Err(wire_error(
+            "worker_execution_workload_client_delegation_invalid",
+            "worker execution workload-client delegation ceiling exceeds its bound",
+        ));
+    }
+    for capability in workload_client_delegation_caps {
+        let capability = capability.as_str().unwrap_or_default();
+        if previous_capability.is_some_and(|previous| previous >= capability)
+            || !capability.starts_with("ryeos.execute.")
+            || ryeos_runtime::authorizer::validate_scope_pattern(capability).is_err()
+        {
+            return Err(wire_error(
+                "worker_execution_workload_client_delegation_invalid",
+                "worker execution workload-client delegation ceiling must contain sorted canonical execution capabilities",
+            ));
+        }
+        previous_capability = Some(capability);
+    }
     for field in ["credential_home_env", "workspace_env"] {
         let value = object
             .get(field)
@@ -517,6 +571,7 @@ fn validate_worker_environment(
         "configuration",
         "credential_requirement",
         "portable_state_contract",
+        "workload_client",
     ];
     if value.len() != KEYS.len() || value.keys().any(|key| !KEYS.contains(&key.as_str())) {
         return Err(wire_error(
@@ -525,7 +580,7 @@ fn validate_worker_environment(
         ));
     }
     if value.get("schema").and_then(serde_json::Value::as_str)
-        != Some("ryeos.worker_environment.v3")
+        != Some("ryeos.worker_environment.v4")
         || value
             .get("category")
             .and_then(serde_json::Value::as_str)
@@ -537,7 +592,7 @@ fn validate_worker_environment(
     {
         return Err(wire_error(
             "worker_environment_invalid",
-            "worker environment is outside the admitted v3 contract",
+            "worker environment is outside the admitted v4 contract",
         ));
     }
     let declarations: Vec<ryeos_engine::external_content::ExternalContentDeclaration> =
@@ -684,6 +739,60 @@ fn validate_worker_environment(
             ));
         }
     }
+    let workload_client = match value.get("workload_client") {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let request: ryeos_runtime::workload_client::WorkloadClientRequestContract =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    wire_error(
+                        "worker_environment_workload_client_invalid",
+                        "worker environment workload-client request is malformed",
+                    )
+                })?;
+            request.validate().map_err(|_| {
+                wire_error(
+                    "worker_environment_workload_client_invalid",
+                    "worker environment workload-client request is outside the closed contract",
+                )
+            })?;
+            let declaration = declarations
+                .iter()
+                .find(|declaration| declaration.id == request.client.realization_id)
+                .ok_or_else(|| {
+                    wire_error(
+                        "worker_environment_workload_client_invalid",
+                        "workload-client realization is not declared by the environment",
+                    )
+                })?;
+            if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree {
+                return Err(wire_error(
+                    "worker_environment_workload_client_invalid",
+                    "workload-client realization must be a complete pinned tree",
+                ));
+            }
+            let parent = std::path::Path::new(&request.client.relative_path)
+                .parent()
+                .and_then(std::path::Path::to_str)
+                .filter(|path| !path.is_empty())
+                .unwrap_or(".");
+            if !executable_search.iter().any(|entry| {
+                entry.realization_id == request.client.realization_id
+                    && entry.relative_directory == parent
+            }) {
+                return Err(wire_error(
+                    "worker_environment_workload_client_invalid",
+                    "workload-client executable is outside the environment executable search",
+                ));
+            }
+            Some(request)
+        }
+        None => {
+            return Err(wire_error(
+                "worker_environment_workload_client_invalid",
+                "worker environment workload_client must be present and nullable",
+            ));
+        }
+    };
     let credential = value
         .get("credential_requirement")
         .and_then(serde_json::Value::as_object)
@@ -731,6 +840,7 @@ fn validate_worker_environment(
         has_external_content: !declarations.is_empty(),
         executable_search,
         process_environment,
+        workload_client,
     })
 }
 
@@ -750,7 +860,8 @@ mod tests {
             "require_pinned_cow": true,
             "required_terminal_publication": "retain_result",
             "max_lifetime_seconds": 86_400,
-            "recover_upstream_session": true
+            "recover_upstream_session": true,
+            "workload_client_delegation_caps": []
         })
     }
 
@@ -811,7 +922,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v3",
+                    "schema":"ryeos.worker_environment.v4",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{
@@ -829,7 +940,8 @@ mod tests {
                         "required_state":"active",
                         "subject_projection_contract":"fixture.account.v1"
                     },
-                    "portable_state_contract":"ryeos.worker_session.restore.v1"
+                    "portable_state_contract":"ryeos.worker_session.restore.v1",
+                    "workload_client":null
                 }),
                 derived: BTreeMap::new(),
                 policy_facts: BTreeMap::new(),
@@ -873,7 +985,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v3",
+                    "schema":"ryeos.worker_environment.v4",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{
@@ -890,7 +1002,8 @@ mod tests {
                         "required_state":"active",
                         "subject_projection_contract":"fixture.account.v1"
                     },
-                    "portable_state_contract":"ryeos.worker_session.restore.v1"
+                    "portable_state_contract":"ryeos.worker_session.restore.v1",
+                    "workload_client":null
                 }),
                 derived: BTreeMap::new(),
                 policy_facts: BTreeMap::new(),
@@ -929,7 +1042,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v3",
+                    "schema":"ryeos.worker_environment.v4",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{"executable_search":[],"process_environment":{}},
@@ -938,7 +1051,8 @@ mod tests {
                         "required_state":"active",
                         "subject_projection_contract":"fixture.account.v1"
                     },
-                    "portable_state_contract":"ryeos.worker_session.restore.v1"
+                    "portable_state_contract":"ryeos.worker_session.restore.v1",
+                    "workload_client":null
                 }),
                 derived: BTreeMap::new(),
                 policy_facts: BTreeMap::new(),
@@ -979,6 +1093,74 @@ mod tests {
         assert_eq!(
             validate_execution_config(&lifetime).unwrap_err().code,
             "worker_execution_policy_invalid"
+        );
+    }
+
+    #[test]
+    fn workload_client_request_must_name_a_declared_searchable_tree_member() {
+        let environment = LaunchPreparedItemWire {
+            canonical_ref: "config:fixture/environments/development".to_owned(),
+            source_space: ItemSpaceWire::Project,
+            effective_trust_class: TrustClassWire::TrustedProject,
+            composed: ryeos_handler_protocol::LaunchComposedViewWire {
+                composed: serde_json::json!({
+                    "category":"fixture/environments",
+                    "schema":"ryeos.worker_environment.v4",
+                    "worker_ref":"worker:fixture/hosted",
+                    "external_content":[{
+                        "id":"workload-client",
+                        "kind":"tree",
+                        "mode":"pinned",
+                        "digest":"a".repeat(64),
+                        "metadata_hint":"fixture-client",
+                        "mount_root": "project",
+                        "mount":"environment/workload-client"
+                    }],
+                    "configuration":{
+                        "executable_search":[{
+                            "realization_id":"workload-client",
+                            "relative_directory":"bin"
+                        }],
+                        "process_environment":{}
+                    },
+                    "credential_requirement":{
+                        "workload_family":"fixture",
+                        "required_state":"active",
+                        "subject_projection_contract":"fixture.account.v1"
+                    },
+                    "portable_state_contract":"ryeos.worker_session.restore.v1",
+                    "workload_client":{
+                        "protocol":"ryeos.workload-client/v1",
+                        "client":{
+                            "realization_id":"workload-client",
+                            "relative_path":"bin/ryeos"
+                        },
+                        "executions":[{
+                            "item_ref":"directive:project/check",
+                            "ref_bindings":{},
+                            "calls":[{"kind":"default"}],
+                            "effect_classes":["live"],
+                            "workspace_access":"immutable_current_generation"
+                        }],
+                        "max_in_flight":1,
+                        "max_invocations_per_boot":8,
+                        "max_lifetime_seconds":300
+                    }
+                }),
+                derived: BTreeMap::new(),
+                policy_facts: BTreeMap::new(),
+            },
+            resolution_digest: serde_json::json!({"digest":"retained"}),
+        };
+        let validated = validate_worker_environment(&environment).unwrap();
+        assert!(validated.workload_client.is_some());
+
+        let mut missing = environment;
+        missing.composed.composed["workload_client"]["client"]["realization_id"] =
+            serde_json::json!("absent");
+        assert_eq!(
+            validate_worker_environment(&missing).unwrap_err().code,
+            "worker_environment_workload_client_invalid"
         );
     }
 

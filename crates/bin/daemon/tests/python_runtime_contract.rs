@@ -155,6 +155,7 @@ fn run_tool_with_hints(
             &params,
             &plan_ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .expect("build_plan walks to subprocess terminal");
 
@@ -164,7 +165,7 @@ fn run_tool_with_hints(
             .expect("load disabled isolation fixture"),
     );
     let engine_ctx = EngineContext {
-        isolation_target_channel: None,
+        isolation_target_channels: Vec::new(),
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,

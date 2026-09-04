@@ -80,6 +80,20 @@ logs/
 # Project .ai/knowledge/ is INCLUDED (project documentation)
 /.ai/*
 !.ai/knowledge/
+!/.ai/manifest.source.yaml
+!/.ai/manifest.yaml
+!/.ai/config/
+/.ai/config/*
+!/.ai/config/development/
+/.ai/config/development/*
+!/.ai/config/development/ryeos/
+!/.ai/config/development/ryeos/*.yaml
+!/.ai/tools/
+/.ai/tools/*
+!/.ai/tools/ryeos/
+/.ai/tools/ryeos/*
+!/.ai/tools/ryeos/development/
+!/.ai/tools/ryeos/development/**
 */.ai/
 !bundles/.ai/
 !bundles/.ai/**

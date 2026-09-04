@@ -90,11 +90,61 @@ pub struct BindRequest {
     pub request_digest: String,
     pub manifest_hash: String,
     pub consumer_ref: String,
+    pub consumer_kind: BindConsumerKind,
+    #[serde(default)]
+    pub project_snapshot_hash: Option<String>,
+    /// Logical project coordinate retained by the shared snapshot context.
+    /// Resolution reads only the materialized snapshot; this path is neither
+    /// opened nor committed to binding identity.
+    #[serde(default)]
+    pub project_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindConsumerKind {
+    InstalledBundle,
+    PinnedProject,
+}
+
+impl BindRequest {
+    pub fn validate_consumer_request(&self) -> anyhow::Result<()> {
+        match self.consumer_kind {
+            BindConsumerKind::InstalledBundle
+                if self.project_snapshot_hash.is_none() && self.project_path.is_none() =>
+            {
+                Ok(())
+            }
+            BindConsumerKind::PinnedProject
+                if self.project_snapshot_hash.is_some() && self.project_path.is_some() =>
+            {
+                let snapshot = self
+                    .project_snapshot_hash
+                    .as_deref()
+                    .expect("checked pinned-project snapshot");
+                if !lillux::valid_hash(snapshot)
+                    || snapshot.bytes().any(|byte| byte.is_ascii_uppercase())
+                {
+                    anyhow::bail!(
+                        "pinned-project binding project_snapshot_hash is not a canonical digest"
+                    );
+                }
+                Ok(())
+            }
+            BindConsumerKind::InstalledBundle => anyhow::bail!(
+                "installed-bundle binding cannot carry project snapshot or path fields"
+            ),
+            BindConsumerKind::PinnedProject => anyhow::bail!(
+                "pinned-project binding requires project_snapshot_hash and project_path"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindResponse {
+    pub binding_subject_id: String,
     pub binding_id: String,
     pub binding_hash: String,
     pub manifest_hash: String,
@@ -106,12 +156,13 @@ pub struct BindResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseRequest {
-    pub binding_id: String,
+    pub binding_subject_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseResponse {
+    pub binding_subject_id: String,
     pub binding_id: String,
     pub binding_hash: String,
     pub manifest_hash: String,
@@ -123,7 +174,7 @@ pub struct ReleaseResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingIntegrityFinding {
-    pub binding_id: String,
+    pub binding_subject_id: String,
     pub binding_hash: String,
     pub error: String,
 }
@@ -482,11 +533,58 @@ pub async fn bind(
 ) -> anyhow::Result<BindResponse> {
     let operator_fingerprint =
         crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    request.validate_consumer_request()?;
+    if request.consumer_kind != BindConsumerKind::InstalledBundle {
+        bail!("pinned-project binding requires exact snapshot preparation");
+    }
+    let consumer = resolve_installed_external_content_consumer(
+        &state,
+        &request.consumer_ref,
+        &request.manifest_hash,
+    )?;
     bind_authorized(
         state,
         operator_fingerprint,
         "external-content-import",
         request,
+        consumer,
+    )
+    .await
+}
+
+/// Complete a project binding after the API layer has materialized the exact
+/// retained snapshot and admitted its source closure. The resolution is the
+/// common pre-realization document used again by launch admission; no live
+/// project path participates in this authorization.
+pub async fn bind_pinned_project(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    request: BindRequest,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+) -> anyhow::Result<BindResponse> {
+    let operator_fingerprint =
+        crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    request.validate_consumer_request()?;
+    if request.consumer_kind != BindConsumerKind::PinnedProject {
+        bail!("installed-bundle binding does not accept project preparation");
+    }
+    let project_snapshot_hash = request
+        .project_snapshot_hash
+        .as_deref()
+        .expect("validated pinned-project request");
+    let consumer = resolve_project_external_content_consumer(
+        &state,
+        resolution,
+        &request.consumer_ref,
+        project_snapshot_hash,
+        &request.manifest_hash,
+    )?;
+    bind_authorized(
+        state,
+        operator_fingerprint,
+        "external-content-import",
+        request,
+        consumer,
     )
     .await
 }
@@ -503,14 +601,22 @@ pub async fn bind_managed_activation_component(
 ) -> anyhow::Result<BindResponse> {
     if !lillux::valid_hash(&operator_fingerprint)
         || request.consumer_ref != activation.document.consumer_ref
+        || request.consumer_kind != BindConsumerKind::InstalledBundle
     {
         bail!("managed external-content binding authority is inconsistent");
     }
+    request.validate_consumer_request()?;
+    let consumer = resolve_installed_external_content_consumer(
+        &state,
+        &request.consumer_ref,
+        &request.manifest_hash,
+    )?;
     bind_authorized(
         state,
         operator_fingerprint,
         "managed-external-content-import",
         request,
+        consumer,
     )
     .await
 }
@@ -520,6 +626,7 @@ async fn bind_authorized(
     operator_fingerprint: String,
     upload_purpose: &'static str,
     request: BindRequest,
+    consumer: ResolvedConsumer,
 ) -> anyhow::Result<BindResponse> {
     if !lillux::valid_hash(&request.request_digest) || !lillux::valid_hash(&request.manifest_hash) {
         bail!("external-content bind request contains a non-canonical digest");
@@ -555,17 +662,22 @@ async fn bind_authorized(
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("external-content bind target has no manifest kind"))?;
-    let consumer = resolve_external_content_consumer(
-        &state,
-        &request.consumer_ref,
-        &request.manifest_hash,
-        manifest_kind,
-    )?;
-    let binding_id = ryeos_state::objects::ExternalContentBinding::derive_binding_id(
-        &request.manifest_hash,
-        &consumer.consumer_ref,
-        &consumer.publisher_fingerprint,
-    )?;
+    if consumer.authority.consumer_ref() != request.consumer_ref {
+        bail!("resolved external-content consumer contradicts the bind request");
+    }
+    let target_node_fingerprint = state.identity.fingerprint().to_owned();
+    let authorizer_grant_digest =
+        crate::operator_authority::admitted_operator_authority_digest(
+            &state,
+            &operator_fingerprint,
+        )?;
+    let binding_subject_id =
+        ryeos_state::objects::ExternalContentBinding::derive_binding_subject_id(
+            &request.manifest_hash,
+            manifest_kind,
+            &consumer.authority,
+            &target_node_fingerprint,
+        )?;
     let publication_key =
         ryeos_state::DurableCasPublicationKey::external_content_import(&request.request_digest)?;
     let recovery = authority.require_recovery()?;
@@ -590,7 +702,9 @@ async fn bind_authorized(
 
     if let Some(current) = state
         .state_store
-        .with_state_db(|db| db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_id))?
+        .with_state_db(|db| {
+            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
+        })?
     {
         let current_value = cas
             .get_object(&current.target_hash)?
@@ -598,11 +712,13 @@ async fn bind_authorized(
         let current_binding =
             ryeos_state::objects::ExternalContentBinding::from_value(&current_value)?;
         if current_binding.state == ryeos_state::objects::ExternalContentBindingState::Active
-            && current_binding.binding_id == binding_id
+            && current_binding.binding_subject_id == binding_subject_id
             && current_binding.manifest_hash == request.manifest_hash
             && current_binding.manifest_kind == manifest_kind
-            && current_binding.consumer_ref == consumer.consumer_ref
-            && current_binding.publisher_fingerprint == consumer.publisher_fingerprint
+            && current_binding.consumer == consumer.authority
+            && current_binding.target_node_fingerprint == target_node_fingerprint
+            && current_binding.authorized_by == operator_fingerprint
+            && current_binding.authorizer_grant_digest == authorizer_grant_digest
         {
             if let Some(admitted_target_hash) = stage.admitted_target_hash() {
                 if admitted_target_hash != current.target_hash {
@@ -638,11 +754,12 @@ async fn bind_authorized(
                 &current.target_hash,
             )?;
             return Ok(BindResponse {
-                binding_id,
+                binding_subject_id,
+                binding_id: current_binding.binding_id,
                 binding_hash: current.target_hash,
                 manifest_hash: request.manifest_hash,
-                consumer_ref: consumer.consumer_ref,
-                publisher_fingerprint: consumer.publisher_fingerprint,
+                consumer_ref: consumer.authority.consumer_ref().to_owned(),
+                publisher_fingerprint: consumer.authority.publisher_fingerprint().to_owned(),
                 idempotent: true,
             });
         }
@@ -650,16 +767,36 @@ async fn bind_authorized(
     if let Some(binding_hash) = stage.admitted_target_hash() {
         let current = state
             .state_store
-            .with_state_db(|db| db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_id))?;
+            .with_state_db(|db| {
+                db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
+            })?;
         if current.as_ref().map(|head| head.target_hash.as_str()) != Some(binding_hash) {
             bail!("admitted external-content binding receipt is not the current signed head");
         }
+        let admitted_value = cas
+            .get_object(binding_hash)?
+            .ok_or_else(|| anyhow::anyhow!("admitted external-content binding is absent"))?;
+        let admitted_binding =
+            ryeos_state::objects::ExternalContentBinding::from_value(&admitted_value)?;
+        if !binding_authorizes_consumer(
+            &admitted_binding,
+            &binding_subject_id,
+            &request.manifest_hash,
+            &consumer.authority,
+            &target_node_fingerprint,
+            manifest_kind,
+        )? || admitted_binding.authorized_by != operator_fingerprint
+            || admitted_binding.authorizer_grant_digest != authorizer_grant_digest
+        {
+            bail!("admitted import receipt belongs to a predecessor binding authorization");
+        }
         return Ok(BindResponse {
-            binding_id,
+            binding_subject_id,
+            binding_id: admitted_binding.binding_id,
             binding_hash: binding_hash.to_owned(),
             manifest_hash: request.manifest_hash,
-            consumer_ref: consumer.consumer_ref,
-            publisher_fingerprint: consumer.publisher_fingerprint,
+            consumer_ref: consumer.authority.consumer_ref().to_owned(),
+            publisher_fingerprint: consumer.authority.publisher_fingerprint().to_owned(),
             idempotent: true,
         });
     }
@@ -691,10 +828,10 @@ async fn bind_authorized(
             let manifest = ryeos_state::objects::ExternalLargeContentManifestObject::from_value(
                 &manifest_value,
             )?;
-            if consumer
-                .grant_max_total_bytes
-                .is_some_and(|maximum| manifest.total_bytes > maximum)
-            {
+            let grant_max_total_bytes = consumer.grant_max_total_bytes.ok_or_else(|| {
+                anyhow::anyhow!("consumer kind has no signed large-content grant")
+            })?;
+            if manifest.total_bytes > grant_max_total_bytes {
                 bail!("staged manifest exceeds the consumer kind's signed large-content ceiling");
             }
             if consumer.declaration_kind
@@ -726,9 +863,10 @@ async fn bind_authorized(
     let binding = ryeos_state::objects::ExternalContentBinding::active(
         request.manifest_hash.clone(),
         manifest_kind.to_owned(),
-        consumer.consumer_ref.clone(),
-        consumer.publisher_fingerprint.clone(),
+        consumer.authority.clone(),
+        target_node_fingerprint,
         operator_fingerprint,
+        authorizer_grant_digest,
     )?;
     let binding_hash = stage.store_object(&guard, &cas, &binding.to_value()?)?;
     let binding_closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
@@ -752,7 +890,8 @@ async fn bind_authorized(
     let signer = crate::state_store::NodeIdentitySigner::from_identity(&state.identity);
     state.state_store.with_state_db(|db| {
         db.ensure_current_external_content_binding_epoch(&guard)?;
-        let current = db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_id)?;
+        let current =
+            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)?;
         if let Some(current) = current.as_ref()
             && current.target_hash == binding_hash
         {
@@ -760,7 +899,7 @@ async fn bind_authorized(
         }
         db.advance_generic_head_ref(
             BINDING_HEAD_NAMESPACE,
-            &binding_id,
+            &binding_subject_id,
             &binding_hash,
             current.as_ref().map(|head| head.target_hash.as_str()),
             &signer,
@@ -771,11 +910,12 @@ async fn bind_authorized(
         tracing::warn!(%error, staging_id = %request.staging_id, "binding head published while import receipt remained retryable");
     }
     Ok(BindResponse {
-        binding_id,
+        binding_subject_id,
+        binding_id: binding.binding_id,
         binding_hash,
         manifest_hash: request.manifest_hash,
-        consumer_ref: consumer.consumer_ref,
-        publisher_fingerprint: consumer.publisher_fingerprint,
+        consumer_ref: consumer.authority.consumer_ref().to_owned(),
+        publisher_fingerprint: consumer.authority.publisher_fingerprint().to_owned(),
         idempotent: false,
     })
 }
@@ -804,10 +944,25 @@ pub async fn scrub(state: Arc<AppState>, context: HandlerContext) -> anyhow::Res
                 .get_object(&head.target_hash)?
                 .ok_or_else(|| anyhow::anyhow!("binding head target is absent"))?;
             let binding = ryeos_state::objects::ExternalContentBinding::from_value(&value)?;
-            if head.namespace != BINDING_HEAD_NAMESPACE || head.name != binding.binding_id {
+            if head.namespace != BINDING_HEAD_NAMESPACE
+                || head.name != binding.binding_subject_id
+            {
                 bail!("binding head coordinates contradict the retained binding");
             }
+            if binding.target_node_fingerprint != state.identity.fingerprint() {
+                bail!("binding belongs to a different target node");
+            }
             if binding.state == ryeos_state::objects::ExternalContentBindingState::Active {
+                require_current_binding_authorizer(&state, &binding)?;
+                let closure =
+                    ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
+                        &cas,
+                        [head.target_hash.clone()],
+                        ryeos_state::object_closure::ObjectClosureLimits::default(),
+                    )?;
+                if !closure.is_complete() {
+                    bail!("active external-content binding closure is incomplete");
+                }
                 let manifest_value = cas
                     .get_object(&binding.manifest_hash)?
                     .ok_or_else(|| anyhow::anyhow!("active binding manifest is absent"))?;
@@ -844,7 +999,7 @@ pub async fn scrub(state: Arc<AppState>, context: HandlerContext) -> anyhow::Res
         match checked {
             Ok(()) => bindings_verified = bindings_verified.saturating_add(1),
             Err(error) => binding_findings.push(BindingIntegrityFinding {
-                binding_id: head.name,
+                binding_subject_id: head.name,
                 binding_hash: head.target_hash,
                 error: format!("{error:#}"),
             }),
@@ -868,17 +1023,17 @@ pub async fn release(
 ) -> anyhow::Result<ReleaseResponse> {
     let operator_fingerprint =
         crate::operator_authority::require_local_configured_operator(&state, &context)?;
-    if !lillux::valid_hash(&request.binding_id)
+    if !lillux::valid_hash(&request.binding_subject_id)
         || request
-            .binding_id
+            .binding_subject_id
             .bytes()
             .any(|byte| byte.is_ascii_uppercase())
     {
-        bail!("external-content release binding_id is not a canonical digest");
+        bail!("external-content release binding_subject_id is not a canonical digest");
     }
     let authority = state.state_store.pinned_state_authority()?;
     let worker_state = state.clone();
-    let binding_id = request.binding_id;
+    let binding_subject_id = request.binding_subject_id;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (command_tx, command_rx) = std::sync::mpsc::sync_channel(1);
     let worker = tokio::task::spawn_blocking(move || {
@@ -895,7 +1050,7 @@ pub async fn release(
                 &worker_state,
                 &authority,
                 &guard,
-                &binding_id,
+                &binding_subject_id,
                 &operator_fingerprint,
             ),
             Ok(ReleaseWorkerCommand::Abort) | Err(_) => {
@@ -909,7 +1064,7 @@ pub async fn release(
         .map_err(anyhow::Error::msg)?;
     if let Err(error) = state
         .write_barrier
-        .quiesce(std::time::Duration::from_secs(30))
+        .quiesce(lillux::time::Duration::from_secs(30))
         .await
         .context("quiesce launches before external-content binding release")
     {
@@ -935,34 +1090,43 @@ fn release_under_guard(
     state: &AppState,
     authority: &ryeos_state::PinnedStateAuthority,
     guard: &ryeos_state::CasMutationGuard,
-    binding_id: &str,
+    binding_subject_id: &str,
     operator_fingerprint: &str,
 ) -> anyhow::Result<ReleaseResponse> {
     let cas = authority.cas_store()?;
     let current = state
         .state_store
-        .with_state_db(|db| db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, binding_id))?
+        .with_state_db(|db| {
+            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, binding_subject_id)
+        })?
         .ok_or_else(|| anyhow::anyhow!("external-content binding does not exist"))?;
     let value = cas
         .get_object(&current.target_hash)?
         .ok_or_else(|| anyhow::anyhow!("external-content binding head target is absent"))?;
     let active = ryeos_state::objects::ExternalContentBinding::from_value(&value)?;
-    if active.binding_id != binding_id {
+    if active.binding_subject_id != binding_subject_id {
         bail!("external-content binding head identity is inconsistent");
     }
     if active.state == ryeos_state::objects::ExternalContentBindingState::Released {
         return Ok(ReleaseResponse {
+            binding_subject_id: active.binding_subject_id,
             binding_id: active.binding_id,
             binding_hash: current.target_hash,
             manifest_hash: active.manifest_hash,
-            consumer_ref: active.consumer_ref,
-            publisher_fingerprint: active.publisher_fingerprint,
+            consumer_ref: active.consumer.consumer_ref().to_owned(),
+            publisher_fingerprint: active.consumer.publisher_fingerprint().to_owned(),
             idempotent: true,
         });
     }
+    let authorizer_grant_digest =
+        crate::operator_authority::admitted_operator_authority_digest(
+            state,
+            operator_fingerprint,
+        )?;
     let released = ryeos_state::objects::ExternalContentBinding::released_from(
         &active,
         operator_fingerprint.to_owned(),
+        authorizer_grant_digest,
     )?;
     let mut stage = authority
         .require_recovery()?
@@ -972,7 +1136,7 @@ fn release_under_guard(
     state.state_store.with_state_db(|db| {
         db.advance_generic_head_ref(
             BINDING_HEAD_NAMESPACE,
-            binding_id,
+            binding_subject_id,
             &released_hash,
             Some(&current.target_hash),
             &signer,
@@ -980,14 +1144,15 @@ fn release_under_guard(
         )
     })?;
     if let Err(error) = stage.finish_admitted(guard) {
-        tracing::warn!(%error, %binding_id, "released binding head published while temporary root remained recoverable");
+        tracing::warn!(%error, %binding_subject_id, "released binding head published while temporary root remained recoverable");
     }
     Ok(ReleaseResponse {
+        binding_subject_id: released.binding_subject_id,
         binding_id: released.binding_id,
         binding_hash: released_hash,
         manifest_hash: released.manifest_hash,
-        consumer_ref: released.consumer_ref,
-        publisher_fingerprint: released.publisher_fingerprint,
+        consumer_ref: released.consumer.consumer_ref().to_owned(),
+        publisher_fingerprint: released.consumer.publisher_fingerprint().to_owned(),
         idempotent: false,
     })
 }
@@ -1000,20 +1165,45 @@ impl Drop for ResumeWriteBarrier {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("external-content consumer has no active operator binding")]
+pub struct BindingNotActive;
+
 pub fn require_active_binding(
     state: &AppState,
     cas: &lillux::CasStore,
     manifest_hash: &str,
-    consumer_ref: &str,
-    publisher_fingerprint: &str,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
 ) -> anyhow::Result<ryeos_state::objects::ExternalContentBinding> {
-    require_active_binding_from_store(
+    let binding = require_active_binding_from_store(
         &state.state_store,
         cas,
         manifest_hash,
-        consumer_ref,
-        publisher_fingerprint,
-    )
+        consumer,
+        state.identity.fingerprint(),
+    )?;
+    require_current_binding_authorizer(state, &binding)?;
+    Ok(binding)
+}
+
+pub fn require_current_binding_authorizer(
+    state: &AppState,
+    binding: &ryeos_state::objects::ExternalContentBinding,
+) -> anyhow::Result<()> {
+    let current_grant = crate::identity::load_verified_authorized_key(
+        &binding.authorized_by,
+        &state.config.authorized_keys_dir,
+        &state.identity,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("external-content binding authorizer was revoked"))?;
+    if current_grant.principal_class
+        != crate::identity::AuthorizedKeyPrincipalClass::LocalClient
+        || current_grant.configured_origin_site_id.is_some()
+        || current_grant.source_file_hash != binding.authorizer_grant_digest
+    {
+        bail!("external-content binding authorizer grant changed");
+    }
+    Ok(())
 }
 
 /// Verify the exact active binding using only the state authority that owns
@@ -1023,18 +1213,18 @@ pub fn require_active_binding_from_store(
     state_store: &crate::state_store::StateStore,
     cas: &lillux::CasStore,
     manifest_hash: &str,
-    consumer_ref: &str,
-    publisher_fingerprint: &str,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
+    target_node_fingerprint: &str,
 ) -> anyhow::Result<ryeos_state::objects::ExternalContentBinding> {
     active_binding_from_store(
         state_store,
         cas,
         manifest_hash,
-        consumer_ref,
-        publisher_fingerprint,
+        consumer,
+        target_node_fingerprint,
     )?
     .map(|(_, binding)| binding)
-    .ok_or_else(|| anyhow::anyhow!("external-content consumer has no active operator binding"))
+    .ok_or_else(|| BindingNotActive.into())
 }
 
 /// Inspect one exact consumer binding without changing its head or retaining
@@ -1044,23 +1234,9 @@ pub fn active_binding_from_store(
     state_store: &crate::state_store::StateStore,
     cas: &lillux::CasStore,
     manifest_hash: &str,
-    consumer_ref: &str,
-    publisher_fingerprint: &str,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
+    target_node_fingerprint: &str,
 ) -> anyhow::Result<Option<(String, ryeos_state::objects::ExternalContentBinding)>> {
-    let binding_id = ryeos_state::objects::ExternalContentBinding::derive_binding_id(
-        manifest_hash,
-        consumer_ref,
-        publisher_fingerprint,
-    )?;
-    let Some(head) = state_store
-        .with_state_db(|db| db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_id))?
-    else {
-        return Ok(None);
-    };
-    let value = cas
-        .get_object(&head.target_hash)?
-        .ok_or_else(|| anyhow::anyhow!("external-content binding head target is absent"))?;
-    let binding = ryeos_state::objects::ExternalContentBinding::from_value(&value)?;
     let manifest_kind = cas
         .get_object(manifest_hash)?
         .and_then(|value| {
@@ -1070,12 +1246,30 @@ pub fn active_binding_from_store(
                 .map(str::to_owned)
         })
         .ok_or_else(|| anyhow::anyhow!("external-content binding manifest is absent or untyped"))?;
+    let binding_subject_id =
+        ryeos_state::objects::ExternalContentBinding::derive_binding_subject_id(
+            manifest_hash,
+            &manifest_kind,
+            consumer,
+            target_node_fingerprint,
+        )?;
+    let Some(head) = state_store
+        .with_state_db(|db| {
+            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
+        })?
+    else {
+        return Ok(None);
+    };
+    let value = cas
+        .get_object(&head.target_hash)?
+        .ok_or_else(|| anyhow::anyhow!("external-content binding head target is absent"))?;
+    let binding = ryeos_state::objects::ExternalContentBinding::from_value(&value)?;
     if !binding_authorizes_consumer(
         &binding,
-        &binding_id,
+        &binding_subject_id,
         manifest_hash,
-        consumer_ref,
-        publisher_fingerprint,
+        consumer,
+        target_node_fingerprint,
         &manifest_kind,
     )? {
         return Ok(None);
@@ -1085,16 +1279,16 @@ pub fn active_binding_from_store(
 
 fn binding_authorizes_consumer(
     binding: &ryeos_state::objects::ExternalContentBinding,
-    binding_id: &str,
+    binding_subject_id: &str,
     manifest_hash: &str,
-    consumer_ref: &str,
-    publisher_fingerprint: &str,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
+    target_node_fingerprint: &str,
     manifest_kind: &str,
 ) -> anyhow::Result<bool> {
-    if binding.binding_id != binding_id
+    if binding.binding_subject_id != binding_subject_id
         || binding.manifest_hash != manifest_hash
-        || binding.consumer_ref != consumer_ref
-        || binding.publisher_fingerprint != publisher_fingerprint
+        || &binding.consumer != consumer
+        || binding.target_node_fingerprint != target_node_fingerprint
         || binding.manifest_kind != manifest_kind
     {
         bail!("external-content binding does not authorize this consumer");
@@ -1106,8 +1300,7 @@ fn binding_authorizes_consumer(
 }
 
 struct ResolvedConsumer {
-    consumer_ref: String,
-    publisher_fingerprint: String,
+    authority: ryeos_state::objects::ExternalContentConsumerAuthority,
     declaration_kind: ryeos_engine::external_content::ExternalContentKind,
     grant_max_total_bytes: Option<u64>,
 }
@@ -1348,58 +1541,124 @@ impl ryeos_state::ExternalContentBlobSink for DurableContentSink<'_> {
     }
 }
 
-fn resolve_external_content_consumer(
+fn resolve_installed_external_content_consumer(
     state: &AppState,
     requested_ref: &str,
     manifest_hash: &str,
-    manifest_kind: &str,
 ) -> anyhow::Result<ResolvedConsumer> {
     let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(requested_ref)
         .map_err(|error| anyhow::anyhow!("invalid consumer ref: {error}"))?;
     if canonical.to_string() != requested_ref {
         bail!("external-content consumer ref must be canonical");
     }
-    let effective = state.engine.with_checked_bundle_generation(|generation| {
-        generation.effective_item(ryeos_engine::engine::EffectiveItemRequest {
+    let resolution =
+        state
+            .engine
+            .effective_resolution_output(ryeos_engine::engine::EffectiveItemRequest {
             item_ref: canonical,
             expected_kind: None,
             project_root: None,
             subject_resolution_authority:
                 ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
-        })
-    })?;
-    if !effective.trusted
-        || effective.trust_class != ryeos_engine::resolution::TrustClass::TrustedBundle
-        || effective.source.bundle_root.is_none()
+        })?;
+    if resolution.effective_trust_class
+        != ryeos_engine::resolution::TrustClass::TrustedBundle
+        || resolution.root.source_space != ryeos_engine::contracts::ItemSpace::Bundle
+        || !matches!(
+            &resolution.root.source_root,
+            ryeos_engine::contracts::ItemSourceRoot::Bundle { .. }
+        )
     {
         bail!("external-content consumer must be a trusted installed-bundle item");
     }
-    let publisher_fingerprint = effective
-        .provenance
+    let publisher_fingerprint = resolution
         .root
         .signer_fingerprint
         .clone()
         .ok_or_else(|| anyhow::anyhow!("trusted external-content consumer has no signer"))?;
+    let consumer = ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+        resolution.root.resolved_ref.clone(),
+        publisher_fingerprint,
+    )?;
+    resolve_external_content_consumer_from_resolution(state, &resolution, consumer, manifest_hash)
+}
+
+fn resolve_project_external_content_consumer(
+    state: &AppState,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    requested_ref: &str,
+    project_snapshot_hash: &str,
+    manifest_hash: &str,
+) -> anyhow::Result<ResolvedConsumer> {
+    let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(requested_ref)
+        .map_err(|error| anyhow::anyhow!("invalid consumer ref: {error}"))?;
+    if canonical.to_string() != requested_ref || resolution.root.resolved_ref != requested_ref {
+        bail!("resolved project consumer does not match the canonical requested ref");
+    }
+    if resolution.root.source_space != ryeos_engine::contracts::ItemSpace::Project
+        || !matches!(
+            &resolution.root.source_root,
+            ryeos_engine::contracts::ItemSourceRoot::Project
+        )
+        || !matches!(
+            resolution.effective_trust_class,
+            ryeos_engine::resolution::TrustClass::TrustedProject
+                | ryeos_engine::resolution::TrustClass::UntrustedProject
+        )
+    {
+        bail!("project external-content consumer must resolve from the pinned project");
+    }
+    let publisher_fingerprint = resolution
+        .root
+        .signer_fingerprint
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("project external-content consumer has no signer"))?;
+    let source_closure = resolution
+        .composed
+        .derived
+        .get(ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY)
+        .ok_or_else(|| anyhow::anyhow!("project consumer has no admitted source closure"))
+        .and_then(ryeos_state::objects::EffectiveSourceClosureProjection::from_value)?;
+    let effective_consumer_digest =
+        ryeos_engine::external_content::pre_external_realization_consumer_digest(resolution)?;
+    let consumer = ryeos_state::objects::ExternalContentConsumerAuthority::pinned_project(
+        requested_ref.to_owned(),
+        publisher_fingerprint,
+        project_snapshot_hash.to_owned(),
+        effective_consumer_digest,
+        source_closure,
+    )?;
+    resolve_external_content_consumer_from_resolution(state, resolution, consumer, manifest_hash)
+}
+
+fn resolve_external_content_consumer_from_resolution(
+    state: &AppState,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    authority: ryeos_state::objects::ExternalContentConsumerAuthority,
+    manifest_hash: &str,
+) -> anyhow::Result<ResolvedConsumer> {
+    if resolution
+        .composed
+        .derived
+        .contains_key(ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY)
+    {
+        bail!("external-content consumer was already realized before binding");
+    }
+    let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(authority.consumer_ref())?;
     let external_contract = state
         .engine
         .kinds
-        .get(&effective.kind)
+        .get(&canonical.kind)
         .and_then(|kind| kind.external_content_contract())
         .ok_or_else(|| anyhow::anyhow!("consumer kind has no signed external-content contract"))?;
-    let grant_max_total_bytes = match manifest_kind {
-        ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND => None,
-        ryeos_state::objects::EXTERNAL_LARGE_CONTENT_MANIFEST_KIND => Some(
-            external_contract
-                .large_content
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("consumer kind has no signed large-content grant"))?
-                .max_total_bytes
-                .unwrap_or(ryeos_state::objects::MAX_LARGE_CONTENT_TOTAL_BYTES),
-        ),
-        other => bail!("unsupported external-content manifest kind `{other}`"),
-    };
-    let declarations = effective
-        .composed_value
+    let grant_max_total_bytes = external_contract.large_content.as_ref().map(|large| {
+        large
+            .max_total_bytes
+            .unwrap_or(ryeos_state::objects::MAX_LARGE_CONTENT_TOTAL_BYTES)
+    });
+    let declarations = resolution
+        .composed
+        .composed
         .get("external_content")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("consumer does not declare external content"))?;
@@ -1413,8 +1672,7 @@ fn resolve_external_content_consumer(
     let declaration = declaration
         .ok_or_else(|| anyhow::anyhow!("consumer does not declare the staged manifest digest"))?;
     Ok(ResolvedConsumer {
-        consumer_ref: effective.canonical_ref,
-        publisher_fingerprint,
+        authority,
         declaration_kind: declaration.kind,
         grant_max_total_bytes,
     })
@@ -1500,6 +1758,35 @@ fn validate_relative_path(value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_request_consumer_coordinates_are_clean_cut() {
+        let bundle = BindRequest {
+            staging_id: "stage".to_owned(),
+            request_digest: "a".repeat(64),
+            manifest_hash: "b".repeat(64),
+            consumer_ref: "worker:tests/profile".to_owned(),
+            consumer_kind: BindConsumerKind::InstalledBundle,
+            project_snapshot_hash: None,
+            project_path: None,
+        };
+        assert!(bundle.validate_consumer_request().is_ok());
+        let project = BindRequest {
+            consumer_kind: BindConsumerKind::PinnedProject,
+            project_snapshot_hash: Some("c".repeat(64)),
+            project_path: Some(std::path::PathBuf::from("/target/project")),
+            ..bundle.clone()
+        };
+        assert!(project.validate_consumer_request().is_ok());
+        assert!(
+            BindRequest {
+                project_path: None,
+                ..project
+            }
+            .validate_consumer_request()
+            .is_err()
+        );
+    }
 
     #[test]
     fn import_identity_is_path_free_and_commits_the_open_root_identity() {
@@ -1589,36 +1876,47 @@ mod tests {
         let manifest_hash = "a".repeat(64);
         let publisher = "b".repeat(64);
         let consumer = "worker:tests/profile";
+        let consumer_authority =
+            ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+                consumer.to_owned(),
+                publisher.clone(),
+            )
+            .unwrap();
+        let target_node = "c".repeat(64);
         let active = ryeos_state::objects::ExternalContentBinding::active(
             manifest_hash.clone(),
             ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
-            consumer.to_owned(),
-            publisher.clone(),
-            "c".repeat(64),
+            consumer_authority.clone(),
+            target_node.clone(),
+            "d".repeat(64),
+            "e".repeat(64),
         )
         .unwrap();
         assert!(
             binding_authorizes_consumer(
                 &active,
-                &active.binding_id,
+                &active.binding_subject_id,
                 &manifest_hash,
-                consumer,
-                &publisher,
+                &consumer_authority,
+                &target_node,
                 ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND,
             )
             .unwrap()
         );
 
-        let released =
-            ryeos_state::objects::ExternalContentBinding::released_from(&active, "d".repeat(64))
-                .unwrap();
+        let released = ryeos_state::objects::ExternalContentBinding::released_from(
+            &active,
+            "f".repeat(64),
+            "1".repeat(64),
+        )
+        .unwrap();
         assert!(
             !binding_authorizes_consumer(
                 &released,
-                &released.binding_id,
+                &released.binding_subject_id,
                 &manifest_hash,
-                consumer,
-                &publisher,
+                &consumer_authority,
+                &target_node,
                 ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND,
             )
             .unwrap()
@@ -1627,22 +1925,30 @@ mod tests {
         assert!(
             binding_authorizes_consumer(
                 &active,
-                &active.binding_id,
+                &active.binding_subject_id,
                 &manifest_hash,
-                "worker:tests/other",
-                &publisher,
+                &ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+                    "worker:tests/other".to_owned(),
+                    publisher.clone(),
+                )
+                .unwrap(),
+                &target_node,
                 ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND,
             )
             .is_err()
         );
-        let wrong_publisher = "e".repeat(64);
+        let wrong_publisher = "2".repeat(64);
         assert!(
             binding_authorizes_consumer(
                 &active,
-                &active.binding_id,
+                &active.binding_subject_id,
                 &manifest_hash,
-                consumer,
-                &wrong_publisher,
+                &ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+                    consumer.to_owned(),
+                    wrong_publisher,
+                )
+                .unwrap(),
+                &target_node,
                 ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND,
             )
             .is_err()

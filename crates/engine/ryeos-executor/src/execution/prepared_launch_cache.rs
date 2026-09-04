@@ -537,6 +537,8 @@ mod tests {
     fn skeleton() -> PreparedManagedLaunchSkeleton {
         PreparedManagedLaunchSkeleton {
             prepared: PreparedRuntimeLaunch {
+                filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+                network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
                 runtime_data: Default::default(),
                 required_secrets: Vec::new(),
                 runtime_facts: Default::default(),
@@ -738,6 +740,8 @@ mod tests {
         fill.complete(
             PreparedManagedLaunchSkeleton {
                 prepared: PreparedRuntimeLaunch {
+                    filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+                    network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
                     runtime_data: Default::default(),
                     required_secrets: Vec::new(),
                     runtime_facts: Default::default(),
@@ -763,6 +767,8 @@ mod tests {
         old_fill.complete(
             PreparedManagedLaunchSkeleton {
                 prepared: PreparedRuntimeLaunch {
+                    filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+                    network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
                     runtime_data: Default::default(),
                     required_secrets: Vec::new(),
                     runtime_facts: Default::default(),
@@ -781,6 +787,8 @@ mod tests {
         new_fill.complete(
             PreparedManagedLaunchSkeleton {
                 prepared: PreparedRuntimeLaunch {
+                    filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+                    network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
                     runtime_data: Default::default(),
                     required_secrets: Vec::new(),
                     runtime_facts: Default::default(),
@@ -809,6 +817,8 @@ mod tests {
         );
         let skeleton = PreparedManagedLaunchSkeleton {
             prepared: PreparedRuntimeLaunch {
+                filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+                network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
                 runtime_data,
                 required_secrets: vec![super::super::launch_preparation::PreparedSecret {
                     name: "DO_NOT_LOG_SECRET_NAME".to_string(),

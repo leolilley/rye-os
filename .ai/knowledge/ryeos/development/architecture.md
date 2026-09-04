@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-04T08:08:42Z:a62f8010374e12f88c2ad5830932b1b8eaa4d218c8dbd37218cbb829c073cbd5:AI26QMNntu4NpQ/StaFlcOL1iLV+2mesGMVzYa1/JAZRo7/FokI+DQ0tevQRHCh5xQ7emXDElTPECyHEQkUzAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-04T09:10:36Z:54a6c84c924312a5428b492e041fa7a8775120e702796c4d513d3246c3e03903:XmwrxhnSqdijvWSA26/ayoE3gmmrN14vvCX/nthypUUPkCpY9KrXqDgfxRZKa50lT1r0ocNCd1+loR9aySUSAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "architecture"
 title: "Architecture Map"
 description: "Short orientation for crates, bundles, execution flow, and trust boundaries"
 entry_type: reference
-version: "1.4.1"
+version: "1.6.0"
 ```
 
 # Architecture Map
@@ -17,8 +17,8 @@ full design document.
 
 | Area | Path | Owns |
 |---|---|---|
-| Kernel primitives | `crates/kernel/lillux/` | process lifecycle/type state, durable filesystem/CAS operations, Ed25519/X25519/SHA primitives |
-| Engine | `crates/engine/ryeos-engine/` | item resolution, trust verification, composition, plans, immutable node isolation policy |
+| Kernel primitives | `crates/kernel/lillux/` | process lifecycle/type state, descriptor and exact-process authority, native Linux sandbox mechanics, durable filesystem/CAS operations, Ed25519/X25519/SHA primitives |
+| Engine | `crates/engine/ryeos-engine/` | item resolution, trust verification, composition, kind-schema projections, plans, immutable node isolation policy |
 | App | `crates/daemon/ryeos-app/` | daemon/app config, engine boot, node-config loading |
 | State | `crates/state/ryeos-state/` | SQLite state, CAS objects, thread state |
 | Runtime shared | `crates/engine/ryeos-runtime/` | callback client, runtime envelopes/types |
@@ -63,7 +63,8 @@ ryeos CLI
   -> engine resolves project -> user -> system
   -> engine verifies trust and composes effective item
   -> plan/handler/protocol selects runtime or tool binary
-  -> node isolation snapshot optionally narrows the executable request
+  -> serialized plan freezes any kind-schema-projected execution ceilings
+  -> plan, parent launch, and node isolation ceilings are intersected
   -> Lillux creates the exact target awaiting durable attachment
   -> daemon persists process ownership and authorizes release
   -> subprocess runs and may call back to daemon
@@ -86,6 +87,14 @@ generic composed dispatch fields. Avoid kind-specific CLI descriptor parsing.
   of the complete signed generation at
   `<app-root>/.ai/node/policies/isolation.yaml`; items cannot override the
   compiled node-policy snapshot.
+- The isolation-adapter wire is a clean-cut v4 contract. It admits a
+  self-contained exact adapter, an explicit PID-namespace choice, and a
+  bounded sorted collection of protected target channels. Core publishes the
+  generic `linux-lillux` backend declaration, but ordinary init profiles keep
+  isolation disabled until a dedicated signed development profile is
+  deliberately added. Direct and adapter launches preserve the same exact
+  target descriptor/environment bindings, while parent protocol owners retain
+  typed Lillux byte streams rather than raw Unix sockets.
 
 See `knowledge:ryeos/core/node/execution-isolation` for node-owned confinement
 and `knowledge:ryeos/core/execution/attachment-before-execution` for the
@@ -128,10 +137,13 @@ floors and surfaces are enforced in code, and editing the file changes nothing.
 Source: `crates/state/ryeos-state/src/{project_sync,ignore}.rs`.
 
 `project.apply-snapshot` materializes an AI-only snapshot to staging, builds a
-`ryeos-api::project_deploy` plan from staged intent, swaps managed project roots,
-prepares runtime projections, advances the deployed ref, and only then finalizes
-backups. If schedule projection or ref advancement fails during the request,
-prepared schedule YAML/DB mutations and root swaps are rolled back.
+`ryeos-api::project_deploy` plan from staged intent, swaps managed project
+surfaces, prepares runtime projections, advances the deployed ref, and only
+then finalizes backups. A surface is either one exact regular file (including
+the root source/generated manifests) or a complete directory subtree. If
+schedule projection or ref advancement fails during the request, prepared
+schedule YAML/DB mutations and every file/directory surface swap are rolled
+back.
 
 ### Project schedule declarations
 
@@ -191,8 +203,42 @@ the apply lock's job).
 
 - Prefer changing the shared source of truth over adding CLI/app-specific
   mirrors of descriptor semantics.
+- Raw namespace, mount, pivot-root, seccomp, descriptor, pidfd, procfs,
+  signal, and bounded process-settle mechanics belong in Lillux. Engine and
+  daemon layers carry only typed launch/process authorities and signed RyeOS
+  policy vocabulary.
+- Process-scoped artifact-generation naming, permissions, advisory lifetime
+  locking, stale collection, and descriptor-relative teardown likewise belong
+  in Lillux. Engine code owns artifact hashes, quotas, and semantic use only.
+- A per-execution control such as network denial is a signed mechanical
+  projection in the kind schema, frozen into `ExecutionPlan`, then
+  irreversibly intersected with parent/node authority. Do not add tool-name,
+  compiler, provider, or project branches to dispatch.
+- Signed Tool configuration may map schema-validated scalar `params` through
+  the existing bounded rye-expr/1 template context into individual argv or
+  environment values. Each rendered argv value remains one argument. Reuse
+  that data path before inventing a tool-specific argument builder, shell/JSON
+  shim, or command-multiplexer binary.
+- Every executable Tool explicitly selects its subprocess protocol through the
+  Tool kind's closed signed allowlist. Use callback-free `opaque` for an
+  untrusted build/test executable; selecting `tool_callback` is an explicit
+  bearer grant, not a default inferred from the Tool kind or command name.
 - If descriptor resolution is needed, use engine APIs instead of manually
   opening kind-specific files.
+- Managed launch preparation owns only the managed program being launched
+  now. A callback/borrowed child shares the exact request engine, project
+  authority, workspace and lifeline through `ExecutionProvenance`, but it is
+  otherwise an ordinary RyeOS execution. Its own effective program must own
+  its command, external realizations, process environment, effects, limits and
+  capsule. Do not add deferred child environments or child-context targets to
+  the parent launch-preparer protocol/capsule.
+- Parent outer-program realization inheritance may supply the sealed byte view
+  used while verifying a child plan when that child declares no replacement
+  realization set. That preserves the execution view already admitted for an
+  ordinary composing parent; it does not import content retained only inside a
+  managed runtime's prepared launch. A child that declares realizations owns
+  its complete replacement set, and an inherited-only entry is never child
+  command or executable authority.
 - Keep `ryeos-api` generic; daemon composition should wire UI-specific pieces.
 - After bundle or binary changes, refresh/sign bundles before trusting test
   failures.

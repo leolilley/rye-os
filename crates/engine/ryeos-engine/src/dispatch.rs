@@ -28,7 +28,14 @@ pub fn execute_plan(
             PlanNode::DispatchSubprocess { spec, .. } => {
                 tracing::info!(cmd = %spec.cmd, "launching subprocess");
                 let start = std::time::Instant::now();
-                let completion = dispatch_subprocess(spec, plan.debug_raw, &plan.root_ref, ctx)?;
+                let completion = dispatch_subprocess(
+                    spec,
+                    plan.debug_raw,
+                    &plan.root_ref,
+                    plan.filesystem_authority_ceiling,
+                    plan.network_authority_ceiling,
+                    ctx,
+                )?;
                 let elapsed = start.elapsed();
                 tracing::debug!(
                     cmd = %spec.cmd,
@@ -72,9 +79,13 @@ fn dispatch_subprocess(
     spec: &PlanSubprocessSpec,
     debug_raw: bool,
     item_ref: &str,
+    filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
+    network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     ctx: &EngineContext,
 ) -> Result<ExecutionCompletion, EngineError> {
-    let request = isolation_plan_request(spec, item_ref, ctx)?;
+    let request = isolation_plan_request(
+        spec, item_ref, filesystem_authority_ceiling, network_authority_ceiling, ctx,
+    )?;
     let capture = debug_raw.then(|| DebugCapture::from_spec(spec));
     let result = lillux::run(request);
     let debug = capture.map(|c| c.into_block(&result));
@@ -191,6 +202,7 @@ fn spec_to_request(spec: &PlanSubprocessSpec) -> Result<lillux::SubprocessReques
         timeout: spec.timeout_secs as f64,
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     })
 }
@@ -471,7 +483,14 @@ pub fn spawn_plan(
     if let Some(node) = plan.nodes.first() {
         match node {
             PlanNode::DispatchSubprocess { spec, .. } => {
-                return spawn_subprocess(spec, plan.debug_raw, &plan.root_ref, ctx);
+                return spawn_subprocess(
+                    spec,
+                    plan.debug_raw,
+                    &plan.root_ref,
+                    plan.filesystem_authority_ceiling,
+                    plan.network_authority_ceiling,
+                    ctx,
+                );
             }
             PlanNode::Complete { .. } => {
                 return Err(EngineError::Internal(
@@ -487,9 +506,17 @@ fn spawn_subprocess(
     spec: &PlanSubprocessSpec,
     debug_raw: bool,
     item_ref: &str,
+    filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
+    network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     ctx: &EngineContext,
 ) -> Result<SpawnedExecutionAwaitingAttachment, EngineError> {
-    let request = isolation_plan_request_awaiting_attachment(spec, item_ref, ctx)?;
+    let request = isolation_plan_request_awaiting_attachment(
+        spec,
+        item_ref,
+        filesystem_authority_ceiling,
+        network_authority_ceiling,
+        ctx,
+    )?;
     let debug = debug_raw.then(|| DebugCapture::from_spec(spec));
 
     match request.spawn() {
@@ -503,23 +530,31 @@ fn spawn_subprocess(
 fn isolation_plan_request(
     spec: &PlanSubprocessSpec,
     item_ref: &str,
+    filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
+    network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     ctx: &EngineContext,
 ) -> Result<lillux::SubprocessRequest, EngineError> {
     let (request, project_path, verified_code) = isolation_plan_request_parts(spec, ctx)?;
+    let filesystem_authority_ceiling = ctx
+        .isolation_filesystem_authority_ceiling.intersect(filesystem_authority_ceiling);
+    let node_filesystem = filesystem_authority_ceiling
+        == crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
     ctx.isolation.apply(
         request,
         crate::isolation::IsolationLaunchContext {
             project_path,
             project_authority: ctx.isolation_project_authority,
-            filesystem_authority_ceiling: ctx.isolation_filesystem_authority_ceiling,
-            network_authority_ceiling: ctx.isolation_network_authority_ceiling,
+            filesystem_authority_ceiling,
+            network_authority_ceiling: ctx
+                .isolation_network_authority_ceiling
+                .intersect(network_authority_ceiling),
             live_access: ctx.isolation_live_access_authority.as_ref(),
-            state_root: ctx.isolation_state_root.as_deref(),
+            state_root: ctx.isolation_state_root.as_deref().filter(|_| node_filesystem),
             checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
             checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
             daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
-            bundle_roots: &ctx.isolation_bundle_roots,
-            node_trusted_keys_dir: ctx.isolation_node_trusted_keys_dir.as_deref(),
+            bundle_roots: if node_filesystem { &ctx.isolation_bundle_roots } else { &[] },
+            node_trusted_keys_dir: ctx.isolation_node_trusted_keys_dir.as_deref().filter(|_| node_filesystem),
             verified_code: &verified_code,
             verified_command: ctx
                 .isolation_verified_command
@@ -531,7 +566,7 @@ fn isolation_plan_request(
                     })
                 }),
             external_read_only_mounts: &ctx.isolation_external_read_only_mounts,
-            target_channel: ctx.isolation_target_channel.as_ref(),
+            target_channels: &ctx.isolation_target_channels,
             item_ref,
             thread_id: &ctx.thread_id,
         },
@@ -541,23 +576,31 @@ fn isolation_plan_request(
 fn isolation_plan_request_awaiting_attachment(
     spec: &PlanSubprocessSpec,
     item_ref: &str,
+    filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
+    network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     ctx: &EngineContext,
 ) -> Result<crate::isolation::IsolationRequestAwaitingAttachment, EngineError> {
     let (request, project_path, verified_code) = isolation_plan_request_parts(spec, ctx)?;
+    let filesystem_authority_ceiling = ctx
+        .isolation_filesystem_authority_ceiling.intersect(filesystem_authority_ceiling);
+    let node_filesystem = filesystem_authority_ceiling
+        == crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
     ctx.isolation.apply_awaiting_attachment(
         request,
         crate::isolation::IsolationLaunchContext {
             project_path,
             project_authority: ctx.isolation_project_authority,
-            filesystem_authority_ceiling: ctx.isolation_filesystem_authority_ceiling,
-            network_authority_ceiling: ctx.isolation_network_authority_ceiling,
+            filesystem_authority_ceiling,
+            network_authority_ceiling: ctx
+                .isolation_network_authority_ceiling
+                .intersect(network_authority_ceiling),
             live_access: ctx.isolation_live_access_authority.as_ref(),
-            state_root: ctx.isolation_state_root.as_deref(),
+            state_root: ctx.isolation_state_root.as_deref().filter(|_| node_filesystem),
             checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
             checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
             daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
-            bundle_roots: &ctx.isolation_bundle_roots,
-            node_trusted_keys_dir: ctx.isolation_node_trusted_keys_dir.as_deref(),
+            bundle_roots: if node_filesystem { &ctx.isolation_bundle_roots } else { &[] },
+            node_trusted_keys_dir: ctx.isolation_node_trusted_keys_dir.as_deref().filter(|_| node_filesystem),
             verified_code: &verified_code,
             verified_command: ctx
                 .isolation_verified_command
@@ -569,7 +612,7 @@ fn isolation_plan_request_awaiting_attachment(
                     })
                 }),
             external_read_only_mounts: &ctx.isolation_external_read_only_mounts,
-            target_channel: ctx.isolation_target_channel.as_ref(),
+            target_channels: &ctx.isolation_target_channels,
             item_ref,
             thread_id: &ctx.thread_id,
         },
@@ -725,7 +768,7 @@ mod tests {
             isolation_verified_code: Vec::new(),
             isolation_verified_command: None,
             isolation_external_read_only_mounts: Vec::new(),
-            isolation_target_channel: None,
+            isolation_target_channels: Vec::new(),
             isolation_workspace: None,
             subprocess_limits: None,
             inherited_fds: Vec::new(),
@@ -756,6 +799,10 @@ mod tests {
             entrypoint: PlanNodeId("entry:test".into()),
             capabilities: PlanCapabilities::default(),
             materialization_requirements: Vec::new(),
+            network_authority_ceiling:
+                crate::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             cache_key: "test".into(),
             executor_chain: vec!["@test".into()],
             executor_authorities: Vec::new(),

@@ -19,6 +19,7 @@ fn shell(script: String) -> SubprocessRequest {
         timeout: 30.0,
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     }
 }
@@ -123,6 +124,7 @@ fn exec_failure_is_reported_by_release_transition() {
         timeout: 30.0,
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     };
     let pending = spawn_awaiting_attachment(request).expect("child reaches final pre-exec hold");
@@ -170,7 +172,7 @@ fn supervised_target_uses_the_same_typed_attachment_transition() {
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("executed");
     let pipe = supervised_launcher_attachment_status_pipe().expect("attachment status pipe");
-    let status_fd = pipe.writer_fd();
+    let status_fd = pipe.writer_descriptor().unwrap() as i32;
     let release_reader = pipe.attachment_release_reader.as_raw_fd();
     let script = format!(
         "(/bin/dd bs=1 count=1 <&{release_reader} >/dev/null 2>&1; printf executed > {}) & target=$!; printf '{{\"child-pid\":%s}}\\n' \"$target\" >&{status_fd}; wait \"$target\"",
@@ -448,7 +450,7 @@ fn supervised_output_overflow_before_release_fails_closed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("executed");
     let pipe = supervised_launcher_attachment_status_pipe().expect("attachment status pipe");
-    let status_fd = pipe.writer_fd();
+    let status_fd = pipe.writer_descriptor().unwrap() as i32;
     let release_reader = pipe.attachment_release_reader.as_raw_fd();
     let script = format!(
         "(/bin/dd bs=1 count=1 <&{release_reader} >/dev/null 2>&1; printf executed > {}) & target=$!; printf '{{\"child-pid\":%s}}\\n' \"$target\" >&{status_fd}; /bin/dd if=/dev/zero bs=1024 count=4 2>/dev/null; wait \"$target\"",

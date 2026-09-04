@@ -430,12 +430,18 @@ fn capture_and_finalize_fresh_effective_program_once(
         materialization,
     )?;
     let mut resolution = resolution;
+    let projectless_authority =
+        ryeos_engine::contracts::SubjectResolutionAuthority::Projectless;
+    let subject_resolution_authority = materialization
+        .map(|binding| binding.subject_authority())
+        .unwrap_or(&projectless_authority);
     let captured_external = ryeos_app::external_content_admission::admit_external_realizations(
         state,
         engine,
         kind,
         &mut resolution,
         roots,
+        subject_resolution_authority,
         inherited_external,
     )
     .map_err(DispatchError::Internal)?;
@@ -492,6 +498,11 @@ pub(crate) fn validate_admitted_effective_program(
                 content as &dyn ryeos_engine::project_content::AuthoritativeProjectContent,
             )
         });
+    let projectless_authority =
+        ryeos_engine::contracts::SubjectResolutionAuthority::Projectless;
+    let subject_resolution_authority = materialization
+        .map(|binding| binding.subject_authority())
+        .unwrap_or(&projectless_authority);
     let mut mutable_authority_races = 0usize;
     loop {
         let snapshots = super::launch_preparation::load_launch_config_set_under_current_authority(
@@ -521,6 +532,7 @@ pub(crate) fn validate_admitted_effective_program(
                     kind,
                     &resolution,
                     roots,
+                    subject_resolution_authority,
                 )
                 .map_err(DispatchError::Internal);
             }

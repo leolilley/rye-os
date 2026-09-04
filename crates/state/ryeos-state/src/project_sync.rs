@@ -166,8 +166,7 @@ pub fn capture_snapshot_policy_from_pinned(
     )?;
     let (config, project_source_hash) = match config_file {
         Some(file) => {
-            let bytes =
-                lillux::read_open_regular_file_bounded(file, MAX_PROJECT_SNAPSHOT_CONFIG_BYTES)?;
+            let bytes = file.read_bounded(MAX_PROJECT_SNAPSHOT_CONFIG_BYTES)?;
             let config: ProjectSnapshotConfig = serde_yaml::from_slice(&bytes)
                 .map_err(|error| anyhow::anyhow!("invalid project snapshot policy: {error}"))?;
             anyhow::ensure!(
@@ -200,7 +199,7 @@ pub fn capture_snapshot_policy_from_pinned(
 fn open_optional_pinned_relative(
     root: &lillux::PinnedDirectory,
     relative: &std::path::Path,
-) -> Result<Option<std::fs::File>> {
+) -> Result<Option<lillux::PinnedRegularFile>> {
     use std::path::Component;
 
     let mut directory = root.try_clone()?;
@@ -210,7 +209,7 @@ fn open_optional_pinned_relative(
             anyhow::bail!("pinned policy path is not normalized");
         };
         if components.peek().is_none() {
-            return directory.open_regular(name, false);
+            return directory.open_pinned_regular(name, false);
         }
         let Some(child) = directory.open_child_directory(name)? else {
             return Ok(None);
@@ -228,6 +227,9 @@ fn hex_sha256(bytes: &[u8]) -> String {
 /// Kind of deployable project `.ai` surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectAiSurfaceKind {
+    /// The source and generated manifests that bind the project bundle's
+    /// identity, kind requirements, and runtime-authority ceiling.
+    ProjectManifest,
     /// Signed RyeOS items that materialize as project content.
     ProjectItems,
     /// Project-authored configuration that materializes as project intent.
@@ -241,15 +243,25 @@ pub enum ProjectAiSurfaceKind {
     NodeExtensionDeclarations,
 }
 
+/// Namespace shape owned by one project `.ai` surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectAiSurfaceShape {
+    /// One exact regular file.
+    File,
+    /// A directory and the complete subtree below it.
+    Directory,
+}
+
 /// Deployable project `.ai` surface descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectAiSurface {
     pub root: &'static str,
     pub kind: ProjectAiSurfaceKind,
+    pub shape: ProjectAiSurfaceShape,
     pub materialize_to_project: bool,
 }
 
-const fn surface(
+const fn directory_surface(
     root: &'static str,
     kind: ProjectAiSurfaceKind,
     materialize_to_project: bool,
@@ -257,6 +269,20 @@ const fn surface(
     ProjectAiSurface {
         root,
         kind,
+        shape: ProjectAiSurfaceShape::Directory,
+        materialize_to_project,
+    }
+}
+
+const fn file_surface(
+    root: &'static str,
+    kind: ProjectAiSurfaceKind,
+    materialize_to_project: bool,
+) -> ProjectAiSurface {
+    ProjectAiSurface {
+        root,
+        kind,
+        shape: ProjectAiSurfaceShape::File,
         materialize_to_project,
     }
 }
@@ -266,49 +292,64 @@ const fn surface(
 /// This intentionally excludes node-owned runtime state such as
 /// `.ai/node/routes`, `.ai/node/schedules`, `.ai/state`, and signing keys.
 pub const PROJECT_AI_SURFACES: &[ProjectAiSurface] = &[
-    surface(".ai/directives", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(".ai/tools", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(".ai/graphs", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(".ai/knowledge", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(".ai/parsers", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(".ai/handlers", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(".ai/protocols", ProjectAiSurfaceKind::ProjectItems, true),
-    surface(
+    file_surface(
+        ".ai/manifest.source.yaml",
+        ProjectAiSurfaceKind::ProjectManifest,
+        true,
+    ),
+    file_surface(
+        ".ai/manifest.yaml",
+        ProjectAiSurfaceKind::ProjectManifest,
+        true,
+    ),
+    directory_surface(".ai/directives", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(".ai/tools", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(".ai/graphs", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(".ai/knowledge", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(".ai/parsers", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(".ai/handlers", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(".ai/protocols", ProjectAiSurfaceKind::ProjectItems, true),
+    directory_surface(
         ".ai/node/engine/kinds",
         ProjectAiSurfaceKind::NodeExtensionDeclarations,
         true,
     ),
-    surface(
+    directory_surface(
         ".ai/node/commands",
         ProjectAiSurfaceKind::NodeExtensionDeclarations,
         true,
     ),
-    surface(
+    directory_surface(
         ".ai/config/agent",
         ProjectAiSurfaceKind::ProjectConfig,
         true,
     ),
-    surface(
+    directory_surface(
         ".ai/config/execution",
         ProjectAiSurfaceKind::ProjectConfig,
         true,
     ),
-    surface(
+    directory_surface(
         ".ai/config/directive-runtime",
         ProjectAiSurfaceKind::ProjectConfig,
         true,
     ),
-    surface(
+    directory_surface(
         ".ai/config/ryeos-runtime",
         ProjectAiSurfaceKind::ProjectConfig,
         true,
     ),
-    surface(
+    directory_surface(
+        ".ai/config/development",
+        ProjectAiSurfaceKind::ProjectConfig,
+        true,
+    ),
+    directory_surface(
         ".ai/config/keys/trusted",
         ProjectAiSurfaceKind::TrustPins,
         true,
     ),
-    surface(
+    directory_surface(
         ".ai/config/schedules",
         ProjectAiSurfaceKind::ScheduleDeclarations,
         true,
@@ -417,11 +458,28 @@ pub fn is_durable_content_capture_floor_excluded(rel_path: &str) -> bool {
 
 fn surface_kind_str(kind: ProjectAiSurfaceKind) -> &'static str {
     match kind {
+        ProjectAiSurfaceKind::ProjectManifest => "project_manifest",
         ProjectAiSurfaceKind::ProjectItems => "project_items",
         ProjectAiSurfaceKind::ProjectConfig => "project_config",
         ProjectAiSurfaceKind::TrustPins => "trust_pins",
         ProjectAiSurfaceKind::ScheduleDeclarations => "schedule_declarations",
         ProjectAiSurfaceKind::NodeExtensionDeclarations => "node_extension_declarations",
+    }
+}
+
+fn surface_shape_str(shape: ProjectAiSurfaceShape) -> &'static str {
+    match shape {
+        ProjectAiSurfaceShape::File => "file",
+        ProjectAiSurfaceShape::Directory => "directory",
+    }
+}
+
+fn surface_matches_path(surface: ProjectAiSurface, rel_path: &str) -> bool {
+    match surface.shape {
+        ProjectAiSurfaceShape::File => rel_path == surface.root,
+        ProjectAiSurfaceShape::Directory => {
+            rel_path == surface.root || rel_path.starts_with(&format!("{}/", surface.root))
+        }
     }
 }
 
@@ -455,9 +513,10 @@ pub fn render_effective_sync_policy_yaml(ignore_source: &str) -> String {
     out.push_str("deployable_surfaces:\n");
     for s in PROJECT_AI_SURFACES {
         out.push_str(&format!(
-            "  - {{ root: {:?}, kind: {}, materialize_to_project: {} }}\n",
+            "  - {{ root: {:?}, kind: {}, shape: {}, materialize_to_project: {} }}\n",
             s.root,
             surface_kind_str(s.kind),
+            surface_shape_str(s.shape),
             s.materialize_to_project
         ));
     }
@@ -596,7 +655,10 @@ pub fn validate_project_manifest_path(
 
     if scope == ProjectSyncScope::AiOnly {
         match classify_project_ai_path(rel_path, ignore) {
-            ProjectAiPathClass::Deployable(surface) if rel_path == surface.root => {
+            ProjectAiPathClass::Deployable(surface)
+                if surface.shape == ProjectAiSurfaceShape::Directory
+                    && rel_path == surface.root =>
+            {
                 anyhow::bail!(
                     "AI-only project manifest path '{}' names a deployable .ai surface root; expected a file below the surface root",
                     rel_path
@@ -667,7 +729,7 @@ pub fn classify_project_ai_path(
     }
 
     for surface in PROJECT_AI_SURFACES {
-        if rel_path == surface.root || rel_path.starts_with(&format!("{}/", surface.root)) {
+        if surface_matches_path(*surface, rel_path) {
             return ProjectAiPathClass::Deployable(*surface);
         }
     }
@@ -681,24 +743,27 @@ pub fn classify_project_ai_path(
 
 /// True when a relative path is inside one of the managed AI sync roots.
 pub fn is_project_ai_sync_path(rel_path: &str) -> bool {
-    PROJECT_AI_SURFACES.iter().any(|surface| {
-        rel_path == surface.root || rel_path.starts_with(&format!("{}/", surface.root))
-    })
+    PROJECT_AI_SURFACES
+        .iter()
+        .any(|surface| surface_matches_path(*surface, rel_path))
 }
 
 /// True when a relative path is exactly one of the managed AI sync roots.
 pub fn is_project_ai_sync_root(rel_path: &str) -> bool {
     PROJECT_AI_SURFACES
         .iter()
-        .any(|surface| rel_path == surface.root)
+        .any(|surface| {
+            surface.shape == ProjectAiSurfaceShape::Directory && rel_path == surface.root
+        })
 }
 
-/// Project AI surfaces materialized to the live project path during apply.
-pub fn materialized_project_ai_surface_roots() -> impl Iterator<Item = &'static str> {
+/// Project AI surfaces atomically materialized to the live project during
+/// apply. Callers must respect each descriptor's exact file/directory shape.
+pub fn materialized_project_ai_surfaces() -> impl Iterator<Item = ProjectAiSurface> {
     PROJECT_AI_SURFACES
         .iter()
         .filter(|surface| surface.materialize_to_project)
-        .map(|surface| surface.root)
+        .copied()
 }
 
 /// Basic relative path safety shared by full-project and AI-only snapshots.
@@ -723,11 +788,14 @@ mod tests {
     #[test]
     fn ai_only_accepts_managed_roots() {
         let m = manifest(&[
+            ".ai/manifest.source.yaml",
+            ".ai/manifest.yaml",
             ".ai/directives/foo.md",
             ".ai/tools/app/tool.yaml",
             ".ai/graphs/app/flow.yaml",
             ".ai/config/execution/execution.yaml",
             ".ai/config/directive-runtime/limits.yaml",
+            ".ai/config/development/ryeos/build-profile.yaml",
             ".ai/config/schedules/snap-track.yaml",
         ]);
         validate_project_manifest_paths(&m, ProjectSyncScope::AiOnly, None).unwrap();
@@ -918,9 +986,27 @@ mod tests {
 
     #[test]
     fn ai_only_does_not_prefix_match_spoofed_roots() {
-        let m = manifest(&[".ai/directives-link/evil.md"]);
-        validate_project_manifest_paths(&m, ProjectSyncScope::AiOnly, None)
+        for path in [
+            ".ai/directives-link/evil.md",
+            ".ai/manifest.yaml/child",
+            ".ai/manifest.yaml.backup",
+        ] {
+            validate_project_manifest_paths(
+                &manifest(&[path]),
+                ProjectSyncScope::AiOnly,
+                None,
+            )
             .expect_err("prefix spoof must be rejected");
+        }
+    }
+
+    #[test]
+    fn exact_file_surfaces_are_not_directory_roots() {
+        assert!(is_project_ai_sync_path(".ai/manifest.source.yaml"));
+        assert!(is_project_ai_sync_path(".ai/manifest.yaml"));
+        assert!(!is_project_ai_sync_root(".ai/manifest.source.yaml"));
+        assert!(!is_project_ai_sync_root(".ai/manifest.yaml"));
+        assert!(is_project_ai_sync_root(".ai/tools"));
     }
 
     #[test]
@@ -950,5 +1036,13 @@ mod tests {
             v["deployable_surfaces"].as_sequence().unwrap().len(),
             PROJECT_AI_SURFACES.len()
         );
+        let manifest = v["deployable_surfaces"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["root"].as_str() == Some(".ai/manifest.yaml"))
+            .expect("generated manifest surface");
+        assert_eq!(manifest["kind"].as_str(), Some("project_manifest"));
+        assert_eq!(manifest["shape"].as_str(), Some("file"));
     }
 }

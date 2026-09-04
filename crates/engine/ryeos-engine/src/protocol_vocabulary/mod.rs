@@ -28,6 +28,11 @@ pub use callback_channel::CallbackChannel;
 mod capabilities;
 pub use capabilities::ProtocolCapabilities;
 
+/// Workload-visible endpoint name for the restricted per-boot RyeOS client.
+/// The value is protocol vocabulary, not an ambient daemon configuration
+/// variable; the trusted bridge alone injects it after target admission.
+pub const WORKLOAD_CLIENT_ENDPOINT_ENV: &str = "RYEOS_WORKLOAD_CLIENT_ENDPOINT";
+
 /// Validate the canonical bundle identifier shared by signed manifest
 /// authoring and qualified binary resolution.
 pub fn validate_bundle_name(name: &str) -> Result<(), VocabularyError> {

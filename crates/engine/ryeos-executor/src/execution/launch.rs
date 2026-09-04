@@ -3799,7 +3799,7 @@ fn capture_managed_descriptor_document(
     Ok(document)
 }
 
-fn verify_admitted_signed_descriptor_document(
+pub(crate) fn verify_admitted_signed_descriptor_document(
     document: &str,
     expected_content_hash: &str,
     expected_signer: &str,
@@ -4675,6 +4675,35 @@ async fn prepare_managed_launch_authority(
         )
         .map_err(BuildAndLaunchError::from)?
     };
+    if admitted_capsule.is_none() {
+        let (filesystem, network) = super::execution_realization::project_launch_isolation_ceilings(
+            params.state,
+            engine,
+            &params.resolved.resolved_item.kind,
+            Some(effective_program.resolution()),
+            params.parent_execution_context.map(|parent| parent.parent_thread_id.as_str()),
+        ).map_err(BuildAndLaunchError::Internal)?;
+        prepared_launch.filesystem_authority_ceiling = filesystem;
+        prepared_launch.network_authority_ceiling = network;
+    }
+    // The current managed protocol grants callback and thread-auth authority.
+    // A captured-filesystem child must select a callback-free direct protocol;
+    // silently passing those bearers would contradict its admitted ceiling.
+    if prepared_launch.filesystem_authority_ceiling
+        == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution
+    {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "captured execution cannot grant managed runtime callback or thread-auth authority"
+        )));
+    }
+    if prepared_launch.network_authority_ceiling
+        == ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::Isolated
+        && !params.state.isolation.is_enforced()
+    {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "managed isolated network authority requires enforced isolation"
+        )));
+    }
     let admitted_artifact_identity =
         ryeos_state::objects::AdmittedLaunchArtifactIdentity::ManagedRuntime {
             runtime_ref: selected_runtime.canonical_ref.to_string(),
@@ -6324,6 +6353,8 @@ async fn run_claimed_thread_row_inner(
     // blocking process and pipe operations. Keep their owner on Tokio's
     // blocking pool so async workers remain free to service runtime UDS
     // callbacks.
+    let filesystem_authority_ceiling = prepared_launch.filesystem_authority_ceiling;
+    let network_authority_ceiling = prepared_launch.network_authority_ceiling;
     let isolation_verified_command = materialized_binary.verified_command;
     let materialized_binary_path = materialized_binary.path;
     let binary_path = materialized_binary_path
@@ -6478,6 +6509,8 @@ async fn run_claimed_thread_row_inner(
             binary: &binary_path,
             project_path: &project_owned,
             project_authority: isolation_project_authority,
+            filesystem_authority_ceiling,
+            network_authority_ceiling,
             project_state_scope: project_state_scope.as_deref(),
             live_access: isolation_live_access,
             state_root: isolation_state_root.as_deref(),

@@ -3122,6 +3122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryeos-workload-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lillux",
+ "ryeos-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

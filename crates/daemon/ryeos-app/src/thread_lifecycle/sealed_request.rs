@@ -568,6 +568,7 @@ impl SealedRootExecutionRequest {
         capsule.validate()?;
         let sealed: Self = serde_json::from_value(capsule.sealed_invocation.clone())
             .context("decode admitted capsule sealed invocation")?;
+        sealed.validate_handler_context()?;
         sealed.validate_executor_route_against_capsule(capsule)?;
         if sealed.admitted_program_value()? != capsule.exact_program
             || sealed.admitted_program_hash()? != capsule.exact_program_hash
@@ -1414,9 +1415,12 @@ impl SealedRootExecutionRequest {
             crate::execution_provenance::ExecutionProvenance::RootLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::ChildLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::RootPinnedGeneration { .. }
-            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. } => {
+            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
+            | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
+                ..
+            } => {
                 ProjectContext::LocalPath {
-                    path: provenance.effective_path().to_path_buf(),
+                    path: provenance.subject_effective_path().to_path_buf(),
                 }
             }
         };
@@ -1431,8 +1435,11 @@ impl SealedRootExecutionRequest {
             crate::execution_provenance::ExecutionProvenance::RootLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::ChildLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::RootPinnedGeneration { .. }
-            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. } => {
-                Some(provenance.effective_path().to_path_buf())
+            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
+            | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
+                ..
+            } => {
+                Some(provenance.subject_effective_path().to_path_buf())
             }
         };
         request.resolved_item.materialized_project_root = rebound_materialized_project_root.clone();

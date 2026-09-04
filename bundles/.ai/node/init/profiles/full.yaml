@@ -106,10 +106,11 @@ policies:
         - ryeos.register.command.dispatch.direct_execute_item_ref
       web: []
   execution:
-    schema: 1
+    schema: 2
     max_live_fanout: 8
     max_private_materialization_copy_bytes: 17179869184
     host_env_passthrough: []
+    workload_client: null
   object_closure:
     schema: 1
     max_roots: 256

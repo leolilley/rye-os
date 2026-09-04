@@ -121,7 +121,7 @@ impl std::error::Error for ExclusiveWorkerCleanupUnproved {}
 
 struct HeldPersistentSession {
     process: ryeos_app::thread_lifecycle::SpawnedPersistentSessionAwaitingAttachment,
-    socket: std::os::unix::net::UnixStream,
+    socket: lillux::InheritedDuplexChannel,
     lifelines: Vec<Box<dyn Send + Sync>>,
 }
 
@@ -423,6 +423,7 @@ pub(crate) fn preview_prepared_dependencies(
                 kind,
                 &dependency.resolution,
                 &roots,
+                &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
             )?;
         let session = if let Some((declaration, protocol)) = session_contract(engine, dependency)? {
             let lifecycle = lifecycle_contract(&declaration)?;
@@ -1112,6 +1113,7 @@ fn admit_session_capsule(
             &dependency.captured_verified_subject()?.resolved.kind,
             &mut resolution,
             &roots,
+            &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
             inherited_content,
             &mut publication,
         )?;
@@ -1162,6 +1164,8 @@ fn admit_session_capsule(
     }
     let verified = dependency.captured_verified_subject()?;
     let mut request = direct_request(state, dependency, &verified, String::new())?;
+    let session = validate_persistent_session_protocol(&protocol.descriptor)
+        .map_err(|error| anyhow!(error))?;
     let mut plan = prepare_captured_item_plan(
         engine,
         &request,
@@ -1169,6 +1173,7 @@ fn admit_session_capsule(
         &dependency.resolution.root.raw_content,
         &state.isolation,
         None,
+        session.workspace_authority.filesystem_ceiling(),
     )?;
     let executor_ref = plan
         .execution_plan()
@@ -1177,6 +1182,13 @@ fn admit_session_capsule(
         .cloned()
         .ok_or_else(|| anyhow!("persistent-session plan has no executor-chain hop"))?;
     request.executor_ref = executor_ref.clone();
+    // Freeze the signed session constraints before hashing the direct plan.
+    // Testimony and every later boot consume this same narrowed pair, not a
+    // presumed isolation mode derived from the fact that this is a session.
+    plan.restrict_isolation_authority(
+        session.workspace_authority.filesystem_ceiling(),
+        session.network_authority.network_ceiling(),
+    );
     plan.bind_persistent_session_workspace(&workspace)?;
     let artifact_identity = plan.admitted_artifact_identity(&request, protocol)?;
 
@@ -1379,8 +1391,7 @@ where
 {
     let capsule = load_capsule(state, capsule_hash)?;
     validate_capsule_current_trust(&state.engine, &capsule)?;
-    let protocol_ref = capsule_protocol_identity(&capsule)?.0;
-    if installed_session_protocol(state, protocol_ref)?.process_mode
+    if retained_session_protocol(&state.engine, &capsule)?.process_mode
         != PersistentSessionProcessMode::PooledRequests
     {
         bail!(
@@ -1420,16 +1431,39 @@ where
     )
 }
 
-fn installed_session_protocol<'a>(
-    state: &'a AppState,
-    protocol_ref: &str,
-) -> Result<&'a ryeos_engine::protocols::descriptor::PersistentSessionProtocol> {
-    let protocol =
-        state.engine.protocols.get(protocol_ref).ok_or_else(|| {
-            anyhow!("persistent-session protocol `{protocol_ref}` is not installed")
-        })?;
-    validate_persistent_session_protocol(&protocol.descriptor)
-        .map_err(|error| anyhow!("persistent-session protocol `{protocol_ref}`: {error}"))
+fn retained_session_protocol(
+    engine: &ryeos_engine::engine::Engine,
+    capsule: &AdmittedPersistentSessionCapsule,
+) -> Result<ryeos_engine::protocols::descriptor::PersistentSessionProtocol> {
+    let ryeos_state::objects::AdmittedLaunchArtifactIdentity::DirectItemExecutor {
+        protocol_ref, protocol_content_hash, protocol_signer_fingerprint, ..
+    } = &capsule.artifact_identity else {
+        bail!("persistent-session protocol has no direct artifact identity");
+    };
+    let ryeos_state::objects::AdmittedExecutionClosure::DirectItemExecutor {
+        protocol_descriptor_document, execution_plan, ..
+    } = &capsule.execution_closure else {
+        bail!("persistent-session protocol has no retained direct closure");
+    };
+    // The current trust store may revoke the retained signer. It must never
+    // replace admitted behavior with a newer descriptor at the same ref.
+    let body = super::launch::verify_admitted_signed_descriptor_document(
+        protocol_descriptor_document, protocol_content_hash, protocol_signer_fingerprint,
+        &engine.node_trust_store,
+    ).map_err(|error| anyhow!("verify retained session protocol: {error}"))?;
+    let descriptor: ryeos_engine::protocols::ProtocolDescriptor = serde_yaml::from_str(&body)?;
+    ryeos_engine::protocols::validate_admitted_protocol_descriptor(protocol_ref, &descriptor)?;
+    let session = validate_persistent_session_protocol(&descriptor)
+        .map_err(|error| anyhow!(error))?;
+    let plan: ryeos_engine::contracts::ExecutionPlan = serde_json::from_value(execution_plan.clone())?;
+    if plan.filesystem_authority_ceiling.intersect(session.workspace_authority.filesystem_ceiling())
+        != plan.filesystem_authority_ceiling
+        || plan.network_authority_ceiling.intersect(session.network_authority.network_ceiling())
+            != plan.network_authority_ceiling
+    {
+        bail!("persistent-session plan widens its retained protocol ceilings");
+    }
+    Ok(session.clone())
 }
 
 fn start_capsule_process(
@@ -1438,8 +1472,7 @@ fn start_capsule_process(
     capsule: &AdmittedPersistentSessionCapsule,
     exact: &PersistentSessionExactProgram,
 ) -> Result<StartedPersistentSession> {
-    let protocol_ref = capsule_protocol_identity(capsule)?.0;
-    let session_protocol = installed_session_protocol(state, protocol_ref)?;
+    let session_protocol = retained_session_protocol(&state.engine, capsule)?;
     if session_protocol.process_mode != PersistentSessionProcessMode::PooledRequests {
         bail!("exclusive persistent-session protocol cannot use the pooled launcher");
     }
@@ -1458,9 +1491,10 @@ fn start_capsule_process(
         capsule,
         exact,
         &workspace,
-        session_protocol,
+        &session_protocol,
         None,
         &BTreeMap::new(),
+        Vec::new(),
     )?;
     held.lifelines.push(Box::new(workspace_lifeline));
     // The fixed pool becomes the process owner as soon as this constructor
@@ -1555,6 +1589,9 @@ fn spawn_capsule_process_held(
     session_protocol: &ryeos_engine::protocols::descriptor::PersistentSessionProtocol,
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
+    mut extra_target_channels: Vec<
+        ryeos_engine::isolation::IsolationTargetChannelAuthority,
+    >,
 ) -> Result<HeldPersistentSession> {
     let resolution = exact.resolution_output.restore();
     super::source_closure::validate_external_mount_separation(state, &resolution)?;
@@ -1649,12 +1686,17 @@ fn spawn_capsule_process_held(
     drop(cas);
     drop(guard);
     drop(authority);
-    let (daemon_socket, worker_socket) = std::os::unix::net::UnixStream::pair()
+    let (daemon_channel, worker_channel) = lillux::inherited_duplex_channel_pair()
+        .map_err(anyhow::Error::msg)
         .context("create daemon-owned persistent-session channel")?;
+    let daemon_socket = daemon_channel;
     let target_channel = ryeos_engine::isolation::IsolationTargetChannelAuthority::new(
-        worker_socket,
+        worker_channel,
+        0,
         capsule.wire.channel_env.clone(),
     )?;
+    extra_target_channels.push(target_channel);
+    extra_target_channels.sort_by_key(|channel| channel.target_fd());
     let executable_search_env = (!capsule.executable_search.is_empty())
         .then(|| {
             lillux::canonical_json(&serde_json::to_value(&capsule.executable_search)?)
@@ -1698,7 +1740,7 @@ fn spawn_capsule_process_held(
         state,
         workspace,
         mounts,
-        target_channel,
+        extra_target_channels,
         &capsule.lifecycle,
         session_protocol.workspace_authority,
         session_protocol.network_authority,
@@ -1730,6 +1772,9 @@ pub fn start_exclusive_capsule(
     workspace: &Path,
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
+    extra_target_channels: Vec<
+        ryeos_engine::isolation::IsolationTargetChannelAuthority,
+    >,
     identity: &ExclusivePersistentSessionIdentity,
     observation_sink: ryeos_app::persistent_session::PersistentSessionObservationSink,
 ) -> Result<()> {
@@ -1737,8 +1782,7 @@ pub fn start_exclusive_capsule(
     validate_capsule_current_trust(&state.engine, &capsule)?;
     let exact: PersistentSessionExactProgram =
         serde_json::from_value(capsule.exact_program.clone())?;
-    let protocol_ref = capsule_protocol_identity(&capsule)?.0;
-    let session_protocol = installed_session_protocol(state, protocol_ref)?;
+    let session_protocol = retained_session_protocol(&state.engine, &capsule)?;
     use ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority;
     if session_protocol.process_mode != PersistentSessionProcessMode::ExclusiveSession
         || session_protocol.workspace_authority
@@ -1778,9 +1822,10 @@ pub fn start_exclusive_capsule(
         &capsule,
         &exact,
         workspace,
-        session_protocol,
+        &session_protocol,
         state_root,
         &runtime_environment,
+        extra_target_channels,
     )?;
     let now = lillux::time::timestamp_millis() as i64;
     let record = WorkerProcessRecord {
@@ -1942,6 +1987,7 @@ fn validate_capsule_current_trust(
     engine: &ryeos_engine::engine::Engine,
     capsule: &AdmittedPersistentSessionCapsule,
 ) -> Result<()> {
+    retained_session_protocol(engine, capsule)?;
     let ryeos_state::objects::AdmittedLaunchArtifactIdentity::DirectItemExecutor {
         root_subject_signer_fingerprint,
         root_subject_source_identity,
@@ -2165,6 +2211,7 @@ mod tests {
             manifest_hash: std::iter::repeat_n(hash_seed, 64).collect(),
             entry_count: 1,
             total_bytes: 1,
+            mount_root: ryeos_state::objects::ExternalContentMountRoot::Project,
             mount: mount.to_owned(),
         }
     }

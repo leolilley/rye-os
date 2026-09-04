@@ -35,6 +35,158 @@ struct PreparedCallbackDispatch {
     effect_authority: Option<ryeos_effect_contract::PreparedEffectDispatchAuthority>,
 }
 
+/// Exact durable workspace coordinate derived from the boot-bound admitted
+/// grant and the root's already-sealed project provenance.
+///
+/// This is only a projection into `RuntimeActionIntent`; it is not a second
+/// lease or child ledger. The workspace journal remains owned by
+/// `execution_workspace`, and worker/session liveness is rechecked by
+/// `StateStore` in the reservation transaction.
+#[derive(Debug, Clone)]
+struct PreparedWorkloadWorkspaceOperation {
+    workspace_id: String,
+    access: ryeos_engine::kind_registry::WorkspaceAccess,
+    worker_instance_id: String,
+    worker_boot_epoch: u64,
+    worker_boot_identity_hash: String,
+    project_authority_digest: String,
+    grant_digest: String,
+    input_base_snapshot_hash: String,
+}
+
+impl PreparedWorkloadWorkspaceOperation {
+    fn seed(&self) -> ryeos_app::runtime_db::NewRuntimeWorkspaceOperation<'_> {
+        ryeos_app::runtime_db::NewRuntimeWorkspaceOperation {
+            workspace_id: &self.workspace_id,
+            access: self.access,
+            worker_instance_id: &self.worker_instance_id,
+            worker_boot_epoch: self.worker_boot_epoch,
+            worker_boot_identity_hash: &self.worker_boot_identity_hash,
+            project_authority_digest: &self.project_authority_digest,
+            workload_client_grant_digest: &self.grant_digest,
+        }
+    }
+}
+
+fn canonical_authority_digest(value: &impl serde::Serialize) -> Result<String> {
+    let value = serde_json::to_value(value)?;
+    let canonical = lillux::canonical_json(&value)?;
+    Ok(lillux::sha256_hex(canonical.as_bytes()))
+}
+
+fn prepare_workload_workspace_operation(
+    state: &AppState,
+    cap: &ryeos_app::callback_token::CallbackCapability,
+    thread_auth: &ThreadAuthState,
+    authoritative_chain_root_id: &str,
+    authoritative_current_site_id: &str,
+    authoritative_origin_site_id: &str,
+    child_provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
+    access: ryeos_engine::kind_registry::WorkspaceAccess,
+) -> Result<PreparedWorkloadWorkspaceOperation> {
+    let grant = cap
+        .workload_client_grant
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workspace access has no admitted workload-client grant"))?;
+    grant.validate()?;
+    if state.node_policy.generation_digest() != grant.node_policy_generation_digest
+        || grant.chain_root_id != authoritative_chain_root_id
+        || grant.placement_thread_id != cap.thread_id
+        || grant.owner_principal != thread_auth.acting_principal
+        || grant.effective_caps != thread_auth.caller_scopes
+        || grant.origin_site_id != authoritative_origin_site_id
+        || authoritative_current_site_id != state.threads.site_id()
+        || grant.effective_caps != cap.effective_caps
+    {
+        anyhow::bail!(
+            "workload-client grant contradicts the current callback/thread placement authority"
+        );
+    }
+    let placement = state
+        .threads
+        .get_thread(&cap.thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("workload-client placement thread disappeared"))?;
+    if placement.status != "running"
+        || placement.chain_root_id != grant.chain_root_id
+        || placement.requested_by.as_deref() != Some(grant.owner_principal.as_str())
+        || placement.origin_site_id != grant.origin_site_id
+        || placement.admitted_launch_capsule_hash.as_deref()
+            != Some(grant.root_launch_capsule_hash.as_str())
+    {
+        anyhow::bail!("workload-client root launch authority changed after boot");
+    }
+    let session = state
+        .state_store
+        .dedicated_session(&cap.thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("workload-client hosted session disappeared"))?;
+    let worker = state
+        .state_store
+        .worker_process(&grant.worker_instance_id)?
+        .ok_or_else(|| anyhow::anyhow!("workload-client worker boot disappeared"))?;
+    if session.chain_root_id != grant.chain_root_id
+        || session.admitted_capsule_hash != grant.session_capsule_hash
+        || session.worker_instance_id.as_deref() != Some(grant.worker_instance_id.as_str())
+        || session.worker_boot_epoch != Some(grant.worker_boot_epoch)
+        || !matches!(
+            session.state.as_str(),
+            "idle" | "turn_running" | "awaiting_approval"
+        )
+        || worker.daemon_generation_id != ryeos_app::runtime_db::daemon_generation_id()
+        || worker.placement_thread_id != grant.placement_thread_id
+        || worker.boot_epoch != grant.worker_boot_epoch
+        || worker.boot_identity_hash != grant.worker_boot_identity_hash
+        || worker.session_capsule_hash != grant.session_capsule_hash
+        || worker.state != ryeos_app::runtime_db::WorkerProcessState::Live
+        || worker.cleanup_state != "owned"
+    {
+        anyhow::bail!("workload-client grant no longer names the exact live worker boot");
+    }
+    if state
+        .state_store
+        .current_chain_placement_thread_id(authoritative_chain_root_id)?
+        .as_deref()
+        != Some(cap.thread_id.as_str())
+    {
+        anyhow::bail!("workload-client caller is not the authoritative chain placement");
+    }
+    let project_authority_digest = canonical_authority_digest(child_provenance.project_authority())?;
+    if project_authority_digest != grant.project_authority_digest {
+        anyhow::bail!("workload-client grant project authority changed after boot");
+    }
+    let input_base_snapshot_hash = child_provenance
+        .pinned_snapshot_hash()
+        .ok_or_else(|| anyhow::anyhow!("shared-workspace execution requires pinned provenance"))?
+        .to_owned();
+    if !matches!(
+        child_provenance.project_authority(),
+        ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+            realization: ryeos_state::objects::PinnedProjectRealization::Cow { .. },
+            ..
+        }
+    ) {
+        anyhow::bail!("shared-workspace execution requires a private pinned-CoW root");
+    }
+    let workspace = crate::execution::workspace::WorkspaceLayout::from_project(
+        child_provenance.effective_path(),
+    )?;
+    let workspace_id = workspace
+        .root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("execution workspace id is not canonical UTF-8"))?
+        .to_owned();
+    Ok(PreparedWorkloadWorkspaceOperation {
+        workspace_id,
+        access,
+        worker_instance_id: grant.worker_instance_id.clone(),
+        worker_boot_epoch: grant.worker_boot_epoch,
+        worker_boot_identity_hash: grant.worker_boot_identity_hash.clone(),
+        project_authority_digest,
+        grant_digest: grant.digest()?,
+        input_base_snapshot_hash,
+    })
+}
+
 fn enforce_inline_result_retention(
     item_ref: &str,
     retention: ryeos_engine::history_policy::ThreadResultRetention,
@@ -128,7 +280,12 @@ fn callback_execution_context(
         ProjectContext::None
     } else {
         ProjectContext::LocalPath {
-            path: child_provenance.effective_path().to_path_buf(),
+            // Admission remains bound to the initiating immutable subject
+            // generation. A workload-delegated child may later receive a
+            // separately captured execution input, but that input is not a
+            // project definition and must never become item-resolution
+            // authority.
+            path: child_provenance.subject_effective_path().to_path_buf(),
         }
     };
     if current_site_id != state.threads.site_id() {
@@ -279,6 +436,13 @@ fn validate_action_occurrence_contract(params: &DispatchActionParams) -> Result<
 }
 
 pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
+    // This is the single generic callback-to-child dispatch boundary. A
+    // hosted workload-client surface must arrive here through a narrowly
+    // admitted method/action projection on the existing callback capability.
+    // A private bridge-local per-invocation broker may adapt transport for a
+    // sandboxed workload, but it must not add a second daemon endpoint,
+    // authentication store, dispatcher, operation ledger, child launcher, or
+    // provenance path.
     let params: DispatchActionParams =
         serde_json::from_value(params.clone()).context("invalid runtime.dispatch_action params")?;
     validate_action_occurrence_contract(&params)?;
@@ -286,6 +450,16 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
     let cap = state
         .callback_tokens
         .validate_token_and_thread(&params.callback_token, &params.thread_id)?;
+    cap.runtime_method_surface
+        .authorize(ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD)?;
+    if let Some(grant) = cap.workload_client_grant.as_ref() {
+        if params.hook_dispatch.is_some() || params.effect_dispatch.is_some() {
+            anyhow::bail!(
+                "workload-client callback authority cannot select hook or effect dispatch"
+            );
+        }
+        grant.authorize_action(&params.action)?;
+    }
     let launch_owner = cap
         .launch_owner
         .as_deref()
@@ -331,9 +505,19 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
     // Authority is selected before capability evaluation. Ordinary callbacks
     // use the root program's grants; hook callbacks use only the exact hook
     // source's captured grants and can never borrow root authority.
-    enforce_callback_caps(&params.action.item_id, &dispatch_caps, &state.authorizer)?;
+    enforce_callback_caps(
+        &params.action.item_id,
+        &dispatch_caps,
+        &state.authorizer,
+        &child_provenance.request_engine().kinds,
+    )?;
     for binding_ref in params.action.ref_bindings.values() {
-        enforce_callback_caps(binding_ref, &dispatch_caps, &state.authorizer)?;
+        enforce_callback_caps(
+            binding_ref,
+            &dispatch_caps,
+            &state.authorizer,
+            &child_provenance.request_engine().kinds,
+        )?;
     }
 
     // Note: DispatchActionParams has `deny_unknown_fields` and no
@@ -370,6 +554,34 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
         }
         None
     };
+    let workload_workspace_access = if let Some(grant) = cap.workload_client_grant.as_ref() {
+        let prepared = prepared_callback_dispatch.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workload-client dispatch lost its exact child preflight")
+        })?;
+        grant.authorize_effect_class(
+            &params.action.item_id,
+            prepared.preflight.effect_class_ceiling,
+        )?;
+        Some(grant.authorize_workspace_access(
+            &params.action.item_id,
+            prepared.preflight.workspace_access,
+        )?)
+    } else {
+        None
+    };
+
+    // Root terminalization, freeze and handoff already drain this gate. Keep
+    // one ordinary hosted operation live across reservation, exact process
+    // quiescence, child execution and settlement; a second workspace gate
+    // would race those existing owners.
+    let _hosted_root_operation = if workload_workspace_access.is_some() {
+        Some(ryeos_app::hosted_operation::begin_hosted_root_operation(
+            &state.state_store,
+            &params.thread_id,
+        )?)
+    } else {
+        None
+    };
 
     let result = handle_execute(
         params,
@@ -382,6 +594,7 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
         &caller_thread.origin_site_id,
         child_provenance,
         prepared_callback_dispatch,
+        workload_workspace_access,
     )
     .await;
     drop(caller_thread);
@@ -717,11 +930,19 @@ fn enforce_callback_caps(
     item_id: &str,
     effective_caps: &[String],
     authorizer: &ryeos_runtime::authorizer::Authorizer,
+    kinds: &ryeos_engine::kind_registry::KindRegistry,
 ) -> std::result::Result<(), crate::dispatch_error::DispatchError> {
     let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(item_id).map_err(|error| {
         crate::dispatch_error::DispatchError::InvalidRef(item_id.to_string(), error.to_string())
     })?;
-    let required = format!("ryeos.execute.{}.{}", canonical.kind, canonical.bare_id);
+    let required = kinds
+        .get(&canonical.kind)
+        .and_then(|schema| schema.inventory_policy.admission.as_ref())
+        .map(|admission| admission.required_capability(&canonical))
+        .ok_or_else(|| crate::dispatch_error::DispatchError::SchemaMisconfigured {
+            kind: canonical.kind.clone(),
+            detail: "kind has no signed execution-capability projection".to_owned(),
+        })?;
 
     if effective_caps.is_empty() {
         return Err(crate::dispatch_error::DispatchError::MissingCap { required });
@@ -755,10 +976,25 @@ async fn handle_execute(
     authoritative_chain_root_id: &str,
     authoritative_current_site_id: &str,
     authoritative_origin_site_id: &str,
-    child_provenance: ryeos_app::execution_provenance::ExecutionProvenance,
+    mut child_provenance: ryeos_app::execution_provenance::ExecutionProvenance,
     prepared_callback_dispatch: Option<PreparedCallbackDispatch>,
+    workload_workspace_access: Option<ryeos_engine::kind_registry::WorkspaceAccess>,
 ) -> Result<Value> {
     let action_digest = ryeos_runtime::callback::dispatch_action_digest(&params.action)?;
+    let prepared_workspace_operation = workload_workspace_access
+        .map(|access| {
+            prepare_workload_workspace_operation(
+                state,
+                cap,
+                thread_auth,
+                authoritative_chain_root_id,
+                authoritative_current_site_id,
+                authoritative_origin_site_id,
+                &child_provenance,
+                access,
+            )
+        })
+        .transpose()?;
     let lifecycle_authority = state
         .state_store
         .get_launch_metadata(&cap.thread_id)?
@@ -783,6 +1019,7 @@ async fn handle_execute(
             &child_provenance,
             lifecycle_authority,
             prepared_callback_dispatch.as_ref(),
+            prepared_workspace_operation.as_ref(),
         )?)
     } else {
         None
@@ -919,15 +1156,49 @@ async fn handle_execute(
         let request_hash = runtime_action_request_hash.as_deref().ok_or_else(|| {
             anyhow::anyhow!("ordinary callback action lost its request authority")
         })?;
-        let child_thread_id = state.state_store.reserve_runtime_action_intent(
-            operation_id,
-            &params.thread_id,
-            ryeos_app::runtime_db::RuntimeActionMode::Inline,
-            request_hash,
-            &ryeos_app::thread_lifecycle::new_thread_id(),
-            None,
-        )?;
+        let proposed_child_thread_id = ryeos_app::thread_lifecycle::new_thread_id();
+        let child_thread_id = match prepared_workspace_operation.as_ref() {
+            Some(workspace_operation) => state
+                .state_store
+                .reserve_runtime_action_intent_with_workspace(
+                    operation_id,
+                    &params.thread_id,
+                    ryeos_app::runtime_db::RuntimeActionMode::Inline,
+                    request_hash,
+                    &proposed_child_thread_id,
+                    None,
+                    &workspace_operation.seed(),
+                )?,
+            None => state.state_store.reserve_runtime_action_intent(
+                operation_id,
+                &params.thread_id,
+                ryeos_app::runtime_db::RuntimeActionMode::Inline,
+                request_hash,
+                &proposed_child_thread_id,
+                None,
+            )?,
+        };
         if state.threads.get_thread(&child_thread_id)?.is_some() {
+            if prepared_workspace_operation.is_some() {
+                let retained = state
+                    .state_store
+                    .get_runtime_action_intent(operation_id)?
+                    .and_then(|intent| intent.workspace_operation)
+                    .ok_or_else(|| {
+                        runtime_action_outcome_unknown(
+                            operation_id,
+                            "retained workload action lost its workspace-operation authority",
+                        )
+                    })?;
+                if retained.phase
+                    != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
+                {
+                    return Err(runtime_action_outcome_unknown(
+                        operation_id,
+                        "retained workspace child is still owned by its original quiescence/settlement path",
+                    ));
+                }
+            }
             let recovered = recover_runtime_action_child_response(
                 state,
                 operation_id,
@@ -995,6 +1266,189 @@ async fn handle_execute(
         None
     };
 
+    let mut exclusive_workspace_quiescence = None;
+    if let Some(workspace_operation) = prepared_workspace_operation.as_ref() {
+        let operation_id = params
+            .action
+            .operation_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("workspace action lost its operation id"))?;
+        let retained = state
+            .state_store
+            .get_runtime_action_intent(operation_id)?
+            .and_then(|intent| intent.workspace_operation)
+            .ok_or_else(|| anyhow::anyhow!("workspace action lost its durable intent"))?;
+        if retained.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved {
+            return Err(runtime_action_outcome_unknown(
+                operation_id,
+                format!(
+                    "workspace action is retained in phase {:?}; its original process authority must settle it",
+                    retained.phase
+                ),
+            ));
+        }
+        match workspace_operation.access {
+            ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration => {
+                let capture_state = state.clone();
+                let capture_operation_id = operation_id.to_owned();
+                let capture_thread_id = params.thread_id.clone();
+                let capture_project_path = child_provenance.effective_path().to_path_buf();
+                let capture_base_snapshot = workspace_operation.input_base_snapshot_hash.clone();
+                let pending = crate::execution::run_bounded_project_capture(move || {
+                    crate::execution::capture_runtime_workspace_input_generation(
+                        &capture_state,
+                        &capture_operation_id,
+                        &capture_thread_id,
+                        &capture_project_path,
+                        &capture_base_snapshot,
+                    )
+                })
+                .await?;
+                let (input_snapshot_hash, publication, quiesced) =
+                    pending.into_unpublished_snapshot_and_quiesced()?;
+                if let Some(publication) = publication
+                    && let Err(error) = publication.publish()
+                {
+                    return match quiesced.resume_or_terminate() {
+                        Ok(()) => {
+                            state.state_store.transition_runtime_workspace_operation(
+                                operation_id,
+                                &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced],
+                                ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+                            )?;
+                            Err(error.context("publish captured workspace-input generation"))
+                        }
+                        Err(settle_error) => Err(error.context(format!(
+                            "workspace-input publication failed and exact root resume/termination was not proved: {settle_error:#}"
+                        ))),
+                    };
+                }
+                let materialize_state = state.clone();
+                let materialize_snapshot_hash = input_snapshot_hash.clone();
+                let materialize_original_path =
+                    child_provenance.original_project_path().to_path_buf();
+                let materialize_checkout_id = format!("workspace-input-{operation_id}");
+                let materialized = crate::execution::run_bounded_project_capture(move || {
+                    crate::execution::project_source::resolve_pinned_snapshot_context(
+                        &materialize_state,
+                        &materialize_snapshot_hash,
+                        materialize_original_path,
+                        &materialize_checkout_id,
+                        crate::execution::project_source::PinnedContextRealization::ReadOnly,
+                    )
+                })
+                .await;
+                let materialized = match materialized {
+                    Ok(materialized) => materialized,
+                    Err(error) => {
+                        return match quiesced.resume_or_terminate() {
+                            Ok(()) => {
+                                state.state_store.transition_runtime_workspace_operation(
+                                    operation_id,
+                                    &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced],
+                                    ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+                                )?;
+                                Err(anyhow::Error::new(error))
+                            }
+                            Err(settle_error) => Err(anyhow::anyhow!(
+                                "workspace-input materialization failed ({error}) and exact root resume/termination was not proved: {settle_error:#}"
+                            )),
+                        };
+                    }
+                };
+                let materialized_authority = (|| -> Result<_> {
+                    let input_lifeline = materialized.temp_dir.ok_or_else(|| {
+                        anyhow::anyhow!("workspace-input materialization has no lifecycle guard")
+                    })?;
+                    let input_materialization =
+                        materialized.pinned_materialization.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workspace-input materialization has no verified authority"
+                            )
+                        })?;
+                    Ok((input_materialization, input_lifeline))
+                })();
+                let (input_materialization, input_lifeline) = match materialized_authority {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        return match quiesced.resume_or_terminate() {
+                            Ok(()) => {
+                                state.state_store.transition_runtime_workspace_operation(
+                                    operation_id,
+                                    &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced],
+                                    ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+                                )?;
+                                Err(error)
+                            }
+                            Err(settle_error) => Err(error.context(format!(
+                                "workspace-input authority was incomplete and exact root resume/termination was not proved: {settle_error:#}"
+                            ))),
+                        };
+                    }
+                };
+                child_provenance = match child_provenance
+                    .with_immutable_workspace_input(input_materialization, input_lifeline)
+                {
+                    Ok(provenance) => provenance,
+                    Err(error) => {
+                        return match quiesced.resume_or_terminate() {
+                            Ok(()) => {
+                                state.state_store.transition_runtime_workspace_operation(
+                                    operation_id,
+                                    &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced],
+                                    ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+                                )?;
+                                Err(error)
+                            }
+                            Err(settle_error) => Err(error.context(format!(
+                                "immutable workspace provenance failed and exact root resume/termination was not proved: {settle_error:#}"
+                            ))),
+                        };
+                    }
+                };
+                quiesced.resume_or_terminate().with_context(|| {
+                    format!(
+                        "resume or terminate exact root after capturing workspace input for `{operation_id}`"
+                    )
+                })?;
+            }
+            ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive => {
+                let quiesce_state = state.clone();
+                let quiesce_operation_id = operation_id.to_owned();
+                let quiesce_thread_id = params.thread_id.clone();
+                let quiesce_project_path = child_provenance.effective_path().to_path_buf();
+                let quiesce_base_snapshot = workspace_operation.input_base_snapshot_hash.clone();
+                exclusive_workspace_quiescence = Some(
+                    crate::execution::run_bounded_project_capture(move || {
+                        crate::execution::quiesce_runtime_workspace_exclusive(
+                            &quiesce_state,
+                            &quiesce_operation_id,
+                            &quiesce_thread_id,
+                            &quiesce_project_path,
+                            &quiesce_base_snapshot,
+                        )
+                    })
+                    .await?,
+                );
+            }
+        }
+        if let Err(error) = state.state_store.transition_runtime_workspace_operation(
+            operation_id,
+            &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced],
+            ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::ChildRunning,
+        ) {
+            if let Some(quiesced) = exclusive_workspace_quiescence.take() {
+                quiesced.resume_or_terminate()?;
+            }
+            state.state_store.transition_runtime_workspace_operation(
+                operation_id,
+                &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced],
+                ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+            )?;
+            return Err(error.context("advance workspace action to child-running"));
+        }
+    }
+
     let project_path = child_provenance.effective_path().to_path_buf();
     // C0 diagnostic: snapshot the run's resolution source before `provenance` is
     // moved into the dispatch request, so a content-hash mismatch can be pinned
@@ -1043,7 +1497,7 @@ async fn handle_execute(
     // we await `dispatch::dispatch` directly. The previous
     // `Handle::current().block_on(...)` was a panic/deadlock risk on
     // the P3b hot path (a runtime-thread blocking on its own runtime).
-    let result = match handler_context {
+    let mut result = match handler_context {
         Some(context) => {
             crate::dispatch::dispatch_verified_with_handler_context(
                 &params.action.item_id,
@@ -1094,7 +1548,7 @@ async fn handle_execute(
                     error,
                 )
             })?;
-            return attach_runtime_dispatch_evidence(
+            result = attach_runtime_dispatch_evidence(
                 recovered,
                 &action_digest,
                 durable_effect_requested,
@@ -1119,6 +1573,38 @@ async fn handle_execute(
             return Err(runtime_action_outcome_unknown(
                 operation_id,
                 "dispatch returned before retained launch/service ownership could prove a terminal child",
+            ));
+        }
+    }
+    if prepared_workspace_operation.is_some() {
+        let operation_id = params
+            .action
+            .operation_id
+            .as_deref()
+            .expect("workspace action was validated with an operation id");
+        if !state
+            .state_store
+            .begin_runtime_workspace_operation_settlement(operation_id)?
+        {
+            return Err(runtime_action_outcome_unknown(
+                operation_id,
+                "workspace child returned before its exact launcher/process authorities settled",
+            ));
+        }
+        if let Some(quiesced) = exclusive_workspace_quiescence.take() {
+            quiesced.resume_or_terminate().with_context(|| {
+                format!(
+                    "resume or terminate exact hosted root after exclusive workspace action `{operation_id}`"
+                )
+            })?;
+        }
+        if !state
+            .state_store
+            .settle_runtime_workspace_operation(operation_id)?
+        {
+            return Err(runtime_action_outcome_unknown(
+                operation_id,
+                "workspace operation remained unsettled after exact child cleanup",
             ));
         }
     }
@@ -1430,6 +1916,7 @@ fn runtime_action_request_hash(
     child_provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
     lifecycle_authority: ryeos_state::objects::ExecutionLifecycleAuthority,
     prepared: Option<&PreparedCallbackDispatch>,
+    workspace_operation: Option<&PreparedWorkloadWorkspaceOperation>,
 ) -> Result<String> {
     let mut effective_caps = dispatch_caps.to_vec();
     effective_caps.sort();
@@ -1466,8 +1953,20 @@ fn runtime_action_request_hash(
                 "subject_effect_class_ceiling": authority.subject_effect_class_ceiling,
             })
         });
+    let workspace_authority = workspace_operation.map(|operation| {
+        serde_json::json!({
+            "workspace_id": &operation.workspace_id,
+            "access": operation.access,
+            "worker_instance_id": &operation.worker_instance_id,
+            "worker_boot_epoch": operation.worker_boot_epoch,
+            "worker_boot_identity_hash": &operation.worker_boot_identity_hash,
+            "project_authority_digest": &operation.project_authority_digest,
+            "workload_client_grant_digest": &operation.grant_digest,
+            "input_base_snapshot_hash": &operation.input_base_snapshot_hash,
+        })
+    });
     let identity = serde_json::json!({
-        "schema": "ryeos.runtime_action_request.v1",
+        "schema": "ryeos.runtime_action_request.v2",
         "action_digest": action_digest,
         "mode": &action.thread,
         "chain_root_id": chain_root_id,
@@ -1486,6 +1985,7 @@ fn runtime_action_request_hash(
         "callback_effective_definition_digest": &cap.effective_definition_digest,
         "prepared_subject": prepared_subject,
         "effect_authority": effect_authority,
+        "workspace_authority": workspace_authority,
     });
     let canonical = lillux::canonical_json(&identity)
         .context("canonicalize exact runtime action request authority")?;
@@ -1507,12 +2007,21 @@ fn parent_execution_context_from_capability(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use lillux::time::{Duration, MonotonicDeadline};
 
     // ── V5.5 P2: enforce_callback_caps ──────────────────────────────
 
     fn test_auth() -> ryeos_runtime::authorizer::Authorizer {
         ryeos_runtime::authorizer::Authorizer::new()
+    }
+
+    fn enforce_test_callback_caps(
+        item_id: &str,
+        effective_caps: &[String],
+        authorizer: &ryeos_runtime::authorizer::Authorizer,
+    ) -> std::result::Result<(), crate::dispatch_error::DispatchError> {
+        let kinds = ryeos_engine::test_support::load_live_kind_registry();
+        enforce_callback_caps(item_id, effective_caps, authorizer, &kinds)
     }
 
     #[test]
@@ -1817,9 +2326,12 @@ mod tests {
             invocation_id: "inv-test".to_string(),
             thread_id: "T-parent".to_string(),
             launch_owner: None,
+            runtime_method_surface:
+                ryeos_app::callback_token::CallbackRuntimeMethodSurface::complete_runtime_protocol(
+                ),
             chain_root_id: "T-parent".to_string(),
             project_path: project.path().to_path_buf(),
-            expires_at: Instant::now() + Duration::from_secs(300),
+            expires_at: MonotonicDeadline::after(Duration::from_secs(300)),
             effective_caps: vec!["ryeos.*".to_string()],
             provenance,
             effective_bundle_id: None,
@@ -1831,6 +2343,7 @@ mod tests {
             hard_limits: serde_json::json!({"turns": 6, "tokens": 1000}),
             depth: 4,
             accounting_scope: None,
+            workload_client_grant: None,
         };
 
         let ctx = parent_execution_context_from_capability(&cap);
@@ -2098,12 +2611,19 @@ mod tests {
         let authorizer = test_auth();
 
         assert!(
-            enforce_callback_caps("tool:test/audit", &selected.dispatch_caps, &authorizer).is_ok()
+            enforce_test_callback_caps("tool:test/audit", &selected.dispatch_caps, &authorizer)
+                .is_ok()
         );
-        assert!(enforce_callback_caps("tool:test/privileged", &root_grants, &authorizer).is_ok());
         assert!(
-            enforce_callback_caps("tool:test/privileged", &selected.dispatch_caps, &authorizer,)
-                .is_err()
+            enforce_test_callback_caps("tool:test/privileged", &root_grants, &authorizer).is_ok()
+        );
+        assert!(
+            enforce_test_callback_caps(
+                "tool:test/privileged",
+                &selected.dispatch_caps,
+                &authorizer,
+            )
+            .is_err()
         );
     }
 
@@ -2152,15 +2672,15 @@ mod tests {
         let auth = test_auth();
         // The `ryeos.*` cap (or expansion) covers all kinds.
         let caps = vec!["ryeos.*".to_string()];
-        assert!(enforce_callback_caps("tool:any/thing", &caps, &auth).is_ok());
-        assert!(enforce_callback_caps("directive:any/thing", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("tool:any/thing", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("directive:any/thing", &caps, &auth).is_ok());
     }
 
     #[test]
     fn caps_empty_denies_everything() {
         let auth = test_auth();
         let caps: Vec<String> = vec![];
-        let err = enforce_callback_caps("tool:foo/bar", &caps, &auth).unwrap_err();
+        let err = enforce_test_callback_caps("tool:foo/bar", &caps, &auth).unwrap_err();
         assert_eq!(err.code(), "missing_cap");
         assert!(err.to_string().contains("ryeos.execute.tool.foo/bar"));
     }
@@ -2169,10 +2689,10 @@ mod tests {
     fn caps_kind_wildcard_matches_any_id_in_kind() {
         let auth = test_auth();
         let caps = vec!["ryeos.execute.tool.*".to_string()];
-        assert!(enforce_callback_caps("tool:any/echo", &caps, &auth).is_ok());
-        assert!(enforce_callback_caps("tool:other/foo", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("tool:any/echo", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("tool:other/foo", &caps, &auth).is_ok());
         // Different kind — denied.
-        let err = enforce_callback_caps("directive:foo/bar", &caps, &auth).unwrap_err();
+        let err = enforce_test_callback_caps("directive:foo/bar", &caps, &auth).unwrap_err();
         assert_eq!(err.code(), "missing_cap");
     }
 
@@ -2182,8 +2702,8 @@ mod tests {
         // `tool:foo/bar` → required cap `ryeos.execute.tool.foo/bar`.
         // Slash is preserved in subject, matching the canonical format.
         let caps = vec!["ryeos.execute.tool.foo/bar".to_string()];
-        assert!(enforce_callback_caps("tool:foo/bar", &caps, &auth).is_ok());
-        let err = enforce_callback_caps("tool:foo/baz", &caps, &auth).unwrap_err();
+        assert!(enforce_test_callback_caps("tool:foo/bar", &caps, &auth).is_ok());
+        let err = enforce_test_callback_caps("tool:foo/baz", &caps, &auth).unwrap_err();
         assert_eq!(err.code(), "missing_cap");
     }
 
@@ -2191,7 +2711,7 @@ mod tests {
     fn caps_invalid_item_id_rejected() {
         let auth = test_auth();
         let caps = vec!["ryeos.execute.tool.foo".to_string()];
-        let err = enforce_callback_caps("not-a-canonical-ref", &caps, &auth).unwrap_err();
+        let err = enforce_test_callback_caps("not-a-canonical-ref", &caps, &auth).unwrap_err();
         assert!(
             err.code() == "invalid_ref",
             "must point at canonical-ref parse failure; got: {}",
@@ -2205,11 +2725,11 @@ mod tests {
         // `ryeos.execute.tool.foo/*` matches `tool:foo/bar` because
         // `/*` is the path-prefix wildcard convention.
         let caps = vec!["ryeos.execute.tool.foo/*".to_string()];
-        assert!(enforce_callback_caps("tool:foo/bar", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("tool:foo/bar", &caps, &auth).is_ok());
         // A sibling `tool:foobar` requires `ryeos.execute.tool.foobar`,
         // which does NOT match `ryeos.execute.tool.foo/*` — the `/`
         // separator is required.
-        let err = enforce_callback_caps("tool:foobar", &caps, &auth).unwrap_err();
+        let err = enforce_test_callback_caps("tool:foobar", &caps, &auth).unwrap_err();
         assert!(matches!(
             err,
             crate::dispatch_error::DispatchError::MissingCap { required }
@@ -2223,7 +2743,7 @@ mod tests {
         // `ryeos.execute.tool.*` matches any tool subject, including
         // those with `/` separators.
         let caps = vec!["ryeos.execute.tool.*".to_string()];
-        assert!(enforce_callback_caps("tool:foo/bar", &caps, &auth).is_ok());
-        assert!(enforce_callback_caps("tool:baz/qux/deep", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("tool:foo/bar", &caps, &auth).is_ok());
+        assert!(enforce_test_callback_caps("tool:baz/qux/deep", &caps, &auth).is_ok());
     }
 }

@@ -51,16 +51,17 @@ Options:
                         (default: .dev-keys/PUBLISHER_DEV.pem)
   --owner LABEL         Owner label for populate-bundles.sh
                         (default: ryeos-dev)
-  --bundle-set SET      Bundle set to populate/install: full,
-                        full-sandbox (full plus the separately built optional
-                        isolation backend), standard
+  --bundle-set SET      Bundle set to populate/install: full, standard
                         (core+central-auth+standard), hosted-node
                         (core+central-auth+hosted-node), or hosted-workflow
-                        (core+central-auth+standard+hosted-node+codex). Every
-                        set selects its exact same-named publisher-authored
-                        node init profile for first policy publication; an
-                        existing signed generation is preserved.
+                        (core+central-auth+standard+hosted-node+codex). Each set
+                        has an explicit default publisher-authored node init
+                        profile; an existing signed generation is preserved.
                         (default: full)
+  --node-profile NAME   Select another publisher-authored policy profile whose
+                        exact_bundles match --bundle-set. For example,
+                        development selects enforced hosted-development policy
+                        over the full bundle set without creating another set.
   --jobs N              Cap cargo build parallelism during --populate (cargo -j N).
                         Use a smaller N if a full release build exhausts memory.
   --crates "A B C"      With --populate, rebuild only these Cargo packages (e.g.
@@ -179,6 +180,11 @@ build_install_init_profile_args() {
             --replace-node-policy-generation
             --confirm-node-policy-generation-replacement
         )
+        # Replacement publishes the selected profile just as first init does.
+        # Keep the same exact post-init inventory check; merely observing a
+        # nonempty generation would allow a partial or wrong replacement to
+        # pass this installer boundary.
+        INSTALL_PUBLISH_INITIAL_POLICY=1
     elif [[ ! -e "$policy_generation_path" && ! -L "$policy_generation_path" ]]; then
         INSTALL_INIT_PROFILE_ARGS=(--node-profile "$mapped_profile")
         INSTALL_PUBLISH_INITIAL_POLICY=1
@@ -444,6 +450,7 @@ reset_node_policy_generation=0
 key="$repo_root/.dev-keys/PUBLISHER_DEV.pem"
 owner="ryeos-dev"
 bundle_set="full"
+node_profile_override=""
 jobs=""            # forwarded to populate as cargo -j N
 crates=""          # forwarded to populate to rebuild only these Cargo packages
 populate_all=0     # explicit opt-in to rebuild the whole bundle set
@@ -489,6 +496,11 @@ while [[ $# -gt 0 ]]; do
             bundle_set="$2"
             shift 2
             ;;
+        --node-profile)
+            [[ $# -ge 2 ]] || die "--node-profile requires a value"
+            node_profile_override="$2"
+            shift 2
+            ;;
         --jobs)
             [[ $# -ge 2 ]] || die "--jobs requires a number"
             jobs="$2"
@@ -524,18 +536,31 @@ fi
 if [[ $reset_node_policy_generation -eq 1 && $run_init -eq 0 ]]; then
     die "--reset-node-policy-generation cannot be combined with --no-init"
 fi
+if [[ -n "$node_profile_override" && $run_init -eq 0 ]]; then
+    die "--node-profile cannot be combined with --no-init"
+fi
 
 bundle_names=()
 while IFS= read -r _bundle_name; do
     bundle_names+=("$_bundle_name")
 done < <(ryeos_bundle_set_names "$bundle_set") || true
 if [[ ${#bundle_names[@]} -eq 0 ]]; then
-    die "--bundle-set must be 'full', 'full-sandbox', 'central-host', 'standard', 'hosted-node', or 'hosted-workflow', got: $bundle_set"
+    die "--bundle-set must be 'full', 'central-host', 'standard', 'hosted-node', or 'hosted-workflow', got: $bundle_set"
 fi
-if ! node_init_profile="$(ryeos_bundle_set_node_init_profile "$bundle_set")"; then
-    die "could not resolve node init profile for bundle set: $bundle_set"
+if [[ -n "$node_profile_override" ]]; then
+    node_init_profile="$node_profile_override"
+else
+    if ! node_init_profile="$(ryeos_bundle_set_node_init_profile "$bundle_set")"; then
+        die "could not resolve default node init profile for bundle set: $bundle_set"
+    fi
 fi
 [[ -n "$node_init_profile" ]] || die "bundle set has no explicit node init profile: $bundle_set"
+if ! node_profile_bundle_set="$(ryeos_node_init_profile_bundle_set "$node_init_profile")"; then
+    die "unsupported --node-profile: $node_init_profile"
+fi
+if [[ "$node_profile_bundle_set" != "$bundle_set" ]]; then
+    die "node init profile '$node_init_profile' requires bundle set '$node_profile_bundle_set', not '$bundle_set'"
+fi
 bundle_names_csv=$(IFS=,; printf '%s\n' "${bundle_names[*]}")
 
 # Every selected source bundle must already carry its exact closed manifest and
@@ -543,7 +568,7 @@ bundle_names_csv=$(IFS=,; printf '%s\n' "${bundle_names[*]}")
 # integrity merely because they stage no Rust binary.
 closed_payload_bundle_names=("${bundle_names[@]}")
 
-if [[ "$bundle_set" != "full" && "$bundle_set" != "full-sandbox" && $run_init -eq 0 ]]; then
+if [[ "$bundle_set" != "full" && $run_init -eq 0 ]]; then
     ryeos_term_warn "--no-init installs lean sources only; existing local initialized state is not rewritten"
 fi
 
@@ -639,9 +664,10 @@ fi
 require_closed_source_bundle_payloads "$repo_root" "${closed_payload_bundle_names[@]}" \
     || die "selected source bundle set is incomplete"
 
-# Validate the complete shared source-root seed closure before stopping a live
-# daemon or replacing installed files. Every distribution carries these seeds
-# and selects exactly the same-named seed through the mapping above.
+# Validate the complete shared source-root profile closure before stopping a
+# live daemon or replacing installed files. Every distribution carries the
+# closed catalog. Its default profile is same-named; an explicit profile may
+# intentionally select different policy over the exact same bundle set.
 for name in "${bundle_names[@]}"; do
     [[ -d "$repo_root/bundles/$name/.ai" ]] || die "missing bundles/$name/.ai"
 done
@@ -822,6 +848,9 @@ if [[ $run_init -eq 1 ]]; then
     if [[ $reset_node_policy_generation -eq 1 ]]; then
         [[ -e "$policy_generation_path" && ! -L "$policy_generation_path" ]] || \
             die "--reset-node-policy-generation requires an existing safe policy generation"
+    elif [[ -n "$node_profile_override" \
+        && ( -e "$policy_generation_path" || -L "$policy_generation_path" ) ]]; then
+        die "--node-profile selects first publication only; use --reset-node-policy-generation to replace an existing generation explicitly"
     fi
     build_install_init_profile_args \
         "$policy_generation_path" "$node_init_profile" "$reset_node_policy_generation" || \
@@ -914,7 +943,7 @@ if [[ $run_init -eq 1 ]]; then
                 die "initialized central-host state unexpectedly contains $name registration"
         done
     fi
-    if [[ "$bundle_set" == "full" || "$bundle_set" == "full-sandbox" ]]; then
+    if [[ "$bundle_set" == "full" ]]; then
         grep -q '^  execute: client:ryeos/tui$' \
             "$state_root/.ai/bundles/ryeos-ui/.ai/node/commands/tui.yaml" || \
             die "initialized tui command is stale or not client-backed"

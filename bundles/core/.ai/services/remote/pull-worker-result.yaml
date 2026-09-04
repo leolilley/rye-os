@@ -1,0 +1,8 @@
+kind: service
+endpoint: remote.pull-worker-result
+required_caps: ["ryeos.execute.service.remote/pull-worker-result"]
+schema:
+  remote: string?
+  project: string
+  chain_root_id: string
+description: "Durably pull one target-attested terminal hosted-worker candidate and apply it to its exact clean-base owner workspace"

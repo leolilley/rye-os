@@ -2,6 +2,7 @@
 category: "ryeos/core/bundle"
 name: "manifest-sign"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 required_caps: []
 description: "Generate and sign .ai/manifest.yaml from .ai/manifest.source.yaml without running the full publish pipeline."
 

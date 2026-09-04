@@ -1,19 +1,22 @@
-<!-- ryeos:signed:2026-09-04T08:45:07Z:36011886825b9e9b51b9066b6569897d76a3b481c8a21d534192ac0ea0cd1234:BqEvSoAKx26a7GQDHJiYZiJIS1Ok7j73PsFk/a0gewSRfZMeKT1TQp4V+QQxECps2KsZYe26oU0iKKA5o4CCCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-04T09:13:19Z:2a2d23ee558c93d4ba47301cadcbdb71fe6f99396c2200754b4b0bb93c231753:ZCKpENZ0l4uw/vL7Y4DfHL7U/MjFOm+0LGNoGwntydqdVTNLE7F782BgNNfvUMVTSpn6FFY/Tx8TPKFS4dMlCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
-description: Implemented source-local command, state-root, signing, and bundle-smoke workflow
+description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.1.1"
+version: "1.4.0"
 ```
 
 # Source-Local Bundle Development
 
 ## Status
 
-This workflow is implemented. The entries below identify its supported
-developer-facing contracts and their owning code.
+The original local command, state-root, signing, and bundle-smoke workflow is
+implemented. The project-bundle and development-realization sections below
+also record source-authored work that still has the explicit artifact,
+runtime-root, signing, and qualification gates they name. They must not be read
+as evidence that remote build/test execution is already available.
 
 - Command descriptors / local command help: routed without daemon alias
   parsing; project-aware tails auto-detect a cwd ancestor containing `.ai/`;
@@ -65,3 +68,249 @@ The replacement selects the install's mapped signed profile and preserves
 node/operator/vault identities, execution history, project heads, and all
 non-policy state. Fresh nodes and nodes already on schema 2 omit the reset
 flag. There is no schema-1 decoder or implicit migration.
+
+## Repository project bundle
+
+The repository-root `.ai` tree is also the source-local `ryeos` project
+bundle. Its signed `.ai/manifest.yaml` is generated from
+`.ai/manifest.source.yaml`; both are exact-file project sync surfaces. The
+manifest declares only the `config`, `knowledge`, and `tool` kind dependencies
+and no runtime authority.
+
+Project AI surfaces have an explicit shape:
+
+- a `file` surface admits exactly the named regular file and never descendants;
+- a `directory` surface admits the named subtree but not a directory entry as
+  project-manifest content; and
+- apply replaces or deletes every materialized surface under one existing
+  rollback window before advancing the deployed project ref.
+
+Development configuration uses the generic
+`.ai/config/development/<project-namespace>/` surface. The RyeOS repository
+therefore uses `.ai/config/development/ryeos/`; the state/engine path contains
+no `ryeos-next` or development-provider branch. Only that namespace, the root
+manifests, and `.ai/tools/ryeos/development/` are unignored in this repository.
+Unrelated root `.ai` content remains private/ignored unless deliberately added
+to the registered project surface and Git contract.
+
+The generated manifest and executable development items are signed by the
+public development publisher fixture. That binds reproducible development
+identity only. It grants no operator, node, release, deployment, vault,
+publication, or remote authority.
+
+## Development execution confinement
+
+Core carries one self-contained `linux-lillux` isolation adapter under the
+clean-cut isolation-adapter v4 protocol. The backend is available signed data,
+not ambient host setup: bundle membership does not activate it and every
+ordinary init profile remains explicitly disabled. The separately selectable
+`development` init profile maps to the existing `full` bundle set and enables
+the backend plus a finite workload-client node ceiling. It is a policy choice,
+not a duplicate bundle distribution. A fresh local development node selects it
+with `--bundle-set full --node-profile development`; replacing an existing
+policy generation additionally requires the explicit
+`--reset-node-policy-generation` decision. Hosted-worker profiles retain their
+independently selected network policy.
+
+The v4 plan carries a bounded, sorted collection of daemon-created target
+channels and an explicit PID-namespace choice. Lillux owns namespace, mount,
+pivot-root, seccomp, descriptor, pidfd/procfs and process-settle mechanics.
+RyeOS layers own only typed authorities, exact adapter identity and signed
+policy/data. Do not recreate those OS mechanics in an executor, daemon,
+release script, project tool, Python bootstrap, or compiler-specific wrapper.
+The same source-to-target descriptor mapping is enforced when isolation is
+disabled, and the daemon side remains a typed Lillux byte-stream endpoint.
+There is no raw Unix-socket conversion escape hatch.
+
+Per-child filesystem and network denial are data driven. The signed Tool kind
+projects composed `filesystem_authority` and `network_authority` into the
+serialized execution plan. Development build/test items author
+`captured_execution` and `isolated`; ordinary Tools use signed `node_policy`
+defaults. Parent restrictions intersect irreversibly. The effective filesystem
+ceiling is supplied before runtime compilation, so host-environment templates
+and path mutations cannot capture ambient values before spawn filtering.
+Execution-realization testimony records the same retained pair that launch
+consumes. Neither restriction is silently accepted when isolation is disabled.
+Generic dispatch never recognizes Cargo, Rust, Zig, Codex, or a project name.
+
+Persistent sessions retain their signed protocol document, not merely its ref.
+Admission intersects that protocol's workspace/network restrictions into the
+plan before hashing. Recovery verifies the retained document against current
+node trust and sealed identity; it never adopts a replacement descriptor from
+the installed registry. Session testimony must not claim captured/isolated
+authority simply because the process is a session.
+
+Every external-content declaration and realized entry names a mandatory
+`mount_root` and canonical relative `mount`. `project` targets the admitted
+workspace; `execution_runtime` targets a strict child of the shared sandbox
+namespace `/ryeos/realizations`. Allowed roots are signed kind/runtime data.
+The Tool contract permits both; Worker, Config, Graph and launch-content
+dependency contracts currently permit project roots only. Runtime mounts use
+the existing descriptor-pinned read-only realization authority, reject mount
+and workspace overlaps, and require enforced isolation. They never use the
+disabled-mode project-copy path or enter project fold-back exclusions. Exact
+realization-member command identity includes the root, path, manifest and
+member digest through restart. No host path becomes portable authority.
+
+Signed subprocess descriptors can project schema-validated scalar invocation
+parameters through the existing bounded rye-expr/1 runtime template context,
+for example one package name into one argv element. The value remains a single
+argument; it is not reparsed as a command line. Prefer that ordinary data path
+for finite project-tool selectors. Do not add a development argv builder,
+shell/JSON shim, compiler-specific dispatcher, or command-multiplexer binary
+when the existing Tool schema, config schema, and runtime template already
+express the operation.
+
+Tool subprocess protocol selection is likewise existing generic signed data.
+Every executable Tool names one protocol admitted by the Tool kind's closed
+allowlist. Development compiler/build/test tools select callback-free
+`protocol:ryeos/core/opaque`, so their subprocess environment contains no
+daemon callback or thread-auth bearer for build scripts to inherit. Tools that
+need callbacks select `tool_callback` explicitly; command names never decide.
+
+The native backend intentionally refuses aggregate resource isolation until a
+typed delegated cgroup-v2 authority is carried to Lillux. Per-process rlimits
+must not be represented as aggregate containment.
+
+Initial confined build/test tools use the backend's existing private writable
+`/tmp` for Cargo home, target output and compiler temporaries. Their exact
+toolchain and dependency trees remain read-only realizations. Do not add a
+durable runtime-view/cache authority merely to improve first-run performance;
+such reuse requires an explicit lifecycle, recovery, quota and GC contract.
+
+## Exact workload-client realization
+
+The restricted workload client is an external realization, not a Core bundle
+binary and not a file extracted from a runtime image. The official release's
+single shared construction solve builds it as a fully static executable from
+the exact release source and publishes a separate deterministic archive:
+
+```text
+ryeos-workload-client-<version>-x86_64-unknown-linux-gnu.tar.gz
+```
+
+The tree contains only `bin/ryeos`, the repository license, and canonical
+`RYEOS-BUILD` testimony. The binary embeds the same testimony in a private ELF
+section. Packaging and recovery verification require exact equality and bind
+the explicit release version, full source revision, UTC build date,
+source-date epoch, target, and release profile. An ordinary Cargo build is
+marked `development` and cannot pass realization publication. Neither build
+path consults Git to invent missing provenance.
+
+The archive is portable content, not target authorization. A project-owned
+worker environment or Tool first declares the real manifest digest produced
+from this exact tree. Each target then uses the existing external-content
+import and pinned-project consumer-binding path. Managed activation remains
+restricted to trusted installed-bundle consumers; it is not widened for the
+source-local project. Do not author a project environment, toolchain, or
+dependency declaration with a placeholder digest. Those signed items land only
+after the corresponding real tree has been produced and imported.
+
+The verifier can publish the verified tree directly beneath an already-
+admitted named-root directory. It stages beside the requested destination and
+renames only the complete verified directory. It never provisions the named
+root, changes node policy, or silently selects a fallback location:
+
+```bash
+scripts/release/verify-workload-client-realization.sh \
+  --version "$version" \
+  --source-revision "$source_revision" \
+  --build-date "$build_date" \
+  --source-date-epoch "$source_date_epoch" \
+  --archive "$archive" \
+  --checksum "$archive.sha256" \
+  --materialize "$named_root/ryeos-workload-client-$version"
+```
+
+## Stage-0 platform payload
+
+`.ai/config/development/ryeos/stage0-platform-x86_64-linux.yaml` is the
+source-local signed input contract for the first compiler payload. It selects
+the exact linux/amd64 publisher-image manifest, immutable dated Rust 1.95.0
+component archives, Zig 0.15.2 archive, upstream indexes, byte bounds, hashes,
+target and source-date epoch. It deliberately contains no output manifest
+digest: that digest does not exist until the real tree is produced and
+imported.
+
+`Dockerfile.development-realizations` runs the transparent publisher without a
+package-manager step. The producer downloads only the selected upstream
+archives, verifies exact sizes and digests, runs the upstream Rust component
+installers into a private tree, extracts Zig into that same compiler payload,
+records the publisher/input/producer/program coordinates, inventories every
+file, normalizes timestamps and emits one deterministic archive. No compiler,
+loader, library or other runtime byte is copied from the publisher image.
+The retained input digest covers the canonical flat contract body, not its
+replaceable signature header, so re-signing unchanged semantics does not alter
+the produced tree.
+
+The official GNU Rust host executables are dynamically linked. The retained
+`RYEOS-RUNTIME-DEPENDENCIES` evidence says exactly which interpreter and
+libraries each executable requires. Consequently this compiler payload is not
+yet executable authority inside the Lillux private root. Its signed
+`execution_gate` remains `exact_runtime_root_mount_required` until generic
+effective-program data can bind descriptor-pinned external-content runtime
+roots at their exact absolute namespace destinations. Mounting ambient host
+`/lib`, `/lib64`, `/usr` or `/bin`, copying those paths from the publisher
+image, or inserting a Rust/Zig-specific wrapper would violate the contract.
+
+The verifier checks the closed archive shape, complete retained tree
+inventory, upstream-index hashes, build testimony, executable dependency
+evidence and signed bounds before optionally publishing one sibling-staged
+directory. It does not clear the execution gate:
+
+```bash
+scripts/release/verify-development-toolchain-stage0.sh \
+  --inputs .ai/config/development/ryeos/stage0-platform-x86_64-linux.yaml \
+  --producer scripts/release/produce-development-toolchain-stage0.sh \
+  --archive "$stage0_archive" \
+  --checksum "$stage0_archive.sha256" \
+  --materialize "$named_root/stage0-toolchain"
+```
+
+Qualifying Stage 0 runs the pinned publisher twice into distinct output
+directories (and preferably distinct empty caches), then passes both archive /
+checksum pairs to `test-development-toolchain-stage0.sh`. The test requires
+byte-identical archives and checksums before applying the verifier to both; it
+does not build or acquire anything itself. The tracked artifact tests consume
+already-built archives, do not compile RyeOS, and never manufacture substitute
+binaries. Artifact production and those tests remain explicit qualification
+steps rather than release-time fallback logic.
+
+## Import and target-local binding
+
+Archive verification is not RyeOS launch authority. After materialization
+beneath a node-policy named root, use the existing operator path to create the
+ordinary content manifest:
+
+```bash
+ryeos external-content import \
+  <named-root-id> <relative-tree> tree content <maximum-bytes>
+```
+
+The result supplies `staging_id`, `request_digest`, and the real
+`manifest_hash`. Only then may the project Tool be authored with a locator-free
+`mode: pinned` tree declaration naming that exact hash, an explicit permitted
+`mount_root`, and a canonical relative `mount`. Sign the Tool, create the exact
+project snapshot, and bind the staging
+capability to that pinned project consumer:
+
+```bash
+ryeos external-content bind \
+  <staging_id> <request_digest> <manifest_hash> \
+  tool:ryeos/development/<tool> pinned_project \
+  <project_snapshot_hash> <project-path>
+```
+
+The same sequence runs independently on every placement target. Portable
+content may move through RyeOS object-closure transfer, but each node creates
+its own operator-authorized binding. Managed activation remains restricted to
+trusted installed-bundle consumers.
+
+The Stage-0 dependency realization cannot be authored honestly before the
+compiler payload, its exact runtime-root dependencies, and their real RyeOS
+manifests are admitted. Its producer is the later signed project Tool that
+invokes the exact admitted Cargo with `vendor --locked --versioned-dirs`; its
+build descendants use only the resulting exact offline tree with `--locked
+--frozen --offline`. A shell process using publisher-image Cargo, an ambient
+Cargo home, or a checked-in placeholder manifest would create a competing
+bootstrap authority, so none is included here.

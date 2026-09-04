@@ -256,6 +256,7 @@ fn daemon_executes_python_hello_world_end_to_end() {
             &serde_json::Value::Null,
             &plan_ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .expect("build_plan walks executor chain to subprocess terminal");
 
@@ -276,7 +277,7 @@ fn daemon_executes_python_hello_world_end_to_end() {
 
     let (app_root, isolation) = isolation_context();
     let engine_ctx = EngineContext {
-        isolation_target_channel: None,
+        isolation_target_channels: Vec::new(),
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
@@ -388,6 +389,7 @@ fn python_script_runtime_supports_bundle_local_imports_without_pythonpath() {
             &serde_json::Value::Null,
             &plan_ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .expect("build_plan walks executor chain to subprocess terminal");
 
@@ -410,7 +412,7 @@ fn python_script_runtime_supports_bundle_local_imports_without_pythonpath() {
 
     let (app_root, isolation) = isolation_context();
     let engine_ctx = EngineContext {
-        isolation_target_channel: None,
+        isolation_target_channels: Vec::new(),
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
@@ -512,6 +514,7 @@ fn python_function_runtime_supports_bundle_local_imports_without_pythonpath() {
             &serde_json::Value::Null,
             &plan_ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .expect("build_plan walks executor chain to subprocess terminal");
 
@@ -534,7 +537,7 @@ fn python_function_runtime_supports_bundle_local_imports_without_pythonpath() {
 
     let (app_root, isolation) = isolation_context();
     let engine_ctx = EngineContext {
-        isolation_target_channel: None,
+        isolation_target_channels: Vec::new(),
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
@@ -637,6 +640,7 @@ fn engine_pipeline_emits_resolve_verify_build_plan_span_tree() {
                 &serde_json::Value::Null,
                 &plan_ctx.execution_hints,
                 None,
+                ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             )
             .expect("build_plan");
     });

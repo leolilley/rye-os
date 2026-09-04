@@ -1886,42 +1886,6 @@ pub(crate) async fn dispatch_method(
         }
     }
 
-    // 7. validate_only: run the full pre-spawn path (args validation, runtime
-    //    lookup, launch-mode check — already done — plus payload projection
-    //    incl. resolution/trust/corpus) and report the call as valid without
-    //    minting a thread or spawning the runtime. Mirrors the
-    //    subprocess/service validate paths.
-    if request.validate_only {
-        project_method_payload(
-            method_decl,
-            canonical_ref,
-            hop_verified.as_ref(),
-            kind,
-            &engine_roots,
-            ctx,
-            request,
-            request.root_admission.as_ref(),
-        )?;
-        method_runtime_config_snapshot_off_thread(
-            kind,
-            &method_decl.runtime_config,
-            &engine_roots,
-            &ctx.engine,
-            state,
-            request.launch_timings.clone(),
-            request.root_admission.as_ref(),
-            &ctx.plan_ctx.subject_resolution_authority,
-        )
-        .await?;
-        return Ok(json!({
-            "validated": true,
-            "item_ref": canonical_ref.to_string(),
-            "kind": kind,
-            "method": method_name,
-            "executor_ref": executor_ref,
-        }));
-    }
-
     // A method invocation is a real executable root. Reuse the exact public
     // admission when present; otherwise admit this already-verified subject
     // once. Method/runtime identity must never stand in for the invoked item.
@@ -1996,6 +1960,56 @@ pub(crate) async fn dispatch_method(
             )
         })?
     };
+
+    let (filesystem_authority_ceiling, network_authority_ceiling) =
+        crate::execution::execution_realization::project_launch_isolation_ceilings(
+            state,
+            &ctx.engine,
+            kind,
+            Some(root_admission.resolution_output()),
+            request.parent_execution_context.as_ref().map(|parent| parent.parent_thread_id.as_str()),
+        ).map_err(DispatchError::Internal)?;
+    if filesystem_authority_ceiling
+        == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution
+    {
+        return Err(DispatchError::CapabilityRejected {
+            reason: "captured execution cannot grant the method runtime's daemon callback authority".to_owned(),
+        });
+    }
+
+    // Validation shares the exact admitted subject and isolation ceilings.
+    // Resolve payload/config under that admission without minting a thread
+    // or spawning a runtime; do not validate against weaker request defaults.
+    if request.validate_only {
+        project_method_payload(
+            method_decl,
+            canonical_ref,
+            hop_verified.as_ref(),
+            kind,
+            &engine_roots,
+            ctx,
+            request,
+            Some(&root_admission),
+        )?;
+        method_runtime_config_snapshot_off_thread(
+            kind,
+            &method_decl.runtime_config,
+            &engine_roots,
+            &ctx.engine,
+            state,
+            request.launch_timings.clone(),
+            Some(&root_admission),
+            &ctx.plan_ctx.subject_resolution_authority,
+        )
+        .await?;
+        return Ok(json!({
+            "validated": true,
+            "item_ref": canonical_ref.to_string(),
+            "kind": kind,
+            "method": method_name,
+            "executor_ref": executor_ref,
+        }));
+    }
 
     // Accepted launch is an admission acknowledgement, so every rejection
     // that depends only on the invoked root must be settled before a durable
@@ -2503,6 +2517,7 @@ pub(crate) async fn dispatch_method(
             timeout: METHOD_RUNTIME_TIMEOUT_SECS as f64,
             limits: None,
             inherited_fds: Vec::new(),
+            inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         };
         let node_trusted_keys_dir = state.config.runtime_root().trusted_keys_dir();
@@ -2527,9 +2542,8 @@ pub(crate) async fn dispatch_method(
                 ryeos_engine::isolation::IsolationLaunchContext {
                     project_path: request.project_path,
                     project_authority: request.provenance.isolation_project_authority(),
-                    filesystem_authority_ceiling:
-                        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
-                network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+                    filesystem_authority_ceiling,
+                    network_authority_ceiling,
                     live_access: live_access.as_ref(),
                     state_root: request.provenance.state_root_override(),
                     checkpoint_dir: None,
@@ -2541,7 +2555,7 @@ pub(crate) async fn dispatch_method(
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],
-                    target_channel: None,
+                    target_channels: &[],
                     item_ref: &runtime_item_ref_string,
                     thread_id: &thread_id,
                 },
@@ -4614,8 +4628,14 @@ pub async fn prepare_admitted_launch_contract(
         .plan_context()
         .subject_resolution_authority
         .clone();
-    let resolution_project_root =
-        resolution_project_root(&subject_authority, provenance.effective_path());
+    // A workload-delegated immutable child may execute against a later
+    // captured read-only generation, but launch-contract resolution remains
+    // bound to the already-admitted subject generation. Treating the input
+    // materialization as a project definition would create a second authority.
+    let resolution_project_root = resolution_project_root(
+        &subject_authority,
+        provenance.subject_effective_path(),
+    );
     let roots = ctx
         .engine
         .resolution_roots(resolution_project_root.map(Path::to_path_buf));
@@ -4902,6 +4922,10 @@ pub struct RootDispatchPreflight {
     pub root_admission: Option<ryeos_app::thread_lifecycle::RootExecutionAdmission>,
     pub root_dispatch_evidence: RootDispatchEvidence,
     pub effect_class_ceiling: Option<ryeos_effect_contract::EffectClass>,
+    /// Kind-owned signed shared-workspace relationship. `None` is deny-all for
+    /// workload-delegated workspace access; ordinary dispatch does not infer a
+    /// relationship from this field.
+    pub workspace_access: Option<ryeos_engine::kind_registry::WorkspaceAccess>,
 }
 
 /// Enforce the caller's durable-effect claim against the exact composed
@@ -4979,6 +5003,22 @@ fn effect_class_ceiling_for_admission(
             detail: format!("signed effect-class projection contains unknown class `{other}`"),
         }),
     }
+}
+
+fn workspace_access_for_admission(
+    engine: &ryeos_engine::engine::Engine,
+    admission: &ryeos_app::thread_lifecycle::RootExecutionAdmission,
+) -> Result<Option<ryeos_engine::kind_registry::WorkspaceAccess>, DispatchError> {
+    let kind = &admission.verified_subject().resolved.canonical_ref.kind;
+    let Some(execution) = engine.kinds.get(kind).and_then(|schema| schema.execution.as_ref()) else {
+        return Ok(None);
+    };
+    execution
+        .project_workspace_access(&admission.resolution_output().composed.composed)
+        .map_err(|error| DispatchError::SchemaMisconfigured {
+            kind: kind.clone(),
+            detail: error.to_string(),
+        })
 }
 
 impl RootDispatchPreflight {
@@ -5088,12 +5128,14 @@ fn finish_root_dispatch_preflight(
     let root_dispatch_evidence =
         RootDispatchEvidence::new(applicability, &requested_subject, &root_admission);
     let effect_class_ceiling = effect_class_ceiling_for_admission(&ctx.engine, &root_admission)?;
+    let workspace_access = workspace_access_for_admission(&ctx.engine, &root_admission)?;
     Ok(RootDispatchPreflight {
         class,
         requested_subject,
         root_admission: Some(root_admission),
         root_dispatch_evidence,
         effect_class_ceiling,
+        workspace_access,
     })
 }
 
@@ -6521,6 +6563,7 @@ metadata:
                 admitted_subject_digest: admitted.resolved.raw_content_digest.clone(),
             },
             effect_class_ceiling: None,
+            workspace_access: None,
         };
 
         preflight.rebind_requested_subject(wrapper.clone());
@@ -7818,6 +7861,9 @@ requires:
             persistent_session: None,
             effective_validator: None,
             effect_class_ceiling: None,
+            workspace_access: None,
+            network_authority_ceiling: None,
+            filesystem_authority_ceiling: None,
         }
     }
 

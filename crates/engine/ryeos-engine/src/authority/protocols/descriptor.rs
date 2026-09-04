@@ -84,11 +84,29 @@ pub enum PersistentSessionWorkspaceAuthority {
     RuntimeWorkspace,
 }
 
+impl PersistentSessionWorkspaceAuthority {
+    pub fn filesystem_ceiling(self) -> crate::isolation::IsolationFilesystemAuthorityCeiling {
+        match self {
+            Self::EphemeralScratch => crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution,
+            Self::RuntimeWorkspace => crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PersistentSessionNetworkAuthority {
     Isolated,
     NodePolicy,
+}
+
+impl PersistentSessionNetworkAuthority {
+    pub fn network_ceiling(self) -> crate::isolation::IsolationNetworkAuthorityCeiling {
+        match self {
+            Self::Isolated => crate::isolation::IsolationNetworkAuthorityCeiling::Isolated,
+            Self::NodePolicy => crate::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

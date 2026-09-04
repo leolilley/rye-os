@@ -34,7 +34,11 @@ const GENERATION_SCHEMA: u32 = 1;
 const STAGED_ROOTS_SCHEMA: u32 = 2;
 const DURABLE_UPLOAD_SCHEMA: u32 = 2;
 const MAX_RECOVERY_RECORD_BYTES: u64 = 1024 * 1024;
-const REMOTE_PULL_JOURNAL_KEY: &str = "remote-pull-journal.key";
+// The authority predates its use by project snapshot apply. Keep the physical
+// coordinate stable while generalizing the API: changing the filename would
+// strand an authenticated remote-pull journal created by the immediately
+// preceding process. This is one authority, not a legacy-name fallback.
+const WORKSPACE_JOURNAL_KEY: &str = "remote-pull-journal.key";
 static UNIQUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -170,18 +174,17 @@ pub struct RecoveryStore {
     directory: std::sync::Arc<lillux::PinnedDirectory>,
 }
 
-fn read_remote_pull_journal_key(file: &mut File) -> Result<[u8; 32]> {
-    let mut bytes = Vec::with_capacity(33);
-    file.take(33).read_to_end(&mut bytes)?;
+fn read_workspace_journal_key(file: &lillux::PinnedRegularFile) -> Result<[u8; 32]> {
+    let bytes = file.read_bounded(33)?;
     if bytes.len() != 32 {
         anyhow::bail!(
-            "node-owned remote pull journal key has invalid length {}",
+            "node-owned workspace journal key has invalid length {}",
             bytes.len()
         );
     }
     bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("remote pull journal key length changed during validation"))
+        .map_err(|_| anyhow::anyhow!("workspace journal key length changed during validation"))
 }
 
 const THREAD_HISTORY_DISCARD_MARKER: &str = "thread-history-discard.json";
@@ -1394,28 +1397,27 @@ impl RecoveryStore {
     /// journal itself lives beside the workspace bytes it describes so it can
     /// survive a daemon crash, but it is never trusted unless its canonical
     /// body authenticates under this key held outside project space.
-    pub fn remote_pull_journal_auth_key(&self) -> Result<[u8; 32]> {
+    pub fn workspace_journal_auth_key(&self) -> Result<[u8; 32]> {
         use rand::RngCore as _;
 
-        let name = std::ffi::OsStr::new(REMOTE_PULL_JOURNAL_KEY);
-        if let Some(mut file) = self.directory.open_regular(name, false)? {
-            return read_remote_pull_journal_key(&mut file);
+        let name = std::ffi::OsStr::new(WORKSPACE_JOURNAL_KEY);
+        if let Some(file) = self.directory.open_pinned_regular(name, false)? {
+            return read_workspace_journal_key(&file);
         }
 
         let mut generated = [0_u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut generated);
-        if let Some(created) = self
+        if self
             .directory
-            .atomic_create_regular(name, &generated, 0o600)?
+            .atomic_create_pinned_regular(name, &generated, 0o600)?
+            .is_some()
         {
-            created.sync_all()?;
-            self.directory.try_clone_descriptor()?.sync_all()?;
             return Ok(generated);
         }
-        let mut existing = self.directory.open_regular(name, false)?.ok_or_else(|| {
-            anyhow::anyhow!("remote pull journal key creation raced with removal")
+        let existing = self.directory.open_pinned_regular(name, false)?.ok_or_else(|| {
+            anyhow::anyhow!("workspace journal key creation raced with removal")
         })?;
-        read_remote_pull_journal_key(&mut existing)
+        read_workspace_journal_key(&existing)
     }
 
     pub(crate) fn runtime_directory(&self) -> &lillux::PinnedDirectory {

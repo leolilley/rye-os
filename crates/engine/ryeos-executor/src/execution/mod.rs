@@ -175,6 +175,21 @@ impl PendingProjectResult {
         self.quiesced.take();
         Ok(())
     }
+
+    pub(crate) fn into_unpublished_snapshot_and_quiesced(
+        mut self,
+    ) -> Result<(String, Option<PendingCasPublication>, QuiescedExecutionGroup)> {
+        // The caller must publish while it still owns the quiesced process
+        // group. Returning both move-only authorities together prevents a
+        // failed publication from implicitly resuming the root while the
+        // durable operation remains `quiesced`.
+        let publication = self.publication.take();
+        let quiesced = self
+            .quiesced
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("captured workspace input lost its quiesced group"))?;
+        Ok((self.snapshot_hash, publication, quiesced))
+    }
 }
 
 /// A managed runtime's result generation captured while its terminal callback
@@ -474,12 +489,8 @@ pub(crate) fn checkout_project_snapshot(
     {
         cache.discard_generation(snapshot_hash)?;
         let cache_root = cache.pinned_root()?;
-        let staging_name = std::ffi::OsString::from(format!(
-            "{snapshot_hash}.staging.{}.{}",
-            std::process::id(),
-            rand::random::<u32>()
-        ));
-        let staging_root = cache_root.create_child(&staging_name, 0o700)?;
+        let (staging_name, staging_root) =
+            cache_root.create_unique_child(&format!("{snapshot_hash}.staging"), 0o700)?;
         let construction = (|| {
             for (relative, project_file) in project_files {
                 let content = cache.ensure_content_file(&cas, project_file)?;
@@ -556,12 +567,8 @@ pub(crate) fn checkout_project_snapshot(
             // mint the proof from the rebuilt descriptor tree.
             cache.discard_generation(snapshot_hash)?;
             let cache_root = cache.pinned_root()?;
-            let staging_name = std::ffi::OsString::from(format!(
-                "{snapshot_hash}.staging.{}.{}",
-                std::process::id(),
-                rand::random::<u32>()
-            ));
-            let staging_root = cache_root.create_child(&staging_name, 0o700)?;
+            let (staging_name, staging_root) =
+                cache_root.create_unique_child(&format!("{snapshot_hash}.staging"), 0o700)?;
             for (relative, project_file) in project_files {
                 let content = cache.ensure_content_file(&cas, project_file)?;
                 let (parent, name) = pinned_output_parent(&staging_root, relative)?;
@@ -953,6 +960,226 @@ pub(crate) fn seal_callback_workspace_generation(
     })
 }
 
+/// Capture the exact current COW generation for a workload-delegated
+/// immutable child without entering the workspace's one-way candidate-freeze
+/// lifecycle. `RuntimeActionIntent` owns the durable barrier and selected
+/// input; `execution_workspace` remains only the materialization journal.
+pub(crate) fn capture_runtime_workspace_input_generation(
+    state: &ryeos_app::state::AppState,
+    operation_id: &str,
+    thread_id: &str,
+    effective_project: &Path,
+    base_snapshot_hash: &str,
+) -> Result<PendingProjectResult> {
+    let intent = state
+        .state_store
+        .get_runtime_action_intent(operation_id)?
+        .ok_or_else(|| anyhow::anyhow!("runtime workspace-operation intent is absent"))?;
+    let operation = intent
+        .workspace_operation
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime action has no workspace-operation authority"))?;
+    if operation.access
+        != ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+        || operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved
+        || intent.first_caller_thread_id != thread_id
+    {
+        anyhow::bail!("runtime workspace operation is not an unstarted immutable capture");
+    }
+
+    let workspace = workspace::WorkspaceLayout::from_project(effective_project)?;
+    let workspace_id = workspace
+        .root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("workspace id is not valid UTF-8"))?;
+    if operation.workspace_id != workspace_id {
+        anyhow::bail!("runtime workspace operation names a different execution workspace");
+    }
+    let record = state
+        .state_store
+        .execution_workspace(workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace journal row is missing"))?;
+    let launch_owner = record
+        .launch_owner
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("workspace has no launch owner"))?;
+    if record.state != WorkspaceState::Active
+        || record.thread_id.as_deref() != Some(thread_id)
+        || record.base_snapshot != base_snapshot_hash
+    {
+        anyhow::bail!("runtime workspace capture contradicts its active workspace journal");
+    }
+    state
+        .state_store
+        .assert_launch_owner(thread_id, launch_owner)?;
+    let process_identity = state
+        .state_store
+        .execution_process_identity_owned(thread_id, launch_owner)?;
+    state.state_store.transition_runtime_workspace_operation(
+        operation_id,
+        &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved],
+        ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing,
+    )?;
+    let quiesced = QuiescedExecutionGroup::stop(process_identity)?;
+
+    let capture = (|| -> Result<(String, PendingCasPublication)> {
+        let authority = pinned_state_authority(state)?;
+        let guard = authority.acquire_shared_guard()?;
+        let cas = authority.cas_store()?;
+        let snapshot = ryeos_state::project_materialization::load_project_snapshot_bounded(
+            &cas,
+            base_snapshot_hash,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("base project snapshot {base_snapshot_hash} is absent"))?;
+        let permit = state
+            .write_barrier
+            .acquire_with_timeout(ryeos_app::write_barrier::ONLINE_WRITE_PERMIT_TIMEOUT)
+            .map_err(|error| anyhow::anyhow!("acquire workspace-input write permit: {error}"))?;
+        let operational_shadow_paths = admitted_operational_shadow_paths(state, thread_id)?;
+        let (next_tree, mut publication) = fold_back_outputs(FoldBackOutputsParams {
+            authority: &authority,
+            cas_mutation_guard: &guard,
+            isolation: &state.isolation,
+            workspace_id,
+            launch_owner,
+            working_dir: &workspace.root,
+            pre_tree_hash: &snapshot.project_tree_hash,
+            policy_hash: &snapshot.effective_policy_hash,
+            base_snapshot_hash,
+            workspace_record: &record,
+            operational_shadow_paths: &operational_shadow_paths,
+        })?;
+        let snapshot_hash = match next_tree {
+            Some(tree_hash) => store_foldback_snapshot(
+                &authority,
+                &guard,
+                &tree_hash,
+                base_snapshot_hash,
+                &mut publication,
+            )?,
+            None => base_snapshot_hash.to_owned(),
+        };
+        drop(permit);
+        state
+            .state_store
+            .assert_launch_owner(thread_id, launch_owner)?;
+        state
+            .state_store
+            .bind_runtime_workspace_input_snapshot(operation_id, &snapshot_hash)?;
+        Ok((snapshot_hash, publication))
+    })();
+
+    match capture {
+        Ok((snapshot_hash, publication)) => Ok(PendingProjectResult {
+            snapshot_hash,
+            publication: Some(publication),
+            quiesced: Some(quiesced),
+        }),
+        Err(error) => match quiesced.resume_or_terminate() {
+            Ok(()) => {
+                state.state_store.transition_runtime_workspace_operation(
+                    operation_id,
+                    &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing],
+                    ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+                )?;
+                Err(error)
+            }
+            Err(settle_error) => Err(error.context(format!(
+                "workspace-input capture failed and exact root resume/termination was not proved: {settle_error:#}"
+            ))),
+        },
+    }
+}
+
+/// Quiesce the exact hosted root while a workload-delegated child receives
+/// exclusive access to its existing mutable CoW workspace.
+///
+/// The durable barrier and phase live on the existing `RuntimeActionIntent`;
+/// `execution_workspace` remains only the materialization/candidate journal.
+/// Do not add an exclusive-operation table or reuse the one-way `Freezing`
+/// state for this transient operation.
+pub(crate) fn quiesce_runtime_workspace_exclusive(
+    state: &ryeos_app::state::AppState,
+    operation_id: &str,
+    thread_id: &str,
+    effective_project: &Path,
+    base_snapshot_hash: &str,
+) -> Result<ExclusiveWorkspaceQuiescence> {
+    let intent = state
+        .state_store
+        .get_runtime_action_intent(operation_id)?
+        .ok_or_else(|| anyhow::anyhow!("runtime workspace-operation intent is absent"))?;
+    let operation = intent
+        .workspace_operation
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime action has no workspace-operation authority"))?;
+    if operation.access != ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive
+        || operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved
+        || intent.first_caller_thread_id != thread_id
+    {
+        anyhow::bail!("runtime workspace operation is not an unstarted exclusive operation");
+    }
+
+    let workspace = workspace::WorkspaceLayout::from_project(effective_project)?;
+    let workspace_id = workspace
+        .root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("workspace id is not valid UTF-8"))?;
+    if operation.workspace_id != workspace_id {
+        anyhow::bail!("runtime workspace operation names a different execution workspace");
+    }
+    let record = state
+        .state_store
+        .execution_workspace(workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace journal row is missing"))?;
+    let launch_owner = record
+        .launch_owner
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("workspace has no launch owner"))?;
+    if record.state != WorkspaceState::Active
+        || record.thread_id.as_deref() != Some(thread_id)
+        || record.base_snapshot != base_snapshot_hash
+    {
+        anyhow::bail!("exclusive workspace operation contradicts its active workspace journal");
+    }
+    state
+        .state_store
+        .assert_launch_owner(thread_id, launch_owner)?;
+    let process_identity = state
+        .state_store
+        .execution_process_identity_owned(thread_id, launch_owner)?;
+    state.state_store.transition_runtime_workspace_operation(
+        operation_id,
+        &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved],
+        ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing,
+    )?;
+    let quiesced = QuiescedExecutionGroup::stop(process_identity)?;
+    if let Err(error) = state.state_store.transition_runtime_workspace_operation(
+        operation_id,
+        &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing],
+        ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiesced,
+    ) {
+        return match quiesced.resume_or_terminate() {
+            Ok(()) => {
+                state.state_store.transition_runtime_workspace_operation(
+                    operation_id,
+                    &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing],
+                    ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released,
+                )?;
+                Err(error.context("record exact exclusive workspace quiescence"))
+            }
+            Err(settle_error) => Err(error.context(format!(
+                "exclusive quiescence could not be recorded and exact root resume/termination was not proved: {settle_error:#}"
+            ))),
+        };
+    }
+    Ok(ExclusiveWorkspaceQuiescence {
+        group: Some(quiesced),
+    })
+}
+
 /// Seal the result generation required by a managed runtime's terminal
 /// project authority. This runs before terminal state commits and while the
 /// runtime is blocked in its authenticated callback, so no process in the
@@ -1239,42 +1466,82 @@ pub fn recover_interrupted_workspace_freeze(
 }
 
 pub(crate) struct QuiescedExecutionGroup {
-    members: Vec<ryeos_app::process::ExecutionProcessIdentity>,
+    authority: Option<lillux::QuiescedProcessGroup>,
 }
 
 impl QuiescedExecutionGroup {
     fn stop(identity: ryeos_app::process::ExecutionProcessIdentity) -> Result<Self> {
-        let outcome = ryeos_app::process::signal_exact_group(&identity, libc::SIGSTOP);
-        if outcome != ryeos_app::process::SignalResult::Delivered {
-            anyhow::bail!(
-                "could not quiesce exact execution group: {}",
-                outcome.as_str()
+        let authority = ryeos_app::process::quiesce_exact_process_group(
+            &identity,
+            lillux::time::Duration::from_secs(2),
+        )?;
+        Ok(Self {
+            authority: Some(authority),
+        })
+    }
+
+    pub(crate) fn resume_or_terminate(mut self) -> Result<()> {
+        let authority = self
+            .authority
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("quiesced process-group authority is absent"))?;
+        authority
+            .resume_or_terminate(lillux::time::Duration::from_secs(5))
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn terminate(mut self) -> Result<()> {
+        let authority = self
+            .authority
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("quiesced process-group authority is absent"))?;
+        authority
+            .terminate(lillux::time::Duration::from_secs(5))
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+/// Cancellation-safe ownership of an exclusively quiesced hosted root.
+///
+/// An ordinary capture guard resumes on drop. Exclusive workspace execution
+/// cannot do that: if its async owner is cancelled while the durable intent
+/// still names a running child, resuming would allow two writers. This wrapper
+/// therefore proves termination with the retained pidfds unless the normal
+/// settlement path explicitly resumes first.
+pub(crate) struct ExclusiveWorkspaceQuiescence {
+    group: Option<QuiescedExecutionGroup>,
+}
+
+impl ExclusiveWorkspaceQuiescence {
+    pub(crate) fn resume_or_terminate(mut self) -> Result<()> {
+        self.group
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("exclusive workspace quiescence is absent"))?
+            .resume_or_terminate()
+    }
+}
+
+impl Drop for ExclusiveWorkspaceQuiescence {
+    fn drop(&mut self) {
+        let Some(group) = self.group.take() else {
+            return;
+        };
+        if let Err(error) = group.terminate() {
+            tracing::error!(
+                %error,
+                "failed to terminate an exclusively quiesced hosted execution group"
             );
         }
-        let members = ryeos_app::process::wait_for_exact_group_quiesced(
-            &identity,
-            std::time::Duration::from_secs(2),
-        )?;
-        Ok(Self { members })
     }
 }
 
 impl Drop for QuiescedExecutionGroup {
     fn drop(&mut self) {
-        for member in &self.members {
-            let outcome = ryeos_app::process::signal_exact_target(member, libc::SIGCONT);
-            if !matches!(
-                outcome,
-                ryeos_app::process::SignalResult::Delivered
-                    | ryeos_app::process::SignalResult::AlreadyDead
-                    | ryeos_app::process::SignalResult::StaleIdentity
-            ) {
-                tracing::error!(
-                    pid = member.target_pid,
-                    outcome = outcome.as_str(),
-                    "failed to resume an exact quiesced execution-group member"
-                );
-            }
+        let Some(authority) = self.authority.take() else {
+            return;
+        };
+        if let Err(error) = authority.resume() {
+            tracing::error!(%error, "failed to resume an exact quiesced execution group");
         }
     }
 }

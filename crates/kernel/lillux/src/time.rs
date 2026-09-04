@@ -12,6 +12,35 @@ pub struct MonotonicTimer {
     started_at: Instant,
 }
 
+/// Opaque process-local monotonic expiry authority.
+///
+/// Callers can ask whether the deadline has elapsed, but never receive the
+/// host `Instant` or compare it as durable identity. This keeps callback and
+/// lease expiry mechanics inside the Lillux time boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct MonotonicDeadline {
+    deadline: Instant,
+}
+
+impl MonotonicDeadline {
+    pub fn after(duration: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + duration,
+        }
+    }
+
+    pub fn has_elapsed(&self) -> bool {
+        Instant::now() > self.deadline
+    }
+
+    /// Remaining duration in this process-local monotonic clock domain.
+    /// Returning zero is the only expiry representation exposed to callers;
+    /// the host `Instant` never escapes Lillux.
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
 impl MonotonicTimer {
     pub fn start() -> Self {
         Self {
@@ -26,6 +55,16 @@ impl MonotonicTimer {
     pub fn elapsed_millis(&self) -> u64 {
         u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
+
+    pub fn elapsed_micros(&self) -> u64 {
+        u64::try_from(self.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Sleep the current thread for one process-local duration. Raw host timing
+/// remains below the Lillux boundary even for synchronous protocol loops.
+pub fn sleep(duration: Duration) {
+    thread::sleep(duration);
 }
 
 pub fn iso8601_now() -> String {

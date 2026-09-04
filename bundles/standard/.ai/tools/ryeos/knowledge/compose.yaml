@@ -4,6 +4,7 @@ version: "1.0.0"
 description: "Recall a knowledge item composed into text within a token budget. Use this at runtime to load a specific knowledge doc on demand — e.g. a per-run model written by an upstream step whose ref is only known now."
 
 executor_id: "@method_dispatch"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 
 method_dispatch:
   method: compose

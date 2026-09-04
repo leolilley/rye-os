@@ -2725,7 +2725,7 @@ pub fn retire_worker_process(
     })
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HostedCommandCompletionFence {
     pub placement_thread_id: String,
@@ -2797,10 +2797,19 @@ pub async fn terminate_session(
         bail!("cancelled termination cannot carry a completed-command fence");
     }
     let initial = current_session(state, placement_thread_id)?;
-    let root_operation = crate::hosted_operation::begin_hosted_root_operation_if_appendable(
-        &state.state_store,
-        &initial.placement_thread_id,
-    )?;
+    // Session termination is a state transition, not another concurrent root
+    // operation. The exclusive existing root gate first drains any admitted
+    // workload child/capture, then prevents a new one from starting while the
+    // worker is retired. This guard is deliberately not committed: the root
+    // runner owns the later authoritative thread terminalization.
+    let root_terminalization = if initial.state == "terminal" {
+        None
+    } else {
+        Some(crate::hosted_operation::begin_hosted_root_terminalization(
+            &state.state_store,
+            &initial.placement_thread_id,
+        )?)
+    };
     let _credential_operation =
         acquire_credential_profile_operation(&initial.credential_profile_id).await?;
     let session = current_session(state, placement_thread_id)?;
@@ -2825,7 +2834,7 @@ pub async fn terminate_session(
             "idempotent":true,
         }));
     }
-    let _root_operation = root_operation
+    let _root_terminalization = root_terminalization
         .ok_or_else(|| anyhow!("nonterminal session has a terminal hosted execution root"))?;
     if session.worker_instance_id.is_none() && session.worker_boot_epoch.is_none() {
         if !matches!(session.state.as_str(), "recovering" | "outcome_unknown") {

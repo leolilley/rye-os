@@ -174,9 +174,28 @@ class CodexContractTests(unittest.TestCase):
         self.assertEqual(manifest_digest, "f1f39917086d223da68135108afa401fe75d47e2b102ea3f81c699595256bfe5")
         self.assertIn(f"    digest: {manifest_digest}", environment)
         self.assertIn("    - realization_id: command-tools", environment)
-        self.assertIn("schema: ryeos.worker_environment.v3", environment)
+        self.assertIn("schema: ryeos.worker_environment.v4", environment)
         self.assertIn("  process_environment: {}", environment)
         self.assertIn("      relative_directory: bin", environment)
+        self.assertIn("workload_client: null", environment)
+
+    def test_hosted_profile_opens_only_the_private_workload_broker_directory(self) -> None:
+        self.assertEqual(self.profile["schema_version"], 2)
+        self.assertEqual(
+            self.profile["workload_client"],
+            {"endpoint_env": "RYEOS_WORKLOAD_CLIENT_ENDPOINT"},
+        )
+        immutable_args = "\n".join(self.profile["workload_args"])
+        self.assertIn('"/tmp/.ryeos-wc"="read"', immutable_args)
+        self.assertIn('":tmpdir"="deny"', immutable_args)
+        self.assertIn('":slash_tmp"="deny"', immutable_args)
+        self.assertNotIn('"RYEOS_*"="exclude"', immutable_args)
+
+        baseline = (SOURCE / self.profile["baseline_config"]).read_text()
+        self.assertIn('"/tmp/.ryeos-wc" = "read"', baseline)
+        self.assertIn('":tmpdir" = "deny"', baseline)
+        self.assertIn('":slash_tmp" = "deny"', baseline)
+        self.assertNotIn('"RYEOS_*" = "exclude"', baseline)
 
     def test_hosted_workflow_profile_admits_the_signed_worker(self) -> None:
         worker = yaml.safe_load(WORKER_PATH.read_text(encoding="utf-8"))

@@ -943,7 +943,10 @@ impl AdmittedProjectBinding {
                 }
             }
             crate::execution_provenance::ExecutionProvenance::RootPinnedGeneration { .. }
-            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. } => {
+            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
+            | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
+                ..
+            } => {
                 let snapshot_hash = match &exact_authority {
                     ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
                         snapshot_hash,
@@ -951,12 +954,12 @@ impl AdmittedProjectBinding {
                     } => snapshot_hash,
                     _ => unreachable!("pinned provenance already validated pinned authority"),
                 };
-                let workspace_lifeline = provenance.workspace_lifeline().ok_or_else(|| {
+                let workspace_lifeline = provenance.subject_workspace_lifeline().ok_or_else(|| {
                     anyhow!("pinned execution provenance has no workspace lifeline")
                 })?;
                 AdmittedProjectMaterialization::Pinned {
                     original_project_path: Some(provenance.original_project_path().to_path_buf()),
-                    effective_path: Some(provenance.effective_path().to_path_buf()),
+                    effective_path: Some(provenance.subject_effective_path().to_path_buf()),
                     snapshot_hash: snapshot_hash.to_string(),
                     workspace_lifeline: Some(workspace_lifeline),
                     verified_materialization: Some(
@@ -6570,8 +6573,11 @@ pub(super) fn build_execution_plan_for_request(
     resolved: &ResolvedExecutionRequest,
     verified: &VerifiedItem,
     sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
+    parent_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
 ) -> Result<ryeos_engine::contracts::ExecutionPlan> {
-    match resolved
+    let filesystem_ceiling = project_execution_filesystem_authority_ceiling(engine, resolved)?
+        .intersect(parent_filesystem_ceiling);
+    let mut plan = match resolved
         .root_admission
         .as_ref()
         .and_then(|admission| admission.admitted_request_snapshot())
@@ -6593,6 +6599,7 @@ pub(super) fn build_execution_plan_for_request(
                     project_root,
                     authority,
                     sealed_content,
+                    filesystem_ceiling,
                 )
                 .map_err(|e| anyhow!("plan build failed: {e}"))
         }
@@ -6613,9 +6620,64 @@ pub(super) fn build_execution_plan_for_request(
                 &resolved.parameters,
                 &resolved.plan_context.execution_hints,
                 sealed_content,
+                filesystem_ceiling,
             )
             .map_err(|e| anyhow!("plan build failed: {e}")),
+    }?;
+    plan.network_authority_ceiling =
+        project_execution_network_authority_ceiling(engine, resolved)?;
+    plan.filesystem_authority_ceiling = plan.filesystem_authority_ceiling.intersect(filesystem_ceiling);
+    Ok(plan)
+}
+
+pub(super) fn project_execution_filesystem_authority_ceiling(
+    engine: &Engine,
+    resolved: &ResolvedExecutionRequest,
+) -> Result<ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling> {
+    let kind = &resolved.resolved_item.kind;
+    let execution = engine
+        .kinds
+        .get(kind)
+        .and_then(|schema| schema.execution.as_ref())
+        .ok_or_else(|| anyhow!("execution kind `{kind}` has no execution schema"))?;
+    if execution.filesystem_authority_ceiling.is_none() {
+        return Ok(ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy);
     }
+    let admission = resolved.root_admission.as_ref().ok_or_else(|| {
+        anyhow!(
+            "execution kind `{kind}` declares a filesystem-authority projection but the request has no admitted composed subject"
+        )
+    })?;
+    execution
+        .project_filesystem_authority_ceiling(&admission.resolution_output().composed.composed)
+        .map_err(|error| anyhow!("compile execution filesystem-authority ceiling: {error}"))
+}
+
+/// Compile the kind-owned network projection from the same complete composed
+/// subject already admitted for this root. Raw item parsing and runtime
+/// dispatch must not infer this field: extensions may have changed it, and the
+/// serialized plan is the authority later intersected with its parent launch.
+pub(super) fn project_execution_network_authority_ceiling(
+    engine: &Engine,
+    resolved: &ResolvedExecutionRequest,
+) -> Result<ryeos_engine::isolation::IsolationNetworkAuthorityCeiling> {
+    let kind = &resolved.resolved_item.kind;
+    let execution = engine
+        .kinds
+        .get(kind)
+        .and_then(|schema| schema.execution.as_ref())
+        .ok_or_else(|| anyhow!("execution kind `{kind}` has no execution schema"))?;
+    let Some(_declaration) = execution.network_authority_ceiling.as_ref() else {
+        return Ok(ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy);
+    };
+    let admission = resolved.root_admission.as_ref().ok_or_else(|| {
+        anyhow!(
+            "execution kind `{kind}` declares a network-authority projection but the request has no admitted composed subject"
+        )
+    })?;
+    execution
+        .project_network_authority_ceiling(&admission.resolution_output().composed.composed)
+        .map_err(|error| anyhow!("compile execution network-authority ceiling: {error}"))
 }
 
 /// Run verify → trust → build_plan without spawning.
@@ -6624,7 +6686,8 @@ pub fn validate_item(
     resolved: &ResolvedExecutionRequest,
 ) -> Result<ValidatedItem> {
     let verified = verified_execution_subject(engine, resolved)?;
-    let plan = build_execution_plan_for_request(engine, resolved, &verified, None)?;
+    let plan = build_execution_plan_for_request(engine, resolved, &verified, None,
+        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy)?;
 
     Ok(ValidatedItem {
         trust_class: verified.trust_class,

@@ -18,6 +18,8 @@ config:
   required_terminal_publication: retain_result
   max_lifetime_seconds: 603600
   recover_upstream_session: true
+  workload_client_delegation_caps:
+    - ryeos.execute.tool.*
 limits:
   duration_seconds: 604200
   spend_usd: "100"

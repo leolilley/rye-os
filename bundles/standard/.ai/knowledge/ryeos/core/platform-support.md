@@ -19,7 +19,7 @@ not mean every distribution currently runs on every operating system or CPU.
 
 | Platform | Package/image support | Node execution support | Notes |
 |---|---|---|---|
-| Linux 6.9+, x86-64, glibc | Supported | Supported | Current bundle binaries target `x86_64-unknown-linux-gnu`. The selected signed isolation bundle supplies its adapter and launcher artifacts. |
+| Linux 6.9+, x86-64, glibc | Supported | Supported | Current bundle binaries target `x86_64-unknown-linux-gnu`. Core supplies the exact self-contained native isolation adapter; node policy decides whether to select it. |
 | Linux 6.9+ x86-64 container (`linux/amd64`) | Supported | Supported | The host kernel supplies the node's pidfd contract. Disabled isolation needs no extra capability; enforced mode needs the documented namespace, seccomp, and AppArmor profile. Published images are single-platform. |
 | Linux AArch64 | Not yet distributed | Not yet supported as a complete node distribution | Host-triple vocabulary exists, but official bundles do not ship AArch64 binaries. |
 | Linux musl | Not yet distributed | Not yet supported as a complete node distribution | Official bundle binaries currently target glibc. |

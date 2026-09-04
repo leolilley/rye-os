@@ -3,7 +3,7 @@
 ---
 category: ryeos/core/engine
 tags: [architecture, isolation, hermetic, env, security, subprocess]
-version: "2.4.0"
+version: "2.5.0"
 description: >
   Hermetic execution and optional OS isolation — env_clear, explicit env
   injection, node-owned policy, signed backend bundles, per-route semaphores,
@@ -26,10 +26,35 @@ launch paths; edits require restart. Parser/composer handlers are trusted engine
 infrastructure and retain the hermetic handler boundary below.
 
 The engine emits a typed backend-neutral launch plan. The selected signed bundle
-declares an adapter, launcher artifacts, target triples, and a capability upper
-bound; live inspection may narrow but never broaden that authority. Backends
-are independently authored and installed bundles. Items may narrow node policy
-but may not select a backend, enable isolation, or request fallback.
+declares an exact adapter, any optional external artifacts it requires, target
+triples, and a capability upper bound; a self-contained adapter legitimately
+declares an empty artifact set. Live inspection may narrow but never broaden
+that authority. Backends are independently authored installed data. Items may
+narrow node policy but may not select a backend, enable isolation, or request
+fallback.
+
+Signed execution-kind projections retain filesystem and network ceilings in
+the admitted plan. `captured_execution` and `isolated` are irreversible
+restrictions: a parent, restart, or current node default cannot widen them.
+Captured execution excludes ambient system, bundle, trust, callback and parent
+environment authority. Host-environment templates are denied during plan
+compilation, not merely filtered from the final process environment. These
+restrictions require enforced isolation; disabled mode refuses them.
+
+External realizations have an explicit logical `mount_root` plus relative
+`mount`. The signed kind/runtime contract owns `allowed_mount_roots`.
+`project` targets the admitted workspace; `execution_runtime` targets a strict
+child of `/ryeos/realizations` inside the private root. Runtime realizations
+are exact descriptor-pinned read-only content, never arbitrary host mounts.
+They reject workspace/mount overlaps, require enforced isolation, and do not
+enter project candidate capture. Realization-member command recovery retains
+the same mount root, relative member and content identity.
+
+Persistent-session execution testimony uses the retained plan's effective
+ceilings, including restrictions from its signed session protocol. Recovery
+verifies the exact retained signed protocol document against current trust;
+an updated installed descriptor at the same ref cannot change admitted
+workspace, network or runtime-environment authority.
 
 At bootstrap and prospective bundle admission, the selected adapter and
 payloads are signature-verified and copied into immutable sealed executable

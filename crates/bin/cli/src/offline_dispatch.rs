@@ -700,6 +700,7 @@ fn exec_tool(
         timeout: timeout as f64,
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     };
     let mut request = isolation
@@ -728,7 +729,7 @@ fn exec_tool(
                 // Offline dispatch admits no launch capsule, so there is no
                 // realization to bind; declaring kinds refuse at finalization.
                 external_read_only_mounts: &[],
-                target_channel: None,
+                target_channels: &[],
                 item_ref: tool_ref_str,
                 thread_id: "offline-cli",
             },
@@ -1069,6 +1070,7 @@ mod tests {
             timeout: 1.0,
             limits: Some(limits),
             inherited_fds: Vec::new(),
+            inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         });
 

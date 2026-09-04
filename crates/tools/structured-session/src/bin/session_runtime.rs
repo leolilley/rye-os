@@ -31,6 +31,7 @@ struct WorkerExecutionConfig {
     required_terminal_publication: String,
     max_lifetime_seconds: u64,
     recover_upstream_session: bool,
+    workload_client_delegation_caps: Vec<String>,
 }
 
 fn main() {
@@ -92,8 +93,19 @@ async fn run_session(
     {
         bail!("admitted worker execution config is outside runtime bounds");
     }
-    let max_lifetime = std::time::Duration::from_secs(config.max_lifetime_seconds);
-    let deadline = tokio::time::Instant::now() + max_lifetime;
+    let mut previous_capability: Option<&str> = None;
+    for capability in &config.workload_client_delegation_caps {
+        if previous_capability.is_some_and(|previous| previous >= capability.as_str())
+            || !capability.starts_with("ryeos.execute.")
+            || ryeos_runtime::authorizer::validate_scope_pattern(capability).is_err()
+        {
+            bail!("admitted workload-client delegation ceiling is not canonical");
+        }
+        previous_capability = Some(capability);
+    }
+    let deadline = lillux::time::MonotonicDeadline::after(
+        lillux::time::Duration::from_secs(config.max_lifetime_seconds),
+    );
     client
         .mark_running(&thread_id)
         .await
@@ -164,7 +176,7 @@ async fn run_session(
         if matches!(status, "terminal" | "freezing") {
             return Ok(terminal_result(thread_id, started));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.has_elapsed() {
             let terminal = client
                 .terminate_dedicated_session(DedicatedSessionTerminateRequest {
                     thread_id: thread_id.clone(),
@@ -178,8 +190,8 @@ async fn run_session(
             .get("updated_at_ms")
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("dedicated session projection has no update sequence"))?;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let wait = remaining.min(std::time::Duration::from_secs(300));
+        let remaining = deadline.remaining();
+        let wait = remaining.min(lillux::time::Duration::from_secs(300));
         let current = client
             .wait_dedicated_session(ryeos_runtime::callback::DedicatedSessionWaitRequest {
                 thread_id: thread_id.clone(),

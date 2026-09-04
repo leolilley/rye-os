@@ -36,6 +36,7 @@ launch_contract:
     max_targets_per_dependency: 1
     max_executable_search_entries: 16
     external_content:
+      allowed_mount_roots: [project]
       max_declarations: 8
       large_content_max_total_bytes: 4294967296
   environment_contributions:
@@ -48,5 +49,9 @@ launch_contract:
     max_requirements: 0
     allowed_names: []
   required_runtime_data: [worker_execution]
-  runtime_facts: {}
+  runtime_facts:
+    workload_client_request:
+      required: false
+      kind: json
+      max_bytes: 65536
 description: Owns one root execution while its admitted session-bound worker is live.

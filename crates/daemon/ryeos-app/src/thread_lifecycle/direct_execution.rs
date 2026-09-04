@@ -4,7 +4,8 @@ use super::*;
 /// execution plan. A daemon workspace is operational state selected after
 /// admission; its thread-specific host path must not fragment artifact,
 /// capsule, or replay identity.
-pub const ADMITTED_DIRECT_PROJECT_ROOT: &str = "/ryeos/admitted-project";
+pub const ADMITTED_DIRECT_PROJECT_ROOT: &str =
+    ryeos_state::objects::ADMITTED_DIRECT_PROJECT_ROOT;
 
 /// Result of spawning the engine pipeline.
 pub struct SpawnedItemAwaitingAttachment {
@@ -89,12 +90,68 @@ pub struct PreparedItemPlan {
     plan: ExecutionPlan,
     pub timeout_secs: u64,
     root_subject_source_identity: ryeos_state::objects::DirectRootSourceIdentity,
-    admitted_command: Option<ryeos_engine::isolation::IsolationDescriptorBoundCommand>,
+    admitted_command: Option<ryeos_engine::isolation::IsolationAdmittedCommand>,
+    realization_command: Option<PreparedRealizationCommand>,
+}
+
+/// Portable coordinate for an executable member of one admitted realization.
+///
+/// The app layer owns this identity because it is persisted in the launch
+/// capsule. The executor may use the coordinate to select an already-bound
+/// materialization, but it must not reinterpret or reconstruct it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRealizationCommand {
+    realization_id: String,
+    manifest_hash: String,
+    mount_root: ryeos_state::objects::ExternalContentMountRoot,
+    mount: String,
+    relative_path: String,
+    executable_blob_hash: String,
+}
+
+impl PreparedRealizationCommand {
+    pub fn realization_id(&self) -> &str {
+        &self.realization_id
+    }
+
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
+    pub fn mount(&self) -> &str {
+        &self.mount
+    }
+
+    pub fn mount_root(&self) -> ryeos_state::objects::ExternalContentMountRoot {
+        self.mount_root
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        Path::new(&self.relative_path)
+    }
+
+    pub fn executable_blob_hash(&self) -> &str {
+        &self.executable_blob_hash
+    }
 }
 
 impl PreparedItemPlan {
     pub fn execution_plan(&self) -> &ExecutionPlan {
         &self.plan
+    }
+
+    /// Freeze independently admitted parent restrictions into the child's
+    /// existing serialized plan before capsule admission. Recovery then reads
+    /// this plan; it must not infer a new ceiling from a mutable parent row.
+    pub fn restrict_isolation_authority(
+        &mut self,
+        filesystem: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
+        network: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling,
+    ) {
+        self.plan.filesystem_authority_ceiling =
+            self.plan.filesystem_authority_ceiling.intersect(filesystem);
+        self.plan.network_authority_ceiling =
+            self.plan.network_authority_ceiling.intersect(network);
     }
 
     /// A private admitted-input root intentionally omits ambient project
@@ -138,7 +195,291 @@ impl PreparedItemPlan {
             concrete_project_root,
             logical_project_root.as_deref(),
         )?;
+        if let Some(command) = &self.realization_command {
+            let execution_path = command.mount_root
+                .destination(logical_project_root.as_deref(), &command.mount)?
+                .join(&command.relative_path);
+            let spec = first_subprocess_spec_mut(&mut self.plan)?;
+            spec.cmd = execution_path.display().to_string();
+            spec.verified_command = Some(
+                ryeos_engine::contracts::PlanVerifiedCommand::CapturedContent {
+                    code: ryeos_engine::isolation::IsolationVerifiedCode {
+                        source_path: execution_path,
+                        content_hash: command.executable_blob_hash.clone(),
+                    },
+                },
+            );
+        }
         Ok(logical_project_root)
+    }
+
+    /// Resolve a signed `realization:<id>/<member>` command from this direct
+    /// execution's own finalized external-realization set.
+    ///
+    /// This deliberately happens at child admission, not in a parent launch
+    /// preparer. The selector supplies no path or bytes: the finalized program
+    /// supplies the exact manifest, the manifest supplies the executable blob
+    /// identity, and target-local external-content admission has already
+    /// proved the consumer binding. The retained command coordinate preserves
+    /// the complete tree layout; the exact member descriptor is promoted to
+    /// executable authority only after that tree has been materialized for
+    /// this spawn.
+    pub fn bind_realization_command(
+        &mut self,
+        state: &crate::state::AppState,
+        engine: &ryeos_engine::engine::Engine,
+        item_kind: &str,
+        resolution: &ryeos_engine::resolution::ResolutionOutput,
+        isolation: &ryeos_engine::isolation::IsolationRuntime,
+    ) -> Result<bool> {
+        let selector = match self.plan.nodes.first() {
+            Some(ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. }) => {
+                if spec.verified_command.is_some() {
+                    return Ok(false);
+                }
+                ryeos_engine::external_content::parse_realization_command_ref(&spec.cmd)?
+            }
+            Some(ryeos_engine::contracts::PlanNode::Complete { .. }) | None => None,
+        };
+        let Some(selector) = selector else {
+            return Ok(false);
+        };
+        if !isolation.is_enforced() {
+            bail!(
+                "realization-member commands require enforced descriptor-mounted isolation"
+            );
+        }
+
+        // The finalized set may also contain entries inherited from the
+        // parent capsule for dependency-byte reuse. Inheritance is not a
+        // command grant: require this child effective program to declare the
+        // selected realization itself before consulting the merged set. Do
+        // not weaken this to an ID-only lookup in `derived`; that would let a
+        // parent prepared/runtime environment become ambient child authority.
+        let contract = engine
+            .kinds
+            .get(item_kind)
+            .and_then(|schema| schema.external_content_contract());
+        let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
+        let declarations = ryeos_engine::external_content::declarations_from_composed(
+            &resolution.composed.composed,
+            contract,
+            declarer,
+        )?
+        .ok_or_else(|| anyhow!("realization command requires a child-owned declaration"))?;
+        let declaration = declarations
+            .iter()
+            .find(|entry| entry.id == selector.realization_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "realization command names undeclared child realization `{}`",
+                    selector.realization_id
+                )
+            })?;
+        if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree
+            || declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned
+        {
+            bail!(
+                "realization command requires a child-owned pinned tree declaration, got `{}`",
+                selector.realization_id
+            );
+        }
+
+        let realized_value = resolution
+            .composed
+            .derived
+            .get(ryeos_state::objects::EXTERNAL_REALIZATIONS_DERIVED_KEY)
+            .ok_or_else(|| anyhow!("realization command has no admitted realization set"))?;
+        let realized =
+            ryeos_engine::external_realization::RealizedExternalContentSet::from_value(
+                realized_value,
+            )?;
+        let realization = realized
+            .iter()
+            .find(|entry| entry.id == selector.realization_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "realization command names absent realization `{}`",
+                    selector.realization_id
+                )
+            })?;
+        if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
+            || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
+        {
+            bail!(
+                "realization command requires a pinned tree realization, got `{}`",
+                selector.realization_id
+            );
+        }
+        if declaration.digest.as_deref() != Some(realization.manifest_hash.as_str()) {
+            bail!(
+                "realization command declaration and admitted manifest identity disagree for `{}`",
+                selector.realization_id
+            );
+        }
+
+        let authority = state.state_store.pinned_state_authority()?;
+        let guard = authority.acquire_shared_guard()?;
+        authority.ensure_guard(&guard)?;
+        let cas = authority.cas_store()?;
+        let manifest_value = cas
+            .get_object(&realization.manifest_hash)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "realization command manifest {} is unavailable",
+                    realization.manifest_hash
+                )
+            })?;
+
+        let blob_hash =
+            match manifest_value.get("kind").and_then(serde_json::Value::as_str) {
+                Some(ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND) => {
+                    let manifest =
+                        ryeos_state::objects::ExternalContentManifestObject::from_value(
+                            &manifest_value,
+                        )?;
+                    let entry = manifest
+                        .entries
+                        .iter()
+                        .find(|entry| entry.path == selector.relative_path)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "realization command member `{}` is absent from `{}`",
+                                selector.relative_path,
+                                selector.realization_id
+                            )
+                        })?;
+                    if entry.kind
+                        != ryeos_state::objects::ExternalContentManifestEntryKind::File
+                        || entry.mode != Some(0o755)
+                    {
+                        bail!(
+                            "realization command member `{}` is not an executable regular file",
+                            selector.relative_path
+                        );
+                    }
+                    let blob_hash = entry
+                        .blob_hash
+                        .as_deref()
+                        .expect("validated ordinary manifest file has a blob hash")
+                        .to_owned();
+                    let (_, observed_size) = cas.open_blob(&blob_hash)?.ok_or_else(|| {
+                        anyhow!("realization command blob {blob_hash} is unavailable")
+                    })?;
+                    if Some(observed_size) != entry.size {
+                        bail!("realization command blob size contradicts its manifest");
+                    }
+                    blob_hash
+                }
+                Some(ryeos_state::objects::EXTERNAL_LARGE_CONTENT_MANIFEST_KIND) => {
+                    let manifest =
+                        ryeos_state::objects::ExternalLargeContentManifestObject::from_value(
+                            &manifest_value,
+                        )?;
+                    let entry = manifest
+                        .entries
+                        .iter()
+                        .find(|entry| entry.path == selector.relative_path)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "realization command member `{}` is absent from `{}`",
+                                selector.relative_path,
+                                selector.realization_id
+                            )
+                        })?;
+                    if entry.kind
+                        != ryeos_state::objects::ExternalContentManifestEntryKind::File
+                        || entry.mode != Some(0o755)
+                    {
+                        bail!(
+                            "realization command member `{}` is not an executable regular file",
+                            selector.relative_path
+                        );
+                    }
+                    match (entry.blob_hash.as_deref(), entry.file_sha256.as_deref()) {
+                        (Some(blob_hash), None) => {
+                            let (_, observed_size) =
+                                cas.open_blob(blob_hash)?.ok_or_else(|| {
+                                    anyhow!(
+                                        "realization command blob {blob_hash} is unavailable"
+                                    )
+                                })?;
+                            if Some(observed_size) != entry.size {
+                                bail!(
+                                    "realization command blob size contradicts its large manifest"
+                                );
+                            }
+                            blob_hash.to_owned()
+                        }
+                        (None, Some(file_hash)) => {
+                            let expected_size = entry.size.expect(
+                                "validated large-manifest regular file has a size",
+                            );
+                            let max_bytes = isolation.verified_command_file_bytes();
+                            if expected_size > max_bytes {
+                                bail!(
+                                    "realization command member `{}` is {} bytes, exceeding the node verified-command limit {max_bytes}",
+                                    selector.relative_path,
+                                    expected_size,
+                                );
+                            }
+                            let store = authority.large_object_store()?;
+                            store.verify_manifest_commitment(entry)?;
+                            let _lease = store.lease_object(file_hash, expected_size)?;
+                            file_hash.to_owned()
+                        }
+                        _ => unreachable!(
+                            "validated large-manifest file has one content identity"
+                        ),
+                    }
+                }
+                Some(other) => bail!(
+                    "realization command names unsupported manifest kind `{other}`"
+                ),
+                None => bail!("realization command manifest has no kind"),
+            };
+        authority.ensure_guard(&guard)?;
+        self.realization_command = Some(PreparedRealizationCommand {
+            realization_id: selector.realization_id,
+            manifest_hash: realization.manifest_hash.clone(),
+            mount_root: realization.mount_root,
+            mount: realization.mount.clone(),
+            relative_path: selector.relative_path,
+            executable_blob_hash: blob_hash,
+        });
+        Ok(true)
+    }
+
+    /// Return the portable realization coordinate that the executor must bind
+    /// after materializing this spawn's exact external-content generation.
+    pub fn realization_command(&self) -> Option<&PreparedRealizationCommand> {
+        self.realization_command.as_ref()
+    }
+
+    /// Accept target-local command authority only after the executor has
+    /// selected it from the materialized realization named by
+    /// [`Self::realization_command`]. This crate validates identity equality;
+    /// it deliberately knows nothing about the executor's cache or mounts.
+    pub fn bind_realization_command_authority(
+        &mut self,
+        admitted: ryeos_engine::isolation::IsolationAdmittedCommand,
+    ) -> Result<()> {
+        if self.realization_command.is_none() {
+            bail!("direct plan has no realization-member command to bind");
+        }
+        let expected = first_subprocess_spec_mut(&mut self.plan)?
+            .verified_command
+            .as_ref()
+            .ok_or_else(|| anyhow!("realization-member plan has no verified command"))?
+            .code()
+            .clone();
+        if ryeos_engine::isolation::IsolationCommandAuthority::authority(&admitted).identity()
+            != &expected
+        {
+            bail!("materialized realization command contradicts its admitted plan identity");
+        }
+        self.admitted_command = Some(admitted);
+        Ok(())
     }
 
     pub fn runtime_ref(&self) -> Result<&str> {
@@ -292,7 +633,10 @@ impl PreparedItemPlan {
         resolved: &ResolvedExecutionRequest,
         protocol: &ryeos_engine::protocols::VerifiedProtocol,
     ) -> Result<ryeos_state::objects::AdmittedLaunchArtifactIdentity> {
-        let canonical_plan = lillux::canonical_json(&admitted_execution_plan_value(&self.plan)?)?;
+        let canonical_plan = lillux::canonical_json(&admitted_execution_plan_value_for_command(
+            &self.plan,
+            self.realization_command.is_some(),
+        )?)?;
         let execution_plan_hash = lillux::sha256_hex(canonical_plan.as_bytes());
         let plan_runtime = self
             .plan
@@ -382,6 +726,30 @@ impl PreparedItemPlan {
         protocol_trust_store: &ryeos_engine::trust::TrustStore,
         admitted_project_root: Option<&Path>,
     ) -> Result<ryeos_state::objects::AdmittedExecutionClosure> {
+        if self.plan.filesystem_authority_ceiling
+            == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution
+        {
+            if !isolation.is_enforced() {
+                bail!("captured execution requires enforced isolation before admission");
+            }
+            if protocol.descriptor.callback_channel
+                != ryeos_engine::protocol_vocabulary::CallbackChannel::None
+                || protocol.descriptor.env_injections.iter().any(|injection| matches!(
+                    injection.source,
+                    ryeos_engine::protocol_vocabulary::EnvInjectionSource::CallbackSocketPath
+                        | ryeos_engine::protocol_vocabulary::EnvInjectionSource::CallbackToken
+                        | ryeos_engine::protocol_vocabulary::EnvInjectionSource::ThreadAuthToken
+                ))
+            {
+                bail!("captured execution cannot receive daemon callback or thread-auth authority");
+            }
+        }
+        if self.plan.network_authority_ceiling
+            == ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::Isolated
+            && !isolation.is_enforced()
+        {
+            bail!("isolated network authority requires enforced isolation before admission");
+        }
         validate_direct_plan_portability(&self.plan, admitted_project_root)?;
         let original_command = match self.plan.nodes.first() {
             Some(ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. }) => {
@@ -389,7 +757,10 @@ impl PreparedItemPlan {
             }
             _ => None,
         };
-        let execution_plan = admitted_execution_plan_value(&self.plan)?;
+        let execution_plan = admitted_execution_plan_value_for_command(
+            &self.plan,
+            self.realization_command.is_some(),
+        )?;
         let protocol_descriptor_document = capture_signed_descriptor_document(
             &protocol.descriptor_path,
             &protocol.raw_content_digest,
@@ -397,6 +768,9 @@ impl PreparedItemPlan {
             protocol_trust_store,
         )?;
         let Some(command) = original_command else {
+            if self.realization_command.is_some() {
+                bail!("realization-member command has no verified executable identity");
+            }
             return Ok(
                 ryeos_state::objects::AdmittedExecutionClosure::DirectItemExecutor {
                     execution_plan,
@@ -407,32 +781,90 @@ impl PreparedItemPlan {
             );
         };
         let original = command.code().clone();
-        let execution_path = admitted_direct_command_path(&original)?;
-        let source = lillux::open_pinned_regular_file_no_follow(&original.source_path)
-            .with_context(|| {
-                format!(
-                    "open admitted direct executable {} through Lillux",
-                    original.source_path.display()
-                )
-            })?;
-        let stored =
-            cas.put_blob_from_open_regular(source.try_clone_descriptor()?, &original.source_path)?;
-        if stored.hash != original.content_hash {
-            bail!(
-                "direct executable changed before admission: expected {}, captured {}",
-                original.content_hash,
-                stored.hash
+        if let Some(realization) = self.realization_command.as_ref() {
+            if self.admitted_command.is_some() {
+                bail!("realization-member command was bound before materialization");
+            }
+            let execution_path = realization.mount_root
+                .destination(Some(Path::new(ADMITTED_DIRECT_PROJECT_ROOT)), &realization.mount)?
+                .join(&realization.relative_path);
+            let spec = match self.plan.nodes.first() {
+                Some(ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. }) => spec,
+                _ => bail!("realization-member execution plan has no subprocess entrypoint"),
+            };
+            if original.source_path != execution_path
+                || spec.cmd != execution_path.display().to_string()
+                || original.content_hash != realization.executable_blob_hash
+            {
+                bail!(
+                    "realization-member execution plan contradicts its admitted command coordinate"
+                );
+            }
+            return Ok(
+                ryeos_state::objects::AdmittedExecutionClosure::DirectItemExecutor {
+                    execution_plan,
+                    protocol_descriptor_document,
+                    command:
+                        ryeos_state::objects::AdmittedDirectCommandClosure::RealizationMember {
+                            executable_blob_hash: realization.executable_blob_hash.clone(),
+                            realization_id: realization.realization_id.clone(),
+                            realization_manifest_hash: realization.manifest_hash.clone(),
+                            realization_mount_root: realization.mount_root,
+                            realization_mount: realization.mount.clone(),
+                            relative_path: realization.relative_path.clone(),
+                            execution_path,
+                        },
+                    admitted_project_root: admitted_project_root.map(Path::to_path_buf),
+                },
             );
         }
+        let execution_path = admitted_direct_command_path(&original)?;
+        let stored_hash = if self.admitted_command.is_some() {
+            let expected_path = admitted_direct_command_path(&original)?;
+            if original.source_path != expected_path {
+                bail!(
+                    "pre-admitted direct executable does not use its stable execution path"
+                );
+            }
+            if cas.open_blob(&original.content_hash)?.is_none() {
+                bail!("pre-admitted direct executable blob disappeared");
+            }
+            original.content_hash.clone()
+        } else {
+            let source = lillux::open_pinned_regular_file_no_follow(&original.source_path)
+                .with_context(|| {
+                    format!(
+                        "open admitted direct executable {} through Lillux",
+                        original.source_path.display()
+                    )
+                })?;
+            let stored = cas.put_blob_from_open_regular(
+                source.try_clone_descriptor()?,
+                &original.source_path,
+            )?;
+            if stored.hash != original.content_hash {
+                bail!(
+                    "direct executable changed before admission: expected {}, captured {}",
+                    original.content_hash,
+                    stored.hash
+                );
+            }
+            stored.hash
+        };
         let (blob, _) = cas
-            .open_blob(&stored.hash)?
+            .open_blob(&stored_hash)?
             .ok_or_else(|| anyhow!("admitted direct executable blob disappeared"))?;
         let cached_identity = ryeos_engine::isolation::IsolationVerifiedCode {
             source_path: execution_path.clone(),
-            content_hash: stored.hash.clone(),
+            content_hash: stored_hash.clone(),
         };
-        self.admitted_command =
-            Some(isolation.bind_admitted_verified_command(cached_identity.clone(), blob)?);
+        if self.admitted_command.is_none() {
+            self.admitted_command = Some(
+                isolation
+                    .bind_admitted_verified_command(cached_identity.clone(), blob)?
+                    .into(),
+            );
+        }
         let spec = first_subprocess_spec_mut(&mut self.plan)?;
         spec.cmd = execution_path.display().to_string();
         match spec
@@ -452,7 +884,7 @@ impl PreparedItemPlan {
                 execution_plan,
                 protocol_descriptor_document,
                 command: ryeos_state::objects::AdmittedDirectCommandClosure::ContentAddressed {
-                    executable_blob_hash: stored.hash,
+                    executable_blob_hash: stored_hash,
                     execution_path,
                 },
                 admitted_project_root: admitted_project_root.map(Path::to_path_buf),
@@ -466,13 +898,31 @@ impl PreparedItemPlan {
         isolation: &ryeos_engine::isolation::IsolationRuntime,
         effective_project_root: Option<&Path>,
     ) -> Result<Self> {
-        Self::recover_from_direct_parts(
+        let prepared = Self::recover_from_direct_parts(
             &capsule.execution_closure,
             &capsule.artifact_identity,
             cas,
             isolation,
             effective_project_root,
-        )
+        )?;
+        // Capsule loading already verifies the node testimony. Check the
+        // contract-specific property projection too: a retained plan and its
+        // realization cannot describe different confinement for the same boot.
+        let value = cas.get_object(&capsule.execution_realization_hash)?
+            .context("direct recovery realization is missing")?;
+        let realization = ryeos_state::objects::AdmittedExecutionRealization::from_current_value(&value)?;
+        if realization.content_hash()? != capsule.execution_realization_hash {
+            bail!("direct recovery realization hash mismatch");
+        }
+        use ryeos_engine::isolation::{IsolationFilesystemAuthorityCeiling, IsolationNetworkAuthorityCeiling};
+        if realization.properties.get(IsolationFilesystemAuthorityCeiling::REALIZATION_PROPERTY)
+            != Some(&serde_json::to_value(prepared.plan.filesystem_authority_ceiling)?)
+            || realization.properties.get(IsolationNetworkAuthorityCeiling::REALIZATION_PROPERTY)
+                != Some(&serde_json::to_value(prepared.plan.network_authority_ceiling)?)
+        {
+            bail!("direct recovery realization contradicts admitted plan isolation ceilings");
+        }
+        Ok(prepared)
     }
 
     pub fn recover_from_persistent_session_capsule(
@@ -535,12 +985,18 @@ impl PreparedItemPlan {
                 bail!("node-policy direct execution is not restart-recoverable")
             }
         };
-        let ryeos_state::objects::AdmittedDirectCommandClosure::ContentAddressed {
-            executable_blob_hash,
-            execution_path,
-        } = command
-        else {
-            bail!("node-policy direct execution is not restart-recoverable");
+        let executable_blob_hash = match command {
+            ryeos_state::objects::AdmittedDirectCommandClosure::ContentAddressed {
+                executable_blob_hash,
+                ..
+            }
+            | ryeos_state::objects::AdmittedDirectCommandClosure::RealizationMember {
+                executable_blob_hash,
+                ..
+            } => executable_blob_hash,
+            ryeos_state::objects::AdmittedDirectCommandClosure::NodePolicy => {
+                bail!("node-policy direct execution is not restart-recoverable")
+            }
         };
         if expected_command_hash != executable_blob_hash {
             bail!("admitted direct executable blob contradicts artifact identity");
@@ -604,6 +1060,28 @@ impl PreparedItemPlan {
         if !command_identity_matches {
             bail!("admitted direct execution plan contradicts command identity");
         }
+        if let ryeos_state::objects::AdmittedDirectCommandClosure::RealizationMember {
+            executable_blob_hash,
+            realization_mount,
+            realization_mount_root,
+            relative_path,
+            execution_path,
+            ..
+        } = command
+        {
+            let expected_path = realization_mount_root
+                .destination(Some(Path::new(ADMITTED_DIRECT_PROJECT_ROOT)), realization_mount)?
+                .join(relative_path);
+            if execution_path != &expected_path
+                || original_spec.cmd != execution_path.display().to_string()
+                || original_command.code().source_path.as_path() != execution_path.as_path()
+                || original_command.code().content_hash != *executable_blob_hash
+            {
+                bail!(
+                    "admitted realization-member plan contradicts its retained command coordinate"
+                );
+            }
+        }
         relocate_admitted_direct_plan(
             &mut plan,
             admitted_project_root.as_deref(),
@@ -617,32 +1095,64 @@ impl PreparedItemPlan {
         if serialized_command.code().content_hash != *executable_blob_hash {
             bail!("admitted direct execution plan command contradicts executable blob");
         }
-        let (blob, _) = cas
-            .open_blob(executable_blob_hash)?
-            .ok_or_else(|| anyhow!("admitted direct executable blob is unavailable"))?;
-        let cached_identity = ryeos_engine::isolation::IsolationVerifiedCode {
-            source_path: execution_path.clone(),
-            content_hash: executable_blob_hash.clone(),
-        };
-        let admitted_command =
-            isolation.bind_admitted_verified_command(cached_identity.clone(), blob)?;
-        spec.cmd = execution_path.display().to_string();
-        match spec
-            .verified_command
-            .as_mut()
-            .expect("verified command checked above")
-        {
-            ryeos_engine::contracts::PlanVerifiedCommand::BundleExecutor { code, .. }
-            | ryeos_engine::contracts::PlanVerifiedCommand::CapturedContent { code } => {
-                *code = cached_identity;
+        let (admitted_command, realization_command) = match command {
+            ryeos_state::objects::AdmittedDirectCommandClosure::ContentAddressed {
+                executable_blob_hash,
+                execution_path,
+            } => {
+                let (blob, _) = cas
+                    .open_blob(executable_blob_hash)?
+                    .ok_or_else(|| anyhow!("admitted direct executable blob is unavailable"))?;
+                let cached_identity = ryeos_engine::isolation::IsolationVerifiedCode {
+                    source_path: execution_path.clone(),
+                    content_hash: executable_blob_hash.clone(),
+                };
+                let admitted = isolation
+                    .bind_admitted_verified_command(cached_identity.clone(), blob)?
+                    .into();
+                spec.cmd = execution_path.display().to_string();
+                match spec
+                    .verified_command
+                    .as_mut()
+                    .expect("verified command checked above")
+                {
+                    ryeos_engine::contracts::PlanVerifiedCommand::BundleExecutor { code, .. }
+                    | ryeos_engine::contracts::PlanVerifiedCommand::CapturedContent { code } => {
+                        *code = cached_identity;
+                    }
+                }
+                (Some(admitted), None)
             }
-        }
+            ryeos_state::objects::AdmittedDirectCommandClosure::RealizationMember {
+                executable_blob_hash,
+                realization_id,
+                realization_manifest_hash,
+                realization_mount,
+                realization_mount_root,
+                relative_path,
+                ..
+            } => (
+                None,
+                Some(PreparedRealizationCommand {
+                    realization_id: realization_id.clone(),
+                    manifest_hash: realization_manifest_hash.clone(),
+                    mount_root: *realization_mount_root,
+                    mount: realization_mount.clone(),
+                    relative_path: relative_path.clone(),
+                    executable_blob_hash: executable_blob_hash.clone(),
+                }),
+            ),
+            ryeos_state::objects::AdmittedDirectCommandClosure::NodePolicy => {
+                unreachable!("node-policy command was refused above")
+            }
+        };
         let timeout_secs = spec.timeout_secs;
         Ok(Self {
             plan,
             timeout_secs,
             root_subject_source_identity: root_subject_source_identity.clone(),
-            admitted_command: Some(admitted_command),
+            admitted_command,
+            realization_command,
         })
     }
 
@@ -670,7 +1180,7 @@ impl PreparedItemPlan {
         state: &crate::state::AppState,
         workspace: &Path,
         external_mounts: Vec<ryeos_engine::isolation::IsolationReadOnlyMountAuthority>,
-        target_channel: ryeos_engine::isolation::IsolationTargetChannelAuthority,
+        target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
         lifecycle: &ryeos_state::objects::PersistentSessionLifecycleContract,
         workspace_authority: ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority,
         network_authority: ryeos_engine::protocols::descriptor::PersistentSessionNetworkAuthority,
@@ -680,18 +1190,12 @@ impl PreparedItemPlan {
         if session_identity.is_empty() || session_identity.len() > 128 {
             bail!("persistent-session process identity is not canonical");
         }
-        use ryeos_engine::protocols::descriptor::{
-            PersistentSessionNetworkAuthority, PersistentSessionWorkspaceAuthority,
-        };
-        let (project_authority, filesystem_authority_ceiling) = match workspace_authority {
-            PersistentSessionWorkspaceAuthority::EphemeralScratch => (
+        use ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority;
+        let project_authority = match workspace_authority {
+            PersistentSessionWorkspaceAuthority::EphemeralScratch =>
                 ryeos_engine::isolation::IsolationProjectAuthority::EphemeralScratch,
-                ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution,
-            ),
-            PersistentSessionWorkspaceAuthority::RuntimeWorkspace => (
+            PersistentSessionWorkspaceAuthority::RuntimeWorkspace =>
                 ryeos_engine::isolation::IsolationProjectAuthority::RuntimeWorkspace,
-                ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
-            ),
         };
         if state_root.is_some()
             && !matches!(
@@ -701,14 +1205,15 @@ impl PreparedItemPlan {
         {
             bail!("persistent-session state root requires runtime-workspace authority");
         }
-        let network_authority_ceiling = match network_authority {
-            PersistentSessionNetworkAuthority::Isolated => {
-                ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::Isolated
-            }
-            PersistentSessionNetworkAuthority::NodePolicy => {
-                ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy
-            }
-        };
+        let filesystem_authority_ceiling = self.plan.filesystem_authority_ceiling;
+        let network_authority_ceiling = self.plan.network_authority_ceiling;
+        if filesystem_authority_ceiling.intersect(workspace_authority.filesystem_ceiling())
+            != filesystem_authority_ceiling
+            || network_authority_ceiling.intersect(network_authority.network_ceiling())
+                != network_authority_ceiling
+        {
+            bail!("persistent-session spawn would narrow an incorrectly sealed plan");
+        }
         let context = EngineContext {
             app_root: state.config.app_root.clone(),
             isolation: state.isolation.clone(),
@@ -728,7 +1233,7 @@ impl PreparedItemPlan {
             isolation_verified_code: Vec::new(),
             isolation_verified_command: self.admitted_command,
             isolation_external_read_only_mounts: external_mounts,
-            isolation_target_channel: Some(target_channel),
+            isolation_target_channels: target_channels,
             isolation_workspace: Some(workspace.to_path_buf()),
             subprocess_limits: Some(lillux::SubprocessLimits {
                 max_open_files: None,
@@ -858,10 +1363,22 @@ fn admitted_direct_command_path(
 /// plan wire, and command pathnames are rewritten to their stable admitted
 /// target path before the execution-plan hash is computed.
 fn admitted_execution_plan_value(plan: &ExecutionPlan) -> Result<Value> {
+    admitted_execution_plan_value_for_command(plan, false)
+}
+
+/// Preserve a realization member's already-canonical logical tree path. The
+/// ordinary direct-command path below intentionally strips a standalone
+/// executable into a content-addressed namespace; applying that rewrite to a
+/// realization member would sever sibling-relative toolchain layout.
+fn admitted_execution_plan_value_for_command(
+    plan: &ExecutionPlan,
+    preserve_realization_path: bool,
+) -> Result<Value> {
     let mut admitted = plan.clone();
     if let Some(ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. }) =
         admitted.nodes.first_mut()
         && let Some(command) = spec.verified_command.as_mut()
+        && !preserve_realization_path
     {
         let original = command.code().source_path.clone();
         let execution_path = admitted_direct_command_path(command.code())?;
@@ -1053,11 +1570,12 @@ pub fn prepare_item_plan(
     lifecycle_authority: ryeos_state::objects::ExecutionLifecycleAuthority,
     live_access: Option<&ryeos_engine::isolation::IsolationLiveAccessAuthority>,
     sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
+    parent_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
 ) -> Result<PreparedItemPlan> {
     engine.with_checked_bundle_generation(|_generation| {
         let verified = super::verified_execution_subject(engine, resolved)?;
         let mut plan =
-            super::build_execution_plan_for_request(engine, resolved, &verified, sealed_content)?;
+            super::build_execution_plan_for_request(engine, resolved, &verified, sealed_content, parent_filesystem_ceiling)?;
         let root_subject_source_identity =
             if resolved.resolved_item.source_space == ryeos_engine::contracts::ItemSpace::Bundle {
                 let expected_name = match &resolved.resolved_item.source_root {
@@ -1093,7 +1611,14 @@ pub fn prepare_item_plan(
                 }
                 None => bail!("item plan is empty"),
             };
-            if spec.verified_command.is_none() {
+            // A realization command is resolved only after daemon-side
+            // effective-program finalization has admitted its exact manifest.
+            // Do not feed the symbolic selector to filesystem/PATH capture or
+            // manufacture a parent launch context to resolve it.
+            if spec.verified_command.is_none()
+                && ryeos_engine::external_content::parse_realization_command_ref(&spec.cmd)?
+                    .is_none()
+            {
                 let project_root = match &resolved.plan_context.project_context {
                     ProjectContext::LocalPath { path } => Some(path.as_path()),
                     ProjectContext::None
@@ -1124,6 +1649,7 @@ pub fn prepare_item_plan(
             timeout_secs,
             root_subject_source_identity,
             admitted_command: None,
+            realization_command: None,
         })
     })
 }
@@ -1138,6 +1664,7 @@ pub fn prepare_captured_item_plan(
     root_source: &str,
     isolation: &ryeos_engine::isolation::IsolationRuntime,
     sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
+    enclosing_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
 ) -> Result<PreparedItemPlan> {
     engine.with_checked_bundle_generation(|_generation| {
         if verified.resolved.canonical_ref.to_string() != resolved.item_ref
@@ -1145,6 +1672,8 @@ pub fn prepare_captured_item_plan(
         {
             bail!("captured direct-plan subject contradicts its request carrier");
         }
+        let filesystem_ceiling = super::project_execution_filesystem_authority_ceiling(engine, resolved)?
+            .intersect(enclosing_filesystem_ceiling);
         let mut plan = engine.build_plan_from_captured_root(
             &resolved.plan_context,
             verified,
@@ -1152,7 +1681,11 @@ pub fn prepare_captured_item_plan(
             &resolved.parameters,
             &resolved.plan_context.execution_hints,
             sealed_content,
+            filesystem_ceiling,
         )?;
+        plan.network_authority_ceiling =
+            super::project_execution_network_authority_ceiling(engine, resolved)?;
+        plan.filesystem_authority_ceiling = plan.filesystem_authority_ceiling.intersect(filesystem_ceiling);
         let expected_name = match &verified.resolved.source_root {
             ryeos_engine::contracts::ItemSourceRoot::Bundle { name } => name.as_str(),
             other => bail!(
@@ -1190,6 +1723,7 @@ pub fn prepare_captured_item_plan(
             timeout_secs,
             root_subject_source_identity,
             admitted_command: None,
+            realization_command: None,
         })
     })
 }
@@ -1360,7 +1894,10 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
     for node in &mut plan.nodes {
         if let ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. } = node {
             let mut builder = crate::env_contract::EnvContractBuilder::new()
-                .with_base_allowlist(std::env::vars_os().map(|(key, value)| {
+                .with_base_allowlist(std::env::vars_os().filter(|_| {
+                    plan.filesystem_authority_ceiling
+                        == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy
+                }).map(|(key, value)| {
                     (
                         key.to_string_lossy().into_owned(),
                         value.to_string_lossy().into_owned(),
@@ -1485,7 +2022,7 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
         isolation_verified_code,
         isolation_verified_command: prepared_plan.admitted_command,
         isolation_external_read_only_mounts,
-        isolation_target_channel: None,
+        isolation_target_channels: Vec::new(),
         isolation_workspace,
         subprocess_limits: None,
         inherited_fds,
@@ -1608,6 +2145,8 @@ mod tests {
                 "custom": []
             },
             "materialization_requirements": [],
+            "network_authority_ceiling": "node_policy",
+            "filesystem_authority_ceiling": "node_policy",
             "cache_key": "test",
             "thread_kind": "tool",
             "executor_chain": ["tool:test/run", "tool:test/runtime"],
@@ -1631,6 +2170,7 @@ mod tests {
             plan,
             root_subject_source_identity: ryeos_state::objects::DirectRootSourceIdentity::Project,
             admitted_command: None,
+            realization_command: None,
         }
     }
 

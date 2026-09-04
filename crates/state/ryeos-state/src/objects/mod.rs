@@ -60,11 +60,11 @@ pub mod thread_snapshot;
 pub mod worker_session_restore;
 
 pub use admitted_launch_capsule::{
-    ADMITTED_DIRECT_COMMAND_ROOT, ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION, AdmittedAccountingScope,
-    AdmittedDirectCommandClosure, AdmittedExecutionClosure, AdmittedLaunchArtifactIdentity,
-    AdmittedLaunchAuthority, AdmittedLaunchCapsule, DirectExecutableIdentity,
-    DirectRootSourceIdentity, DirectRuntimeIdentity, DirectRuntimeSourceSpace,
-    admitted_direct_command_execution_path,
+    ADMITTED_DIRECT_COMMAND_ROOT, ADMITTED_DIRECT_PROJECT_ROOT,
+    ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION, AdmittedAccountingScope, AdmittedDirectCommandClosure,
+    AdmittedExecutionClosure, AdmittedLaunchArtifactIdentity, AdmittedLaunchAuthority,
+    AdmittedLaunchCapsule, DirectExecutableIdentity, DirectRootSourceIdentity, DirectRuntimeIdentity,
+    DirectRuntimeSourceSpace, admitted_direct_command_execution_path,
 };
 pub use attestation::Attestation;
 pub use bundle_event::{
@@ -111,9 +111,10 @@ pub use external_content_activation::{
 pub use external_content_binding::{
     EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE, EXTERNAL_CONTENT_BINDING_KIND,
     EXTERNAL_CONTENT_BINDING_SCHEMA, EXTERNAL_CONTENT_BINDING_SCHEMA_EPOCH, ExternalContentBinding,
-    ExternalContentBindingState,
+    ExternalContentBindingState, ExternalContentConsumerAuthority,
 };
 pub use external_content_manifest::{
+    EXECUTION_RUNTIME_REALIZATIONS_ROOT, ExternalContentMountRoot,
     EXTERNAL_CONTENT_MANIFEST_KIND, EXTERNAL_CONTENT_TREE_SCHEMA,
     EXTERNAL_REALIZATIONS_DERIVED_KEY, ExternalContentKind, ExternalContentManifestEntry,
     ExternalContentManifestEntryKind, ExternalContentManifestObject, ExternalContentMode,

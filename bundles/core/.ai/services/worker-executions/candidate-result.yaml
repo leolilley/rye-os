@@ -1,0 +1,7 @@
+kind: service
+endpoint: worker-executions.candidate-result
+required_caps: ["ryeos.execute.service.worker-executions/candidate-result"]
+state_access: read_only_existing
+ui_read_only: true
+schema: {chain_root_id: string, source_site_id: string}
+description: "Return target-signed testimony for one owner-bound, terminal, validated, retained hosted-worker candidate"
