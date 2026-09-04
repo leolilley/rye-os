@@ -1020,7 +1020,10 @@ mod tests {
             project.path(),
             project.path(),
             Path::new(""),
-            &crate::ignore::matcher_from_builtins(),
+            &crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+                patterns: vec![".venv/".to_owned()],
+            })
+            .unwrap(),
             None,
             &mut files,
         )

@@ -96,6 +96,9 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
         ryeos_state::object_closure::ObjectClosureLimits::default().max_object_bytes,
     )?;
     let policy = ProjectSnapshotPolicy::from_value(&policy_obj)?;
+    let target_ignore = state
+        .node_policy
+        .require::<ryeos_app::node_policy::sections::ingest_ignore::CompiledIngestIgnorePolicy>()?;
     if policy.sync_scope != ProjectSyncScope::AiOnly {
         anyhow::bail!(
             "project.apply-snapshot only accepts ai_only snapshots in v1 (got {:?})",
@@ -109,6 +112,10 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
     )?;
     let tree = ProjectTree::from_value(&tree_obj)?;
     ryeos_state::project_sync::validate_project_tree_paths(&tree, &policy)?;
+    ryeos_state::project_sync::validate_project_tree_against_target_ignore(
+        &tree,
+        &target_ignore.matcher,
+    )?;
     ryeos_state::project_sync::validate_captured_policy_source(&cas, &tree, &policy)?;
 
     let current_ref = state

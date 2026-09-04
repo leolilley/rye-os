@@ -1519,7 +1519,10 @@ mod tests {
             store_budget_bytes: 8192,
             minimum_free_bytes: 1024,
         };
-        let ignore = crate::ignore::matcher_from_builtins();
+        let ignore = crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+            patterns: Vec::new(),
+        })
+        .unwrap();
         let first = import_request_digest(&request, &limits, 7, 11, &ignore).unwrap();
         let same_open_root = import_request_digest(&request, &limits, 7, 11, &ignore).unwrap();
         let rebound_root = import_request_digest(&request, &limits, 8, 11, &ignore).unwrap();

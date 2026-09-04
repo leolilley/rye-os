@@ -946,7 +946,12 @@ mod tests {
             scheduler_db: Arc::new(ryeos_scheduler::db::SchedulerDb::new_in_memory().unwrap()),
             scheduler_runtime_gate: Arc::new(tokio::sync::RwLock::new(())),
             scheduler_reload_tx: None,
-            ignore_matcher: Arc::new(ryeos_app::ignore::matcher_from_builtins()),
+            ignore_matcher: Arc::new(
+                ryeos_app::ignore::IgnoreMatcher::from_config(&ryeos_app::ignore::IgnoreConfig {
+                    patterns: Vec::new(),
+                })
+                .unwrap(),
+            ),
             vault_fingerprint: None,
             accounting: None,
             persistent_sessions: Arc::new(

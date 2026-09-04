@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-03T11:56:15Z:6103458e04a658fdbd80db411a156a8c86619276d80e226e28256e8a527d585f:/iOrF67P7KUnFHP9CLEZcQ8WbFjZ/7vK+47gTOkqt7maNwN0dzlw+jO2FWDEoDjHrGwGkfvFJ+IrqlKu21XlAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-04T08:08:29Z:3dafc28a9162dbca69be1c53bb8bb03c3a1f7d975e96fa0ec45ae6d1d5a36286:fblTxRtpGox27w5tVG3waXSy9oM5oJufFsY7ABy9wxfuXffoQMH77fcXX2jkHK2oVCAu+T8bTSJnNBVCTS+bCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - central-auth
@@ -172,8 +172,19 @@ policies:
         verified_artifact_total_bytes: 268435456
         verified_artifact_files: 4096
   ingest_ignore:
-    schema: 1
-    additional_patterns: []
+    schema: 2
+    patterns:
+      - "*.pyc"
+      - ".DS_Store"
+      - ".env"
+      - ".git/"
+      - ".hg/"
+      - ".svn/"
+      - ".venv/"
+      - "/.ai/config/remotes/"
+      - "__pycache__/"
+      - "node_modules/"
+      - "target/"
   external_content:
     schema: 1
     roots: {}

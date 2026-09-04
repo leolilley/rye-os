@@ -1271,10 +1271,5 @@ mod tests {
                 .iter()
                 .any(|rule| rule.contains(".ryeos-pull-staging-*"))
         );
-        assert!(
-            identity
-                .iter()
-                .any(|rule| rule.starts_with("built_in_ignore:"))
-        );
     }
 }

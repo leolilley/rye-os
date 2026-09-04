@@ -2078,7 +2078,7 @@ mod tests {
         let mut policies = current.policies().clone();
         policies.insert(
             "ingest_ignore".to_owned(),
-            serde_json::json!({"schema": 1, "additional_patterns": ["*.trace"]}),
+            serde_json::json!({"schema": 2, "patterns": ["*.trace"]}),
         );
         let update = current
             .prepare_replacement(&table, policies, Path::new("operator-policy.yaml"))
@@ -2207,6 +2207,55 @@ mod tests {
         assert_eq!(
             fs::read(state.join(".ai/state/preserved-sentinel")).unwrap(),
             b"preserved"
+        );
+    }
+
+    #[test]
+    fn explicit_policy_cut_replaces_a_trusted_predecessor_section_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let user = tmp.path().join("home");
+        let opts = make_opts(&state, &user);
+        run_init(&opts).expect("initial current generation");
+
+        let identity = ryeos_app::identity::NodeIdentity::load(
+            &state.join(".ai/node/identity/private_key.pem"),
+        )
+        .unwrap();
+        let predecessor = serde_json::json!({
+            "schema": 1,
+            "additional_patterns": [],
+        });
+        let bytes = ryeos_app::node_document::render_signed_item(
+            "ingest_ignore",
+            "policy",
+            &predecessor,
+            &identity,
+        )
+        .unwrap();
+        fs::write(state.join(".ai/node/policies/ingest_ignore.yaml"), bytes).unwrap();
+
+        let error = run_init(&opts).expect_err("ordinary init must not reinterpret schema 1");
+        assert!(
+            format!("{error:#}").contains("ingest_ignore policy schema is not current"),
+            "got: {error:#}"
+        );
+
+        let mut replacement = opts;
+        replacement.replace_node_policy_generation = true;
+        run_init(&replacement).expect("explicit schema cut replaces predecessor generation");
+
+        let trust = TrustStore::load(None, &state.join(".ai/config")).unwrap();
+        let current = ryeos_app::node_policy::generation::load_optional_policy_generation(
+            &state,
+            &trust,
+            &ryeos_app::node_policy::NodePolicyTable::new(),
+        )
+        .unwrap()
+        .expect("current policy generation");
+        assert_eq!(
+            current.policies()["ingest_ignore"]["schema"],
+            serde_json::json!(2)
         );
     }
 

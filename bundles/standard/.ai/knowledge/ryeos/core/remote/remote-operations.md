@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-02T12:38:43Z:4144523d8b88376364cc66272bfcc31806b6891ffa29315d85d0d6ed3c36962e:euKHSVuCa6KZs3ipiCOeS3XrYUKVL87gjHEra6rAvQ/5DrJFPuF+hATmxd4SVWKTvwcIKGn4r34pd/YeyMjOBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-04T08:52:01Z:973399d15097f923654f5970e046708f16ca6f700e4ad396a4ef0b9fb5166d43:tUcI3PNdFLwHnzjjMgL/uL8Eikoelxr1w7QGd64bAwsVppXuloKS59JuFli6JoJ5URY0tJs8tVfJXEmH34VLAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core
 tags: [remote, operations, trust, security, networking]
-version: "3.7.5"
+version: "3.7.6"
 description: >
   Remote execution and bundle synchronization — trust model,
   operator workflows, fail-closed semantics, and security requirements.
@@ -339,14 +339,17 @@ authorize the new node key.
 ## Remote Ignore Cache
 
 `ryeos remote configure` caches the remote node's ingest-ignore rules
-in the local remotes config. Subsequent push/execute operations use
-these cached rules to capture the pushed project snapshot policy and tree.
+in the local remotes config. Subsequent push/execute operations union those
+cached target exclusions with the source node's current signed exclusions to
+capture the pushed project snapshot policy and tree. The destination still
+validates actual paths against its current policy before accepting a HEAD.
 
 If the remote changes its ignore rules, re-run `ryeos remote configure`.
 
-If no cached rules are available, the push handler fetches them inline
-and persists them. If the inline fetch fails, the push is **aborted** —
-the handler does not silently fall back to local ignore rules.
+If no cached rules are available, the push handler fetches them inline for the
+operation without manufacturing or persisting partial remote configuration. If
+the inline fetch fails, the push is **aborted** — the handler does not silently
+fall back to either an empty or source-only policy.
 
 ## HTTPS Requirement
 

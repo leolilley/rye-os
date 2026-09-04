@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-03T11:56:15Z:8abce39e683c2abb098874647068fb6a1f44e5455b9179e0993f39315403a54d:lcCLjNxl/mGUDJo/oLorr0G1xRE8yKrPQAIybFcyZCEO+X49lvPE7fQqMeCnhQ+OQp4UaLH88IzxGcAfAk7XDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-04T08:08:42Z:a62f8010374e12f88c2ad5830932b1b8eaa4d218c8dbd37218cbb829c073cbd5:AI26QMNntu4NpQ/StaFlcOL1iLV+2mesGMVzYa1/JAZRo7/FokI+DQ0tevQRHCh5xQ7emXDElTPECyHEQkUzAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "architecture"
 title: "Architecture Map"
 description: "Short orientation for crates, bundles, execution flow, and trust boundaries"
 entry_type: reference
-version: "1.4.0"
+version: "1.4.1"
 ```
 
 # Architecture Map
@@ -102,22 +102,24 @@ schedule declarations under `.ai/config/schedules`, and project-authored node
 extension declarations such as `.ai/node/engine/kinds` and `.ai/node/verbs`.
 
 What must NOT deploy is split into two reason-named code constants, both
-enforced as a **scope-independent floor** — they apply to `full_project` sync as
-well as `ai_only` (config can add to them but never remove):
+enforced as a **scope-independent structural floor** — they apply to
+`full_project` sync as well as `ai_only` and are not ignore policy:
 
 - `NEVER_DEPLOY_SECRETS` — credentials: `.ai/node/identity`, `.ai/node/auth`,
   `.ai/node/vault`, `.ai/config/keys/signing`.
-- `NODE_OWNED` — node runtime state: `.ai/state`, `.ai/node/schedules`,
-  `.ai/node/routes`, `.ai/node/bundles`.
+- `NODE_OWNED` — node runtime state and transaction anchors: `.ai/state`,
+  `.ai/cache`, `.ai/.bundles.lock`, `.ai/node/schedules`, `.ai/node/routes`,
+  `.ai/node/bundles`.
 
 Classification order is `never_deploy_secrets → ignore → node_owned →
 deployable → unknown/non-ai`, so an ignored file inside a deployable surface
 (e.g. `.ai/tools/x/__pycache__/y.pyc`) is dropped, not shipped. The ingest
-ignore policy (`.ai/node/policies/ingest_ignore.yaml`) supports **path-anchored**
-patterns (e.g. `/.ai/config/remotes/`, which is ignored by default for fresh
-inits — a project's remotes config is environment-specific and must not travel).
-It is a member of the complete node-signed policy generation and is changed
-through the stopped-node policy workflow, not edited in place.
+ignore policy (`.ai/node/policies/ingest_ignore.yaml`) is the complete source of
+conventional ignore patterns; the engine contributes no hidden defaults. It
+supports **path-anchored** patterns (e.g. `/.ai/config/remotes/`, which shipped
+profiles select because a project's remotes config is environment-specific and
+must not travel). It is a member of the complete node-signed policy generation
+and is changed through the stopped-node policy workflow, not edited in place.
 
 `ryeos init` writes a generated, **read-only** `.ai/node/sync/policy.yaml` that
 documents the effective policy — deployable surfaces, both floors, and a pointer

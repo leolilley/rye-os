@@ -7,7 +7,9 @@ use sha2::{Digest as _, Sha256};
 use crate::ignore::IgnoreMatcher;
 use crate::objects::{ProjectFile, ProjectSnapshotPolicy, ProjectTree, SourceManifest};
 
-const PROJECT_CONFIG_POLICY_SOURCE: &str = "project_config";
+pub const PROJECT_CONFIG_POLICY_SOURCE: &str = "project_config";
+pub const NODE_PATTERNS_POLICY_SOURCE: &str = "node_patterns";
+const NODE_PATTERNS_PROJECTION_SCHEMA: u32 = 1;
 
 /// Scope declared by a project snapshot.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -47,16 +49,23 @@ pub fn absent_project_snapshot_source_hashes(
         PROJECT_CONFIG_POLICY_SOURCE.to_string(),
         absent_project_snapshot_config_hash(),
     );
-    let node_patterns = node_matcher.canonical_patterns().to_vec();
-    let node_identity = lillux::canonical_json(&serde_json::json!({
-        "schema": 1,
-        "patterns": node_patterns,
-    }))?;
     source_hashes.insert(
-        "node_additions".to_string(),
-        hex_sha256(node_identity.as_bytes()),
+        NODE_PATTERNS_POLICY_SOURCE.to_string(),
+        project_snapshot_node_patterns_hash(node_matcher.canonical_patterns())?,
     );
     Ok(source_hashes)
+}
+
+/// Snapshot-owned semantic identity for the exact conventional patterns used
+/// during capture. This deliberately does not reproduce the node-policy
+/// section kind or schema; the node-policy compiler remains their sole owner.
+pub fn project_snapshot_node_patterns_hash(patterns: &[String]) -> Result<String> {
+    let identity = lillux::canonical_json(&serde_json::json!({
+        "kind": "project_snapshot_node_patterns",
+        "schema": NODE_PATTERNS_PROJECTION_SCHEMA,
+        "patterns": patterns,
+    }))?;
+    Ok(hex_sha256(identity.as_bytes()))
 }
 
 /// Bind a captured tree to the policy-source presence/content fact recorded in
@@ -131,7 +140,8 @@ impl ProjectSnapshotConfig {
 }
 
 /// Build the immutable policy for one capture. The committed project source is
-/// optional; the node matcher remains additive and cannot loosen code floors.
+/// optional; the node matcher is the exact signed conventional-ignore policy
+/// and remains independent from the non-bypassable structural floor.
 pub fn capture_snapshot_policy(
     project_root: &std::path::Path,
     node_matcher: &IgnoreMatcher,
@@ -305,11 +315,10 @@ pub const PROJECT_AI_SURFACES: &[ProjectAiSurface] = &[
     ),
 ];
 
-/// Secrets that must never leave the machine. **Code-enforced floor**: this is
-/// enforced for every sync scope, and configuration may only ever *add* to it,
-/// never remove an entry. Shipping any of these would leak a credential.
+/// RyeOS-owned credential roots that must never leave the machine.
+/// **Code-enforced structural floor**: this is independent from configurable
+/// ignore policy and applies to every sync scope.
 pub const NEVER_DEPLOY_SECRETS: &[&str] = &[
-    ".env",
     ".ai/node/identity",
     ".ai/node/auth",
     ".ai/node/vault",
@@ -317,15 +326,20 @@ pub const NEVER_DEPLOY_SECRETS: &[&str] = &[
 ];
 
 /// Node-owned runtime state that belongs to whichever node runs it (not project
-/// content). **Code-enforced floor**: enforced for every sync scope; config may
-/// only *add*. Deploying these would clobber or leak the remote's own state.
+/// content). **Code-enforced structural floor**: enforced for every sync scope
+/// independently from configurable ignore policy. Deploying these would
+/// clobber or leak the remote's own state.
 pub const NODE_ROUTES_ROOT: &str = ".ai/node/routes";
 pub const NODE_SCHEDULES_ROOT: &str = ".ai/node/schedules";
 pub const NODE_BUNDLES_ROOT: &str = ".ai/node/bundles";
+pub const BUNDLE_REGISTRY_LOCK: &str = ".ai/.bundles.lock";
 
 pub const NODE_OWNED: &[&str] = &[
     ".ai/state",
     ".ai/cache",
+    // Installed-bundle registry synchronization anchor. It is an empty
+    // process lock, not project dependency metadata.
+    BUNDLE_REGISTRY_LOCK,
     NODE_SCHEDULES_ROOT,
     NODE_ROUTES_ROOT,
     NODE_BUNDLES_ROOT,
@@ -369,16 +383,7 @@ pub fn snapshot_floor_rules() -> Vec<String> {
 /// identity and capture enforcement cannot drift into separate hard-coded
 /// path lists.
 pub fn durable_content_capture_floor_rules() -> Vec<String> {
-    let mut rules = snapshot_floor_rules();
-    rules.extend(
-        crate::ignore::durable_capture_floor()
-            .canonical_patterns()
-            .iter()
-            .map(|pattern| format!("built_in_ignore:{pattern}")),
-    );
-    rules.sort();
-    rules.dedup();
-    rules
+    snapshot_floor_rules()
 }
 
 /// Match `rel_path` against a set of `.ai` prefixes on segment boundaries,
@@ -403,12 +408,11 @@ pub fn is_project_snapshot_floor_excluded(rel_path: &str) -> bool {
         || transaction_artifact
 }
 
-/// Floor for content copied into durable CAS rather than merely read live.
-/// The project safety floor and the shared built-in ingest floor are both
-/// mandatory; a node's loaded ignore configuration may only narrow further.
+/// Structural floor for content copied into durable CAS rather than merely
+/// read live. Conventional exclusions are supplied separately by the exact
+/// signed node policy captured with the snapshot.
 pub fn is_durable_content_capture_floor_excluded(rel_path: &str) -> bool {
     is_project_snapshot_floor_excluded(rel_path)
-        || crate::ignore::durable_capture_floor().is_ignored(rel_path)
 }
 
 fn surface_kind_str(kind: ProjectAiSurfaceKind) -> &'static str {
@@ -534,6 +538,23 @@ pub fn validate_project_tree_paths(
     Ok(())
 }
 
+/// Apply the receiving node's current signed conventional-ignore authority to
+/// an already validated transferred tree. Source and target policies need not
+/// be identical: admission is their intersection over actual content, not a
+/// cross-node policy-identity requirement.
+pub fn validate_project_tree_against_target_ignore(
+    tree: &ProjectTree,
+    target: &IgnoreMatcher,
+) -> Result<()> {
+    if let Some(path) = tree.files.keys().find(|path| target.is_ignored(path)) {
+        anyhow::bail!(
+            "project tree path '{}' is excluded by the target node's current signed ingest-ignore policy",
+            path
+        );
+    }
+    Ok(())
+}
+
 /// Validate a single manifest path for the declared sync scope.
 pub fn validate_project_manifest_path(
     rel_path: &str,
@@ -562,6 +583,13 @@ pub fn validate_project_manifest_path(
     if is_project_snapshot_floor_excluded(rel_path) {
         anyhow::bail!(
             "manifest path '{}' is a RyeOS transaction artifact and cannot be deployed",
+            rel_path
+        );
+    }
+
+    if ignore.is_some_and(|matcher| matcher.is_ignored(rel_path)) {
+        anyhow::bail!(
+            "project manifest path '{}' matches the captured node/project ignore policy and must not be in the manifest",
             rel_path
         );
     }
@@ -753,10 +781,10 @@ mod tests {
         // Secrets and node-owned runtime state must be rejected even under
         // full_project sync, which previously only checked path safety.
         for path in [
-            ".env",
             ".ai/node/identity/private_key.pem",
             ".ai/config/keys/signing/k.pem",
             ".ai/state/runtime.sqlite3",
+            ".ai/.bundles.lock",
             ".ai/node/routes/apply.yaml",
             "src/.ryeos-quarantine.1.2",
             "nested/.ryeos-pull-backup-1.2/journal.json",
@@ -771,8 +799,46 @@ mod tests {
     }
 
     #[test]
+    fn public_development_fixture_is_policy_data_not_secret_authority() {
+        let fixture = manifest(&[".dev-keys/PUBLISHER_DEV.pem"]);
+        validate_project_manifest_paths(&fixture, ProjectSyncScope::FullProject, None)
+            .expect("tracked public development fixture is ordinary project content");
+
+        let ignore = crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+            patterns: vec![".dev-keys/".to_owned()],
+        })
+        .unwrap();
+        validate_project_manifest_paths(&fixture, ProjectSyncScope::FullProject, Some(&ignore))
+            .expect_err("an exact signed node policy may exclude the fixture");
+    }
+
+    #[test]
+    fn target_policy_intersects_content_without_requiring_policy_identity() {
+        let tree = ProjectTree {
+            files: std::collections::BTreeMap::from([("src/lib.rs".to_owned(), "ab".repeat(32))]),
+        };
+        let different_but_safe =
+            crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+                patterns: vec!["target/".to_owned()],
+            })
+            .unwrap();
+        validate_project_tree_against_target_ignore(&tree, &different_but_safe).unwrap();
+
+        let excludes_transferred_path =
+            crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+                patterns: vec!["*.rs".to_owned()],
+            })
+            .unwrap();
+        validate_project_tree_against_target_ignore(&tree, &excludes_transferred_path)
+            .expect_err("target policy must reject matching transferred content");
+    }
+
+    #[test]
     fn ignored_file_inside_surface_is_not_deployable() {
-        let ignore = crate::ignore::matcher_from_builtins();
+        let ignore = crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+            patterns: vec!["__pycache__/".to_owned()],
+        })
+        .unwrap();
         // A junk file inside a deployable surface classifies as Ignored, not
         // Deployable — ignore wins over the surface allowlist.
         assert_eq!(
@@ -783,9 +849,15 @@ mod tests {
 
     #[test]
     fn classifies_project_ai_paths() {
-        assert!(matches!(
+        assert_eq!(
             classify_project_ai_path(".env", None),
-            ProjectAiPathClass::NeverDeploySecret { prefix: ".env" }
+            ProjectAiPathClass::NonAiPath
+        );
+        assert!(matches!(
+            classify_project_ai_path(".ai/.bundles.lock", None),
+            ProjectAiPathClass::NodeOwned {
+                prefix: ".ai/.bundles.lock"
+            }
         ));
         assert!(matches!(
             classify_project_ai_path(".ai/config/schedules/snap-track.yaml", None),
@@ -862,7 +934,6 @@ mod tests {
             Some(".ai/node/policies/ingest_ignore.yaml")
         );
         let secrets = v["never_deploy_secrets"].as_sequence().unwrap();
-        assert!(secrets.iter().any(|x| x.as_str() == Some(".env")));
         assert!(
             secrets
                 .iter()
@@ -870,6 +941,11 @@ mod tests {
         );
         let node_owned = v["node_owned"].as_sequence().unwrap();
         assert!(node_owned.iter().any(|x| x.as_str() == Some(".ai/state")));
+        assert!(
+            node_owned
+                .iter()
+                .any(|x| x.as_str() == Some(BUNDLE_REGISTRY_LOCK))
+        );
         assert_eq!(
             v["deployable_surfaces"].as_sequence().unwrap().len(),
             PROJECT_AI_SURFACES.len()

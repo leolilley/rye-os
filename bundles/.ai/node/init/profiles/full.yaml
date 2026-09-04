@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-03T11:56:15Z:65d31589dd57efc9ba5aa4bba5e2e25cda64c42346e5737066374088e3b224eb:htP/z4KfKKBDPUPCMW90ygSNwYpRgDUelIuoIADaDqXZ3nbIRREKson8ZP1fT/J4AqxoWLyjTi8tSBNGDOJxCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-04T08:08:29Z:2bd5bdd41e2825863c5aaaf8bd10fef375c1155309530129206df001726198c3:1wr4HSDslHz+DAXKn9+ZLsNnuODdUjeME5irVOLUNOv4gJzeMshgYo/pRk7OGRHJaUnu+eyURKlJRLAhe8PjBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -186,8 +186,19 @@ policies:
         verified_artifact_total_bytes: 268435456
         verified_artifact_files: 4096
   ingest_ignore:
-    schema: 1
-    additional_patterns: []
+    schema: 2
+    patterns:
+      - "*.pyc"
+      - ".DS_Store"
+      - ".env"
+      - ".git/"
+      - ".hg/"
+      - ".svn/"
+      - ".venv/"
+      - "/.ai/config/remotes/"
+      - "__pycache__/"
+      - "node_modules/"
+      - "target/"
   external_content:
     schema: 1
     roots: {}

@@ -1364,7 +1364,10 @@ mod pinned_child_authority_tests {
         let tree_hash = cas.store_object(&tree.to_value()).unwrap();
         let policy = ProjectSnapshotPolicy::from_matcher(
             ryeos_state::project_sync::ProjectSyncScope::FullProject,
-            &ryeos_state::ignore::matcher_from_builtins(),
+            &ryeos_state::ignore::IgnoreMatcher::from_config(&ryeos_state::ignore::IgnoreConfig {
+                patterns: Vec::new(),
+            })
+            .unwrap(),
         )
         .unwrap();
         let policy_hash = cas.store_object(&policy.to_value()).unwrap();
