@@ -498,6 +498,8 @@ pub fn ensure_open_regular_file_unchanged(
 /// Read one already-open regular file through an exact descriptor observation.
 /// The caller supplies the admitted byte ceiling; Lillux proves size, identity,
 /// timestamps, and permissions stayed fixed for the whole read.
+/// Positional reads are mandatory: cloned descriptors share a seek cursor and
+/// must not corrupt one another's verification when reused concurrently.
 pub fn read_open_regular_file_stable_bounded(
     file: &mut File,
     before: &OpenRegularFileObservation,
@@ -507,21 +509,47 @@ pub fn read_open_regular_file_stable_bounded(
         anyhow::bail!("regular file exceeds {max_bytes} bytes");
     }
     ensure_open_regular_file_unchanged(file, before)?;
-    file.seek(std::io::SeekFrom::Start(0))?;
     let expected = usize::try_from(before.size())
         .map_err(|_| anyhow::anyhow!("regular file size does not fit this platform"))?;
     let mut bytes = vec![0_u8; expected];
-    file.read_exact(&mut bytes)?;
+    let mut offset = 0;
+    while offset < expected {
+        let count = read_regular_file_at(file, &mut bytes[offset..], offset as u64)?;
+        if count == 0 {
+            anyhow::bail!("regular file ended before its observed length");
+        }
+        offset += count;
+    }
     let mut sentinel = [0_u8; 1];
-    if file.read(&mut sentinel)? != 0 {
+    if read_regular_file_at(file, &mut sentinel, before.size())? != 0 {
         anyhow::bail!("regular file grew while its content was being observed");
     }
     ensure_open_regular_file_unchanged(file, before)?;
     Ok(bytes)
 }
 
+fn read_regular_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    loop {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::FileExt::read_at(file, bytes, offset);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::FileExt::seek_read(file, bytes, offset);
+        #[cfg(not(any(unix, windows)))]
+        let result = {
+            let _ = (file, &bytes, offset);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "positional regular-file reads are unsupported",
+            ))
+        };
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 fn digest_open_regular_file_exact(file: &mut File, expected_bytes: u64) -> Result<String> {
-    file.seek(std::io::SeekFrom::Start(0))?;
     let mut digest = sha2::Sha256::new();
     use sha2::Digest as _;
     let mut buffer = [0_u8; 1024 * 1024];
@@ -529,7 +557,8 @@ fn digest_open_regular_file_exact(file: &mut File, expected_bytes: u64) -> Resul
     while remaining > 0 {
         let requested = usize::try_from(remaining.min(buffer.len() as u64))
             .expect("bounded digest chunk always fits usize");
-        let read = file.read(&mut buffer[..requested])?;
+        let read =
+            read_regular_file_at(file, &mut buffer[..requested], expected_bytes - remaining)?;
         if read == 0 {
             anyhow::bail!("regular file ended before admitted size {expected_bytes} was consumed");
         }
@@ -537,7 +566,7 @@ fn digest_open_regular_file_exact(file: &mut File, expected_bytes: u64) -> Resul
         remaining -= read as u64;
     }
     let mut sentinel = [0_u8; 1];
-    if file.read(&mut sentinel)? != 0 {
+    if read_regular_file_at(file, &mut sentinel, expected_bytes)? != 0 {
         anyhow::bail!("regular file grew beyond admitted size {expected_bytes}");
     }
     Ok(format!("{:x}", digest.finalize()))
@@ -5276,10 +5305,10 @@ pub fn read_open_regular_file_bounded(mut file: File, max_bytes: u64) -> Result<
 /// Read an already-open regular file whose descriptor length was observed by
 /// the caller before reserving memory.
 ///
-/// The allocation is exactly `expected_bytes + 1`: the sentinel byte closes a
-/// concurrent-growth race without allowing `read_to_end` to grow the vector
-/// beyond the caller's reservation. The descriptor identity and metadata must
-/// remain stable across the read, and the sentinel must remain unused.
+/// The allocation is exactly `expected_bytes`, plus one stack sentinel byte.
+/// Positional bounded reads close the concurrent-growth and shared-cursor races
+/// without growing beyond the caller's reservation. The descriptor identity
+/// and metadata must remain stable, and the sentinel must remain unused.
 pub fn read_open_regular_file_exact_bounded(
     mut file: File,
     expected_bytes: u64,
@@ -5298,27 +5327,11 @@ pub fn read_open_regular_file_exact_bounded(
             before.len()
         );
     }
-    let allocation_bytes = expected_bytes
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("regular-file sentinel allocation overflow"))?;
-    let capacity = usize::try_from(allocation_bytes)
-        .context("regular-file sentinel allocation does not fit this platform")?;
-    file.seek(std::io::SeekFrom::Start(0))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    std::io::Read::by_ref(&mut file)
-        .take(allocation_bytes)
-        .read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).ok() != Some(expected_bytes) {
-        anyhow::bail!(
-            "open regular-file length changed while reading (expected {expected_bytes}, read {})",
-            bytes.len()
-        );
-    }
-    let after = file.metadata()?;
-    if !same_regular_file_observation(&before, &after) {
-        anyhow::bail!("open regular-file identity or metadata changed while reading");
-    }
-    Ok(bytes)
+    read_open_regular_file_stable_bounded(
+        &mut file,
+        &OpenRegularFileObservation { metadata: before },
+        max_bytes,
+    )
 }
 
 /// UTF-8 variant of [`read_regular_file_no_follow`].
@@ -6271,6 +6284,30 @@ mod tests {
         let observed = observe_open_regular_file(&file).unwrap();
         std::fs::write(&path, b"second-value").unwrap();
         assert!(read_open_regular_file_stable_bounded(&mut file, &observed, 1024).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_descriptor_reads_leave_a_shared_cursor_unchanged() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"exact retained bytes").unwrap();
+        file.seek(std::io::SeekFrom::Start(4)).unwrap();
+        let observed = observe_open_regular_file(&file).unwrap();
+        let mut clone = file.try_clone().unwrap();
+        assert_eq!(
+            read_open_regular_file_stable_bounded(&mut clone, &observed, 128).unwrap(),
+            b"exact retained bytes"
+        );
+        assert_eq!(file.stream_position().unwrap(), 4);
+        let (digest, _) =
+            digest_open_regular_file_stable_exact(&mut clone, observed.size()).unwrap();
+        assert_eq!(digest, crate::cas::sha256_hex(b"exact retained bytes"));
+        assert_eq!(file.stream_position().unwrap(), 4);
+        assert_eq!(
+            read_open_regular_file_exact_bounded(clone, observed.size(), 128).unwrap(),
+            b"exact retained bytes"
+        );
+        assert_eq!(file.stream_position().unwrap(), 4);
     }
 
     #[cfg(target_os = "linux")]

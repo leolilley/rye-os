@@ -242,8 +242,10 @@ impl VerifiedArtifactStore {
         handle: Arc<std::fs::File>,
     ) -> Result<MaterializedArtifact, EngineError> {
         let artifact = self.root.path().join(name);
-        protect_verified_artifact(&handle, &artifact)?;
-        let (content, _) = read_regular_file_handle_limited(
+        // Reuse is read-only validation. Re-running chmod here changes ctime
+        // and races every concurrent reader; it also repairs permissions that
+        // should instead make an already-published artifact fail closed.
+        let (content, observation) = read_regular_file_handle_limited(
             "verified artifact",
             &artifact,
             handle
@@ -251,6 +253,16 @@ impl VerifiedArtifactStore {
                 .map_err(|error| refused(error.to_string()))?,
             self.max_file_bytes,
         )?;
+        if observation
+            .full_permission_mode()
+            .map_err(|error| refused(error.to_string()))?
+            != 0o500
+        {
+            return Err(refused(format!(
+                "verified artifact {} changed its protected permissions",
+                artifact.display()
+            )));
+        }
         if lillux::cas::sha256_hex(&content) != expected_hash {
             return Err(refused(format!(
                 "verified artifact {} failed its content-address check",
@@ -5238,12 +5250,16 @@ mod tests {
         // pathname lookup. Removing the name therefore cannot redirect later
         // readers, and each reader still re-hashes the pinned bytes.
         std::fs::remove_file(&first.path).unwrap();
+        let before_reuse = lillux::observe_open_regular_file(&first.handle).unwrap();
+        let start = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             let workers = (0..8)
                 .map(|_| {
                     let store = Arc::clone(&store);
                     let content_hash = content_hash.clone();
+                    let start = &start;
                     scope.spawn(move || {
+                        start.wait();
                         store
                             .existing(&content_hash, &content_hash)
                             .unwrap()
@@ -5258,6 +5274,33 @@ mod tests {
                 assert_eq!(metadata.ino(), first_metadata.ino());
             }
         });
+        lillux::ensure_open_regular_file_unchanged(&first.handle, &before_reuse).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_artifact_reuse_refuses_instead_of_repairing_changed_permissions() {
+        let app_root = tempfile::tempdir().unwrap();
+        let pinned_root = lillux::PinnedDirectory::open(app_root.path())
+            .unwrap()
+            .unwrap();
+        let store = VerifiedArtifactStore::create(
+            &pinned_root,
+            &IsolationPolicy::disabled_for_authoring().limits,
+        )
+        .unwrap();
+        let hash = lillux::cas::sha256_hex(b"admitted bytes");
+        let artifact = store.materialize(&hash, &hash, b"admitted bytes").unwrap();
+        lillux::set_open_regular_file_mode(&artifact.handle, 0o700).unwrap();
+        let changed = lillux::observe_open_regular_file(&artifact.handle).unwrap();
+        assert!(
+            store
+                .existing(&hash, &hash)
+                .unwrap_err()
+                .to_string()
+                .contains("protected permissions")
+        );
+        lillux::ensure_open_regular_file_unchanged(&artifact.handle, &changed).unwrap();
     }
 
     #[cfg(unix)]

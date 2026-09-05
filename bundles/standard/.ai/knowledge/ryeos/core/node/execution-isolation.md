@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T05:00:33Z:15c88dd27a8598edc877cfc78c34e1522390dd43f10b0dbf940c03bff5189fa5:wsF86gn/5+cMCDFVr5CX6yxFka/D2BKmLpBzjEQekJ9OAeM0zBw6vt4oMsIxth02jyS/h8xFFF7y2dLhgtZ6CA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T05:16:12Z:676c7af9bc6c5f70990d6df974f277cfb73a4a35027ab26db09faf1638d6bda5:vkZX/d2gMbOM36OONFaKddlMOX3Tn4XZJMkLGhFFlRL+pcbeWY9lifgSa60y5e+qLDYzHN4jhzw+RHX+WDeyDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.9.0"
+version: "1.10.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -64,6 +64,14 @@ and removes each exact staging alias before any workload starts. Unsealed bytes
 cannot use this materialization path, and sealed sources cannot grant writable
 mounts. These are backend mechanics, not a new realization, host-path fallback,
 or permission to weaken the node policy.
+
+Concurrent verification of a retained artifact does not mutate it. Protection
+is established at creation; reuse checks exact protected permissions and hashes
+the retained inode without reapplying chmod or repairing an unexpected mode.
+Exact byte reads and digests use positional I/O, not seek/read on duplicated
+descriptors: duplicated descriptors share a cursor. Size, metadata and growth
+checks remain mandatory. This preserves parallel parser/service validation
+without serializing all consumers behind another global lock.
 
 The engine also keeps node trust separate from project/request trust. The
 `node_trust_store` is loaded only from persistent node configuration and is the
