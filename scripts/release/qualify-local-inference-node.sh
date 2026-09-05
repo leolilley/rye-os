@@ -120,9 +120,8 @@ uds_path="$qualification_root/ryeosd.sock"
 mkdir -p "$policy_root" "$home_root" "$project_root"
 
 # `ryeos init --source` deliberately admits every immediate bundle directory.
-# A source checkout also contains separately authored optional bundle sets (for
-# example full-sandbox), so pointing init at the checkout would make an
-# unrelated optional payload part of this qualification. Build the same closed
+# Pointing init at the checkout could therefore make unrelated source-only
+# authoring bundles part of this qualification. Build the same closed
 # `full` source layout that packaging and local installation derive from the
 # shared bundle-set authority. This is a disposable source view, not a second
 # bundle selection contract or a lasting node/workload root.

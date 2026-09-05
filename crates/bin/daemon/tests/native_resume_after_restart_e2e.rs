@@ -145,6 +145,7 @@ fn build_subprocess_spec(project_dir: &Path) -> PlanSubprocessSpec {
             &serde_json::Value::Null,
             &ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .expect("plan builds");
 

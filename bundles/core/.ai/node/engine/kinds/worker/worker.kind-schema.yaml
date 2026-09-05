@@ -42,6 +42,7 @@ execution:
   external_content:
     realization_derived: effective_external_realizations
     allowed_roots: ["bundle:own"]
+    allowed_mount_roots: [project]
     max_declarations: 8
     large_content:
       max_total_bytes: 4294967296

@@ -3996,11 +3996,35 @@ fn ensure_current_external_content_bindings(state: &StateDb) -> Result<()> {
             .get_object(&head.target_hash)?
             .ok_or_else(|| anyhow!("external-content binding head target is absent"))?;
         let binding = ryeos_state::objects::ExternalContentBinding::from_value(&value)?;
-        if head.namespace != namespace || head.name != binding.binding_id {
+        if head.namespace != namespace || head.name != binding.binding_subject_id {
             bail!("external-content binding head coordinates are inconsistent");
         }
         if binding.state != ryeos_state::objects::ExternalContentBindingState::Active {
             continue;
+        }
+        if let Some(source_projection) = binding.consumer.source_closure() {
+            let source_value = cas
+                .get_object(&source_projection.binding_hash)?
+                .ok_or_else(|| anyhow!("project external-content source binding is absent"))?;
+            let source_binding =
+                ryeos_state::objects::EffectiveSourceBinding::from_value(&source_value)?;
+            if source_binding.digest()? != source_projection.binding_hash
+                || source_binding.content_manifest_hash != source_projection.content_manifest_hash
+                || source_binding.owner_key()? != source_projection.owner_key
+            {
+                bail!("project external-content source projection is inconsistent");
+            }
+            let source_manifest_value = cas
+                .get_object(&source_binding.content_manifest_hash)?
+                .ok_or_else(|| anyhow!("project external-content source manifest is absent"))?;
+            let source_manifest =
+                ryeos_state::objects::SourceClosureManifest::from_value(&source_manifest_value)?;
+            source_binding.validate_content_manifest(&source_manifest)?;
+            if source_manifest.entries.len() != source_projection.file_count
+                || source_manifest.totals.total_bytes != source_projection.total_bytes
+            {
+                bail!("project external-content source totals are inconsistent");
+            }
         }
         let manifest = cas
             .get_object(&binding.manifest_hash)?
@@ -12995,7 +13019,7 @@ impl StateStore {
             }
         }
         roots.extend(g.runtime_db.retained_candidate_snapshot_roots()?);
-        roots.extend(g.runtime_db.handoff_cas_object_roots()?);
+        roots.extend(g.runtime_db.runtime_child_cas_object_roots()?);
         Ok(roots.into_iter().collect())
     }
 
@@ -14355,8 +14379,148 @@ impl StateStore {
         )
     }
 
+    /// Reserve the shared-workspace relationship in the existing
+    /// RuntimeActionIntent transaction. `execution_workspace` remains the
+    /// materialization journal; it must not be repurposed as a transient lease
+    /// state machine, and no parallel workspace-lock table may be introduced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_runtime_action_intent_with_workspace(
+        &self,
+        operation_id: &str,
+        caller_thread_id: &str,
+        mode: runtime_db::RuntimeActionMode,
+        request_hash: &str,
+        proposed_child_thread_id: &str,
+        child_project_authority: Option<&ryeos_state::objects::ExecutionProjectAuthority>,
+        workspace_operation: &runtime_db::NewRuntimeWorkspaceOperation<'_>,
+    ) -> Result<String> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        let caller = g
+            .state_db
+            .get_thread(caller_thread_id)?
+            .ok_or_else(|| anyhow!("runtime action caller {caller_thread_id} does not exist"))?;
+        let _admission = g.state_db.authorize_runtime_pin(&caller.chain_root_id)?;
+        let workspace = g
+            .runtime_db
+            .workspace(workspace_operation.workspace_id)?
+            .ok_or_else(|| anyhow!("runtime action workspace is absent"))?;
+        if workspace.thread_id.as_deref() != Some(caller_thread_id)
+            || workspace.state != runtime_db::WorkspaceState::Active
+        {
+            bail!("runtime action workspace is not the caller's active workspace");
+        }
+        let session = g
+            .runtime_db
+            .dedicated_session(caller_thread_id)?
+            .ok_or_else(|| anyhow!("workspace operation caller has no hosted session"))?;
+        if session.chain_root_id != caller.chain_root_id
+            || session.workspace_id != workspace_operation.workspace_id
+            || session.worker_instance_id.as_deref() != Some(workspace_operation.worker_instance_id)
+            || session.worker_boot_epoch != Some(workspace_operation.worker_boot_epoch)
+            || !matches!(
+                session.state.as_str(),
+                "idle" | "turn_running" | "awaiting_approval"
+            )
+        {
+            bail!("runtime workspace operation contradicts the current hosted placement");
+        }
+        let worker = g
+            .runtime_db
+            .worker_process(workspace_operation.worker_instance_id)?
+            .ok_or_else(|| anyhow!("runtime workspace operation worker is absent"))?;
+        if worker.placement_thread_id != caller_thread_id
+            || worker.boot_epoch != workspace_operation.worker_boot_epoch
+            || worker.boot_identity_hash != workspace_operation.worker_boot_identity_hash
+            || worker.daemon_generation_id != runtime_db::daemon_generation_id()
+            || worker.session_capsule_hash != session.admitted_capsule_hash
+            || worker.state != runtime_db::WorkerProcessState::Live
+            || worker.cleanup_state != "owned"
+        {
+            bail!("runtime workspace operation worker boot is not current and live");
+        }
+        g.runtime_db.reserve_runtime_action_intent_with_workspace(
+            operation_id,
+            &caller.chain_root_id,
+            caller_thread_id,
+            mode,
+            request_hash,
+            proposed_child_thread_id,
+            child_project_authority,
+            Some(workspace_operation),
+        )
+    }
+
     pub fn runtime_action_intents(&self) -> Result<Vec<runtime_db::RuntimeActionIntent>> {
         self.lock()?.runtime_db.runtime_action_intents()
+    }
+
+    /// Durable, non-released shared-workspace operations for one hosted root.
+    /// This derives from RuntimeActionIntent; callers must not create a second
+    /// lease registry for boot, freeze, handoff, or capability-mint fencing.
+    pub fn active_runtime_workspace_operations_for_chain(
+        &self,
+        chain_root_id: &str,
+    ) -> Result<Vec<runtime_db::RuntimeActionIntent>> {
+        Ok(self
+            .lock()?
+            .runtime_db
+            .runtime_action_intents()?
+            .into_iter()
+            .filter(|intent| {
+                intent.chain_root_id == chain_root_id
+                    && intent
+                        .workspace_operation
+                        .as_ref()
+                        .is_some_and(|operation| {
+                            operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::Released
+                        })
+            })
+            .collect())
+    }
+
+    pub fn assert_no_active_runtime_workspace_operation_for_chain(
+        &self,
+        chain_root_id: &str,
+    ) -> Result<()> {
+        let active = self.active_runtime_workspace_operations_for_chain(chain_root_id)?;
+        if !active.is_empty() {
+            bail!(
+                "hosted execution root `{chain_root_id}` retains {} unsettled workspace operation(s)",
+                active.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Placement-local form used by the existing root terminalization gate.
+    /// A continued chain's placement thread is deliberately not assumed to be
+    /// equal to its stable chain root.
+    pub fn assert_no_active_runtime_workspace_operation_for_placement(
+        &self,
+        placement_thread_id: &str,
+    ) -> Result<()> {
+        let active = self
+            .lock()?
+            .runtime_db
+            .runtime_action_intents()?
+            .into_iter()
+            .filter(|intent| {
+                intent.first_caller_thread_id == placement_thread_id
+                    && intent
+                        .workspace_operation
+                        .as_ref()
+                        .is_some_and(|operation| {
+                            operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::Released
+                        })
+            })
+            .count();
+        if active != 0 {
+            bail!(
+                "hosted execution placement `{placement_thread_id}` retains {active} unsettled workspace operation(s)"
+            );
+        }
+        Ok(())
     }
 
     pub fn get_runtime_action_intent(
@@ -14366,6 +14530,167 @@ impl StateStore {
         self.lock()?
             .runtime_db
             .get_runtime_action_intent(operation_id)
+    }
+
+    pub fn transition_runtime_workspace_operation(
+        &self,
+        operation_id: &str,
+        expected: &[runtime_db::RuntimeWorkspaceOperationPhase],
+        next: runtime_db::RuntimeWorkspaceOperationPhase,
+    ) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        self.lock()?
+            .runtime_db
+            .transition_runtime_workspace_operation(operation_id, expected, next)
+    }
+
+    pub fn bind_runtime_workspace_input_snapshot(
+        &self,
+        operation_id: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        self.lock()?
+            .runtime_db
+            .bind_runtime_workspace_input_snapshot(operation_id, snapshot_hash)
+    }
+
+    /// Release an operation only after existing thread/launcher authorities
+    /// prove that its exact child is absent or terminal and process-detached.
+    /// Signal delivery or terminal status alone is never reap evidence.
+    pub fn begin_runtime_workspace_operation_settlement(&self, operation_id: &str) -> Result<bool> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        let intent = g
+            .runtime_db
+            .get_runtime_action_intent(operation_id)?
+            .ok_or_else(|| anyhow!("runtime workspace operation `{operation_id}` is absent"))?;
+        let operation = intent
+            .workspace_operation
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime action `{operation_id}` has no workspace operation"))?;
+        if operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::Settling
+            || operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::Released
+        {
+            return Ok(true);
+        }
+        if operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::ChildRunning {
+            bail!(
+                "runtime workspace operation `{operation_id}` cannot settle from {:?}",
+                operation.phase
+            );
+        }
+        let child = g.state_db.get_thread(&intent.child_thread_id)?;
+        let launch_claim = g.runtime_db.get_launch_claim(&intent.child_thread_id)?;
+        let in_process = g
+            .runtime_db
+            .in_process_handler_reservation(&intent.child_thread_id)?;
+        let process_attached = g
+            .runtime_db
+            .get_runtime_info(&intent.child_thread_id)?
+            .and_then(|runtime| runtime.process_identity)
+            .is_some();
+        let settled = match child.as_ref() {
+            None => launch_claim.is_none() && in_process.is_none() && !process_attached,
+            Some(child) => {
+                is_terminal_status(&child.status)
+                    && launch_claim.is_none()
+                    && in_process.is_none()
+                    && !process_attached
+            }
+        };
+        if !settled {
+            return Ok(false);
+        }
+        g.runtime_db.transition_runtime_workspace_operation(
+            operation_id,
+            &[runtime_db::RuntimeWorkspaceOperationPhase::ChildRunning],
+            runtime_db::RuntimeWorkspaceOperationPhase::Settling,
+        )?;
+        Ok(true)
+    }
+
+    /// Release an operation only after existing thread/launcher authorities
+    /// prove that its exact child is absent or terminal and process-detached.
+    /// Signal delivery or terminal status alone is never reap evidence.
+    pub fn settle_runtime_workspace_operation(&self, operation_id: &str) -> Result<bool> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        let Some(intent) = g.runtime_db.get_runtime_action_intent(operation_id)? else {
+            bail!("runtime workspace operation `{operation_id}` is absent");
+        };
+        let Some(operation) = intent.workspace_operation.as_ref() else {
+            bail!("runtime action `{operation_id}` has no workspace operation");
+        };
+        if operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::Released {
+            return Ok(true);
+        }
+        let root_worker = g
+            .runtime_db
+            .worker_process(&operation.worker_instance_id)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime workspace operation `{operation_id}` lost its exact root-worker boot"
+                )
+            })?;
+        let exact_root_boot = root_worker.placement_thread_id == intent.first_caller_thread_id
+            && root_worker.boot_epoch == operation.worker_boot_epoch
+            && root_worker.boot_identity_hash == operation.worker_boot_identity_hash;
+        let current_live_root = exact_root_boot
+            && root_worker.daemon_generation_id == runtime_db::daemon_generation_id()
+            && root_worker.state == runtime_db::WorkerProcessState::Live
+            && root_worker.cleanup_state == "owned";
+        let reaped_root = exact_root_boot
+            && root_worker.state == runtime_db::WorkerProcessState::Dead
+            && root_worker.cleanup_state == "reaped";
+        if !current_live_root && !reaped_root {
+            // Startup recovery must not release this barrier while the old
+            // hosted worker may still own the workspace. A current callback
+            // may release only while it retains the exact current boot; a
+            // later daemon requires the existing worker-cleanup authority's
+            // durable death proof.
+            return Ok(false);
+        }
+        let child = g.state_db.get_thread(&intent.child_thread_id)?;
+        let launch_claim = g.runtime_db.get_launch_claim(&intent.child_thread_id)?;
+        let in_process = g
+            .runtime_db
+            .in_process_handler_reservation(&intent.child_thread_id)?;
+        let process_attached = g
+            .runtime_db
+            .get_runtime_info(&intent.child_thread_id)?
+            .and_then(|runtime| runtime.process_identity)
+            .is_some();
+        let settled = match child.as_ref() {
+            None => launch_claim.is_none() && in_process.is_none() && !process_attached,
+            Some(child) => {
+                is_terminal_status(&child.status)
+                    && launch_claim.is_none()
+                    && in_process.is_none()
+                    && !process_attached
+            }
+        };
+        if !settled {
+            return Ok(false);
+        }
+        if operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::ChildRunning {
+            g.runtime_db.transition_runtime_workspace_operation(
+                operation_id,
+                &[runtime_db::RuntimeWorkspaceOperationPhase::ChildRunning],
+                runtime_db::RuntimeWorkspaceOperationPhase::Settling,
+            )?;
+        }
+        let refreshed = g
+            .runtime_db
+            .get_runtime_action_intent(operation_id)?
+            .and_then(|intent| intent.workspace_operation)
+            .ok_or_else(|| anyhow!("runtime workspace operation disappeared during settlement"))?;
+        g.runtime_db.transition_runtime_workspace_operation(
+            operation_id,
+            &[refreshed.phase],
+            runtime_db::RuntimeWorkspaceOperationPhase::Released,
+        )?;
+        Ok(true)
     }
 
     pub fn bind_detached_action_project_authority(
@@ -17081,14 +17406,22 @@ mod tests {
         let active = ryeos_state::objects::ExternalContentBinding::active(
             "a".repeat(64),
             ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
-            "worker:tests/old".to_owned(),
-            "b".repeat(64),
+            ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+                "worker:tests/old".to_owned(),
+                "b".repeat(64),
+            )
+            .unwrap(),
+            identity.fingerprint().to_owned(),
             "c".repeat(64),
+            "b".repeat(64),
         )
         .unwrap();
-        let released =
-            ryeos_state::objects::ExternalContentBinding::released_from(&active, "c".repeat(64))
-                .unwrap();
+        let released = ryeos_state::objects::ExternalContentBinding::released_from(
+            &active,
+            "c".repeat(64),
+            "b".repeat(64),
+        )
+        .unwrap();
         let binding_hash = authority
             .cas_store()
             .unwrap()
@@ -17097,7 +17430,7 @@ mod tests {
         state
             .write_generic_head_ref(
                 ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE,
-                &released.binding_id,
+                &released.binding_subject_id,
                 &binding_hash,
                 signer.as_ref(),
                 &guard,
@@ -18046,6 +18379,7 @@ mod tests {
                 timeout: 5.0,
                 limits: None,
                 inherited_fds: Vec::new(),
+                inherited_fd_mappings: Vec::new(),
                 supervised_status: None,
             })
             .expect("spawn after state store scope quiesces");

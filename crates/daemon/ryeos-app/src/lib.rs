@@ -32,6 +32,7 @@ pub mod external_content_admission;
 pub mod federated_follow;
 pub mod handler_context;
 pub mod handler_error;
+pub mod hosted_candidate_result;
 pub mod hosted_operation;
 pub mod identity;
 pub mod ignore;

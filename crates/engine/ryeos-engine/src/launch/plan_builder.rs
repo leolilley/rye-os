@@ -911,6 +911,9 @@ pub struct BuildPlanInput<'a> {
     pub trust_store: &'a TrustStore,
     pub node_trust_store: &'a TrustStore,
     pub host_env: &'a HostEnvBindings,
+    /// Already admitted composed/parent filesystem ceiling. It is consumed
+    /// before runtime templates can read host bindings, not just at spawn.
+    pub filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     pub project_authority: Option<(
         &'a Path,
         &'a dyn crate::project_content::AuthoritativeProjectContent,
@@ -939,6 +942,7 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
         trust_store,
         node_trust_store,
         host_env,
+        filesystem_authority_ceiling: admitted_filesystem_ceiling,
         project_authority,
         sealed_content,
     } = input;
@@ -1147,6 +1151,29 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
             .ok_or_else(|| EngineError::UnsupportedKind {
                 kind: resolved.kind.clone(),
             })?;
+    // The chain compiler owns the signed root carrier. Daemon admission
+    // subsequently freezes projections from its fully composed subject, but
+    // standalone/offline plan execution must also honor this root's declared
+    // restrictions instead of silently substituting node-policy authority.
+    let execution =
+        root_kind_schema
+            .execution
+            .as_ref()
+            .ok_or_else(|| EngineError::SchemaLoaderError {
+                reason: format!("kind `{}` has no execution schema", resolved.kind),
+            })?;
+    let root_value = &terminal.intermediates[0].parsed;
+    let filesystem_authority_ceiling = execution
+        .project_filesystem_authority_ceiling(root_value)?
+        .intersect(admitted_filesystem_ceiling);
+    let network_authority_ceiling = execution.project_network_authority_ceiling(root_value)?;
+    let no_host_environment = HostEnvBindings::default();
+    let host_env = match filesystem_authority_ceiling {
+        crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution => {
+            &no_host_environment
+        }
+        crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy => host_env,
+    };
     let runtime_spec =
         root_kind_schema
             .runtime()
@@ -1223,6 +1250,8 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
         entrypoint: entrypoint_id,
         capabilities,
         materialization_requirements: Vec::new(),
+        network_authority_ceiling,
+        filesystem_authority_ceiling,
         cache_key,
         thread_kind: Some(resolved.kind.clone()),
         executor_chain: terminal.chain,
@@ -1405,7 +1434,7 @@ mod tests {
         let parent = tempdir();
         let bundle_root = parent.join("runtime-bundle");
         fs::create_dir_all(bundle_root.join(crate::AI_DIR)).unwrap();
-        let backend = "  - id: linux\n    protocol: ryeos.isolation-adapter/v3\n    targets: [x86_64-unknown-linux-gnu]\n    adapter: adapter\n    artifacts: {launcher: launcher}\n    capabilities: [filesystem.private_root]\n";
+        let backend = "  - id: linux\n    protocol: ryeos.isolation-adapter/v4\n    targets: [x86_64-unknown-linux-gnu]\n    adapter: adapter\n    artifacts: {}\n    capabilities: [filesystem.private_root]\n";
         let body = format!(
             "name: runtime-bundle\nversion: 1.0.0\nprovides_kinds: []\nrequires_kinds: []\nisolation_backends:\n{backend}{backend}"
         );
@@ -1707,6 +1736,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -1777,6 +1808,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -1848,6 +1881,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -1895,6 +1930,8 @@ config:
             trust_store: &TrustStore::empty(),
             node_trust_store: &TrustStore::empty(),
             host_env: &HostEnvBindings::default(),
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -2436,6 +2473,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -2580,6 +2619,7 @@ env_config:
     var: RYEOS_PYTHON
   env:
     PYTHONUNBUFFERED: "1"
+    QUALIFICATION_LABEL: "${BUILD_LABEL}"
 config:
   command: "${interpreter}"
   args:
@@ -2623,6 +2663,13 @@ category: ryeos/core/subprocess\n";
         let roots = ResolutionRoots::from_flat(Some(project_dir.join(AI_DIR)), vec![]);
 
         // 5. Build plan — this walks the full 3-hop chain
+        let host_env = HostEnvBindings {
+            allowed: std::collections::HashSet::from(["BUILD_LABEL".to_owned()]),
+            values: std::collections::HashMap::from([(
+                "BUILD_LABEL".to_owned(),
+                "host-only".to_owned(),
+            )]),
+        };
         let plan = build_plan(BuildPlanInput {
             item: &item,
             root_source: None,
@@ -2635,11 +2682,38 @@ category: ryeos/core/subprocess\n";
             registry_fingerprint: "fp:test",
             trust_store: &ts,
             node_trust_store: &ts,
-            host_env: &HostEnvBindings::default(),
+            host_env: &host_env,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
         .expect("build_plan should succeed for valid 3-hop chain");
+
+        // The raw root has no restrictive projection: this restriction was
+        // supplied by the composed subject or parent admission. It must take
+        // effect before handler templates consume the otherwise allowed host
+        // value, rather than only clearing inherited variables at spawn.
+        let error = build_plan(BuildPlanInput {
+            item: &item,
+            root_source: None,
+            parameters: &json!({"message": "hello"}),
+            hints: &ExecutionHints::default(),
+            ctx: &ctx,
+            kinds: &kinds,
+            parsers: &parsers,
+            roots: &roots,
+            registry_fingerprint: "fp:test",
+            trust_store: &ts,
+            node_trust_store: &ts,
+            host_env: &host_env,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution,
+            project_authority: None,
+            sealed_content: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("BUILD_LABEL"), "{error}");
 
         // 6. Verify the plan structure
         assert_eq!(plan.root_ref, "tool:my_tool");

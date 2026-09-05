@@ -1,18 +1,20 @@
 //! Operator-owned binding between retained external bytes and one consumer.
 //!
 //! Importing bytes proves only that the node captured them. This object is the
-//! separate durable grant that permits one canonical implementation ref from
-//! one trusted publisher to consume the retained manifest. A signed generic
-//! head selects the current binding state. Released bindings deliberately do
-//! not retain the manifest through CAS closure.
+//! separate target-local grant that permits one exact consumer authority to
+//! use the retained manifest. A signed generic head selects the current grant
+//! for a stable subject coordinate. The selected immutable binding identity
+//! additionally commits to the local authorizer and its node-signed grant.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::EffectiveSourceClosureProjection;
+
 pub const EXTERNAL_CONTENT_BINDING_KIND: &str = "external_content_binding";
-pub const EXTERNAL_CONTENT_BINDING_SCHEMA: &str = "ryeos.external_content_binding.v1";
+pub const EXTERNAL_CONTENT_BINDING_SCHEMA: &str = "ryeos.external_content_binding.v2";
 pub const EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE: &str = "external-content-bindings";
-pub const EXTERNAL_CONTENT_BINDING_SCHEMA_EPOCH: u32 = 2;
+pub const EXTERNAL_CONTENT_BINDING_SCHEMA_EPOCH: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,18 +23,130 @@ pub enum ExternalContentBindingState {
     Released,
 }
 
+/// Exact authority of the item for which retained bytes are authorized.
+///
+/// Bundle consumers retain the installed-publisher boundary used by managed
+/// activation. Project consumers are deliberately generation-scoped and
+/// commit to the effective item after exact source admission but before
+/// external realization admission; using the post-realization digest would
+/// make binding authority circular.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalContentConsumerAuthority {
+    InstalledBundle {
+        consumer_ref: String,
+        publisher_fingerprint: String,
+    },
+    PinnedProject {
+        consumer_ref: String,
+        publisher_fingerprint: String,
+        project_snapshot_hash: String,
+        effective_consumer_digest: String,
+        source_closure: EffectiveSourceClosureProjection,
+    },
+}
+
+impl ExternalContentConsumerAuthority {
+    pub fn installed_bundle(
+        consumer_ref: String,
+        publisher_fingerprint: String,
+    ) -> anyhow::Result<Self> {
+        let authority = Self::InstalledBundle {
+            consumer_ref,
+            publisher_fingerprint,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    pub fn pinned_project(
+        consumer_ref: String,
+        publisher_fingerprint: String,
+        project_snapshot_hash: String,
+        effective_consumer_digest: String,
+        source_closure: EffectiveSourceClosureProjection,
+    ) -> anyhow::Result<Self> {
+        let authority = Self::PinnedProject {
+            consumer_ref,
+            publisher_fingerprint,
+            project_snapshot_hash,
+            effective_consumer_digest,
+            source_closure,
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
+    pub fn consumer_ref(&self) -> &str {
+        match self {
+            Self::InstalledBundle { consumer_ref, .. }
+            | Self::PinnedProject { consumer_ref, .. } => consumer_ref,
+        }
+    }
+
+    pub fn publisher_fingerprint(&self) -> &str {
+        match self {
+            Self::InstalledBundle {
+                publisher_fingerprint,
+                ..
+            }
+            | Self::PinnedProject {
+                publisher_fingerprint,
+                ..
+            } => publisher_fingerprint,
+        }
+    }
+
+    pub fn source_closure(&self) -> Option<&EffectiveSourceClosureProjection> {
+        match self {
+            Self::InstalledBundle { .. } => None,
+            Self::PinnedProject { source_closure, .. } => Some(source_closure),
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_bounded_identity("external-content consumer ref", self.consumer_ref())?;
+        validate_hash(
+            "external-content consumer publisher fingerprint",
+            self.publisher_fingerprint(),
+        )?;
+        if let Self::PinnedProject {
+            project_snapshot_hash,
+            effective_consumer_digest,
+            source_closure,
+            ..
+        } = self
+        {
+            validate_hash(
+                "external-content consumer project snapshot",
+                project_snapshot_hash,
+            )?;
+            validate_hash(
+                "external-content effective consumer digest",
+                effective_consumer_digest,
+            )?;
+            source_closure.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalContentBinding {
     pub schema: String,
     pub kind: String,
+    /// Stable head coordinate for manifest + consumer + target node.
+    pub binding_subject_id: String,
+    /// Immutable identity of this exact authorization event.
     pub binding_id: String,
     pub manifest_hash: String,
     pub manifest_kind: String,
-    pub consumer_ref: String,
-    pub publisher_fingerprint: String,
+    pub consumer: ExternalContentConsumerAuthority,
+    pub target_node_fingerprint: String,
     pub state: ExternalContentBindingState,
-    pub bound_by: String,
+    pub authorized_by: String,
+    pub authorizer_grant_digest: String,
     pub recorded_at: String,
 }
 
@@ -40,39 +154,66 @@ impl ExternalContentBinding {
     pub fn active(
         manifest_hash: String,
         manifest_kind: String,
-        consumer_ref: String,
-        publisher_fingerprint: String,
-        bound_by: String,
+        consumer: ExternalContentConsumerAuthority,
+        target_node_fingerprint: String,
+        authorized_by: String,
+        authorizer_grant_digest: String,
     ) -> anyhow::Result<Self> {
-        let binding_id =
-            Self::derive_binding_id(&manifest_hash, &consumer_ref, &publisher_fingerprint)?;
+        let recorded_at = lillux::time::iso8601_now();
+        let binding_subject_id = Self::derive_binding_subject_id(
+            &manifest_hash,
+            &manifest_kind,
+            &consumer,
+            &target_node_fingerprint,
+        )?;
+        let binding_id = Self::derive_binding_id(
+            &binding_subject_id,
+            ExternalContentBindingState::Active,
+            &authorized_by,
+            &authorizer_grant_digest,
+            &recorded_at,
+        )?;
         let value = Self {
             schema: EXTERNAL_CONTENT_BINDING_SCHEMA.to_owned(),
             kind: EXTERNAL_CONTENT_BINDING_KIND.to_owned(),
+            binding_subject_id,
             binding_id,
             manifest_hash,
             manifest_kind,
-            consumer_ref,
-            publisher_fingerprint,
+            consumer,
+            target_node_fingerprint,
             state: ExternalContentBindingState::Active,
-            bound_by,
-            recorded_at: lillux::time::iso8601_now(),
+            authorized_by,
+            authorizer_grant_digest,
+            recorded_at,
         };
         value.validate()?;
         Ok(value)
     }
 
-    pub fn released_from(active: &Self, released_by: String) -> anyhow::Result<Self> {
+    pub fn released_from(
+        active: &Self,
+        released_by: String,
+        authorizer_grant_digest: String,
+    ) -> anyhow::Result<Self> {
         active.validate()?;
         if active.state != ExternalContentBindingState::Active {
             anyhow::bail!("only an active external-content binding can be released");
         }
-        let value = Self {
+        let mut value = Self {
             state: ExternalContentBindingState::Released,
-            bound_by: released_by,
+            authorized_by: released_by,
+            authorizer_grant_digest,
             recorded_at: lillux::time::iso8601_now(),
             ..active.clone()
         };
+        value.binding_id = Self::derive_binding_id(
+            &value.binding_subject_id,
+            value.state,
+            &value.authorized_by,
+            &value.authorizer_grant_digest,
+            &value.recorded_at,
+        )?;
         value.validate()?;
         Ok(value)
     }
@@ -88,21 +229,50 @@ impl ExternalContentBinding {
         Ok(serde_json::to_value(self)?)
     }
 
-    pub fn derive_binding_id(
+    pub fn derive_binding_subject_id(
         manifest_hash: &str,
-        consumer_ref: &str,
-        publisher_fingerprint: &str,
+        manifest_kind: &str,
+        consumer: &ExternalContentConsumerAuthority,
+        target_node_fingerprint: &str,
     ) -> anyhow::Result<String> {
         validate_hash("external-content binding manifest", manifest_hash)?;
-        validate_bounded_identity("external-content binding consumer ref", consumer_ref)?;
+        validate_manifest_kind(manifest_kind)?;
+        consumer.validate()?;
         validate_hash(
-            "external-content binding publisher fingerprint",
-            publisher_fingerprint,
+            "external-content binding target node",
+            target_node_fingerprint,
         )?;
         let canonical = lillux::canonical_json(&serde_json::json!({
+            "schema": "ryeos.external_content_binding_subject.v2",
             "manifest_hash": manifest_hash,
-            "consumer_ref": consumer_ref,
-            "publisher_fingerprint": publisher_fingerprint,
+            "manifest_kind": manifest_kind,
+            "consumer": consumer,
+            "target_node_fingerprint": target_node_fingerprint,
+        }))?;
+        Ok(lillux::sha256_hex(canonical.as_bytes()))
+    }
+
+    pub fn derive_binding_id(
+        binding_subject_id: &str,
+        state: ExternalContentBindingState,
+        authorized_by: &str,
+        authorizer_grant_digest: &str,
+        recorded_at: &str,
+    ) -> anyhow::Result<String> {
+        validate_hash("external-content binding subject", binding_subject_id)?;
+        validate_hash("external-content binding authorizer", authorized_by)?;
+        validate_hash(
+            "external-content binding authorizer grant",
+            authorizer_grant_digest,
+        )?;
+        super::parse_canonical_timestamp(recorded_at)?;
+        let canonical = lillux::canonical_json(&serde_json::json!({
+            "schema": EXTERNAL_CONTENT_BINDING_SCHEMA,
+            "binding_subject_id": binding_subject_id,
+            "state": state,
+            "authorized_by": authorized_by,
+            "authorizer_grant_digest": authorizer_grant_digest,
+            "recorded_at": recorded_at,
         }))?;
         Ok(lillux::sha256_hex(canonical.as_bytes()))
     }
@@ -114,34 +284,52 @@ impl ExternalContentBinding {
         if self.kind != EXTERNAL_CONTENT_BINDING_KIND {
             anyhow::bail!("external-content binding kind is invalid");
         }
+        validate_hash("external-content binding subject", &self.binding_subject_id)?;
         validate_hash("external-content binding id", &self.binding_id)?;
         validate_hash("external-content binding manifest", &self.manifest_hash)?;
-        if !matches!(
-            self.manifest_kind.as_str(),
-            super::EXTERNAL_CONTENT_MANIFEST_KIND | super::EXTERNAL_LARGE_CONTENT_MANIFEST_KIND
-        ) {
-            anyhow::bail!("external-content binding names an unsupported manifest kind");
-        }
-        validate_bounded_identity("external-content binding consumer ref", &self.consumer_ref)?;
+        validate_manifest_kind(&self.manifest_kind)?;
+        self.consumer.validate()?;
         validate_hash(
-            "external-content binding publisher fingerprint",
-            &self.publisher_fingerprint,
+            "external-content binding target node",
+            &self.target_node_fingerprint,
         )?;
+        validate_hash("external-content binding authorizer", &self.authorized_by)?;
         validate_hash(
-            "external-content binding operator fingerprint",
-            &self.bound_by,
+            "external-content binding authorizer grant",
+            &self.authorizer_grant_digest,
         )?;
         super::parse_canonical_timestamp(&self.recorded_at)?;
-        let expected = Self::derive_binding_id(
+        let expected_subject = Self::derive_binding_subject_id(
             &self.manifest_hash,
-            &self.consumer_ref,
-            &self.publisher_fingerprint,
+            &self.manifest_kind,
+            &self.consumer,
+            &self.target_node_fingerprint,
         )?;
-        if self.binding_id != expected {
-            anyhow::bail!("external-content binding id contradicts its authority tuple");
+        if self.binding_subject_id != expected_subject {
+            anyhow::bail!("external-content binding subject contradicts its authority tuple");
+        }
+        let expected_binding = Self::derive_binding_id(
+            &self.binding_subject_id,
+            self.state,
+            &self.authorized_by,
+            &self.authorizer_grant_digest,
+            &self.recorded_at,
+        )?;
+        if self.binding_id != expected_binding {
+            anyhow::bail!("external-content binding id contradicts its authorization tuple");
         }
         Ok(())
     }
+}
+
+fn validate_manifest_kind(value: &str) -> anyhow::Result<()> {
+    if !matches!(
+        value,
+        super::EXTERNAL_CONTENT_MANIFEST_KIND | super::EXTERNAL_LARGE_CONTENT_MANIFEST_KIND
+    ) {
+        anyhow::bail!("external-content binding names an unsupported manifest kind");
+    }
+    Ok(())
 }
 
 fn validate_hash(label: &str, value: &str) -> anyhow::Result<()> {
@@ -165,21 +353,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_binding_round_trips_and_release_does_not_change_identity() {
+    fn project_binding_identity_includes_generation_source_node_and_authorizer() {
+        let consumer = ExternalContentConsumerAuthority::pinned_project(
+            "tool:project/build".to_owned(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            EffectiveSourceClosureProjection {
+                schema: super::super::EFFECTIVE_SOURCE_BINDING_SCHEMA,
+                binding_hash: "e".repeat(64),
+                content_manifest_hash: "f".repeat(64),
+                owner_key: "1".repeat(64),
+                file_count: 1,
+                total_bytes: 1,
+            },
+        )
+        .unwrap();
         let active = ExternalContentBinding::active(
             "a".repeat(64),
             super::super::EXTERNAL_LARGE_CONTENT_MANIFEST_KIND.to_owned(),
-            "worker:standard/local".to_owned(),
-            "b".repeat(64),
-            "c".repeat(64),
+            consumer,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
         )
         .unwrap();
+        let active_value = active.to_value().unwrap();
         assert_eq!(
-            ExternalContentBinding::from_value(&active.to_value().unwrap()).unwrap(),
+            ExternalContentBinding::from_value(&active_value).unwrap(),
             active
         );
-        let released = ExternalContentBinding::released_from(&active, "d".repeat(64)).unwrap();
-        assert_eq!(released.binding_id, active.binding_id);
+        assert!(active_value.get("project_path").is_none());
+        let foreign_subject = ExternalContentBinding::derive_binding_subject_id(
+            &active.manifest_hash,
+            &active.manifest_kind,
+            &active.consumer,
+            &"7".repeat(64),
+        )
+        .unwrap();
+        assert_ne!(foreign_subject, active.binding_subject_id);
+        let released =
+            ExternalContentBinding::released_from(&active, "5".repeat(64), "6".repeat(64)).unwrap();
+        assert_eq!(released.binding_subject_id, active.binding_subject_id);
+        assert_ne!(released.binding_id, active.binding_id);
         assert_eq!(released.state, ExternalContentBindingState::Released);
     }
 }

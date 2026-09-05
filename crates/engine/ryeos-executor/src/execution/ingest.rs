@@ -178,7 +178,14 @@ pub fn materialize_project_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_operationally_excluded, restore_operational_shadow_files};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::{
+        ingest_project_tree, is_operationally_excluded, materialize_project_file,
+        restore_operational_shadow_files,
+    };
+    use ryeos_app::node_policy::NodePolicySection as _;
 
     #[test]
     fn private_input_shadows_preserve_base_files_and_do_not_publish_evidence() {
@@ -244,5 +251,130 @@ mod tests {
             &exclusions
         ));
         assert!(!is_operationally_excluded("vendor", &exclusions));
+    }
+
+    #[test]
+    fn signed_standard_policy_drives_capture_closure_and_materialization() {
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../bundles/.ai/node/init/profiles/standard.yaml"
+        ));
+        let body = lillux::signature::strip_signature_lines(raw);
+        let profile: ryeos_app::node_policy::generation::NodeInitProfile =
+            serde_yaml::from_str(&body).unwrap();
+        profile
+            .validate(
+                &ryeos_app::node_policy::NodePolicyTable::new(),
+                Path::new("standard.yaml"),
+            )
+            .unwrap();
+        let parsed = ryeos_app::node_policy::sections::ingest_ignore::IngestIgnorePolicySection
+            .parse(
+                &ryeos_app::node_policy::NodePolicyContext {
+                    section: "ingest_ignore".to_owned(),
+                    source_file: "standard.yaml".into(),
+                    signer_fingerprint: "ab".repeat(32),
+                },
+                profile.policies().get("ingest_ignore").unwrap(),
+            )
+            .unwrap();
+        let policy_record = parsed
+            .as_any()
+            .downcast_ref::<
+                ryeos_app::node_policy::sections::ingest_ignore::CompiledIngestIgnorePolicy,
+            >()
+            .unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        for (relative, bytes) in [
+            ("src/lib.rs", b"pub fn retained() {}\n".as_slice()),
+            (
+                ".dev-keys/PUBLISHER_DEV.pem",
+                b"public development fixture\n".as_slice(),
+            ),
+            (".git/config", b"git metadata\n".as_slice()),
+            (".env", b"LOCAL_ONLY=value\n".as_slice()),
+            ("target/debug/output", b"build output\n".as_slice()),
+            (".ai/.bundles.lock", b"".as_slice()),
+        ] {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let state_root = tempfile::tempdir().unwrap();
+        let state_db =
+            ryeos_state::StateDb::open(state_root.path(), Arc::new(ryeos_state::TrustStore::new()))
+                .unwrap();
+        let authority = state_db.pinned_authority().unwrap();
+        let guard = authority.acquire_shared_guard().unwrap();
+        let project_root = lillux::PinnedDirectory::open(project.path())
+            .unwrap()
+            .unwrap();
+        let snapshot_policy = ryeos_state::project_sync::capture_snapshot_policy_from_pinned(
+            &project_root,
+            &policy_record.matcher,
+            ryeos_state::project_sync::ProjectSyncScope::FullProject,
+        )
+        .unwrap();
+        let tree =
+            ingest_project_tree(&authority, &guard, &project_root, &snapshot_policy).unwrap();
+
+        assert_eq!(
+            tree.files.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                ".dev-keys/PUBLISHER_DEV.pem".to_owned(),
+                "src/lib.rs".to_owned()
+            ]
+        );
+
+        let cas = authority.cas_store().unwrap();
+        let policy_hash = cas.store_object(&snapshot_policy.to_value()).unwrap();
+        let tree_hash = cas.store_object(&tree.to_value()).unwrap();
+        let snapshot = ryeos_state::objects::ProjectSnapshot {
+            project_tree_hash: tree_hash,
+            effective_policy_hash: policy_hash,
+            message: None,
+            parent_hashes: Vec::new(),
+            created_at: "2026-09-04T00:00:00Z".to_owned(),
+            source: "signed-standard-policy-test".to_owned(),
+        };
+        let snapshot_hash = cas.store_object(&snapshot.to_value()).unwrap();
+        let closure = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
+            &cas,
+            &snapshot_hash,
+        )
+        .unwrap();
+        assert_eq!(closure.tree().tree().files, tree.files);
+        let object_closure =
+            ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
+                &cas,
+                [snapshot_hash.clone()],
+                ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport(),
+            )
+            .unwrap();
+        assert!(object_closure.is_complete());
+
+        let materialized = tempfile::tempdir().unwrap();
+        for (relative, object_hash) in &tree.files {
+            let target = materialized.path().join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            materialize_project_file(&authority, &guard, object_hash, &target).unwrap();
+        }
+        let admitted = ryeos_state::project_materialization::PinnedProjectMaterialization::verify(
+            &authority,
+            &guard,
+            &snapshot_hash,
+            materialized.path(),
+        )
+        .unwrap();
+        admitted.ensure_path_binding().unwrap();
+        assert_eq!(
+            std::fs::read(materialized.path().join(".dev-keys/PUBLISHER_DEV.pem")).unwrap(),
+            b"public development fixture\n"
+        );
+        for excluded in [".git", ".env", "target", ".ai/.bundles.lock"] {
+            assert!(!materialized.path().join(excluded).exists(), "{excluded}");
+        }
     }
 }

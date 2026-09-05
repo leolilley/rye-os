@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-03T11:56:15Z:7a6029762745eaa6f9678981109c15f77fea47c650543c0d7b2f3af492379749:MvmzYf2/w+3hHwrcF/1NVELdmo/ArJUkRIL6LCbqeMmiPjTo/cd8gcqDZ+14s8HqJ418/KKvnIz+Gqss6FRtAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-04T08:08:29Z:87adced845abd4a9008e519bc90e0dd4246d1b71407c4f305e6ebfd5ccbb3e1a:u+tqcMhNoNZlc8hxKd2N4fn0yFc7FzUZP0x/iCdEYfES25V6wOlifx5fzrk05r9IsNzFJP8UdlcAuL60JiLEBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - central-auth
@@ -87,10 +87,11 @@ policies:
         - ryeos.register.command.root.system
       hosted-node: []
   execution:
-    schema: 1
+    schema: 2
     max_live_fanout: 8
     max_private_materialization_copy_bytes: 17179869184
     host_env_passthrough: []
+    workload_client: null
   object_closure:
     schema: 1
     max_roots: 256
@@ -144,8 +145,19 @@ policies:
         verified_artifact_total_bytes: 268435456
         verified_artifact_files: 4096
   ingest_ignore:
-    schema: 1
-    additional_patterns: []
+    schema: 2
+    patterns:
+      - "*.pyc"
+      - ".DS_Store"
+      - ".env"
+      - ".git/"
+      - ".hg/"
+      - ".svn/"
+      - ".venv/"
+      - "/.ai/config/remotes/"
+      - "__pycache__/"
+      - "node_modules/"
+      - "target/"
   external_content:
     schema: 1
     roots: {}

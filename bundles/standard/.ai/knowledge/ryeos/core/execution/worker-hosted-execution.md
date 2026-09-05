@@ -167,7 +167,7 @@ A project worker execution selects its signed portable environment through the
 runtime-declared `environment` ref binding. The selector is not an ordinary
 parameter and cannot be smuggled through the worker input envelope. The generic
 launch preparer accepts only a trusted bundle/project `config` with the closed
-`ryeos.worker_environment.v3` schema, derives the exact worker dependency from
+`ryeos.worker_environment.v4` schema, derives the exact worker dependency from
 it, and retains the engine-resolved path-free binding record in the outer
 admitted program. The environment may additionally declare locator-free pinned
 external content and an ordered executable-search list over those exact tree
@@ -177,7 +177,7 @@ rooted search directories and never inherits an ambient host `PATH`. Changing
 the config bytes at the same canonical ref therefore changes
 `exact_program_hash`.
 
-The v3 configuration may also declare `process_environment`. This is not an
+The v4 configuration may also declare `process_environment`. This is not an
 extension of content authority and is not a project/vault environment overlay.
 The kind-owned preparer emits a generic path-free environment contribution as
 a sibling of execution and content dependencies. Every contribution names its
@@ -204,6 +204,59 @@ alongside its fixed minimal environment. Existing
 policy remain the final enforcement path. No host environment, absolute
 authored path, credential home, project ignore entry, or kind-specific engine
 branch becomes environment authority.
+
+The required-nullable v4 `workload_client` member is independent of process
+environment and external-content authority. `null` disables it. A non-null
+request names one exact client member in an already declared pinned tree plus
+a finite, sorted set of child item refs, ref-binding values, call forms,
+effect classes, signed workspace-access assertions, in-flight count,
+invocation count and lifetime. The signed
+worker-execution configuration separately supplies a delegation ceiling, and
+the node execution policy may disable or further bound the feature. Admission
+intersects the original verified caller scopes, root delegation ceiling,
+project request, current node ceiling and each child kind's mechanically
+derived exact execution capability. No item, provider, compiler, project or
+workload name is engine vocabulary.
+
+RyeOS does not expose an operator key, callback bearer, thread-auth bearer,
+daemon address or ordinary CLI transport to the workload. The daemon retains
+those existing authorities in memory and creates one boot-bound protected
+target channel. Its secret-free boot frame contains only the protocol, grant
+digest and byte/concurrency bounds. Inside an enforced private-tmp and fresh
+PID-namespace sandbox, the trusted bridge publishes one random owner-private
+local endpoint. Lillux accepts only a non-init peer visible in that PID
+namespace, while the client proves the connected server is namespace PID 1;
+pathname replacement therefore cannot impersonate the retained broker. A
+restricted client realization staged as `ryeos` supports only
+`ryeos execute`; it has no app-root discovery, HTTP/daemon fallback, signing,
+remote, lifecycle, installation or publication surface.
+
+A nested workload permission profile may reopen only the fixed private broker
+directory `/tmp/.ryeos-wc` as read-only beneath broader tmp-directory denies.
+The random endpoint, bidirectional PID proof and daemon admission still bind
+the usable surface to the exact outer worker boot. Whether the nested sandbox
+can connect under that exact read-only rule is an installed acceptance gate;
+failure must not be repaired by widening `/tmp` or moving the endpoint into a
+project/runtime-view tree.
+
+The endpoint locator is not a callback/thread-auth bearer or daemon address,
+but possession lets a direct descendant inside the outer worker sandbox ask
+to exercise the exact bounded boot grant. Every such request remains subject
+to the daemon's complete live revalidation. RyeOS-dispatched child tools use
+their own admitted clean environment and inherit neither that endpoint nor any
+outer worker credential. This distinction must not be weakened into a claim
+that arbitrary direct shell descendants cannot observe their parent's
+environment.
+
+The bridge only frames and multiplexes requests. The daemon validates the
+exact live chain, placement, worker instance, boot epoch/identity, root and
+session capsules, project authority, node-policy generation and retained grant
+on every invocation, then enters the existing `runtime.dispatch_action`
+handler. Existing callback storage, thread auth, `RuntimeActionIntent`, child
+links, borrowed-child provenance, child launcher, effect handling and recovery
+remain the only execution owners. Implementations must extend those owners;
+they must not add a workload-client API, signing principal, token store,
+operation ledger, child registry or launcher.
 
 The outer program projection classifies every sealed invocation field. It
 retains executable semantics, trust, exact source content, composed resolution,
@@ -398,6 +451,10 @@ The historical command-observation read additionally requires the exact
 `placement_thread_id` because command sequence is placement-local and may recur
 after handoff. It verifies that placement's retained command and turn facts
 without redirecting the query to the current chain head.
+`ryeos remote worker pull-result [remote] <chain_root_id>` is the distinct
+source-side command for returning a frozen retained project candidate; it
+requires a configured full-project binding and never accepts caller-supplied
+base or candidate hashes.
 Historical catch-up uses chain replay and live attachment uses the existing
 cursor-based chain event stream. Attach and detach are client behavior: opening
 or closing that stream creates no session row and mutates no worker authority.
@@ -773,6 +830,26 @@ exactly `any`. Candidate evaluators use read-only or CoW-discard authority.
 The one candidate-integration root uses retain-current-HEAD only to preserve D
 for independent evaluation; it never advances HEAD itself. Only the later
 owner-authorized publication root may perform the exact B-to-D HEAD CAS.
+
+An owner may instead return a terminal retained candidate to a configured
+source site with `service:worker-executions/candidate-result` and
+`service:remote/pull-worker-result`. The target read service accepts only the
+origin-bound configured owner and reconstructs current chain/placement, the
+exact reserved command and turn-completion fence, separately bound launch and
+persistent-session capsules, admitted project/base, and captured candidate.
+Its v2 attestation describes a `frozen`/`retained` candidate, with fresh
+closure/base evidence and its exact digest. This is not evaluator qualification
+or publication authority. An interactive worker root stays running awaiting
+disposition; a bounded worker root must already be authoritatively completed
+with its exact candidate and terminal-outcome testimony. Returning it never
+reopens that root or releases its finite-budget accounting. The source retains
+the exact attestation and route in
+an ordinary durable sync job, fetches the content-addressed closure, and
+applies it through the existing clean-base atomic remote-result path. Exact
+result-tree recognition closes retry after an apply/settlement crash. Pulling
+does not advance either project HEAD and leaves the actual target disposition
+unchanged (`retained` or `retained_for_review`); publication or discard remains
+a separate explicit owner action.
 
 For a runtime that declares native resume, a proved-dead launch owner does not
 discard an unpublished CoW workspace. Startup retains the exact workspace

@@ -2,6 +2,7 @@
 category: "ryeos/core/bundle"
 name: "verify"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 required_caps: []
 description: "Validate all bundle items, signatures, metadata anchoring, and manifest without rewriting files."
 

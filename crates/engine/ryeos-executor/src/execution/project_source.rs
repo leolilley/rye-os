@@ -377,6 +377,149 @@ pub fn resolve_pinned_snapshot_context(
     })
 }
 
+/// Exact target-local preparation used before an operator may bind retained
+/// external content to a project consumer. This is the same snapshot overlay,
+/// resolution and source-admission machinery used by execution; the bind path
+/// does not gain a second project loader or trust interpretation.
+pub struct PreparedPinnedProjectExternalConsumer {
+    resolution: ryeos_engine::resolution::ResolutionOutput,
+    _source_closure: ryeos_app::source_closure_admission::AdmittedSourceClosure,
+    _project_context: ResolvedProjectContext,
+}
+
+impl PreparedPinnedProjectExternalConsumer {
+    pub fn resolution(&self) -> &ryeos_engine::resolution::ResolutionOutput {
+        &self.resolution
+    }
+}
+
+pub fn prepare_pinned_project_external_consumer(
+    state: &AppState,
+    consumer_ref: &str,
+    project_snapshot_hash: &str,
+    project_path: PathBuf,
+    principal_fingerprint: String,
+    principal_scopes: Vec<String>,
+    checkout_id: &str,
+) -> anyhow::Result<PreparedPinnedProjectExternalConsumer> {
+    let project_context = resolve_pinned_snapshot_context(
+        state,
+        project_snapshot_hash,
+        project_path,
+        checkout_id,
+        PinnedContextRealization::ReadOnly,
+    )?;
+    let subject_resolution_authority =
+        ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+            snapshot_hash: project_snapshot_hash.to_owned(),
+        };
+    let site_id = state.threads.site_id().to_owned();
+    let plan_context = ryeos_engine::contracts::PlanContext {
+        requested_by: ryeos_engine::contracts::EffectivePrincipal::Local(
+            ryeos_engine::contracts::Principal {
+                fingerprint: principal_fingerprint,
+                scopes: principal_scopes,
+            },
+        ),
+        project_context: ryeos_engine::contracts::ProjectContext::LocalPath {
+            path: project_context.effective_path.clone(),
+        },
+        subject_resolution_authority: subject_resolution_authority.clone(),
+        current_site_id: site_id.clone(),
+        origin_site_id: site_id,
+        execution_hints: Default::default(),
+        validate_only: true,
+    };
+    let verified = crate::executor::resolve_and_verify(
+        &project_context.request_engine,
+        &plan_context,
+        consumer_ref,
+        Some("project external-content consumer"),
+    )?;
+    let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(consumer_ref)?;
+    if canonical.to_string() != consumer_ref {
+        anyhow::bail!("project external-content consumer ref must be canonical");
+    }
+    let mut resolution = project_context.request_engine.effective_resolution_output(
+        ryeos_engine::engine::EffectiveItemRequest {
+            item_ref: canonical,
+            expected_kind: None,
+            project_root: Some(project_context.effective_path.clone()),
+            subject_resolution_authority: subject_resolution_authority.clone(),
+        },
+    )?;
+    if resolution.root.resolved_ref != verified.resolved.canonical_ref.to_string()
+        || resolution.root.source_content_digest != verified.resolved.content_hash
+        || resolution.root.raw_content_digest != verified.resolved.raw_content_digest
+    {
+        anyhow::bail!("project external-content consumer resolution differs from verified subject");
+    }
+    let item_kind = verified.resolved.kind.as_str();
+    let source_contract = project_context
+        .request_engine
+        .kinds
+        .get(item_kind)
+        .and_then(|schema| schema.execution.as_ref())
+        .and_then(|execution| execution.source_closure.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project external-content consumer kind has no signed source-closure contract"
+            )
+        })?;
+    let roots = project_context
+        .request_engine
+        .resolution_roots(Some(project_context.effective_path.clone()));
+    let materialization = project_context
+        .pinned_materialization
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("pinned project consumer has no materialization proof"))?;
+    let project_authority = Some((
+        project_context.effective_path.as_path(),
+        materialization as &dyn ryeos_engine::project_content::AuthoritativeProjectContent,
+    ));
+    let source_policy = if matches!(
+        &source_contract.location,
+        ryeos_engine::kind_registry::SourceClosureLocationDecl::ItemNamespace
+    ) {
+        let executor_id = verified
+            .resolved
+            .metadata
+            .executor_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("project source consumer has no executor chain"))?;
+        ryeos_engine::launch::plan_builder::resolve_executor_source_policy(
+            executor_id,
+            &resolution.root.source_path,
+            item_kind,
+            &project_context.request_engine.kinds,
+            &project_context.request_engine.parser_dispatcher,
+            &roots,
+            &project_context.request_engine.trust_store,
+            &project_context.request_engine.node_trust_store,
+            project_authority,
+        )?
+    } else {
+        None
+    };
+    let source_closure = ryeos_app::source_closure_admission::admit_source_closure(
+        state,
+        &project_context.request_engine,
+        item_kind,
+        &mut resolution,
+        &roots,
+        project_authority.map(|(root, content)| (root, content, project_snapshot_hash.to_owned())),
+        source_policy.as_ref(),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("project external-content consumer produced no admitted source closure")
+    })?;
+    Ok(PreparedPinnedProjectExternalConsumer {
+        resolution,
+        _source_closure: source_closure,
+        _project_context: project_context,
+    })
+}
+
 struct PinnedSnapshotContextParams<'a> {
     state: &'a AppState,
     authority: &'a ryeos_state::PinnedStateAuthority,

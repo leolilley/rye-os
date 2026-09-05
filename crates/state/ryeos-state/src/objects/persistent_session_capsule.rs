@@ -15,7 +15,11 @@ use super::{
 };
 
 pub const PERSISTENT_SESSION_CAPSULE_KIND: &str = "persistent_session_capsule";
-pub const PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION: u32 = 6;
+// v7 requires direct-plan filesystem/network ceilings and explicit logical
+// mount roots in retained realizations. Predecessors are not launch authority.
+// v8 also requires exact evidence-attachment bindings in the retained program.
+// A v7 program omits that identity and cannot be reinterpreted during recovery.
+pub const PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION: u32 = 8;
 pub const MAX_EXECUTABLE_SEARCH_PATH_ENTRIES: usize = 32;
 pub const MAX_SESSION_PROCESS_ENVIRONMENT_ENTRIES: usize = 32;
 pub const MAX_SESSION_PROCESS_ENVIRONMENT_ENCODED_BYTES: usize = 4_096;

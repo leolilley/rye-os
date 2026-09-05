@@ -6,7 +6,7 @@
 //! callback token minting unchanged. Callback children are derived only
 //! by cloning this value as a borrowed child.
 //!
-//! The five variants enumerate the five legal shapes. Invalid shapes
+//! The six variants enumerate the six legal shapes. Invalid shapes
 //! (for example, "Root PushedHead without lifeline" or "borrowed child
 //! with snapshot hash") do not compile.
 
@@ -52,10 +52,11 @@ impl PinnedMaterializationAuthority {
 /// Single source of truth for what engine, workspace, lineage, and role
 /// belong to an execution.
 ///
-/// Construct via `root_live_fs` / `root_pushed_head`, or derive callback
-/// children via `clone_for_borrowed_child`. The private seal field on
-/// each variant prevents construction outside this module while still
-/// permitting explicit variant matching by consumers.
+/// Construct via `root_live_fs` / `root_pushed_head`, derive an ordinary
+/// callback child via `clone_for_borrowed_child`, and derive the transient
+/// immutable-input shape only through `with_immutable_workspace_input`. The
+/// private seal field on each variant prevents construction outside this
+/// module while still permitting explicit variant matching by consumers.
 #[derive(Clone)]
 pub enum ExecutionProvenance {
     /// Execution with no project authority. The effective directory is a
@@ -144,6 +145,24 @@ pub enum ExecutionProvenance {
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
         candidate_evaluation:
             Option<Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>>,
+        __seal: ProvenanceSeal,
+    },
+
+    /// Borrowed child whose item/source authority remains the parent's sealed
+    /// pinned generation while its process observes a separately captured,
+    /// immutable generation of the current shared COW workspace.
+    ChildImmutableWorkspaceInput {
+        request_engine: Arc<Engine>,
+        original_project_path: PathBuf,
+        subject_effective_path: PathBuf,
+        subject_workspace_lifeline: Arc<TempDirGuard>,
+        base_snapshot_hash: String,
+        subject_pinned_materialization: PinnedMaterializationAuthority,
+        effective_path: PathBuf,
+        workspace_lifeline: Arc<TempDirGuard>,
+        input_snapshot_hash: String,
+        input_pinned_materialization: PinnedMaterializationAuthority,
+        project_authority: ryeos_state::objects::ExecutionProjectAuthority,
         __seal: ProvenanceSeal,
     },
 }
@@ -257,6 +276,9 @@ impl ExecutionProvenance {
             }
             | Self::ChildPinnedGeneration {
                 project_authority, ..
+            }
+            | Self::ChildImmutableWorkspaceInput {
+                project_authority, ..
             } => subject_resolution_authority_for_pinned(project_authority),
         }
     }
@@ -365,7 +387,9 @@ impl ExecutionProvenance {
                 workspace_lifeline: slot,
                 ..
             } => *slot = workspace_lifeline,
-            Self::RootPinnedGeneration { .. } | Self::ChildPinnedGeneration { .. } => {
+            Self::RootPinnedGeneration { .. }
+            | Self::ChildPinnedGeneration { .. }
+            | Self::ChildImmutableWorkspaceInput { .. } => {
                 panic!(
                     "ExecutionProvenance::with_workspace_lifeline: pushed-head provenance already owns its workspace"
                 );
@@ -397,7 +421,9 @@ impl ExecutionProvenance {
             | Self::ChildLiveProject { state_root, .. } => {
                 *state_root = override_root;
             }
-            Self::RootPinnedGeneration { .. } | Self::ChildPinnedGeneration { .. } => {
+            Self::RootPinnedGeneration { .. }
+            | Self::ChildPinnedGeneration { .. }
+            | Self::ChildImmutableWorkspaceInput { .. } => {
                 if override_root.is_some() {
                     panic!(
                         "ExecutionProvenance::with_state_root: state_root is a \
@@ -417,7 +443,9 @@ impl ExecutionProvenance {
             Self::Projectless { .. } => None,
             Self::RootLiveProject { state_root, .. }
             | Self::ChildLiveProject { state_root, .. } => state_root.as_deref(),
-            Self::RootPinnedGeneration { .. } | Self::ChildPinnedGeneration { .. } => None,
+            Self::RootPinnedGeneration { .. }
+            | Self::ChildPinnedGeneration { .. }
+            | Self::ChildImmutableWorkspaceInput { .. } => None,
         }
     }
 
@@ -512,7 +540,9 @@ impl ExecutionProvenance {
                 Self::RootLiveProject { .. } | Self::ChildLiveProject { .. },
                 ryeos_state::objects::ExecutionProjectAuthority::LiveProject { .. }
             ) | (
-                Self::RootPinnedGeneration { .. } | Self::ChildPinnedGeneration { .. },
+                Self::RootPinnedGeneration { .. }
+                    | Self::ChildPinnedGeneration { .. }
+                    | Self::ChildImmutableWorkspaceInput { .. },
                 ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration { .. }
             )
         );
@@ -583,6 +613,45 @@ impl ExecutionProvenance {
                 materialization.ensure_root_binding()?;
             }
         }
+        if let Self::ChildImmutableWorkspaceInput {
+            subject_effective_path,
+            subject_workspace_lifeline,
+            base_snapshot_hash,
+            subject_pinned_materialization,
+            effective_path,
+            workspace_lifeline,
+            input_snapshot_hash,
+            input_pinned_materialization,
+            ..
+        } = &self
+        {
+            if !subject_workspace_lifeline.owns_effective_path(subject_effective_path) {
+                anyhow::bail!("immutable-input provenance lost its sealed subject materialization");
+            }
+            if let Some(materialization) = subject_pinned_materialization.verified() {
+                if materialization.snapshot_hash() != base_snapshot_hash
+                    || !materialization.owns_path(subject_effective_path)?
+                {
+                    anyhow::bail!(
+                        "immutable-input subject materialization contradicts its sealed generation"
+                    );
+                }
+                materialization.ensure_root_binding()?;
+            }
+            if !workspace_lifeline.owns_effective_path(effective_path) {
+                anyhow::bail!("immutable-input lifeline does not own its execution path");
+            }
+            if let Some(materialization) = input_pinned_materialization.verified() {
+                if materialization.snapshot_hash() != input_snapshot_hash
+                    || !materialization.owns_path(effective_path)?
+                {
+                    anyhow::bail!(
+                        "immutable-input materialization contradicts its captured generation"
+                    );
+                }
+                materialization.ensure_root_binding()?;
+            }
+        }
         match &mut self {
             Self::Projectless {
                 project_authority: slot,
@@ -601,6 +670,10 @@ impl ExecutionProvenance {
                 ..
             }
             | Self::ChildPinnedGeneration {
+                project_authority: slot,
+                ..
+            }
+            | Self::ChildImmutableWorkspaceInput {
                 project_authority: slot,
                 ..
             } => *slot = authority,
@@ -623,6 +696,9 @@ impl ExecutionProvenance {
                 project_authority, ..
             }
             | Self::ChildPinnedGeneration {
+                project_authority, ..
+            }
+            | Self::ChildImmutableWorkspaceInput {
                 project_authority, ..
             } => project_authority,
         }
@@ -900,6 +976,15 @@ impl ExecutionProvenance {
     }
 
     /// Derive borrowed-callback-child provenance from this parent.
+    ///
+    /// "Borrowed" is intentionally limited to the immutable request engine,
+    /// project/workspace authority, and the lifeline that keeps that exact
+    /// workspace present. It does not copy the parent's prepared runtime
+    /// launch, process environment, executable dependencies, effect grant, or
+    /// resource limits. The child is an ordinary RyeOS execution and must
+    /// resolve and admit its own effective program under those borrowed
+    /// project coordinates. Do not turn provenance into a deferred child
+    /// environment carrier; that would create a second program authority.
     pub fn clone_for_borrowed_child(&self) -> Self {
         match self {
             Self::Projectless {
@@ -989,7 +1074,84 @@ impl ExecutionProvenance {
                 candidate_evaluation: candidate_evaluation.clone(),
                 __seal: ProvenanceSeal(()),
             },
+            Self::ChildImmutableWorkspaceInput {
+                request_engine,
+                original_project_path,
+                subject_effective_path,
+                subject_workspace_lifeline,
+                base_snapshot_hash,
+                subject_pinned_materialization,
+                effective_path,
+                workspace_lifeline,
+                input_snapshot_hash,
+                input_pinned_materialization,
+                project_authority,
+                ..
+            } => Self::ChildImmutableWorkspaceInput {
+                request_engine: request_engine.clone(),
+                original_project_path: original_project_path.clone(),
+                subject_effective_path: subject_effective_path.clone(),
+                subject_workspace_lifeline: subject_workspace_lifeline.clone(),
+                base_snapshot_hash: base_snapshot_hash.clone(),
+                subject_pinned_materialization: subject_pinned_materialization.clone(),
+                effective_path: effective_path.clone(),
+                workspace_lifeline: workspace_lifeline.clone(),
+                input_snapshot_hash: input_snapshot_hash.clone(),
+                input_pinned_materialization: input_pinned_materialization.clone(),
+                project_authority: child_authority(project_authority),
+                __seal: ProvenanceSeal(()),
+            },
         }
+    }
+
+    /// Give an already-borrowed pinned child a separately materialized,
+    /// immutable view of the current shared workspace. The subject-side path,
+    /// materialization and project authority remain untouched so the captured
+    /// input cannot become a new item or external-content consumer authority.
+    ///
+    /// Candidate-freezing state is not an implementation shortcut here: this
+    /// transient read generation never changes the root workspace lifecycle.
+    pub fn with_immutable_workspace_input(
+        self,
+        input_materialization: ryeos_state::PinnedProjectMaterialization,
+        input_workspace_lifeline: Arc<TempDirGuard>,
+    ) -> anyhow::Result<Self> {
+        input_materialization.ensure_root_binding()?;
+        let input_snapshot_hash = input_materialization.snapshot_hash().to_owned();
+        let effective_path = input_materialization.path().to_path_buf();
+        if !input_workspace_lifeline.owns_effective_path(&effective_path) {
+            anyhow::bail!("immutable workspace-input lifeline does not own its materialization");
+        }
+        let Self::ChildPinnedGeneration {
+            request_engine,
+            original_project_path,
+            effective_path: subject_effective_path,
+            workspace_lifeline: subject_workspace_lifeline,
+            base_snapshot_hash,
+            pinned_materialization: subject_pinned_materialization,
+            project_authority,
+            ..
+        } = self
+        else {
+            anyhow::bail!("immutable workspace input requires borrowed pinned provenance");
+        };
+        Self::ChildImmutableWorkspaceInput {
+            request_engine,
+            original_project_path,
+            subject_effective_path,
+            subject_workspace_lifeline,
+            base_snapshot_hash,
+            subject_pinned_materialization,
+            effective_path,
+            workspace_lifeline: input_workspace_lifeline,
+            input_snapshot_hash,
+            input_pinned_materialization: PinnedMaterializationAuthority::Verified(
+                input_materialization,
+            ),
+            project_authority,
+            __seal: ProvenanceSeal(()),
+        }
+        .validate_project_authority_binding()
     }
 
     /// Construct provenance for a fresh child chain root that executes from
@@ -1044,6 +1206,7 @@ impl ExecutionProvenance {
             | Self::RootPinnedGeneration { request_engine, .. }
             | Self::ChildLiveProject { request_engine, .. }
             | Self::ChildPinnedGeneration { request_engine, .. } => request_engine,
+            Self::ChildImmutableWorkspaceInput { request_engine, .. } => request_engine,
         }
     }
 
@@ -1054,7 +1217,21 @@ impl ExecutionProvenance {
             Self::RootLiveProject { project_path, .. }
             | Self::ChildLiveProject { project_path, .. } => project_path.as_path(),
             Self::RootPinnedGeneration { effective_path, .. }
-            | Self::ChildPinnedGeneration { effective_path, .. } => effective_path.as_path(),
+            | Self::ChildPinnedGeneration { effective_path, .. }
+            | Self::ChildImmutableWorkspaceInput { effective_path, .. } => effective_path.as_path(),
+        }
+    }
+
+    /// Filesystem root from which the child program was resolved and admitted.
+    /// This differs from `effective_path` only for an immutable shared-workspace
+    /// read, whose process sees a later captured generation.
+    pub fn subject_effective_path(&self) -> &Path {
+        match self {
+            Self::ChildImmutableWorkspaceInput {
+                subject_effective_path,
+                ..
+            } => subject_effective_path,
+            _ => self.effective_path(),
         }
     }
 
@@ -1079,6 +1256,10 @@ impl ExecutionProvenance {
             | Self::ChildPinnedGeneration {
                 original_project_path,
                 ..
+            }
+            | Self::ChildImmutableWorkspaceInput {
+                original_project_path,
+                ..
             } => original_project_path.as_path(),
         }
     }
@@ -1093,7 +1274,20 @@ impl ExecutionProvenance {
             Self::RootPinnedGeneration { snapshot_hash, .. } => Some(snapshot_hash),
             Self::ChildPinnedGeneration {
                 base_snapshot_hash, ..
+            }
+            | Self::ChildImmutableWorkspaceInput {
+                base_snapshot_hash, ..
             } => Some(base_snapshot_hash),
+        }
+    }
+
+    pub fn immutable_workspace_input_snapshot_hash(&self) -> Option<&str> {
+        match self {
+            Self::ChildImmutableWorkspaceInput {
+                input_snapshot_hash,
+                ..
+            } => Some(input_snapshot_hash),
+            _ => None,
         }
     }
 
@@ -1104,9 +1298,9 @@ impl ExecutionProvenance {
             Self::RootLiveProject { .. } | Self::ChildLiveProject { .. } => {
                 ProjectSourceKind::LiveFs
             }
-            Self::RootPinnedGeneration { .. } | Self::ChildPinnedGeneration { .. } => {
-                ProjectSourceKind::PushedHead
-            }
+            Self::RootPinnedGeneration { .. }
+            | Self::ChildPinnedGeneration { .. }
+            | Self::ChildImmutableWorkspaceInput { .. } => ProjectSourceKind::PushedHead,
         }
     }
 
@@ -1115,6 +1309,9 @@ impl ExecutionProvenance {
     pub fn isolation_project_authority(
         &self,
     ) -> ryeos_engine::isolation::IsolationProjectAuthority {
+        if matches!(self, Self::ChildImmutableWorkspaceInput { .. }) {
+            return ryeos_engine::isolation::IsolationProjectAuthority::ReadOnly;
+        }
         isolation_project_authority_for_project(self.project_authority())
     }
 
@@ -1144,6 +1341,19 @@ impl ExecutionProvenance {
             | Self::ChildPinnedGeneration {
                 workspace_lifeline, ..
             } => Some(workspace_lifeline.clone()),
+            Self::ChildImmutableWorkspaceInput {
+                workspace_lifeline, ..
+            } => Some(workspace_lifeline.clone()),
+        }
+    }
+
+    pub fn subject_workspace_lifeline(&self) -> Option<Arc<TempDirGuard>> {
+        match self {
+            Self::ChildImmutableWorkspaceInput {
+                subject_workspace_lifeline,
+                ..
+            } => Some(subject_workspace_lifeline.clone()),
+            _ => self.workspace_lifeline(),
         }
     }
 
@@ -1157,9 +1367,25 @@ impl ExecutionProvenance {
                 pinned_materialization,
                 ..
             } => pinned_materialization.verified(),
+            Self::ChildImmutableWorkspaceInput {
+                subject_pinned_materialization,
+                ..
+            } => subject_pinned_materialization.verified(),
             Self::Projectless { .. }
             | Self::RootLiveProject { .. }
             | Self::ChildLiveProject { .. } => None,
+        }
+    }
+
+    pub fn immutable_workspace_input_materialization(
+        &self,
+    ) -> Option<&ryeos_state::PinnedProjectMaterialization> {
+        match self {
+            Self::ChildImmutableWorkspaceInput {
+                input_pinned_materialization,
+                ..
+            } => input_pinned_materialization.verified(),
+            _ => None,
         }
     }
 
@@ -1174,7 +1400,9 @@ impl ExecutionProvenance {
         match self {
             Self::Projectless { is_child, .. } => *is_child,
             Self::RootLiveProject { .. } | Self::RootPinnedGeneration { .. } => false,
-            Self::ChildLiveProject { .. } | Self::ChildPinnedGeneration { .. } => true,
+            Self::ChildLiveProject { .. }
+            | Self::ChildPinnedGeneration { .. }
+            | Self::ChildImmutableWorkspaceInput { .. } => true,
         }
     }
 }
@@ -1239,7 +1467,9 @@ impl std::fmt::Debug for ExecutionProvenance {
                     | Self::ChildLiveProject {
                         workspace_lifeline, ..
                     } => workspace_lifeline.is_some(),
-                    Self::RootPinnedGeneration { .. } | Self::ChildPinnedGeneration { .. } => true,
+                    Self::RootPinnedGeneration { .. }
+                    | Self::ChildPinnedGeneration { .. }
+                    | Self::ChildImmutableWorkspaceInput { .. } => true,
                 },
             )
             .field(
@@ -1253,8 +1483,15 @@ impl std::fmt::Debug for ExecutionProvenance {
                     }
                     Self::ChildPinnedGeneration {
                         base_snapshot_hash, ..
+                    }
+                    | Self::ChildImmutableWorkspaceInput {
+                        base_snapshot_hash, ..
                     } => Some(base_snapshot_hash.as_str()),
                 },
+            )
+            .field(
+                "immutable_workspace_input_snapshot_hash",
+                &self.immutable_workspace_input_snapshot_hash(),
             )
             .field("state_root", &self.state_root_override())
             .field(

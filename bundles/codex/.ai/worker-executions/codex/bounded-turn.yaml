@@ -23,6 +23,8 @@ config:
     turn_start_route: turn.start
     max_uncontacted_attempts: 3
   candidate_disposition: retained_for_review
+  workload_client_delegation_caps:
+    - ryeos.execute.tool.*
 limits:
   turns: 1
   duration_seconds: 15000

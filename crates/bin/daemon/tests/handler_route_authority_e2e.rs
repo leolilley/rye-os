@@ -188,6 +188,7 @@ fn anonymous_route_principal_is_denied_at_build_plan() {
         &serde_json::Value::Null,
         &ctx.execution_hints,
         None,
+        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
     );
 
     let _ = fs::remove_dir_all(&project_dir);
@@ -234,6 +235,7 @@ fn route_handler_fixed_scope_executes_handler_end_to_end() {
             &serde_json::Value::Null,
             &ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .expect("build_plan must succeed under fixed route-handler authority");
 
@@ -243,7 +245,7 @@ fn route_handler_fixed_scope_executes_handler_end_to_end() {
             .expect("load disabled isolation fixture"),
     );
     let engine_ctx = EngineContext {
-        isolation_target_channel: None,
+        isolation_target_channels: Vec::new(),
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,

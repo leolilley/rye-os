@@ -3,6 +3,7 @@ category: "rye/web"
 version: "1.0.0"
 tool_type: "subprocess"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Fetch an HTTP(S) page and return markdown, text, or HTML"
 
 config:

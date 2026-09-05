@@ -2,7 +2,7 @@
 //!
 //! A profile is authority-bearing executable policy.  This compiler runs
 //! while the worker source closure is being admitted, before any process is
-//! launched.  It accepts only the fixed v1 vocabulary and exact local schema
+//! launched.  It accepts only the fixed v2 vocabulary and exact local schema
 //! blobs captured in the same signed source closure.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +36,7 @@ pub fn compile(
         "workload_executable",
         "workload_args",
         "workload_home_env",
+        "workload_client",
         "baseline_config",
         "baseline_destination",
         "portable_state",
@@ -51,7 +52,7 @@ pub fn compile(
     if object.len() != required.len() || required.iter().any(|key| !object.contains_key(*key)) {
         bail!("structured-session profile has an unknown or missing top-level field");
     }
-    if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
+    if object.get("schema_version").and_then(Value::as_u64) != Some(2) {
         bail!("structured-session profile schema is not admitted");
     }
     if object
@@ -67,6 +68,18 @@ pub fn compile(
     validate_file_name(value_string(object, "baseline_destination")?)?;
     crate::protocol_vocabulary::validate_env_name(value_string(object, "workload_home_env")?)
         .map_err(|error| anyhow!(error))?;
+    match object.get("workload_client") {
+        Some(Value::Null) => {}
+        Some(Value::Object(workload_client)) => {
+            require_keys(workload_client, &["endpoint_env"], &[])?;
+            if value_string(workload_client, "endpoint_env")?
+                != crate::protocol_vocabulary::WORKLOAD_CLIENT_ENDPOINT_ENV
+            {
+                bail!("structured-session workload-client endpoint environment is not current");
+            }
+        }
+        _ => bail!("structured-session workload_client must be present and nullable"),
+    }
     if let Some(portable_state) = object
         .get("portable_state")
         .filter(|value| !value.is_null())
@@ -928,11 +941,12 @@ mod tests {
 
     fn fixture_profile(route_id: &str, method: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "schema_version":1,
+            "schema_version":2,
             "workload_realization_id":"fixture-runtime",
             "workload_executable":"fixture-worker",
             "workload_args":[],
             "workload_home_env":"FIXTURE_HOME",
+            "workload_client":null,
             "baseline_config":"baseline.conf",
             "baseline_destination":"runtime.conf",
             "portable_state":null,
@@ -994,7 +1008,7 @@ mod tests {
         assert_eq!(first.schema_hashes, second.schema_hashes);
         assert_eq!(
             first.contract.get("schema_version").and_then(Value::as_u64),
-            Some(1)
+            Some(2)
         );
     }
 

@@ -171,6 +171,11 @@ pub struct LaunchContractDecl {
     /// launch preparer may select. Resolution and trust are always derived by
     /// the engine; the handler supplies only canonical item refs.
     pub execution_dependencies: LaunchExecutionDependencyPolicy,
+    // Keep deferred child execution out of this contract. The targets below
+    // belong to the managed runtime being launched, not to future ordinary
+    // RyeOS children. A child owns a separately admitted effective program;
+    // its content, command, effects, limits, and recovery authority must not
+    // be copied into this parent runtime declaration.
     /// Signed mechanical ceiling for non-executable bound items whose exact
     /// pinned realizations may contribute to named execution dependencies.
     /// Kind/space/trust remain authoritative in `ref_bindings` and are not
@@ -228,6 +233,7 @@ pub struct LaunchContentDependencyPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchContentExternalPolicy {
+    pub allowed_mount_roots: Vec<crate::external_content::ExternalContentMountRoot>,
     pub max_declarations: u16,
     pub large_content_max_total_bytes: Option<u64>,
 }
@@ -251,6 +257,7 @@ impl LaunchContentExternalPolicy {
             realization_derived: crate::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY
                 .to_owned(),
             allowed_roots: Vec::new(),
+            allowed_mount_roots: self.allowed_mount_roots.clone(),
             max_declarations: usize::from(self.max_declarations),
             large_content: self.large_content_max_total_bytes.map(|maximum| {
                 crate::kind_registry::KindLargeContentGrant {
@@ -1243,6 +1250,16 @@ fn validate_launch_contract(yaml_path: &Path, yaml: &RuntimeYaml) -> Result<(), 
             return runtime_yaml_error(
                 yaml_path,
                 "launch_contract.content_dependencies.external_content.max_declarations is outside the substrate ceiling",
+            );
+        }
+        let mount_roots = external
+            .allowed_mount_roots
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if mount_roots.is_empty() || mount_roots.len() != external.allowed_mount_roots.len() {
+            return runtime_yaml_error(
+                yaml_path,
+                "launch content-dependency mount roots must be nonempty and unique",
             );
         }
         if let Some(maximum) = external.large_content_max_total_bytes

@@ -3,8 +3,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ExecutionLaunchDriver, ExecutionLifecycleAuthority, ExecutionProjectAuthority,
-    ExecutionRecoveryAuthority, validate_trimmed_control_free,
+    EXTERNAL_REALIZATIONS_DERIVED_KEY, ExecutionLaunchDriver, ExecutionLifecycleAuthority,
+    ExecutionProjectAuthority, ExecutionRecoveryAuthority, ExternalContentKind,
+    ExternalContentMode, ExternalContentRealizationSet, validate_trimmed_control_free,
 };
 
 // v17 seals the flat exact node-history policy provenance carried by the v12
@@ -14,12 +15,20 @@ use super::{
 // v19 requires the generic, target-bound environment-contribution projection
 // in every prepared managed-runtime launch. Predecessor capsules cannot be
 // interpreted as current portable launch authority.
-// v20 seals the daemon-authored scheduled-fire coordinate as invocation
-// authority while keeping it outside executable-program identity. v21 seals
-// independently-evaluated-candidate purpose and dual generation authority as
-// executable-program identity.
-pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 21;
+// v20 distinguishes a standalone content-addressed command from an executable
+// member overlaid into its complete admitted realization tree. Predecessor
+// direct capsules cannot claim that sibling-relative runtime layout.
+// v21 requires every serialized execution plan to carry the kind-projected
+// per-execution network ceiling. Predecessor plans cannot be reinterpreted as
+// having inherited node-policy networking.
+// v22 requires the filesystem ceiling beside networking in direct plans.
+// Both include admitted parent restrictions before becoming launch authority.
+// v23 combines those execution ceilings/mount roots with the daemon-authored
+// scheduled-fire coordinate (invocation-only) and independent candidate
+// purpose/dual-generation authority (executable-program identity).
+pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 23;
 pub const ADMITTED_DIRECT_COMMAND_ROOT: &str = "/ryeos/admitted-direct-command";
+pub const ADMITTED_DIRECT_PROJECT_ROOT: &str = "/ryeos/admitted-project";
 
 const SEALED_ROOT_INVOCATION_FIELDS: &[&str] = &[
     "captured_history_policy",
@@ -382,6 +391,17 @@ pub enum AdmittedDirectCommandClosure {
         /// binaries whose loader resolves adjacent libraries from `$ORIGIN`.
         execution_path: std::path::PathBuf,
     },
+    RealizationMember {
+        executable_blob_hash: String,
+        realization_id: String,
+        realization_manifest_hash: String,
+        realization_mount_root: super::ExternalContentMountRoot,
+        realization_mount: String,
+        relative_path: String,
+        /// Exact project-root-relative target at which isolation overlays the
+        /// executable descriptor inside the complete read-only realization.
+        execution_path: std::path::PathBuf,
+    },
     NodePolicy,
 }
 
@@ -453,6 +473,52 @@ impl AdmittedExecutionClosure {
                     if &expected != execution_path {
                         anyhow::bail!(
                             "admitted direct execution path does not match its content-addressed namespace"
+                        );
+                    }
+                }
+                if let AdmittedDirectCommandClosure::RealizationMember {
+                    executable_blob_hash,
+                    realization_id,
+                    realization_manifest_hash,
+                    realization_mount_root,
+                    realization_mount,
+                    relative_path,
+                    execution_path,
+                } = command
+                {
+                    super::thread_snapshot::validate_canonical_hash(
+                        "admitted realization command blob hash",
+                        executable_blob_hash,
+                    )?;
+                    super::thread_snapshot::validate_canonical_hash(
+                        "admitted realization command manifest hash",
+                        realization_manifest_hash,
+                    )?;
+                    if realization_id.is_empty()
+                        || realization_id.len() > 64
+                        || !realization_id.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                    {
+                        anyhow::bail!("admitted realization command id is not canonical");
+                    }
+                    super::validate_canonical_project_relative_path(realization_mount)?;
+                    super::validate_canonical_project_relative_path(relative_path)?;
+                    validate_absolute_normalized_path(
+                        "admitted realization command execution path",
+                        execution_path,
+                    )?;
+                    let expected = realization_mount_root
+                        .destination(
+                            Some(std::path::Path::new(ADMITTED_DIRECT_PROJECT_ROOT)),
+                            realization_mount,
+                        )?
+                        .join(relative_path);
+                    if execution_path != &expected {
+                        anyhow::bail!(
+                            "admitted realization command path contradicts its mount/member coordinate"
                         );
                     }
                 }
@@ -1396,6 +1462,7 @@ impl AdmittedLaunchCapsule {
                 AdmittedExecutionClosure::DirectItemExecutor {
                     execution_plan,
                     protocol_descriptor_document,
+                    command,
                     ..
                 },
             ) => {
@@ -1417,6 +1484,46 @@ impl AdmittedLaunchCapsule {
                     lillux::sha256_hex(lillux::canonical_json(execution_plan)?.as_bytes());
                 if &observed_plan_hash != execution_plan_hash {
                     anyhow::bail!("admitted direct execution plan contradicts artifact identity");
+                }
+                if let AdmittedDirectCommandClosure::RealizationMember {
+                    realization_id,
+                    realization_manifest_hash,
+                    realization_mount_root,
+                    realization_mount,
+                    ..
+                } = command
+                {
+                    let realization_value = self
+                        .exact_program
+                        .get("resolution_output")
+                        .and_then(|value| value.get("composed"))
+                        .and_then(|value| value.get("derived"))
+                        .and_then(|value| value.get(EXTERNAL_REALIZATIONS_DERIVED_KEY))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "realization-member command has no exact external-realization set"
+                            )
+                        })?;
+                    let realizations =
+                        ExternalContentRealizationSet::from_value(realization_value)?;
+                    let Some(realization) = realizations
+                        .iter()
+                        .find(|entry| entry.id == *realization_id)
+                    else {
+                        anyhow::bail!(
+                            "realization-member command is absent from its exact program"
+                        );
+                    };
+                    if realization.kind != ExternalContentKind::Tree
+                        || realization.mode != ExternalContentMode::Pinned
+                        || realization.manifest_hash != *realization_manifest_hash
+                        || realization.mount_root != *realization_mount_root
+                        || realization.mount != *realization_mount
+                    {
+                        anyhow::bail!(
+                            "realization-member command contradicts its exact program realization"
+                        );
+                    }
                 }
                 if !resolved_ref_bindings.is_empty() {
                     anyhow::bail!(
@@ -1469,6 +1576,7 @@ impl AdmittedLaunchCapsule {
                     DirectExecutableIdentity::BundleExecutor { .. }
                         | DirectExecutableIdentity::CapturedContent { .. },
                     AdmittedDirectCommandClosure::ContentAddressed { .. }
+                        | AdmittedDirectCommandClosure::RealizationMember { .. }
                 )
             );
             if !consistent {
@@ -1480,6 +1588,10 @@ impl AdmittedLaunchCapsule {
                 AdmittedDirectCommandClosure::ContentAddressed {
                     executable_blob_hash,
                     execution_path: _,
+                }
+                | AdmittedDirectCommandClosure::RealizationMember {
+                    executable_blob_hash,
+                    ..
                 },
             ) = (executable_identity, command)
                 && content_hash != executable_blob_hash

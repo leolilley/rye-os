@@ -2,6 +2,7 @@
 category: "ryeos/core/bundle"
 name: "publish"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 required_caps: []
 description: "Full bundle release pipeline: bootstrap-sign, rebuild CAS, sign items, generate manifest, emit trust doc."
 

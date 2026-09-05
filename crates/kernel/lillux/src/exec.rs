@@ -42,10 +42,37 @@ pub struct SubprocessRequest {
     /// Lillux retains the handles and clears `FD_CLOEXEC` only in the forked
     /// child. Trusted launchers use these for descriptor-backed authorities.
     pub inherited_fds: Vec<std::sync::Arc<std::fs::File>>,
+    /// Exact child-descriptor mappings. Sources remain CLOEXEC in the parent;
+    /// Lillux reserves free destinations before fork and installs every
+    /// mapping only in the trusted pre-exec boundary.
+    pub inherited_fd_mappings: Vec<InheritedDescriptorMapping>,
     /// Optional trusted launcher status channel. When present, Lillux waits for
     /// the launcher to report the host PID of its target and supervises that
     /// target's process group in addition to the outer launcher process.
     pub supervised_status: Option<SupervisedProcessStatus>,
+}
+
+/// One exact already-open descriptor mapped to a distinct child coordinate.
+/// Construction remains inside typed Lillux channel authority.
+pub struct InheritedDescriptorMapping {
+    source: std::sync::Arc<std::fs::File>,
+    target_fd: u32,
+}
+
+impl InheritedDescriptorMapping {
+    fn source_descriptor(&self) -> Result<u32, String> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            protect_descriptor_from_exec(self.source.as_ref())?;
+            u32::try_from(self.source.as_raw_fd())
+                .map_err(|_| "mapped inherited descriptor exceeds u32".to_owned())
+        }
+        #[cfg(not(unix))]
+        {
+            Err("mapped inherited descriptors are unavailable on this platform".to_owned())
+        }
+    }
 }
 
 /// Resource limits applied to a spawned subprocess.
@@ -147,33 +174,18 @@ pub struct SupervisedLauncherAttachmentStatusPipe {
 }
 
 impl SupervisedLauncherStatusPipe {
-    /// Raw descriptor to pass to the trusted launcher.
-    #[cfg(unix)]
-    pub fn writer_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd as _;
-        self.writer.as_raw_fd()
-    }
-
-    #[cfg(not(unix))]
-    pub fn writer_fd(&self) -> i32 {
-        // Construction fails on non-Linux platforms, so this value is never
-        // handed to a child. Keeping the method in the cross-platform API lets
-        // shared launcher plumbing compile without platform-specific branches.
-        -1
+    /// Validated numeric coordinate committed to the trusted launch protocol.
+    /// This is not a raw handle or ownership transfer.
+    pub fn writer_descriptor(&self) -> Result<u32, String> {
+        inherited_descriptor_coordinate(self.writer.as_ref())
     }
 }
 
 impl SupervisedLauncherAttachmentStatusPipe {
-    /// Raw status descriptor to pass to the trusted launcher.
-    #[cfg(unix)]
-    pub fn writer_fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd as _;
-        self.writer.as_raw_fd()
-    }
-
-    #[cfg(not(unix))]
-    pub fn writer_fd(&self) -> i32 {
-        -1
+    /// Validated numeric coordinate committed to the trusted launch protocol.
+    /// This is not a raw handle or ownership transfer.
+    pub fn writer_descriptor(&self) -> Result<u32, String> {
+        inherited_descriptor_coordinate(self.writer.as_ref())
     }
 }
 
@@ -502,6 +514,45 @@ pub struct InheritedDescriptorAuthority {
     handle: std::sync::Arc<std::fs::File>,
 }
 
+/// Return the validated numeric coordinate for an exact, CLOEXEC-protected
+/// descriptor that will be retained by a typed Lillux launch request.
+pub fn inherited_descriptor_coordinate(file: &std::fs::File) -> Result<u32, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err("inherited descriptor coordinates are unavailable on this platform".to_owned())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        protect_descriptor_from_exec(file)?;
+        let descriptor = file.as_raw_fd();
+        if descriptor <= libc::STDERR_FILENO {
+            return Err(format!("inherited descriptor {descriptor} overlaps stdio"));
+        }
+        u32::try_from(descriptor)
+            .map_err(|_| "inherited descriptor exceeds the protocol coordinate range".to_owned())
+    }
+}
+
+/// Return the Linux descriptor-rooted pathname for one exact inherited file.
+/// The caller must retain the same file through the child launch.
+pub fn inherited_descriptor_path_for(file: &std::fs::File) -> Result<std::path::PathBuf, String> {
+    let descriptor = inherited_descriptor_coordinate(file)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = descriptor;
+        Err("descriptor-rooted inherited paths are unavailable on this platform".to_owned())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(std::path::PathBuf::from(format!(
+            "/proc/self/fd/{descriptor}"
+        )))
+    }
+}
+
 impl InheritedDescriptorAuthority {
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -518,28 +569,9 @@ pub(crate) fn inherited_descriptor_path(
     }
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd as _;
         let file = std::sync::Arc::new(file);
-        let fd = file.as_raw_fd();
-        if fd <= libc::STDERR_FILENO {
-            return Err(format!("inherited descriptor {fd} overlaps stdio"));
-        }
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
-            return Err(format!(
-                "inherited descriptor {fd} cannot be inspected: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if flags & libc::FD_CLOEXEC == 0 {
-            return Err(format!(
-                "inherited descriptor {fd} is not protected by FD_CLOEXEC"
-            ));
-        }
-        Ok(InheritedDescriptorAuthority {
-            path: std::path::PathBuf::from(format!("/proc/self/fd/{fd}")),
-            handle: file,
-        })
+        let path = inherited_descriptor_path_for(file.as_ref())?;
+        Ok(InheritedDescriptorAuthority { path, handle: file })
     }
 }
 
@@ -589,14 +621,93 @@ pub struct InheritedDuplexChannel {
 
 /// Child-side authority for one connected inherited duplex channel.
 ///
-/// The descriptor stays close-on-exec in the parent. Consuming this authority
-/// binds both the hidden descriptor value and its inheritance to exactly one
-/// command. Raw descriptor mechanics never leave Lillux.
+/// The descriptor stays close-on-exec in the parent. Binding this authority to
+/// a launch request carries both its hidden source identity and exact target
+/// coordinate; each request rejects aliased sources and destinations. Raw
+/// descriptor mechanics never leave Lillux.
+#[derive(Debug, Clone)]
 pub struct InheritedDuplexChannelChildAuthority {
     channel: std::sync::Arc<std::fs::File>,
 }
 
 impl InheritedDuplexChannelChildAuthority {
+    /// Numeric descriptor committed into an external typed launch protocol.
+    /// Lillux retains ownership and validates liveness/CLOEXEC before exposing
+    /// the coordinate; callers receive no raw handle or conversion authority.
+    pub fn inherited_descriptor(&self) -> Result<u32, String> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let descriptor = self.channel.as_raw_fd();
+            protect_descriptor_from_exec(self.channel.as_ref())?;
+            u32::try_from(descriptor)
+                .map_err(|_| "inherited duplex descriptor exceeds u32".to_owned())
+        }
+        #[cfg(not(unix))]
+        {
+            Err("inherited duplex channels are unavailable on this platform".to_owned())
+        }
+    }
+
+    /// Retain this exact channel through a Lillux subprocess launch. This is
+    /// deliberately narrower than exposing or cloning the underlying file.
+    pub fn retain_for_child(&self, inherited_fds: &mut Vec<std::sync::Arc<std::fs::File>>) {
+        inherited_fds.push(std::sync::Arc::clone(&self.channel));
+    }
+
+    /// Bind this exact channel into an existing Lillux request for the direct
+    /// (non-adapter) launch path.
+    pub fn bind_to_subprocess_request(
+        &self,
+        request: &mut SubprocessRequest,
+        descriptor_env_name: &str,
+        target_fd: u32,
+    ) -> Result<(), String> {
+        let descriptor = self.inherited_descriptor()?;
+        if target_fd == 1 || target_fd == 2 {
+            return Err("inherited duplex target descriptor overlaps stdout or stderr".to_owned());
+        }
+        if request
+            .inherited_fd_mappings
+            .iter()
+            .any(|mapping| mapping.target_fd == target_fd)
+        {
+            return Err(format!(
+                "subprocess already contains target descriptor mapping {target_fd}"
+            ));
+        }
+        if request
+            .inherited_fd_mappings
+            .iter()
+            .map(InheritedDescriptorMapping::source_descriptor)
+            .collect::<Result<Vec<_>, _>>()?
+            .contains(&descriptor)
+        {
+            return Err(format!(
+                "subprocess already contains inherited duplex source descriptor {descriptor}"
+            ));
+        }
+        if request
+            .envs
+            .iter()
+            .any(|(name, _)| name == descriptor_env_name)
+        {
+            return Err(format!(
+                "subprocess environment already contains protected descriptor binding {descriptor_env_name}"
+            ));
+        }
+        request
+            .envs
+            .push((descriptor_env_name.to_owned(), target_fd.to_string()));
+        request
+            .inherited_fd_mappings
+            .push(InheritedDescriptorMapping {
+                source: std::sync::Arc::clone(&self.channel),
+                target_fd,
+            });
+        Ok(())
+    }
+
     /// Consume this authority into one child command. The exact descriptor is
     /// both retained by the command and installed under `descriptor_env_name`;
     /// callers cannot split or replay those two operations.
@@ -660,6 +771,23 @@ impl InheritedDuplexChannel {
         }
         #[cfg(not(unix))]
         {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "inherited duplex channels are unavailable on this platform",
+            ))
+        }
+    }
+
+    /// Configure nonblocking byte-stream operation without exposing the
+    /// platform socket or descriptor to the protocol owner.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.stream.set_nonblocking(nonblocking)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = nonblocking;
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "inherited duplex channels are unavailable on this platform",
@@ -763,8 +891,10 @@ unsafe fn take_inherited_duplex_channel(
     let descriptor = encoded
         .parse::<std::os::fd::RawFd>()
         .map_err(|error| format!("parse inherited descriptor {name}: {error}"))?;
-    if descriptor <= libc::STDERR_FILENO {
-        return Err(format!("inherited descriptor {name} overlaps standard I/O"));
+    if descriptor == libc::STDOUT_FILENO || descriptor == libc::STDERR_FILENO {
+        return Err(format!(
+            "inherited descriptor {name} overlaps standard output or error"
+        ));
     }
     // SAFETY: the caller guarantees unique ownership of this live descriptor.
     // Adopt it before any fallible inspection so every error path closes it.
@@ -2685,6 +2815,163 @@ pub fn lib_spawn_awaiting_attachment(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn inherited_mapping_control_descriptors(
+    attachment_gate: Option<&AttachmentWorkerGate>,
+    supervised_status: Option<&SupervisedProcessStatus>,
+) -> BTreeSet<i32> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut descriptors = BTreeSet::new();
+    if let Some(gate) = attachment_gate {
+        descriptors.insert(gate.status_writer.as_raw_fd());
+        descriptors.insert(gate.release_reader.as_raw_fd());
+        descriptors.insert(gate.child_status_reader_fd);
+        descriptors.insert(gate.child_release_writer_fd);
+        if let Some(directory) = gate.cwd_directory.as_ref() {
+            descriptors.insert(directory.as_raw_fd());
+        }
+        descriptors.extend(gate.inherited_child_close_fds.iter().copied());
+    }
+    if let Some(status) = supervised_status {
+        match status {
+            SupervisedProcessStatus::Run { reader } => {
+                descriptors.insert(reader.as_raw_fd());
+            }
+            SupervisedProcessStatus::AwaitingAttachment {
+                reader,
+                attachment_release,
+            } => {
+                descriptors.insert(reader.as_raw_fd());
+                if let Some(writer) = attachment_release.writer.as_ref() {
+                    descriptors.insert(writer.as_raw_fd());
+                }
+            }
+        }
+    }
+    descriptors
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn inherited_mapping_control_descriptors(
+    supervised_status: Option<&SupervisedProcessStatus>,
+) -> BTreeSet<i32> {
+    let _ = supervised_status;
+    BTreeSet::new()
+}
+
+/// Prepare collision-free source copies and reserve every otherwise-free
+/// target descriptor before `Command` allocates its private exec-error pipe.
+/// Reservations are CLOEXEC and exist only in the parent until spawn returns;
+/// the trusted child hook installs the exact mappings after stdio/control
+/// setup. This avoids process-global `dup2` and keeps concurrent children from
+/// observing a mapped authority after exec.
+#[cfg(unix)]
+fn prepare_inherited_fd_mappings(
+    mappings: &[InheritedDescriptorMapping],
+    ordinary_inherited: &[i32],
+    forbidden_targets: &BTreeSet<i32>,
+) -> Result<(Vec<(i32, i32)>, Vec<std::fs::File>), String> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    if mappings.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut targets = BTreeSet::new();
+    let mut sources = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(mappings.len());
+    let mut maximum_target = 2_i32;
+    for mapping in mappings {
+        let source = i32::try_from(mapping.source_descriptor()?)
+            .map_err(|_| "mapped inherited source exceeds the platform descriptor range")?;
+        let target = i32::try_from(mapping.target_fd)
+            .map_err(|_| "mapped inherited target exceeds the platform descriptor range")?;
+        if target == libc::STDOUT_FILENO || target == libc::STDERR_FILENO {
+            return Err(format!(
+                "mapped inherited target descriptor {target} overlaps stdout or stderr"
+            ));
+        }
+        if !targets.insert(target) {
+            return Err(format!(
+                "duplicate mapped inherited target descriptor {target}"
+            ));
+        }
+        if !sources.insert(source) {
+            return Err(format!(
+                "duplicate mapped inherited source descriptor {source}"
+            ));
+        }
+        if ordinary_inherited.contains(&target) {
+            return Err(format!(
+                "mapped target descriptor {target} aliases an ordinary inherited authority"
+            ));
+        }
+        if ordinary_inherited.contains(&source) {
+            return Err(format!(
+                "mapped source descriptor {source} aliases an ordinary inherited authority"
+            ));
+        }
+        if forbidden_targets.contains(&target) {
+            return Err(format!(
+                "mapped target descriptor {target} aliases Lillux process-control authority"
+            ));
+        }
+        maximum_target = maximum_target.max(target);
+        normalized.push((source, target));
+    }
+
+    let temporary_floor = maximum_target
+        .checked_add(1)
+        .ok_or_else(|| "mapped inherited target descriptor overflows".to_owned())?
+        .max(3);
+    let mut source_copies = Vec::with_capacity(normalized.len());
+    for (source, _) in &normalized {
+        let duplicate = unsafe { libc::fcntl(*source, libc::F_DUPFD_CLOEXEC, temporary_floor) };
+        if duplicate < 0 {
+            return Err(format!(
+                "duplicate mapped inherited descriptor {source}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: F_DUPFD_CLOEXEC returned one new uniquely owned descriptor.
+        source_copies.push(unsafe { std::fs::File::from_raw_fd(duplicate) });
+    }
+
+    let mut lifelines = Vec::with_capacity(source_copies.len() + normalized.len());
+    let mut prepared = Vec::with_capacity(normalized.len());
+    for ((_, target), source_copy) in normalized.into_iter().zip(source_copies) {
+        let source = source_copy.as_raw_fd();
+        let target_flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
+        if target_flags < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EBADF) {
+                return Err(format!(
+                    "inspect mapped target descriptor {target}: {error}"
+                ));
+            }
+            // `Command` owns standard-input setup and protects its private
+            // exec-error channel before our pre-exec hook runs. A closed
+            // parent stdin therefore needs no process-global reservation;
+            // the hook below replaces the child's configured fd 0 exactly.
+            if target != libc::STDIN_FILENO {
+                let reservation = unsafe { libc::dup3(source, target, libc::O_CLOEXEC) };
+                if reservation < 0 {
+                    return Err(format!(
+                        "reserve mapped target descriptor {target}: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                // SAFETY: target was proven closed and dup3 created one new
+                // owned descriptor at that exact coordinate.
+                lifelines.push(unsafe { std::fs::File::from_raw_fd(reservation) });
+            }
+        }
+        prepared.push((source, target));
+        lifelines.push(source_copy);
+    }
+    Ok((prepared, lifelines))
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn lib_spawn_awaiting_attachment(
     _request: SubprocessRequest,
@@ -2712,6 +2999,7 @@ fn lib_spawn_with_stdio(
         timeout,
         limits,
         inherited_fds,
+        inherited_fd_mappings,
         supervised_status,
     } = request;
     if inherit_stdio
@@ -2761,7 +3049,7 @@ fn lib_spawn_with_stdio(
         raw
     };
     #[cfg(not(unix))]
-    if !inherited_fds.is_empty() {
+    if !inherited_fds.is_empty() || !inherited_fd_mappings.is_empty() {
         return Err(spawn_failure(
             start,
             "Failed to spawn: inherited descriptors are unsupported on this platform",
@@ -2774,6 +3062,21 @@ fn lib_spawn_with_stdio(
             "Failed to spawn: supervised launcher status is supported only on Linux",
         ));
     }
+
+    #[cfg(target_os = "linux")]
+    let forbidden_mapping_targets =
+        inherited_mapping_control_descriptors(attachment_gate.as_ref(), supervised_status.as_ref());
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let forbidden_mapping_targets =
+        inherited_mapping_control_descriptors(supervised_status.as_ref());
+    #[cfg(unix)]
+    let (raw_inherited_fd_mappings, inherited_fd_mapping_lifelines) =
+        prepare_inherited_fd_mappings(
+            &inherited_fd_mappings,
+            &raw_inherited_fds,
+            &forbidden_mapping_targets,
+        )
+        .map_err(|error| spawn_failure(start, format!("Failed to spawn: {error}")))?;
 
     let envs_str: Vec<String> = envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
@@ -2894,6 +3197,11 @@ fn lib_spawn_with_stdio(
                         pending_control_fds,
                     )?;
                 }
+                for (source, target) in &raw_inherited_fd_mappings {
+                    if libc::dup3(*source, *target, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
@@ -2909,6 +3217,11 @@ fn lib_spawn_with_stdio(
                 for fd in &raw_inherited_fds {
                     let flags = libc::fcntl(*fd, libc::F_GETFD);
                     if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for (source, target) in &raw_inherited_fd_mappings {
+                    if libc::dup2(*source, *target) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -2946,6 +3259,8 @@ fn lib_spawn_with_stdio(
         Ok(c) => c,
         Err(e) => return Err(spawn_failure(start, format!("Failed to spawn: {e}"))),
     };
+    #[cfg(unix)]
+    drop(inherited_fd_mapping_lifelines);
     #[cfg(target_os = "linux")]
     drop(attachment_gate);
     // The forked child now owns its inherited descriptor copies. Close the
@@ -2953,6 +3268,7 @@ fn lib_spawn_with_stdio(
     // writer open here would hide a launcher's pre-target EOF and force every
     // failed setup to wait for the full supervision timeout.
     drop(inherited_fds);
+    drop(inherited_fd_mappings);
     let wrapper_pid = child.id();
 
     // On Unix with setsid, pid == pgid since the child is its own process group leader.
@@ -4851,6 +5167,7 @@ fn do_exec(
         timeout,
         limits: None,
         inherited_fds: Vec::new(),
+        inherited_fd_mappings: Vec::new(),
         supervised_status: None,
     });
     serde_json::json!({

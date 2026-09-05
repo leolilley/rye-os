@@ -39,24 +39,76 @@ fn require_admission_binding(
     state: &AppState,
     cas: &lillux::CasStore,
     manifest_hash: &str,
-    consumer_ref: &str,
-    publisher_fingerprint: &str,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
 ) -> anyhow::Result<ryeos_state::objects::ExternalContentBinding> {
-    crate::operator_external_content::active_binding_from_store(
-        &state.state_store,
-        cas,
-        manifest_hash,
-        consumer_ref,
-        publisher_fingerprint,
-    )?
-    .map(|(_, binding)| binding)
-    .ok_or_else(|| {
-        ExternalContentBindingUnavailable {
-            manifest_hash: manifest_hash.to_owned(),
-            consumer_ref: consumer_ref.to_owned(),
+    crate::operator_external_content::require_active_binding(state, cas, manifest_hash, consumer)
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::operator_external_content::BindingNotActive>()
+                .is_some()
+            {
+                return ExternalContentBindingUnavailable {
+                    manifest_hash: manifest_hash.to_owned(),
+                    consumer_ref: consumer.consumer_ref().to_owned(),
+                }
+                .into();
+            }
+            error
+        })
+}
+
+fn consumer_authority(
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
+) -> anyhow::Result<ryeos_state::objects::ExternalContentConsumerAuthority> {
+    let publisher = resolution.root.signer_fingerprint.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "locator-free external-content consumer has no verified publisher fingerprint"
+        )
+    })?;
+    match (resolution.root.source_space, &resolution.root.source_root) {
+        (
+            ryeos_engine::contracts::ItemSpace::Bundle,
+            ryeos_engine::contracts::ItemSourceRoot::Bundle { .. },
+        ) => ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+            resolution.root.resolved_ref.clone(),
+            publisher,
+        ),
+        (
+            ryeos_engine::contracts::ItemSpace::Project,
+            ryeos_engine::contracts::ItemSourceRoot::Project,
+        ) => {
+            let project_snapshot_hash = subject_resolution_authority
+                .operational_generation()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "project external-content consumer requires exact generation authority"
+                    )
+                })?;
+            let source_closure = resolution
+                .composed
+                .derived
+                .get(ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("project external-content consumer has no source closure")
+                })
+                .and_then(ryeos_state::objects::EffectiveSourceClosureProjection::from_value)?;
+            let effective_consumer_digest =
+                ryeos_engine::external_content::pre_external_realization_consumer_digest(
+                    resolution,
+                )?;
+            ryeos_state::objects::ExternalContentConsumerAuthority::pinned_project(
+                resolution.root.resolved_ref.clone(),
+                publisher,
+                project_snapshot_hash.to_owned(),
+                effective_consumer_digest,
+                source_closure,
+            )
         }
-        .into()
-    })
+        _ => anyhow::bail!(
+            "external-content consumer has incoherent or unsupported source authority"
+        ),
+    }
 }
 
 /// Admission evidence retained until the finalized launch capsule becomes the
@@ -99,6 +151,7 @@ pub fn preview_external_content_pins(
     kind: &str,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
     roots: &ryeos_engine::item_resolution::ResolutionRoots,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
 ) -> anyhow::Result<Option<ExternalContentValidationPreview>> {
     let contract = engine
         .kinds
@@ -154,7 +207,13 @@ pub fn preview_external_content_pins(
                 let ready = status != "mismatched";
                 (Some(observed), None, status, ready)
             }
-            None => preview_retained_external_content(state, contract, resolution, declaration)?,
+            None => preview_retained_external_content(
+                state,
+                contract,
+                resolution,
+                subject_resolution_authority,
+                declaration,
+            )?,
         };
         ready_for_admission &= ready;
         previews.push(ExternalContentPinPreview {
@@ -212,8 +271,13 @@ pub fn preview_portable_content_dependency_with_realizations(
                 declaration.id
             );
         }
-        let (observed_digest, binding_digest, status, ready) =
-            preview_retained_external_content(state, Some(&contract), resolution, declaration)?;
+        let (observed_digest, binding_digest, status, ready) = preview_retained_external_content(
+            state,
+            Some(&contract),
+            resolution,
+            &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+            declaration,
+        )?;
         ready_for_admission &= ready;
         previews.push(ExternalContentPinPreview {
             id: declaration.id.clone(),
@@ -342,6 +406,7 @@ fn retained_realization_set(
             manifest_hash: digest.to_owned(),
             entry_count,
             total_bytes,
+            mount_root: declaration.mount_root,
             mount: declaration.mount.clone(),
         });
     }
@@ -352,6 +417,7 @@ fn preview_retained_external_content(
     state: &AppState,
     contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
     declaration: &ExternalContentDeclaration,
 ) -> anyhow::Result<(Option<String>, Option<String>, &'static str, bool)> {
     if declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned {
@@ -366,15 +432,7 @@ fn preview_retained_external_content(
             declaration.id
         )
     })?;
-    let publisher = resolution
-        .root
-        .signer_fingerprint
-        .as_deref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "locator-free external-content consumer has no verified publisher fingerprint"
-            )
-        })?;
+    let consumer = consumer_authority(resolution, subject_resolution_authority)?;
     let authority = pinned_state_authority(state)?;
     let guard = authority.acquire_shared_guard()?;
     authority.ensure_guard(&guard)?;
@@ -440,12 +498,13 @@ fn preview_retained_external_content(
         &state.state_store,
         &cas,
         digest,
-        &resolution.root.resolved_ref,
-        publisher,
+        &consumer,
+        state.identity.fingerprint(),
     )?;
     drop(guard);
     match binding {
-        Some((binding_digest, _)) => {
+        Some((binding_digest, binding)) => {
+            crate::operator_external_content::require_current_binding_authorizer(state, &binding)?;
             Ok((Some(digest.to_owned()), Some(binding_digest), "ready", true))
         }
         None => Ok((Some(digest.to_owned()), None, "missing_binding", false)),
@@ -492,6 +551,7 @@ pub fn admit_external_realizations(
     kind: &str,
     resolution: &mut ryeos_engine::resolution::ResolutionOutput,
     roots: &ryeos_engine::item_resolution::ResolutionRoots,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
     inherited: Option<&RealizedExternalContentSet>,
 ) -> anyhow::Result<Option<AdmittedExternalRealizations>> {
     let mut publication = None;
@@ -501,6 +561,7 @@ pub fn admit_external_realizations(
         kind,
         resolution,
         roots,
+        subject_resolution_authority,
         inherited,
         &mut publication,
     )?;
@@ -516,6 +577,7 @@ pub fn admit_external_realizations_in_publication(
     kind: &str,
     resolution: &mut ryeos_engine::resolution::ResolutionOutput,
     roots: &ryeos_engine::item_resolution::ResolutionRoots,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
     inherited: Option<&RealizedExternalContentSet>,
     publication: &mut Option<PendingCasPublication>,
 ) -> anyhow::Result<Option<AdmittedExternalRealizations>> {
@@ -540,6 +602,7 @@ pub fn admit_external_realizations_in_publication(
         resolution,
         contract,
         declarations,
+        subject_resolution_authority,
         inherited,
         publication,
         kind,
@@ -583,6 +646,7 @@ pub fn admit_portable_content_dependency_in_publication(
         resolution,
         Some(&contract),
         declarations,
+        &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
         inherited,
         publication,
         "content-dependency",
@@ -598,6 +662,7 @@ fn admit_declarations_in_publication(
     resolution: &mut ryeos_engine::resolution::ResolutionOutput,
     contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
     declarations: Vec<ExternalContentDeclaration>,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
     inherited: Option<&RealizedExternalContentSet>,
     publication: &mut Option<PendingCasPublication>,
     diagnostic_kind: &str,
@@ -642,8 +707,11 @@ fn admit_declarations_in_publication(
 
     let mut content_total = 0u64;
     let mut large_total = 0u64;
-    let consumer_ref = resolution.root.resolved_ref.clone();
-    let consumer_publisher = resolution.root.signer_fingerprint.clone();
+    let retained_consumer = declarations
+        .iter()
+        .any(|declaration| declaration.locator.is_none())
+        .then(|| consumer_authority(resolution, subject_resolution_authority))
+        .transpose()?;
     for declaration in &declarations {
         if declaration.mode == ryeos_engine::external_content::ExternalContentMode::Pinned
             && declaration.locator.is_none()
@@ -661,12 +729,14 @@ fn admit_declarations_in_publication(
                 &mut sink,
                 &mut content_total,
                 state,
-                &consumer_ref,
-                consumer_publisher.as_deref(),
+                retained_consumer
+                    .as_ref()
+                    .expect("locator-free declaration resolved consumer authority"),
             )?);
             continue;
         }
         if declaration.mode == ryeos_engine::external_content::ExternalContentMode::Pinned
+            && declaration.locator.is_none()
             && let Some(digest) = declaration.digest.as_deref()
             && let Some(large_manifest) =
                 ryeos_state::objects::load_if_large_content_manifest(&cas, digest)?
@@ -682,8 +752,9 @@ fn admit_declarations_in_publication(
                 &mut sink,
                 &mut large_total,
                 state,
-                &consumer_ref,
-                consumer_publisher.as_deref(),
+                retained_consumer
+                    .as_ref()
+                    .expect("locator-free declaration resolved consumer authority"),
             )?);
             continue;
         }
@@ -743,6 +814,7 @@ fn admit_declarations_in_publication(
             manifest_hash,
             entry_count: manifest.entry_count,
             total_bytes: manifest.total_bytes,
+            mount_root: declaration.mount_root,
             mount: declaration.mount.clone(),
         });
     }
@@ -786,13 +858,9 @@ fn seal_pinned_content_realization(
     sink: &mut GuardedCasBlobSink<'_>,
     content_total: &mut u64,
     state: &AppState,
-    consumer_ref: &str,
-    consumer_publisher: Option<&str>,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
 ) -> anyhow::Result<RealizedExternalContent> {
-    let consumer_publisher = consumer_publisher.ok_or_else(|| {
-        anyhow::anyhow!("retained external-content consumer has no verified publisher fingerprint")
-    })?;
-    require_admission_binding(state, cas, digest, consumer_ref, consumer_publisher)?;
+    require_admission_binding(state, cas, digest, consumer)?;
     if declaration.locator.is_some() {
         anyhow::bail!(
             "external content `{}` must bind retained bytes without a live locator",
@@ -826,6 +894,7 @@ fn seal_pinned_content_realization(
         manifest_hash: digest.to_owned(),
         entry_count: manifest.entry_count,
         total_bytes: manifest.total_bytes,
+        mount_root: declaration.mount_root,
         mount: declaration.mount.clone(),
     })
 }
@@ -942,8 +1011,7 @@ fn seal_pinned_large_realization(
     sink: &mut GuardedCasBlobSink<'_>,
     large_total: &mut u64,
     state: &AppState,
-    consumer_ref: &str,
-    consumer_publisher: Option<&str>,
+    consumer: &ryeos_state::objects::ExternalContentConsumerAuthority,
 ) -> anyhow::Result<RealizedExternalContent> {
     let grant = contract
         .and_then(|contract| contract.large_content.as_ref())
@@ -953,10 +1021,7 @@ fn seal_pinned_large_realization(
                 declaration.id
             )
         })?;
-    let consumer_publisher = consumer_publisher.ok_or_else(|| {
-        anyhow::anyhow!("large-content consumer has no verified publisher fingerprint")
-    })?;
-    require_admission_binding(state, cas, digest, consumer_ref, consumer_publisher)?;
+    require_admission_binding(state, cas, digest, consumer)?;
     if declaration.locator.is_some() {
         anyhow::bail!(
             "external content `{}` must bind large bytes from the retained store, not a live locator",
@@ -997,6 +1062,7 @@ fn seal_pinned_large_realization(
         manifest_hash: digest.to_owned(),
         entry_count: manifest.entry_count,
         total_bytes: manifest.total_bytes,
+        mount_root: declaration.mount_root,
         mount: declaration.mount.clone(),
     })
 }

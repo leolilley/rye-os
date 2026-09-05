@@ -1,6 +1,7 @@
 # ryeos:signed:2026-08-24T16:46:26Z:1bf4dd50eef87d0f2a684d190b9a4dfefeb564a7e3dc62ac925e5cee5d5d2545:PaGB4ucyMD8rhHo3v0SqNObcuwUGq6PpWAW9DQ1Xj9Zu8RfCjUhkgBSIfY8NSb/6JZQNRf/gm1/arqPpkuJoCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 version: "1.0.0"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 category: "ryeos/core"
 name: "authorize-client"
 required_caps: ["ryeos.execute.tool.ryeos.core.authorize-client"]

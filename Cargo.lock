@@ -2862,6 +2862,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryeos-lillux-isolation-adapter"
+version = "0.1.0"
+dependencies = [
+ "lillux",
+ "ryeos-isolation-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ryeos-node"
 version = "0.1.0"
 dependencies = [
@@ -3061,6 +3071,16 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "url",
+]
+
+[[package]]
+name = "ryeos-workload-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lillux",
+ "ryeos-runtime",
+ "serde_json",
 ]
 
 [[package]]

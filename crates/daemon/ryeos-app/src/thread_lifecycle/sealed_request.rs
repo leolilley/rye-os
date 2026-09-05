@@ -131,7 +131,9 @@ where
 /// daemon-authored scheduled-fire coordinate. v15 seals the narrow
 /// independently-evaluated-candidate purpose and its exact base/candidate
 /// authority.
-pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 15;
+/// v16 combines candidate/scheduler authority with the current exact
+/// filesystem/network and realization-root execution contract.
+pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -580,6 +582,7 @@ impl SealedRootExecutionRequest {
                 .validate()
                 .context("validate sealed candidate-evaluation authority")?;
         }
+        sealed.validate_handler_context()?;
         sealed.validate_executor_route_against_capsule(capsule)?;
         if sealed.admitted_program_value()? != capsule.exact_program
             || sealed.admitted_program_hash()? != capsule.exact_program_hash
@@ -1523,11 +1526,12 @@ impl SealedRootExecutionRequest {
             crate::execution_provenance::ExecutionProvenance::RootLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::ChildLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::RootPinnedGeneration { .. }
-            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. } => {
-                ProjectContext::LocalPath {
-                    path: provenance.effective_path().to_path_buf(),
-                }
-            }
+            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
+            | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
+                ..
+            } => ProjectContext::LocalPath {
+                path: provenance.subject_effective_path().to_path_buf(),
+            },
         };
         let mut rebound_plan_context = request.plan_context.clone();
         rebound_plan_context.project_context = rebound_project_context;
@@ -1540,9 +1544,10 @@ impl SealedRootExecutionRequest {
             crate::execution_provenance::ExecutionProvenance::RootLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::ChildLiveProject { .. }
             | crate::execution_provenance::ExecutionProvenance::RootPinnedGeneration { .. }
-            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. } => {
-                Some(provenance.effective_path().to_path_buf())
-            }
+            | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
+            | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
+                ..
+            } => Some(provenance.subject_effective_path().to_path_buf()),
         };
         request.resolved_item.materialized_project_root = rebound_materialized_project_root.clone();
         {

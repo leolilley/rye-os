@@ -809,6 +809,7 @@ pub async fn run(
             timeout: AUGMENTATION_RUNTIME_TIMEOUT_SECS as f64,
             limits: None,
             inherited_fds: Vec::new(),
+            inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         };
         let live_access = provenance
@@ -835,7 +836,7 @@ pub async fn run(
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],
-                    target_channel: None,
+                    target_channels: &[],
                     item_ref: &runtime_item_ref_string,
                     thread_id: &child_thread_id,
                 },
@@ -2499,7 +2500,12 @@ mod tests {
             ),
             scheduler_runtime_gate: Arc::new(tokio::sync::RwLock::new(())),
             scheduler_reload_tx: None,
-            ignore_matcher: Arc::new(ryeos_app::ignore::matcher_from_builtins()),
+            ignore_matcher: Arc::new(
+                ryeos_app::ignore::IgnoreMatcher::from_config(&ryeos_app::ignore::IgnoreConfig {
+                    patterns: Vec::new(),
+                })
+                .unwrap(),
+            ),
             vault_fingerprint: None,
             accounting: None,
             persistent_sessions: Arc::new(
@@ -2636,6 +2642,7 @@ mod tests {
                         timeout: 30.0,
                         limits: None,
                         inherited_fds: Vec::new(),
+                        inherited_fd_mappings: Vec::new(),
                         supervised_status: None,
                     };
                     let result = match lillux::spawn_awaiting_attachment(request) {

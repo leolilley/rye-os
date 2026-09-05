@@ -38,8 +38,7 @@ resets the mode-0400 compatibility config before every worker generation; the
 workload may rewrite that seed, but it is neither retained policy nor a
 same-UID integrity boundary. When a generic RyeOS isolation backend is enabled
 it also overlays that file read-only, but Codex activation does not require
-RyeOS's optional Bubblewrap isolation bundle or any other RyeOS isolation
-backend. OpenAI's pinned standalone package does require its own packaged
+RyeOS's node isolation backend. OpenAI's pinned standalone package does require its own packaged
 `codex-resources/bwrap` companion for restricted Linux command execution. The
 activation imports that exact workload-owned file beside Codex; it does not
 select RyeOS's isolation backend, install or discover a host `bwrap`, or

@@ -704,6 +704,23 @@ async fn dispatch_streaming_subprocess(
     };
     let subject_item_ref = subject.item_ref;
     let subject_thread_profile = subject.thread_profile;
+    let (filesystem_authority_ceiling, network_authority_ceiling) =
+        crate::execution::execution_realization::project_launch_isolation_ceilings(
+            state,
+            &ctx.engine,
+            &verified_subject.resolved.kind,
+            request
+                .root_admission
+                .as_ref()
+                .map(|admission| admission.resolution_output()),
+            request
+                .parent_execution_context
+                .as_ref()
+                .map(|parent| parent.parent_thread_id.as_str()),
+        )
+        .map_err(DispatchError::Internal)?;
+    let node_filesystem = filesystem_authority_ceiling
+        == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
 
     if request.parent_execution_context.is_some() && request.previous_thread_id.is_some() {
         return Err(DispatchError::Internal(anyhow::anyhow!(
@@ -852,19 +869,22 @@ async fn dispatch_streaming_subprocess(
             ))
         })
         .collect::<Result<Vec<_>, DispatchError>>()?;
-    let envs = ryeos_app::env_contract::EnvContractBuilder::new()
-        .with_base_allowlist(std::env::vars_os().map(|(key, value)| {
-            (
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        }))
-        .map_err(|error| DispatchError::Internal(error.into()))?
-        .with_daemon_roots(roots)
-        .map_err(|error| DispatchError::Internal(error.into()))?
-        .with_typed_bindings(protocol_bindings)
-        .map_err(|error| DispatchError::Internal(error.into()))?
-        .build();
+    let envs =
+        ryeos_app::env_contract::EnvContractBuilder::new()
+            .with_base_allowlist(std::env::vars_os().filter(|_| node_filesystem).map(
+                |(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                },
+            ))
+            .map_err(|error| DispatchError::Internal(error.into()))?
+            .with_daemon_roots(roots)
+            .map_err(|error| DispatchError::Internal(error.into()))?
+            .with_typed_bindings(protocol_bindings)
+            .map_err(|error| DispatchError::Internal(error.into()))?
+            .build();
     // Streaming execution used to run as an untracked `lillux::run` blocking
     // task. A forced UDS shutdown could therefore drop the request future while
     // leaving a process absent from the daemon's exact-identity drain. Give
@@ -1055,6 +1075,7 @@ async fn dispatch_streaming_subprocess(
             timeout: 120.0,
             limits: None,
             inherited_fds: Vec::new(),
+            inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         };
         let live_access = request
@@ -1068,21 +1089,23 @@ async fn dispatch_streaming_subprocess(
                 ryeos_engine::isolation::IsolationLaunchContext {
                     project_path: request.project_path,
                     project_authority: request.provenance.isolation_project_authority(),
-                    filesystem_authority_ceiling:
-                        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
-                    network_authority_ceiling:
-                        ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+                    filesystem_authority_ceiling,
+                    network_authority_ceiling,
                     live_access: live_access.as_ref(),
-                    state_root: request.provenance.state_root_override(),
+                    state_root: request
+                        .provenance
+                        .state_root_override()
+                        .filter(|_| node_filesystem),
                     checkpoint_dir: None,
                     checkpoint_authority: None,
                     daemon_socket_path: None,
-                    bundle_roots: &bundle_roots,
-                    node_trusted_keys_dir: Some(&state.config.runtime_root().trusted_keys_dir()),
+                    bundle_roots: if node_filesystem { &bundle_roots } else { &[] },
+                    node_trusted_keys_dir: node_filesystem
+                        .then_some(&state.config.runtime_root().trusted_keys_dir()),
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],
-                    target_channel: None,
+                    target_channels: &[],
                     item_ref: &subject_item_ref,
                     thread_id: &thread_id,
                 },

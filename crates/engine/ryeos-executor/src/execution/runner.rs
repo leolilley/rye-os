@@ -762,6 +762,36 @@ fn prepare_cas_context(
                 tree_publication: None,
             })
         }
+        ExecutionProvenance::ChildImmutableWorkspaceInput {
+            effective_path,
+            workspace_lifeline,
+            input_snapshot_hash,
+            ..
+        } => {
+            guard.track_temp_dir(workspace_lifeline.clone());
+            if !effective_path.is_dir() {
+                anyhow::bail!(
+                    "immutable child input does not exist or is not a directory: {}",
+                    effective_path.display()
+                );
+            }
+            let (tree_hash, policy_hash) = read_pre_tree_for_snapshot(state, input_snapshot_hash)?;
+            tracing::trace!(
+                thread_id = %thread_id,
+                effective_path = %effective_path.display(),
+                input_snapshot_hash = %input_snapshot_hash,
+                "immutable shared-workspace input prepared"
+            );
+            Ok(PreparedCasContext {
+                effective_path: effective_path.clone(),
+                pre_tree_hash: Some(tree_hash),
+                pre_policy_hash: Some(policy_hash),
+                // Workload-operation recovery kills and settles the child; it
+                // never promotes transient input capture to resume authority.
+                resume_snapshot_hash: provenance.pinned_snapshot_hash().map(str::to_owned),
+                tree_publication: None,
+            })
+        }
         ExecutionProvenance::RootLiveProject {
             project_path,
             workspace_lifeline,
@@ -2322,8 +2352,15 @@ fn retained_resolution_has_filesystem_bindings(
         .composed
         .derived
         .contains_key(ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY);
-    let has_external =
-        !super::external_content::admitted_realization_mounts(resolution)?.is_empty();
+    // Runtime-root realizations are not project fold-back exclusions, but
+    // still require exact filesystem binding before this process can launch.
+    let has_external = resolution
+        .composed
+        .derived
+        .get(ryeos_state::objects::EXTERNAL_REALIZATIONS_DERIVED_KEY)
+        .map(ryeos_state::objects::ExternalContentRealizationSet::from_value)
+        .transpose()?
+        .is_some_and(|realizations| !realizations.is_empty());
     Ok(has_source || has_external)
 }
 
@@ -2478,6 +2515,11 @@ pub(crate) fn prepare_process_inputs(
     retained_resolution: &ryeos_engine::resolution::ResolutionOutput,
     base_path: &Path,
 ) -> Result<PreparedProcessInputs> {
+    // `retained_resolution` is the execution being spawned. For a borrowed
+    // child this already materializes/mounts the child's finalized source and
+    // external realizations into the borrowed workspace while preserving the
+    // parent's workspace lifeline. Do not route a managed parent's prepared
+    // launch dependencies around this path as a second child environment.
     super::source_closure::validate_external_mount_separation(state, retained_resolution)?;
     let has_bindings = retained_resolution_has_filesystem_bindings(retained_resolution)?;
     let project_class = process_project_class(provenance);
@@ -2635,6 +2677,14 @@ fn admitted_root_launch_metadata(
         publication: mut external_publication,
         source_policy,
     } = finalized;
+    if let Some(parent_thread_id) = params.parent_thread_id.as_deref() {
+        let (filesystem, network) =
+            super::execution_realization::admitted_parent_isolation_ceilings(
+                state,
+                parent_thread_id,
+            )?;
+        prepared_plan.restrict_isolation_authority(filesystem, network);
+    }
     if let Some(source_policy) = source_policy.as_ref() {
         source_policy.assert_matches_plan(prepared_plan.execution_plan())?;
     }
@@ -2801,10 +2851,13 @@ pub(crate) fn finalize_direct_effective_program(
             .resolution_workspace()
             .map(std::path::Path::to_path_buf),
     );
-    // A declaring kind captures here exactly as the managed path does, and a
-    // direct launch dispatched as a child (`parent_thread_id`) inherits its
-    // parent's sealed realization under the same inheritance rule — resolved from the
-    // parent's durable capsule, fail-closed on missing or malformed lineage.
+    // A declaring kind captures here exactly as the managed path does. A
+    // direct launch dispatched as a child (`parent_thread_id`) may reuse the
+    // parent's outer sealed realization set under the existing inheritance
+    // rule, resolved from the durable parent capsule and fail-closed on broken
+    // lineage. This is dependency-byte inheritance, not permission to treat a
+    // managed parent's prepared launch as the child's environment: a child
+    // declaration and command remain owned by the child's effective program.
     let inherited_external = parent_thread_id
         .map(|parent_thread_id| {
             state
@@ -2886,6 +2939,7 @@ pub(crate) fn finalize_direct_effective_program(
             item_kind,
             &mut resolution,
             &roots,
+            materialization.subject_authority(),
             inherited_external.as_ref(),
             &mut publication,
         )?;
@@ -3176,8 +3230,24 @@ pub async fn run_and_wait(
             sealed_dependency_bytes
                 .as_ref()
                 .map(|sealed| sealed as &dyn ryeos_engine::project_content::SealedDependencyBytes),
+            match params.parent_thread_id.as_deref() {
+                Some(parent) => {
+                    super::execution_realization::admitted_parent_isolation_ceilings(
+                        &state, parent,
+                    )?
+                    .0
+                }
+                None => ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            },
         )?
     };
+    prepared_plan.bind_realization_command(
+        &state,
+        &engine,
+        &params.resolved.resolved_item.kind,
+        finalized_direct.program.resolution(),
+        state.isolation.as_ref(),
+    )?;
     if params.provenance.project_source()
         == ryeos_app::execution_provenance::ProjectSourceKind::LiveFs
         && retained_resolution_has_filesystem_bindings(finalized_direct.program.resolution())?
@@ -3401,6 +3471,11 @@ pub async fn run_and_wait(
                 path: effective_path.clone(),
             };
     }
+    super::external_content::bind_prepared_realization_command(
+        &mut prepared_plan,
+        wait_bound_external.as_ref(),
+        state.isolation.as_ref(),
+    )?;
 
     // Spawn — use the per-request engine (pushed_head overlay or
     // daemon startup engine), NOT state.engine directly.
@@ -4140,8 +4215,24 @@ pub async fn run_detached(
             sealed_dependency_bytes
                 .as_ref()
                 .map(|sealed| sealed as &dyn ryeos_engine::project_content::SealedDependencyBytes),
+            match params.parent_thread_id.as_deref() {
+                Some(parent) => {
+                    super::execution_realization::admitted_parent_isolation_ceilings(
+                        &state, parent,
+                    )?
+                    .0
+                }
+                None => ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            },
         )?
     };
+    prepared_plan.bind_realization_command(
+        &state,
+        &engine,
+        &params.resolved.resolved_item.kind,
+        finalized_direct.program.resolution(),
+        state.isolation.as_ref(),
+    )?;
     if params.provenance.project_source()
         == ryeos_app::execution_provenance::ProjectSourceKind::LiveFs
         && retained_resolution_has_filesystem_bindings(finalized_direct.program.resolution())?
@@ -4270,6 +4361,11 @@ pub async fn run_detached(
                 path: effective_path.clone(),
             };
     }
+    super::external_content::bind_prepared_realization_command(
+        &mut prepared_plan,
+        bg_bound_external.as_ref(),
+        state.isolation.as_ref(),
+    )?;
 
     // Capture thread details before moving guard
     let admitted_thread_id = created.thread_id.clone();
@@ -6483,7 +6579,7 @@ async fn run_existing_recovered_thread(
         | ProjectContext::SnapshotHash { .. }
         | ProjectContext::ProjectRef { .. } => None,
     };
-    let prepared_plan = thread_lifecycle::PreparedItemPlan::recover_from_execution_closure(
+    let mut prepared_plan = thread_lifecycle::PreparedItemPlan::recover_from_execution_closure(
         &admitted_capsule,
         &cas,
         state.isolation.as_ref(),
@@ -6491,6 +6587,15 @@ async fn run_existing_recovered_thread(
     )
     .inspect_err(|_| {
         guard.fail_thread("admitted_execution_closure_invalid");
+        guard.cleanup();
+    })?;
+    super::external_content::bind_prepared_realization_command(
+        &mut prepared_plan,
+        bg_external_realizations.as_ref(),
+        state.isolation.as_ref(),
+    )
+    .inspect_err(|_| {
+        guard.fail_thread("admitted_realization_command_invalid");
         guard.cleanup();
     })?;
     if params.provenance.project_source()

@@ -71,6 +71,7 @@ pub mod remote_import_admitted_root;
 pub mod remote_list;
 pub mod remote_project_status;
 pub mod remote_pull;
+pub mod remote_pull_worker_result;
 pub mod remote_push;
 pub mod remote_reconcile_project_head;
 pub mod remote_run;
@@ -181,6 +182,7 @@ pub const ALL: &[ServiceDescriptor] = &[
     credential_profiles::REVOKE_DESCRIPTOR,
     credential_profiles::DELETE_DESCRIPTOR,
     dedicated_sessions::STATUS_DESCRIPTOR,
+    dedicated_sessions::CANDIDATE_RESULT_DESCRIPTOR,
     dedicated_sessions::CHECKPOINT_DESCRIPTOR,
     dedicated_sessions::RESUME_DESCRIPTOR,
     dedicated_sessions::HANDOFF_PREFLIGHT_DESCRIPTOR,
@@ -228,6 +230,7 @@ pub const ALL: &[ServiceDescriptor] = &[
     remote_sync_project_ai::DESCRIPTOR,
     remote_project_status::DESCRIPTOR,
     remote_pull::DESCRIPTOR,
+    remote_pull_worker_result::DESCRIPTOR,
     remote_execute::DESCRIPTOR,
     remote_import_admitted_head::DESCRIPTOR,
     remote_import_admitted_root::DESCRIPTOR,

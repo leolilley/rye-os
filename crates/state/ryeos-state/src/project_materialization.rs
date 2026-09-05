@@ -626,7 +626,10 @@ mod tests {
         let tree_hash = cas.store_object(&tree.to_value()).unwrap();
         let policy = ProjectSnapshotPolicy::from_matcher(
             crate::project_sync::ProjectSyncScope::FullProject,
-            &crate::ignore::matcher_from_builtins(),
+            &crate::ignore::IgnoreMatcher::from_config(&crate::ignore::IgnoreConfig {
+                patterns: Vec::new(),
+            })
+            .unwrap(),
         )
         .unwrap();
         let policy_hash = cas.store_object(&policy.to_value()).unwrap();

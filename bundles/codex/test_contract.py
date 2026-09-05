@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
 import stat
@@ -30,6 +29,7 @@ README_PATH = BUNDLE / "README.md"
 WORKER_EXECUTION_PATHS = (
     BUNDLE / ".ai/worker-executions/codex/login.yaml",
     BUNDLE / ".ai/worker-executions/codex/session.yaml",
+    BUNDLE / ".ai/worker-executions/codex/bounded-turn.yaml",
 )
 
 
@@ -174,9 +174,28 @@ class CodexContractTests(unittest.TestCase):
         self.assertEqual(manifest_digest, "f1f39917086d223da68135108afa401fe75d47e2b102ea3f81c699595256bfe5")
         self.assertIn(f"    digest: {manifest_digest}", environment)
         self.assertIn("    - realization_id: command-tools", environment)
-        self.assertIn("schema: ryeos.worker_environment.v3", environment)
+        self.assertIn("schema: ryeos.worker_environment.v4", environment)
         self.assertIn("  process_environment: {}", environment)
         self.assertIn("      relative_directory: bin", environment)
+        self.assertIn("workload_client: null", environment)
+
+    def test_hosted_profile_opens_only_the_private_workload_broker_directory(self) -> None:
+        self.assertEqual(self.profile["schema_version"], 2)
+        self.assertEqual(
+            self.profile["workload_client"],
+            {"endpoint_env": "RYEOS_WORKLOAD_CLIENT_ENDPOINT"},
+        )
+        immutable_args = "\n".join(self.profile["workload_args"])
+        self.assertIn('"/tmp/.ryeos-wc"="read"', immutable_args)
+        self.assertIn('":tmpdir"="deny"', immutable_args)
+        self.assertIn('":slash_tmp"="deny"', immutable_args)
+        self.assertNotIn('"RYEOS_*"="exclude"', immutable_args)
+
+        baseline = (SOURCE / self.profile["baseline_config"]).read_text()
+        self.assertIn('"/tmp/.ryeos-wc" = "read"', baseline)
+        self.assertIn('":tmpdir" = "deny"', baseline)
+        self.assertIn('":slash_tmp" = "deny"', baseline)
+        self.assertNotIn('"RYEOS_*" = "exclude"', baseline)
 
     def test_hosted_workflow_profile_admits_the_signed_worker(self) -> None:
         worker = yaml.safe_load(WORKER_PATH.read_text(encoding="utf-8"))
@@ -197,8 +216,7 @@ class CodexContractTests(unittest.TestCase):
         hosted_scopes = set(match.group(1).split(","))
         declared_runtime_scopes = set()
         for path in WORKER_EXECUTION_PATHS:
-            body = "\n".join(path.read_text(encoding="utf-8").splitlines()[1:])
-            execution = yaml.safe_load(body)
+            execution = yaml.safe_load(path.read_text(encoding="utf-8"))
             declared_runtime_scopes.update(
                 execution["requires"]["capabilities"]["declared"]
             )
@@ -223,22 +241,40 @@ class CodexContractTests(unittest.TestCase):
         ):
             self.assertNotIn(internal_scope, hosted_scopes)
 
-    def test_portable_session_has_a_finite_conserved_execution_allowance(self) -> None:
-        session_path = BUNDLE / ".ai/worker-executions/codex/session.yaml"
-        body = "\n".join(session_path.read_text(encoding="utf-8").splitlines()[1:])
-        session = yaml.safe_load(body)
+    def test_worker_profiles_bound_time_without_claiming_subscription_spend(self) -> None:
+        # These profiles enforce process/execution time, not the frontier
+        # subscription's financial allowance. Financial limits belong only to
+        # an execution that has admitted provider-accounting authority.
+        for path in WORKER_EXECUTION_PATHS:
+            with self.subTest(profile=path.stem):
+                execution = yaml.safe_load(path.read_text(encoding="utf-8"))
+                self.assertNotIn("spend_usd", execution["limits"])
+                self.assertGreater(execution["config"]["max_lifetime_seconds"], 0)
+                self.assertGreaterEqual(
+                    execution["limits"]["duration_seconds"],
+                    execution["config"]["max_lifetime_seconds"],
+                )
 
-        # worker-execution-runtime has no direct provider financial authority:
-        # this is the finite RyeOS execution allowance that can be transferred
-        # exactly across placements, not evidence of ChatGPT subscription spend.
-        allowance = session["limits"]["spend_usd"]
-        self.assertIsInstance(allowance, str)
-        self.assertRegex(allowance, r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
-        try:
-            parsed = Decimal(allowance)
-        except InvalidOperation as error:
-            self.fail(f"session allowance is not a canonical decimal: {error}")
-        self.assertGreater(parsed, Decimal(0))
+    def test_worker_profiles_combine_mode_disposition_and_delegation_ceiling(self) -> None:
+        for path in WORKER_EXECUTION_PATHS:
+            with self.subTest(profile=path.stem):
+                execution = yaml.safe_load(path.read_text(encoding="utf-8"))
+                config = execution["config"]
+                bounded = path.stem == "bounded-turn"
+                self.assertEqual(
+                    config["mode"]["kind"], "bounded_turn" if bounded else "session"
+                )
+                self.assertEqual(
+                    config["candidate_disposition"],
+                    "retained_for_review" if bounded else "owner_decision",
+                )
+                self.assertEqual(
+                    config["workload_client_delegation_caps"],
+                    [] if path.stem == "login" else ["ryeos.execute.tool.*"],
+                )
+                if bounded:
+                    self.assertEqual(execution["limits"]["turns"], 1)
+                    self.assertEqual(config["mode"]["max_uncontacted_attempts"], 3)
 
     def test_every_mapped_codex_file_reconstructs_its_worker_manifest_pin(self) -> None:
         activation = ACTIVATION_PATH.read_text(encoding="utf-8")

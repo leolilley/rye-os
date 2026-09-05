@@ -221,7 +221,8 @@ pub async fn push_descendant_snapshot_with_session(
 /// than a full-project tree. It still emits the current typed project snapshot
 /// closure; excluded ordinary project paths are absent from that tree.
 ///
-/// `remote_ignore`, when supplied, is applied to every candidate path
+/// The union of the source node's current policy and `remote_ignore` is
+/// applied to every candidate path
 /// under the allow-list so files the remote would later reject (e.g.
 /// `__pycache__/`, `*.pyc`) are dropped client-side instead of
 /// blowing up at `/push-head`.
@@ -231,11 +232,12 @@ pub async fn push_project_ai_only(
     authority: &PinnedStateAuthority,
     local_project_path: &Path,
     remote_project_path_for_ref: &str,
-    remote_ignore: Option<&IgnoreMatcher>,
+    remote_ignore: &IgnoreMatcher,
 ) -> Result<PushResult> {
     let app_root = &state.config.app_root;
     refuse_walking_root(local_project_path, app_root)?;
 
+    let transfer_ignore = state.ignore_matcher.union(remote_ignore)?;
     let local_cas = authority.cas_store()?;
     let recovery = authority.require_recovery()?;
     let project_root = lillux::PinnedDirectory::open(local_project_path)?.ok_or_else(|| {
@@ -250,19 +252,9 @@ pub async fn push_project_ai_only(
     };
 
     let operation = async {
-        let empty;
-        let matcher = match remote_ignore {
-            Some(matcher) => matcher,
-            None => {
-                empty = IgnoreMatcher::from_config(&ryeos_state::ignore::IgnoreConfig {
-                    patterns: Vec::new(),
-                })?;
-                &empty
-            }
-        };
         let policy = ryeos_state::project_sync::capture_snapshot_policy_from_pinned(
             &project_root,
-            matcher,
+            &transfer_ignore,
             ProjectSyncScope::AiOnly,
         )?;
         let tree = {
@@ -277,7 +269,7 @@ pub async fn push_project_ai_only(
         ryeos_state::project_sync::validate_captured_policy_source(&local_cas, &tree, &policy)?;
         if ryeos_state::project_sync::capture_snapshot_policy_from_pinned(
             &project_root,
-            matcher,
+            &transfer_ignore,
             ProjectSyncScope::AiOnly,
         )? != policy
         {
@@ -360,17 +352,18 @@ pub async fn push_project_ai_only(
 
 /// Push a project directory to a remote node.
 ///
-/// 1. Apply the remote's ingest ignore rules to build the manifest
+/// 1. Apply the union of source and remote ingest-ignore rules
 /// 2. Ingest locally into CAS
 /// 3. Build manifest + snapshot
 /// 4. Check which typed objects and blobs the remote already has
 /// 5. Upload missing blobs and objects, including manifest + snapshot
 /// 6. Call push-head to write the HEAD ref
 ///
-/// The `remote_ignore` matcher is the **only** ignore policy used: the
-/// manifest is built using the remote's rules so that the pushed content
-/// matches what the remote would accept during ingest. Callers must
-/// resolve ignore rules before calling this function.
+/// Both policies are independently authoritative. Their exclusion union keeps
+/// source-forbidden content out of local CAS/upload and target-forbidden
+/// content out of the transferred generation. The target still rechecks its
+/// current policy at admission. Callers must resolve the target rules before
+/// calling this function.
 pub async fn push_project(
     client: &RemoteClient,
     state: &Arc<AppState>,
@@ -391,6 +384,7 @@ pub async fn push_project(
     refuse_walking_root(project_path, app_root)?;
 
     // 1. Ingest project directory into local CAS using remote's ignore rules.
+    let transfer_ignore = state.ignore_matcher.union(remote_ignore)?;
     let local_cas = authority.cas_store()?;
     let recovery = authority.require_recovery()?;
     let project_root = lillux::PinnedDirectory::open(project_path)?.ok_or_else(|| {
@@ -404,7 +398,7 @@ pub async fn push_project(
     let operation = async {
         let policy = ryeos_state::project_sync::capture_snapshot_policy_from_pinned(
             &project_root,
-            remote_ignore,
+            &transfer_ignore,
             ProjectSyncScope::FullProject,
         )?;
         let tree = {
@@ -419,7 +413,7 @@ pub async fn push_project(
         ryeos_state::project_sync::validate_captured_policy_source(&local_cas, &tree, &policy)?;
         if ryeos_state::project_sync::capture_snapshot_policy_from_pinned(
             &project_root,
-            remote_ignore,
+            &transfer_ignore,
             ProjectSyncScope::FullProject,
         )? != policy
         {

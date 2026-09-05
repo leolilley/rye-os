@@ -156,6 +156,7 @@ fn build_and_extract_cancellation(
             &serde_json::Value::Null,
             &ctx.execution_hints,
             None,
+            ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         )
         .map_err(|e| e.to_string())?;
 

@@ -1,0 +1,15 @@
+tokens: [remote, worker, pull-result]
+description: "Pull one terminal hosted-worker candidate from a configured remote and apply it to the exact clean-base project"
+forms:
+  - slots:
+      - field: remote
+      - field: chain_root_id
+  - slots:
+      - field: chain_root_id
+project:
+  resolution: required
+  bind_parameter: project
+dispatch:
+  kind: execute_ref
+  execute: service:remote/pull-worker-result
+  availability: daemon

@@ -65,6 +65,7 @@ struct WorkerExecutionConfig {
     recover_upstream_session: bool,
     mode: WorkerExecutionMode,
     candidate_disposition: String,
+    workload_client_delegation_caps: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +254,7 @@ async fn run_session(
         bail!("admitted worker execution config is outside runtime bounds");
     }
     validate_runtime_mode_policy(&config)?;
+    validate_runtime_delegation_ceiling(&config.workload_client_delegation_caps)?;
     let (credential_profile_id, bounded_goal) = match &config.mode {
         WorkerExecutionMode::Session => {
             let inputs: SessionInputs =
@@ -271,8 +273,9 @@ async fn run_session(
             (inputs.credential_profile_id, Some(inputs.goal))
         }
     };
-    let max_lifetime = std::time::Duration::from_secs(config.max_lifetime_seconds);
-    let interactive_deadline = tokio::time::Instant::now() + max_lifetime;
+    let interactive_deadline = lillux::time::MonotonicDeadline::after(
+        lillux::time::Duration::from_secs(config.max_lifetime_seconds),
+    );
     client
         .mark_running(&thread_id)
         .await
@@ -374,7 +377,7 @@ async fn run_session(
             .await;
         }
         let remaining_ms = u64::try_from(lifetime_ms - elapsed_ms)?;
-        tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
+        lillux::time::MonotonicDeadline::after(lillux::time::Duration::from_millis(remaining_ms))
     } else {
         interactive_deadline
     };
@@ -423,8 +426,9 @@ async fn run_session(
                 .map_err(|error| anyhow!(error.to_string()))?;
             return Ok(terminal_result(thread_id, terminal));
         }
-        let aggregate_deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(u64::try_from(remaining_ms)?);
+        let aggregate_deadline = lillux::time::MonotonicDeadline::after(
+            lillux::time::Duration::from_millis(u64::try_from(remaining_ms)?),
+        );
         deadline = deadline.min(aggregate_deadline);
     }
     if started.get("state").and_then(Value::as_str) == Some("recovering") {
@@ -499,7 +503,7 @@ async fn run_session(
         if matches!(status, "terminal" | "freezing") {
             return Ok(terminal_result(thread_id, started));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.has_elapsed() {
             let terminal = client
                 .terminate_dedicated_session(DedicatedSessionTerminateRequest {
                     thread_id: thread_id.clone(),
@@ -514,8 +518,8 @@ async fn run_session(
             .get("updated_at_ms")
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("dedicated session projection has no update sequence"))?;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let wait = remaining.min(std::time::Duration::from_secs(300));
+        let remaining = deadline.remaining();
+        let wait = remaining.min(lillux::time::Duration::from_secs(300));
         let current = client
             .wait_dedicated_session(ryeos_runtime::callback::DedicatedSessionWaitRequest {
                 thread_id: thread_id.clone(),
@@ -555,6 +559,23 @@ fn validate_runtime_mode_policy(config: &WorkerExecutionConfig) -> Result<()> {
     }
 }
 
+fn validate_runtime_delegation_ceiling(capabilities: &[String]) -> Result<()> {
+    if capabilities.len() > 256 {
+        bail!("admitted workload-client delegation ceiling exceeds its bound");
+    }
+    let mut previous_capability: Option<&str> = None;
+    for capability in capabilities {
+        if previous_capability.is_some_and(|previous| previous >= capability.as_str())
+            || !capability.starts_with("ryeos.execute.")
+            || ryeos_runtime::authorizer::validate_scope_pattern(capability).is_err()
+        {
+            bail!("admitted workload-client delegation ceiling is not canonical");
+        }
+        previous_capability = Some(capability);
+    }
+    Ok(())
+}
+
 fn validate_goal_payload(label: &str, payload: &Value) -> Result<()> {
     if !payload.is_object() {
         bail!("bounded {label} payload must be an object");
@@ -575,7 +596,7 @@ async fn run_bounded_turn(
     turn_start_route: &str,
     max_uncontacted_attempts: u32,
     goal: BoundedTurnGoal,
-    deadline: tokio::time::Instant,
+    deadline: lillux::time::MonotonicDeadline,
 ) -> Result<RuntimeResult> {
     if let Some(approval) = pending_approval(session, thread_id)? {
         return cancel_bounded_session(
@@ -735,7 +756,7 @@ async fn run_bounded_turn(
             )
             .await;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.has_elapsed() {
             return cancel_bounded_session(
                 client,
                 thread_id,
@@ -797,8 +818,8 @@ async fn run_bounded_turn(
             .get("updated_at_ms")
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("dedicated session projection has no update sequence"))?;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let wait = remaining.min(std::time::Duration::from_secs(300));
+        let remaining = deadline.remaining();
+        let wait = remaining.min(lillux::time::Duration::from_secs(300));
         *session = client
             .wait_dedicated_session(ryeos_runtime::callback::DedicatedSessionWaitRequest {
                 thread_id: thread_id.to_owned(),
@@ -843,7 +864,7 @@ async fn issue_bounded_step(
     route_id: &str,
     payload: Value,
     max_uncontacted_attempts: u32,
-    deadline: tokio::time::Instant,
+    deadline: lillux::time::MonotonicDeadline,
 ) -> std::result::Result<BoundedStepSettlement, BoundedStepIssueError> {
     if !matches!(step, "session-start" | "turn-start") {
         return Err(bounded_step_error(
@@ -858,7 +879,7 @@ async fn issue_bounded_step(
         ));
     }
     for attempt in 1..=max_uncontacted_attempts {
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.has_elapsed() {
             return Err(bounded_duration_error(
                 "bounded worker deadline reached before command admission",
             ));
@@ -873,7 +894,7 @@ async fn issue_bounded_step(
             })
             .await
             .map_err(|error| {
-                if tokio::time::Instant::now() >= deadline
+                if deadline.has_elapsed()
                     || matches!(
                         &error,
                         CallbackError::ActionFailed { code, .. } if code == "budget_exhausted"
@@ -1159,12 +1180,31 @@ mod tests {
                 max_uncontacted_attempts: 3,
             },
             candidate_disposition: "retained_for_review".to_owned(),
+            workload_client_delegation_caps: vec!["ryeos.execute.tool.*".to_owned()],
         };
         validate_runtime_mode_policy(&config).unwrap();
 
         let mut owner_decision = config;
         owner_decision.candidate_disposition = "owner_decision".to_owned();
         assert!(validate_runtime_mode_policy(&owner_decision).is_err());
+    }
+
+    #[test]
+    fn workload_client_delegation_ceiling_is_explicit_canonical_execution_authority() {
+        validate_runtime_delegation_ceiling(&[]).unwrap();
+        validate_runtime_delegation_ceiling(&["ryeos.execute.tool.*".to_owned()]).unwrap();
+        for invalid in [
+            vec!["*".to_owned()],
+            vec!["ryeos.runtime.dedicated_session.*".to_owned()],
+            vec!["ryeos.execute.tool.*".to_owned(); 2],
+            vec![
+                "ryeos.execute.tool.z".to_owned(),
+                "ryeos.execute.tool.a".to_owned(),
+            ],
+            vec!["ryeos.execute.tool.*".to_owned(); 257],
+        ] {
+            assert!(validate_runtime_delegation_ceiling(&invalid).is_err());
+        }
     }
 
     #[test]

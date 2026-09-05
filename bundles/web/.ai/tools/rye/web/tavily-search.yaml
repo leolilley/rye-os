@@ -3,6 +3,7 @@ category: "rye/web"
 version: "1.0.0"
 tool_type: "subprocess"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Search the web via Tavily — a fast, reliable search API built for LLM use. Returns ranked result titles, URLs, and snippets. Requires TAVILY_API_KEY."
 
 # Resolved from host env by name (vault > host env > .env) and injected into the

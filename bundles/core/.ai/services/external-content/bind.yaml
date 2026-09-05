@@ -7,4 +7,7 @@ schema:
   request_digest: string
   manifest_hash: string
   consumer_ref: string
-description: "Bind a staged external-content manifest to one exact trusted bundle consumer"
+  consumer_kind: string
+  project_snapshot_hash: string?
+  project_path: string?
+description: "Bind a staged external-content manifest to one exact installed-bundle or pinned-project consumer"

@@ -43,6 +43,7 @@ mod routing;
 #[cfg(feature = "crash-qualification-test-support")]
 mod runtime_phase_cut;
 mod transport;
+mod workload_client;
 
 #[cfg(test)]
 pub(crate) use routing::dispatch;
@@ -392,6 +393,9 @@ pub(crate) async fn dispatch_runtime_method(
             .assert_launch_owner(&cap.thread_id, owner)?;
     }
 
+    if let Some(cap) = callback_cap.as_ref() {
+        cap.runtime_method_surface.authorize(method)?;
+    }
     enforce_aggregate_work_deadline(method, state, callback_cap.as_ref())?;
 
     enforce_runtime_callback_admission(method, params, state)?;
@@ -402,7 +406,7 @@ pub(crate) async fn dispatch_runtime_method(
     let clean_params = strip_transport_fields(params);
 
     match method {
-        "runtime.dispatch_action" => {
+        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD => {
             ryeos_executor::execution::runtime_dispatch::handle(params, state).await
         }
         "runtime.spawn_follow_child" => {
@@ -619,6 +623,20 @@ fn enforce_aggregate_work_deadline(
     state: &AppState,
     cap: Option<&ryeos_app::callback_token::CallbackCapability>,
 ) -> Result<()> {
+    enforce_aggregate_work_deadline_at_ms(
+        method,
+        state,
+        cap,
+        lillux::time::timestamp_millis(),
+    )
+}
+
+fn enforce_aggregate_work_deadline_at_ms(
+    method: &str,
+    state: &AppState,
+    cap: Option<&ryeos_app::callback_token::CallbackCapability>,
+    now_ms: i64,
+) -> Result<()> {
     // Gate every callback that can begin/advance child work, provider work, or
     // durable workload publication. Reads and lifecycle/accounting settlement
     // remain available after expiry so the daemon can fail and clean up the
@@ -648,12 +666,13 @@ fn enforce_aggregate_work_deadline(
     ) {
         return Ok(());
     }
-    enforce_aggregate_deadline(state, cap)
+    enforce_aggregate_deadline(state, cap, now_ms)
 }
 
 fn enforce_aggregate_deadline(
     state: &AppState,
     cap: Option<&ryeos_app::callback_token::CallbackCapability>,
+    now_ms: i64,
 ) -> Result<()> {
     let Some(scope) = cap.and_then(|cap| cap.accounting_scope.as_ref()) else {
         return Ok(());
@@ -667,7 +686,7 @@ fn enforce_aggregate_deadline(
         .ok_or_else(|| anyhow!("sealed execution scope has no aggregate budget authority"))?;
     if budget
         .deadline_at_ms
-        .is_some_and(|deadline| lillux::time::timestamp_millis() >= deadline)
+        .is_some_and(|deadline| now_ms >= deadline)
     {
         return Err(ryeos_executor::dispatch_error::DispatchError::LaunchPreparationFailed {
             code: "budget_exhausted".to_owned(),
@@ -717,7 +736,7 @@ fn is_running_runtime_mutation(method: &str) -> bool {
         method,
         "runtime.append_event"
             | "runtime.append_events"
-            | "runtime.dispatch_action"
+            | ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD
             | "runtime.spawn_follow_child"
             | "runtime.request_continuation"
             | "runtime.author_item"
@@ -782,7 +801,7 @@ fn is_sensitive_runtime_read_method(method: &str) -> bool {
 fn is_thread_auth_method(method: &str) -> bool {
     matches!(
         method,
-        "runtime.dispatch_action" | "runtime.spawn_follow_child"
+        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD | "runtime.spawn_follow_child"
     )
 }
 
@@ -2079,7 +2098,12 @@ mod tests {
             scheduler_db: Arc::new(crate::scheduler::db::SchedulerDb::new_in_memory().unwrap()),
             scheduler_runtime_gate: Arc::new(tokio::sync::RwLock::new(())),
             scheduler_reload_tx: None,
-            ignore_matcher: Arc::new(ryeos_app::ignore::matcher_from_builtins()),
+            ignore_matcher: Arc::new(
+                ryeos_app::ignore::IgnoreMatcher::from_config(&ryeos_app::ignore::IgnoreConfig {
+                    patterns: Vec::new(),
+                })
+                .unwrap(),
+            ),
             vault_fingerprint: None,
             accounting: None,
             persistent_sessions: Arc::new(
@@ -5382,6 +5406,190 @@ mod tests {
                 || err.message.contains("thread_auth"),
             "expected invalid-thread-auth error, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn exact_callback_method_surface_is_enforced_before_runtime_routing() {
+        let (_tmp, state) = setup_app_state();
+        create_running_test_thread(&state, "T-method-surface");
+        let cbt = generate_test_callback(
+            &state,
+            "T-method-surface",
+            std::path::PathBuf::from("/p"),
+            std::time::Duration::from_secs(300),
+            vec!["*".to_string()],
+            test_provenance(&state, "/p"),
+            "0".repeat(64),
+        );
+        assert!(
+            state
+                .callback_tokens
+                .restrict_runtime_methods(
+                    &cbt.token,
+                    ryeos_app::callback_token::CallbackRuntimeMethodSurface::exact(vec![
+                        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD.to_owned(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap()
+        );
+
+        let response = dispatch(
+            rpc(
+                "runtime.vault_get",
+                json!({
+                    "callback_token": cbt.token,
+                    "thread_id": "T-method-surface",
+                }),
+            ),
+            &state,
+        )
+        .await;
+        let error = rpc_err(&response);
+        assert!(
+            error
+                .message
+                .contains("does not authorize runtime method `runtime.vault_get`")
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_workload_callback_inherits_deadline_without_widening_settlement_authority() {
+        let (tmp, mut state) = setup_app_state();
+        let thread_id = "T-workload-budget";
+        create_running_test_thread(&state, thread_id);
+        let ledger = Arc::new(
+            ryeos_app::accounting_db::AccountingDb::open_default(
+                &tmp.path().join("workload-budget"),
+            )
+            .unwrap(),
+        );
+        let execution_budget_id = "execution-workload-budget";
+        ledger
+            .create_execution_account_prepared(execution_budget_id, thread_id, None)
+            .unwrap();
+        let budget = ledger
+            .ensure_execution_resource_budget(
+                execution_budget_id,
+                &ryeos_engine::launch_envelope_types::AggregateExecutionLimits {
+                    duration_seconds: 60,
+                    worker_executions: 1,
+                    provider_contacts: 1,
+                },
+            )
+            .unwrap();
+        let deadline_at_ms = budget.deadline_at_ms.unwrap();
+        state.accounting = Some(Arc::clone(&ledger));
+        let root = generate_test_callback(
+            &state,
+            thread_id,
+            std::path::PathBuf::from("/p"),
+            std::time::Duration::from_secs(300),
+            vec!["*".to_owned()],
+            test_provenance(&state, "/p"),
+            "0".repeat(64),
+        );
+        let (budget_authority_site_id, ledger_epoch) = ledger.site_identity();
+        assert!(state.callback_tokens.set_accounting_scope(
+            &root.token,
+            ryeos_state::objects::AdmittedAccountingScope {
+                budget_authority_site_id,
+                ledger_epoch,
+                execution_budget_id: execution_budget_id.to_owned(),
+                directive_budget_id: None,
+            },
+        ));
+        let root = state.callback_tokens.validate_token_only(&root.token).unwrap();
+        let workload = generate_test_callback(
+            &state,
+            thread_id,
+            std::path::PathBuf::from("/p"),
+            std::time::Duration::from_secs(300),
+            vec!["ryeos.execute.tool.fixture".to_owned()],
+            test_provenance(&state, "/p"),
+            "0".repeat(64),
+        );
+        assert!(state.callback_tokens.set_accounting_scope(
+            &workload.token,
+            root.accounting_scope.clone().unwrap(),
+        ));
+        assert!(state.callback_tokens.restrict_runtime_methods(
+            &workload.token,
+            ryeos_app::callback_token::CallbackRuntimeMethodSurface::exact(vec![
+                ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD.to_owned(),
+            ])
+            .unwrap(),
+        ).unwrap());
+        let workload = state.callback_tokens.validate_token_only(&workload.token).unwrap();
+        assert_eq!(workload.accounting_scope, root.accounting_scope);
+        enforce_aggregate_work_deadline_at_ms(
+            ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD,
+            &state,
+            Some(&workload),
+            deadline_at_ms - 1,
+        )
+        .unwrap();
+        let error = enforce_aggregate_work_deadline_at_ms(
+            ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD,
+            &state,
+            Some(&workload),
+            deadline_at_ms,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ryeos_executor::dispatch_error::DispatchError>(),
+            Some(ryeos_executor::dispatch_error::DispatchError::LaunchPreparationFailed {
+                code, ..
+            }) if code == "budget_exhausted"
+        ));
+        for method in [
+            "runtime.finalize_thread",
+            "runtime.complete_command",
+            "runtime.provider_attempt_settle",
+            "runtime.provider_attempt_release_unissued",
+            "runtime.provider_attempt_local_stream_control",
+            "runtime.get_thread",
+        ] {
+            enforce_aggregate_work_deadline_at_ms(
+                method,
+                &state,
+                Some(&root),
+                deadline_at_ms,
+            )
+            .unwrap();
+            assert!(workload.runtime_method_surface.authorize(method).is_err());
+        }
+        assert_eq!(
+            ledger.execution_resource_budget_snapshot(execution_budget_id).unwrap(),
+            Some(budget),
+        );
+
+        // The internal entry point requires no kernel peer for dispatch, but
+        // cannot bypass a missing inherited ledger to reach child decoding.
+        let tat = state.thread_auth.mint(
+            thread_id,
+            "user:test".to_owned(),
+            workload.effective_caps.clone(),
+            None,
+            state.threads.site_id(),
+            state.threads.site_id(),
+            std::time::Duration::from_secs(300),
+        ).unwrap();
+        state.accounting = None;
+        let error = dispatch_runtime_method(
+            ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD,
+            &json!({
+                "callback_token": workload.token,
+                "thread_id": thread_id,
+                "thread_auth_token": tat.token,
+                "action": {},
+            }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no live accounting ledger"));
     }
 
     #[tokio::test]

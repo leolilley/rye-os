@@ -414,6 +414,88 @@ pub struct RuntimeActionIntent {
     pub launch_metadata: Option<crate::launch_metadata::RuntimeLaunchMetadata>,
     pub incompatible_launch_metadata: Option<IncompatibleLaunchMetadata>,
     pub initial_events: Option<Vec<crate::state_store::NewEventRecord>>,
+    /// Optional generic shared-workspace authority for this exact action.
+    /// RuntimeActionIntent is the sole durable owner: do not add a parallel
+    /// workspace-lease table or a second child-operation ledger.
+    pub workspace_operation: Option<RuntimeWorkspaceOperation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeWorkspaceOperationPhase {
+    Reserved,
+    Quiescing,
+    Quiesced,
+    ChildRunning,
+    Settling,
+    Released,
+}
+
+impl RuntimeWorkspaceOperationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Quiescing => "quiescing",
+            Self::Quiesced => "quiesced",
+            Self::ChildRunning => "child_running",
+            Self::Settling => "settling",
+            Self::Released => "released",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "quiescing" => Ok(Self::Quiescing),
+            "quiesced" => Ok(Self::Quiesced),
+            "child_running" => Ok(Self::ChildRunning),
+            "settling" => Ok(Self::Settling),
+            "released" => Ok(Self::Released),
+            other => bail!("invalid runtime workspace-operation phase `{other}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkspaceOperation {
+    pub workspace_id: String,
+    pub access: ryeos_engine::kind_registry::WorkspaceAccess,
+    pub phase: RuntimeWorkspaceOperationPhase,
+    pub worker_instance_id: String,
+    pub worker_boot_epoch: u64,
+    pub worker_boot_identity_hash: String,
+    pub project_authority_digest: String,
+    pub workload_client_grant_digest: String,
+    pub input_snapshot_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRuntimeWorkspaceOperation<'a> {
+    pub workspace_id: &'a str,
+    pub access: ryeos_engine::kind_registry::WorkspaceAccess,
+    pub worker_instance_id: &'a str,
+    pub worker_boot_epoch: u64,
+    pub worker_boot_identity_hash: &'a str,
+    pub project_authority_digest: &'a str,
+    pub workload_client_grant_digest: &'a str,
+}
+
+fn workspace_access_as_str(access: ryeos_engine::kind_registry::WorkspaceAccess) -> &'static str {
+    match access {
+        ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration => {
+            "immutable_current_generation"
+        }
+        ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive => "shared_exclusive",
+    }
+}
+
+fn parse_workspace_access(value: &str) -> Result<ryeos_engine::kind_registry::WorkspaceAccess> {
+    match value {
+        "immutable_current_generation" => {
+            Ok(ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration)
+        }
+        "shared_exclusive" => Ok(ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive),
+        other => bail!("invalid runtime workspace-operation access `{other}`"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -426,6 +508,46 @@ pub struct RecoveryWaitDisposition {
 }
 
 fn decode_runtime_action_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeActionIntent> {
+    let workspace_id = row.get::<_, Option<String>>(10)?;
+    let workspace_operation = workspace_id
+        .map(|workspace_id| {
+            let access =
+                parse_workspace_access(row.get::<_, String>(11)?.as_str()).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })?;
+            let phase = RuntimeWorkspaceOperationPhase::parse(row.get::<_, String>(12)?.as_str())
+                .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    12,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?;
+            let worker_boot_epoch = row.get::<_, i64>(14)?;
+            let worker_boot_epoch = u64::try_from(worker_boot_epoch).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Integer,
+                    error.into(),
+                )
+            })?;
+            Ok::<_, rusqlite::Error>(RuntimeWorkspaceOperation {
+                workspace_id,
+                access,
+                phase,
+                worker_instance_id: row.get(13)?,
+                worker_boot_epoch,
+                worker_boot_identity_hash: row.get(15)?,
+                project_authority_digest: row.get(16)?,
+                workload_client_grant_digest: row.get(17)?,
+                input_snapshot_hash: row.get(18)?,
+            })
+        })
+        .transpose()?;
     Ok(RuntimeActionIntent {
         operation_id: row.get(0)?,
         chain_root_id: row.get(1)?,
@@ -461,6 +583,7 @@ fn decode_runtime_action_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run
                     Box::new(error),
                 )
             })?,
+        workspace_operation,
     })
 }
 
@@ -897,6 +1020,15 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
     admitted_launch_capsule_hash TEXT,
     launch_metadata TEXT,
     initial_events TEXT,
+    workspace_id TEXT,
+    workspace_access TEXT CHECK (workspace_access IN ('immutable_current_generation', 'shared_exclusive')),
+    workspace_operation_phase TEXT CHECK (workspace_operation_phase IN ('reserved', 'quiescing', 'quiesced', 'child_running', 'settling', 'released')),
+    workspace_worker_instance_id TEXT,
+    workspace_worker_boot_epoch INTEGER CHECK (workspace_worker_boot_epoch > 0),
+    workspace_worker_boot_identity_hash TEXT,
+    workspace_project_authority_digest TEXT,
+    workspace_grant_digest TEXT,
+    workspace_input_snapshot_hash TEXT,
     created_at_ms INTEGER NOT NULL,
     CHECK (
         mode = 'detached'
@@ -906,11 +1038,53 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
             AND launch_metadata IS NULL
             AND initial_events IS NULL
         )
+    ),
+    CHECK (
+        (
+            workspace_id IS NULL
+            AND workspace_access IS NULL
+            AND workspace_operation_phase IS NULL
+            AND workspace_worker_instance_id IS NULL
+            AND workspace_worker_boot_epoch IS NULL
+            AND workspace_worker_boot_identity_hash IS NULL
+            AND workspace_project_authority_digest IS NULL
+            AND workspace_grant_digest IS NULL
+            AND workspace_input_snapshot_hash IS NULL
+        )
+        OR
+        (
+            mode = 'inline'
+            AND
+            workspace_id IS NOT NULL
+            AND workspace_access IS NOT NULL
+            AND workspace_operation_phase IS NOT NULL
+            AND workspace_worker_instance_id IS NOT NULL
+            AND workspace_worker_boot_epoch IS NOT NULL
+            AND workspace_worker_boot_identity_hash IS NOT NULL
+            AND workspace_project_authority_digest IS NOT NULL
+            AND workspace_grant_digest IS NOT NULL
+            AND (
+                workspace_input_snapshot_hash IS NULL
+                OR workspace_access = 'immutable_current_generation'
+            )
+        )
     )
 );
 
 CREATE INDEX IF NOT EXISTS idx_runtime_action_intent_chain_root
     ON runtime_action_intent(chain_root_id);
+
+-- This is the mechanical shared-workspace barrier. Immutable children leave
+-- the index after binding their separate read-only generation; an exclusive
+-- child remains indexed until release. The runtime-action row remains the
+-- only lease authority, so no parallel lock/child table is needed.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_action_workspace_barrier
+    ON runtime_action_intent(workspace_id)
+    WHERE workspace_operation_phase IN ('reserved', 'quiescing', 'quiesced')
+       OR (
+           workspace_access = 'shared_exclusive'
+           AND workspace_operation_phase IN ('child_running', 'settling')
+       );
 
 CREATE TABLE IF NOT EXISTS thread_recovery_wait (
     thread_id TEXT PRIMARY KEY,
@@ -1317,18 +1491,18 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // and launch-metadata epoch 23. It also makes each handoff credential
 // reservation the durable owner of the exact target project-HEAD fence until
 // authoritative adoption. Predecessor reservations cannot prove that fence.
-// Epoch 22 stores the original worker boot epoch inside every completion fence,
-// adds the signed candidate-disposition policy, and retains the closed bounded
-// terminal outcome before worker cleanup. A current recovery worker must never
-// be substituted for the epoch that observed a completed turn, and recovery
-// must not reconstruct or redrive a bounded outcome from mutable session state.
-// Epoch 23 retains the exact independently completed evaluator testimony used
-// by owner adoption and HEAD publication. It is a projection on the existing
-// candidate controller, never an append to the terminal worker root.
-// Epoch 24 journals candidate qualification before its append-only adoption
-// fact is contacted. Recovery can therefore settle the exact fact or roll back
-// a proved-uncontacted reservation without discovering roots sideways.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 24;
+// Epoch 22 extends the existing RuntimeActionIntent authority with the generic
+// shared-workspace access class, exact worker boot/grant/project coordinates,
+// phase barrier, and immutable input generation. Predecessor action rows
+// cannot authorize or recover these operations.
+// Epoch 25 combines that workspace-operation authority with bounded worker
+// outcomes/original completion epochs, independent candidate evaluation, and
+// journaled qualification/disposition. It also admits launch-metadata 27,
+// sealed-request 16, launch capsule 23 and persistent-session capsule 8.
+// Neither the source-local epoch 22 nor the
+// separately checkpointed campaign epochs 22–24 can authorize this combined
+// execution contract; there is no open-time migration.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 25;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -1642,6 +1816,60 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                     },
                     sqlite_schema::ColumnSpec {
                         name: "initial_events",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_access",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_operation_phase",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_worker_instance_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_worker_boot_epoch",
+                        col_type: "INTEGER",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_worker_boot_identity_hash",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_project_authority_digest",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_grant_digest",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_input_snapshot_hash",
                         col_type: "TEXT",
                         pk: false,
                         not_null: false,
@@ -2940,6 +3168,12 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                 table: "runtime_action_intent",
                 columns: &["chain_root_id"],
                 unique: false,
+            },
+            sqlite_schema::IndexSpec {
+                name: "idx_runtime_action_workspace_barrier",
+                table: "runtime_action_intent",
+                columns: &["workspace_id"],
+                unique: true,
             },
             sqlite_schema::IndexSpec {
                 name: "idx_follow_waiter_successor",
@@ -4291,6 +4525,15 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
     if let Some(authority) = &intent.child_project_authority {
         authority.validate()?;
     }
+    if let Some(operation) = &intent.workspace_operation {
+        if !matches!(intent.mode, RuntimeActionMode::Inline) {
+            bail!(
+                "runtime action `{}` carries workspace authority outside unary inline mode",
+                intent.operation_id
+            );
+        }
+        validate_runtime_workspace_operation(operation)?;
+    }
     if intent.launch_metadata.is_some() && intent.incompatible_launch_metadata.is_some() {
         bail!(
             "detached operation `{}` has both current and incompatible launch authority",
@@ -4333,6 +4576,66 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
                 intent.operation_id
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_runtime_workspace_operation(operation: &RuntimeWorkspaceOperation) -> Result<()> {
+    for (label, value, limit) in [
+        ("workspace id", operation.workspace_id.as_str(), 256usize),
+        (
+            "worker instance id",
+            operation.worker_instance_id.as_str(),
+            256usize,
+        ),
+    ] {
+        if value.is_empty()
+            || value.len() > limit
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            bail!("runtime workspace-operation {label} is not canonical");
+        }
+    }
+    if operation.worker_boot_epoch == 0 || operation.worker_boot_epoch > i64::MAX as u64 {
+        bail!("runtime workspace-operation worker boot epoch must be positive");
+    }
+    for (label, digest) in [
+        (
+            "worker boot identity",
+            operation.worker_boot_identity_hash.as_str(),
+        ),
+        (
+            "project authority",
+            operation.project_authority_digest.as_str(),
+        ),
+        (
+            "workload-client grant",
+            operation.workload_client_grant_digest.as_str(),
+        ),
+    ] {
+        validate_sha256(&format!("runtime workspace-operation {label}"), digest)?;
+    }
+    if let Some(snapshot_hash) = operation.input_snapshot_hash.as_deref() {
+        validate_sha256("runtime workspace-operation input snapshot", snapshot_hash)?;
+        if operation.access
+            != ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+        {
+            bail!("exclusive runtime workspace operation cannot carry an input snapshot");
+        }
+    }
+    // A rejected operation may release before capture and therefore has no
+    // selected input. Once an immutable child can have been contacted, the
+    // exact input is mandatory. `Released` preserves either valid historical
+    // shape rather than inventing an input for a pre-contact failure.
+    if matches!(
+        operation.phase,
+        RuntimeWorkspaceOperationPhase::ChildRunning | RuntimeWorkspaceOperationPhase::Settling
+    ) && operation.access
+        == ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+        && operation.input_snapshot_hash.is_none()
+    {
+        bail!("running immutable workspace operation has no sealed input generation");
     }
     Ok(())
 }
@@ -8259,10 +8562,10 @@ impl RuntimeDb {
             bail!("new worker process must enter as attached and owned");
         }
         let tx = self.conn.unchecked_transaction()?;
-        let session: Option<(String, String, String, String, i64)> = tx
+        let session: Option<(String, String, String, String, i64, String)> = tx
             .query_row(
                 "SELECT admitted_capsule_hash, workspace_id, state,
-                        credential_profile_id, credential_generation
+                        credential_profile_id, credential_generation, chain_root_id
                  FROM dedicated_session WHERE placement_thread_id = ?1",
                 [&record.placement_thread_id],
                 |row| {
@@ -8272,16 +8575,36 @@ impl RuntimeDb {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((capsule_hash, workspace_id, session_state, profile_id, generation)) = session
+        let Some((
+            capsule_hash,
+            workspace_id,
+            session_state,
+            profile_id,
+            generation,
+            chain_root_id,
+        )) = session
         else {
             bail!("worker process references an unknown dedicated session");
         };
         if capsule_hash != record.session_capsule_hash || session_state != "admitted" {
             bail!("worker process contradicts admitted session authority or state");
+        }
+        let unsettled_workspace_operation: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_action_intent
+              WHERE chain_root_id=?1 AND workspace_id IS NOT NULL
+                AND workspace_operation_phase!='released')",
+            [&chain_root_id],
+            |row| row.get(0),
+        )?;
+        if unsettled_workspace_operation {
+            bail!(
+                "dedicated worker attachment is fenced by an unsettled shared-workspace operation"
+            );
         }
         let credential_fenced: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM credential_profile
@@ -10146,8 +10469,38 @@ impl RuntimeDb {
         proposed_child_thread_id: &str,
         child_project_authority: Option<&ryeos_state::objects::ExecutionProjectAuthority>,
     ) -> Result<String> {
+        self.reserve_runtime_action_intent_with_workspace(
+            operation_id,
+            chain_root_id,
+            caller_thread_id,
+            mode,
+            request_hash,
+            proposed_child_thread_id,
+            child_project_authority,
+            None,
+        )
+    }
+
+    /// Workspace-aware form of runtime-action reservation. This extends the
+    /// existing one-operation/one-child row; callers must not reserve a second
+    /// lock row and attempt to couple it after the fact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_runtime_action_intent_with_workspace(
+        &self,
+        operation_id: &str,
+        chain_root_id: &str,
+        caller_thread_id: &str,
+        mode: RuntimeActionMode,
+        request_hash: &str,
+        proposed_child_thread_id: &str,
+        child_project_authority: Option<&ryeos_state::objects::ExecutionProjectAuthority>,
+        workspace_operation: Option<&NewRuntimeWorkspaceOperation<'_>>,
+    ) -> Result<String> {
         if matches!(mode, RuntimeActionMode::Inline) && child_project_authority.is_some() {
             bail!("inline runtime action cannot carry detached project authority");
+        }
+        if workspace_operation.is_some() && !matches!(mode, RuntimeActionMode::Inline) {
+            bail!("shared-workspace runtime action must use unary inline child execution");
         }
         validate_runtime_action_intent(
             operation_id,
@@ -10157,13 +10510,36 @@ impl RuntimeDb {
             request_hash,
             proposed_child_thread_id,
         )?;
+        let proposed_workspace_operation = workspace_operation
+            .map(|seed| RuntimeWorkspaceOperation {
+                workspace_id: seed.workspace_id.to_owned(),
+                access: seed.access,
+                phase: RuntimeWorkspaceOperationPhase::Reserved,
+                worker_instance_id: seed.worker_instance_id.to_owned(),
+                worker_boot_epoch: seed.worker_boot_epoch,
+                worker_boot_identity_hash: seed.worker_boot_identity_hash.to_owned(),
+                project_authority_digest: seed.project_authority_digest.to_owned(),
+                workload_client_grant_digest: seed.workload_client_grant_digest.to_owned(),
+                input_snapshot_hash: None,
+            })
+            .map(|operation| {
+                validate_runtime_workspace_operation(&operation)?;
+                Ok::<_, anyhow::Error>(operation)
+            })
+            .transpose()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO runtime_action_intent(
                 operation_id, chain_root_id, first_caller_thread_id, mode,
                 request_hash, child_thread_id,
-                child_project_authority, created_at_ms
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                child_project_authority,
+                workspace_id, workspace_access, workspace_operation_phase,
+                workspace_worker_instance_id, workspace_worker_boot_epoch,
+                workspace_worker_boot_identity_hash,
+                workspace_project_authority_digest, workspace_grant_digest,
+                created_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                      ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(operation_id) DO NOTHING",
             params![
                 operation_id,
@@ -10175,51 +10551,82 @@ impl RuntimeDb {
                 child_project_authority
                     .map(encode_current_project_authority)
                     .transpose()?,
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| operation.workspace_id.as_str()),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| workspace_access_as_str(operation.access)),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| operation.phase.as_str()),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| operation.worker_instance_id.as_str()),
+                proposed_workspace_operation
+                    .as_ref()
+                    .and_then(|operation| i64::try_from(operation.worker_boot_epoch).ok()),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| operation.worker_boot_identity_hash.as_str()),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| operation.project_authority_digest.as_str()),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| operation.workload_client_grant_digest.as_str()),
                 lillux::time::timestamp_millis(),
             ],
         )?;
-        let (
-            stored_chain,
-            stored_caller,
-            stored_mode,
-            stored_request,
-            child_thread_id,
-            stored_authority,
-        ): (String, String, String, String, String, Option<String>) = tx.query_row(
-            "SELECT chain_root_id, first_caller_thread_id, mode, request_hash,
-                    child_thread_id, child_project_authority
-                   FROM runtime_action_intent WHERE operation_id=?1",
+        let persisted = tx.query_row(
+            "SELECT operation_id, chain_root_id, first_caller_thread_id, mode,
+                    request_hash, child_thread_id,
+                    child_project_authority, admitted_launch_capsule_hash,
+                    launch_metadata, initial_events,
+                    workspace_id, workspace_access, workspace_operation_phase,
+                    workspace_worker_instance_id, workspace_worker_boot_epoch,
+                    workspace_worker_boot_identity_hash,
+                    workspace_project_authority_digest, workspace_grant_digest,
+                    workspace_input_snapshot_hash
+               FROM runtime_action_intent WHERE operation_id=?1",
             params![operation_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
+            decode_runtime_action_intent,
         )?;
-        if stored_chain != chain_root_id
-            || stored_caller != caller_thread_id
-            || stored_mode != mode.as_str()
-            || stored_request != request_hash
+        if persisted.chain_root_id != chain_root_id
+            || persisted.first_caller_thread_id != caller_thread_id
+            || persisted.mode != mode
+            || persisted.request_hash != request_hash
         {
             bail!(
                 "runtime action `{operation_id}` was reused with different chain, caller, mode, or request authority"
             );
         }
-        let stored_authority = stored_authority
-            .as_deref()
-            .map(decode_current_project_authority)
-            .transpose()?;
-        if child_project_authority.is_some() && stored_authority.as_ref() != child_project_authority
+        if child_project_authority.is_some()
+            && persisted.child_project_authority.as_ref() != child_project_authority
         {
             bail!("runtime action `{operation_id}` was reused with different project authority");
         }
+        let workspace_authority_matches = match (
+            persisted.workspace_operation.as_ref(),
+            proposed_workspace_operation.as_ref(),
+        ) {
+            (None, None) => true,
+            (Some(stored), Some(proposed)) => {
+                stored.workspace_id == proposed.workspace_id
+                    && stored.access == proposed.access
+                    && stored.worker_instance_id == proposed.worker_instance_id
+                    && stored.worker_boot_epoch == proposed.worker_boot_epoch
+                    && stored.worker_boot_identity_hash == proposed.worker_boot_identity_hash
+                    && stored.project_authority_digest == proposed.project_authority_digest
+                    && stored.workload_client_grant_digest == proposed.workload_client_grant_digest
+            }
+            _ => false,
+        };
+        if !workspace_authority_matches {
+            bail!("runtime action `{operation_id}` was reused with different workspace authority");
+        }
         tx.commit()?;
-        Ok(child_thread_id)
+        Ok(persisted.child_thread_id)
     }
 
     /// Bind the project authority selected for a previously-reserved detached
@@ -10311,7 +10718,12 @@ impl RuntimeDb {
                 "SELECT operation_id, chain_root_id, first_caller_thread_id, mode,
                         request_hash, child_thread_id,
                         child_project_authority, admitted_launch_capsule_hash,
-                        launch_metadata, initial_events
+                        launch_metadata, initial_events,
+                        workspace_id, workspace_access, workspace_operation_phase,
+                        workspace_worker_instance_id, workspace_worker_boot_epoch,
+                        workspace_worker_boot_identity_hash,
+                        workspace_project_authority_digest, workspace_grant_digest,
+                        workspace_input_snapshot_hash
                  FROM runtime_action_intent WHERE operation_id=?1 AND mode='detached'",
                 params![operation_id],
                 decode_runtime_action_intent,
@@ -10358,7 +10770,12 @@ impl RuntimeDb {
                 "SELECT operation_id, chain_root_id, first_caller_thread_id, mode,
                         request_hash, child_thread_id,
                         child_project_authority, admitted_launch_capsule_hash,
-                        launch_metadata, initial_events
+                        launch_metadata, initial_events,
+                        workspace_id, workspace_access, workspace_operation_phase,
+                        workspace_worker_instance_id, workspace_worker_boot_epoch,
+                        workspace_worker_boot_identity_hash,
+                        workspace_project_authority_digest, workspace_grant_digest,
+                        workspace_input_snapshot_hash
                    FROM runtime_action_intent WHERE operation_id=?1",
                 params![operation_id],
                 decode_runtime_action_intent,
@@ -10375,7 +10792,12 @@ impl RuntimeDb {
             "SELECT operation_id, chain_root_id, first_caller_thread_id, mode,
                     request_hash, child_thread_id,
                     child_project_authority, admitted_launch_capsule_hash,
-                    launch_metadata, initial_events
+                    launch_metadata, initial_events,
+                    workspace_id, workspace_access, workspace_operation_phase,
+                    workspace_worker_instance_id, workspace_worker_boot_epoch,
+                    workspace_worker_boot_identity_hash,
+                    workspace_project_authority_digest, workspace_grant_digest,
+                    workspace_input_snapshot_hash
                FROM runtime_action_intent ORDER BY created_at_ms, operation_id",
         )?;
         let intents = statement
@@ -10388,11 +10810,138 @@ impl RuntimeDb {
         Ok(intents)
     }
 
-    /// CAS objects referenced by durable handoff intents before their child
-    /// rows become authoritative chain roots. GC must retain these roots
-    /// for the entire intent lifetime, including crash recovery between
-    /// authority sealing and child birth.
-    pub fn handoff_cas_object_roots(&self) -> Result<Vec<String>> {
+    pub fn transition_runtime_workspace_operation(
+        &self,
+        operation_id: &str,
+        expected: &[RuntimeWorkspaceOperationPhase],
+        next: RuntimeWorkspaceOperationPhase,
+    ) -> Result<()> {
+        if expected.is_empty() {
+            bail!("runtime workspace-operation transition has no expected phase");
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (access, phase, input_snapshot_hash): (String, String, Option<String>) = tx
+            .query_row(
+                "SELECT workspace_access, workspace_operation_phase,
+                        workspace_input_snapshot_hash
+                   FROM runtime_action_intent
+                  WHERE operation_id=?1 AND workspace_id IS NOT NULL",
+                params![operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("runtime workspace operation `{operation_id}` is absent"))?;
+        let access = parse_workspace_access(&access)?;
+        let phase = RuntimeWorkspaceOperationPhase::parse(&phase)?;
+        if phase == next {
+            tx.commit()?;
+            return Ok(());
+        }
+        if !expected.contains(&phase) {
+            bail!(
+                "runtime workspace operation `{operation_id}` is {phase:?}, expected one of {expected:?}"
+            );
+        }
+        let legal = matches!(
+            (phase, next),
+            (
+                RuntimeWorkspaceOperationPhase::Reserved,
+                RuntimeWorkspaceOperationPhase::Quiescing
+                    | RuntimeWorkspaceOperationPhase::Released
+            ) | (
+                RuntimeWorkspaceOperationPhase::Quiescing,
+                RuntimeWorkspaceOperationPhase::Quiesced | RuntimeWorkspaceOperationPhase::Released
+            ) | (
+                RuntimeWorkspaceOperationPhase::Quiesced,
+                RuntimeWorkspaceOperationPhase::ChildRunning
+                    | RuntimeWorkspaceOperationPhase::Released
+            ) | (
+                RuntimeWorkspaceOperationPhase::ChildRunning,
+                RuntimeWorkspaceOperationPhase::Settling
+            ) | (
+                RuntimeWorkspaceOperationPhase::Settling,
+                RuntimeWorkspaceOperationPhase::Released
+            )
+        );
+        if !legal {
+            bail!(
+                "runtime workspace operation `{operation_id}` cannot transition from {phase:?} to {next:?}"
+            );
+        }
+        if next == RuntimeWorkspaceOperationPhase::ChildRunning
+            && access == ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+            && input_snapshot_hash.is_none()
+        {
+            bail!("immutable runtime workspace operation cannot launch without sealed input");
+        }
+        if next == RuntimeWorkspaceOperationPhase::Quiesced
+            && access == ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+        {
+            bail!(
+                "immutable runtime workspace operation must bind input and quiesced phase atomically"
+            );
+        }
+        let changed = tx.execute(
+            "UPDATE runtime_action_intent
+                SET workspace_operation_phase=?3
+              WHERE operation_id=?1 AND workspace_operation_phase=?2",
+            params![operation_id, phase.as_str(), next.as_str()],
+        )?;
+        if changed != 1 {
+            bail!("runtime workspace-operation transition lost its exact phase CAS");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind the immutable generation captured while the parent worker was
+    /// quiesced. The operation intent becomes its durable recovery/GC owner;
+    /// no second snapshot-selection ledger may be added around this write.
+    pub fn bind_runtime_workspace_input_snapshot(
+        &self,
+        operation_id: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        validate_sha256("runtime workspace-operation input snapshot", snapshot_hash)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE runtime_action_intent
+                SET workspace_input_snapshot_hash=?2,
+                    workspace_operation_phase='quiesced'
+              WHERE operation_id=?1
+                AND workspace_access='immutable_current_generation'
+                AND workspace_operation_phase='quiescing'
+                AND workspace_input_snapshot_hash IS NULL",
+            params![operation_id, snapshot_hash],
+        )?;
+        let stored: String = tx
+            .query_row(
+                "SELECT workspace_input_snapshot_hash
+                   FROM runtime_action_intent
+                  WHERE operation_id=?1
+                    AND workspace_access='immutable_current_generation'
+                    AND workspace_operation_phase='quiesced'",
+                params![operation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime workspace operation `{operation_id}` is not awaiting immutable input"
+                )
+            })?;
+        if stored != snapshot_hash {
+            bail!("runtime workspace operation `{operation_id}` selected a different input");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// CAS objects referenced by durable runtime-child intents before their
+    /// child rows become authoritative roots, plus transient immutable input
+    /// generations retained by a non-released workspace operation. GC must
+    /// retain these roots across every crash boundary owned by the intent.
+    pub fn runtime_child_cas_object_roots(&self) -> Result<Vec<String>> {
         let mut roots = BTreeSet::new();
         for intent in self.runtime_action_intents()? {
             if let Some(hash) = intent.admitted_launch_capsule_hash {
@@ -10405,6 +10954,13 @@ impl RuntimeDb {
                 if let Some(hash) = authority.operational_snapshot_projection() {
                     roots.insert(hash.to_string());
                 }
+            }
+            if let Some(snapshot_hash) = intent.workspace_operation.as_ref().and_then(|operation| {
+                (operation.phase != RuntimeWorkspaceOperationPhase::Released)
+                    .then_some(operation.input_snapshot_hash.as_ref())
+                    .flatten()
+            }) {
+                roots.insert(snapshot_hash.clone());
             }
         }
         for waiter in self.list_follow_waiters()? {

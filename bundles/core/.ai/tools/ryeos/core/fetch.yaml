@@ -2,6 +2,7 @@
 category: "ryeos/core"
 name: "fetch"
 executor_id: "@subprocess"
+execution_protocol: "protocol:ryeos/core/tool_callback"
 required_caps: ["bundle.read"]
 description: "Resolve, optionally verify, and read an item via the engine"
 

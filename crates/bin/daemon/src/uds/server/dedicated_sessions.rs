@@ -554,7 +554,7 @@ pub(super) async fn wait(
         state,
         &request.thread_id,
         request.observed_updated_at_ms,
-        std::time::Duration::from_millis(request.timeout_ms),
+        lillux::time::Duration::from_millis(request.timeout_ms),
     )
     .await?;
     attach_exact_pending_approval(state, session, &request.thread_id)
@@ -678,10 +678,11 @@ pub(super) async fn start(
     if request.thread_id != cap.thread_id {
         bail!("dedicated-session start is restricted to the callback root");
     }
-    let _root_operation = ryeos_app::hosted_operation::begin_hosted_root_operation(
+    let _root_operation = ryeos_app::hosted_operation::begin_hosted_root_operation_async(
         &state.state_store,
         &request.thread_id,
-    )?;
+    )
+    .await?;
     let _credential_operation = ryeos_app::hosted_operation::acquire_credential_profile_operation(
         &request.credential_profile_id,
     )
@@ -1107,6 +1108,32 @@ pub(super) async fn start(
         lifecycle_generation: credential_generation,
         control_channel_identity,
     };
+    let workload_client_channel = match super::workload_client::prepare_for_dedicated_boot(
+        state, cap, &identity,
+    ) {
+        Ok(channel) => channel,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let reason = bounded_worker_failure_reason(
+                "dedicated worker workload-client admission failed: ",
+                &detail,
+            );
+            let settlement = settle_failed_dedicated_worker_start(
+                state,
+                &request.thread_id,
+                &worker_instance_id,
+                boot_epoch,
+                &reason,
+                true,
+            );
+            return match settlement {
+                Ok(()) => Err(anyhow!(reason)),
+                Err(settlement) => Err(anyhow!(
+                    "{reason}; explicit workload-client admission settlement also failed: {settlement:#}"
+                )),
+            };
+        }
+    };
     let runtime_environment = BTreeMap::from([
         (
             request.credential_home_env.clone(),
@@ -1130,6 +1157,7 @@ pub(super) async fn start(
     let start_workspace = workspace_path.clone();
     let start_state_root = state_root.clone();
     let start_identity = identity.clone();
+    let extra_target_channels = workload_client_channel.into_iter().collect();
     let observation_state = state.clone();
     let observation_thread_id = identity.placement_thread_id.clone();
     let observation_boot_epoch = identity.boot_epoch;
@@ -1149,6 +1177,7 @@ pub(super) async fn start(
             &start_workspace,
             Some(&start_state_root),
             &runtime_environment,
+            extra_target_channels,
             &start_identity,
             observation_sink,
         )

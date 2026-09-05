@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-02T20:32:26Z:9690facd9dd7551eca555c4652b21119fc06a276d917ee5ed4bc3d0bc0fa608d:8K2Tz47/qc4vOLJrtlE3EyRAleK4+fL5vrRP1RN3zkMwsrgZQJeUr+zKzBnALmy8EF94PaUitzn4h/fLRZExCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-04T08:52:01Z:c7eec0af7e0c327897234724e081fd1a59e1a72f48a25efd9a7d50e5638f6e84:2tPCGY9pS4xv/0zdRly2t6fNzNFL3ahPwQuKXuo4a7Xs8tTkj79LXzGE+djVJXHTz5nDdcgKMklmtSNQmsuBDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/remote
 tags: [remote, cli, reference, manpage, capabilities]
-version: "1.0.3"
+version: "1.0.4"
 description: >
   Manpage-style reference for ryeos remote commands, including local
   capabilities, remote authorized-key scopes, routes, examples, and
@@ -297,9 +297,11 @@ ryeos remote push --remote prod --project /absolute/path/to/project
 
 The push pipeline ingests local project content, uploads missing CAS
 objects, and writes a principal-scoped remote pushed HEAD via
-`/push-head`. It uses the remote's cached ingest-ignore rules; if the
-cache is missing the handler fetches `/ingest-ignore` inline and aborts
-if that fetch fails.
+`/push-head`. Before local CAS ingestion, it unions the source node's current
+signed exclusions with the target's cached ingest-ignore rules. If the target
+cache is missing, the handler fetches `/ingest-ignore` inline and aborts if
+that fetch fails. The receiving node independently rechecks every transferred
+path against its then-current signed policy before advancing a HEAD.
 
 The ordinary command is node-owned. A durable workflow that must retain the
 configured operator across later remote control selects that principal

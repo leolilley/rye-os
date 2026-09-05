@@ -21,6 +21,8 @@ config:
   mode:
     kind: session
   candidate_disposition: owner_decision
+  workload_client_delegation_caps:
+    - ryeos.execute.tool.*
 limits:
   duration_seconds: 604200
 requires:

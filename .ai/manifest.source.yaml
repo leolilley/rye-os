@@ -1,0 +1,9 @@
+# ryeos:signed:2026-09-04T09:13:19Z:c0af01e4e230f4f2a4404b82902a30e4e008f156834214c5fcb4b77205482e6d:C4mBH7I5+W6Xxne2M3VdcsUFSRfPu7eozCnbT+Fh7s1U3+mHorY1r/aBt5VSy3KIrwoD8E3FCma19/oIYiBMDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+name: ryeos
+version: "0.1.0"
+description: "Source-local RyeOS development project bundle"
+requires_kinds:
+  - config
+  - knowledge
+  - tool
+uses_kinds: []

@@ -23,6 +23,7 @@ pub mod resolver;
 pub mod scalar_or_vec;
 pub mod template;
 pub mod verified_loader;
+pub mod workload_client;
 
 pub use arg_binder::bind_argv;
 pub use authorizer::{
@@ -87,3 +88,8 @@ pub use ryeos_state::{
 /// concurrency bound. All runtime and executor producers share this value so
 /// omission cannot create an unwindowed cohort or divergent defaults.
 pub const DEFAULT_LIVE_FANOUT_WINDOW_WIDTH: u32 = 8;
+
+/// Canonical daemon callback method used to dispatch one ordinary RyeOS child
+/// action. Shared by clients and callback-capability admission so the method
+/// name cannot drift into separate string authorities.
+pub const RUNTIME_DISPATCH_ACTION_METHOD: &str = "runtime.dispatch_action";

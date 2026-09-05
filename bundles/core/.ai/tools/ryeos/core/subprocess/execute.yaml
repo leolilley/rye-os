@@ -2,6 +2,7 @@
 category: "ryeos/core/subprocess"
 version: "1.0.0"
 executor_id: null
+execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Internal terminal executor for @subprocess. Not directly executable; wrap it with a tool that declares executor_id: \"@subprocess\" and a config block."
 
 terminal_executor:

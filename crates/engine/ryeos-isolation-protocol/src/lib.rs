@@ -8,15 +8,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAcc
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-}
-
-pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v3";
+pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v4";
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -156,7 +148,7 @@ impl<'de> Visitor<'de> for StrictJsonValueVisitor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IsolationAdapterProtocolVersion {
-    #[serde(rename = "ryeos.isolation-adapter/v3")]
+    #[serde(rename = "ryeos.isolation-adapter/v4")]
     Current,
 }
 
@@ -218,6 +210,8 @@ pub enum IsolationCapability {
     NetworkIsolated,
     #[serde(rename = "process.host_pid_namespace")]
     ProcessHostPidNamespace,
+    #[serde(rename = "process.isolated_pid_namespace")]
+    ProcessIsolatedPidNamespace,
     #[serde(rename = "process.target_pid_reporting")]
     ProcessTargetPidReporting,
     #[serde(rename = "lifecycle.shared_process_group")]
@@ -318,14 +312,6 @@ impl IsolationBackendDeclaration {
                 "isolation backend must declare capabilities",
             ));
         }
-        if !self
-            .artifacts
-            .contains_key(&IsolationArtifactRole::Launcher)
-        {
-            return Err(ProtocolValidationError::new(
-                "isolation backend must declare a launcher artifact",
-            ));
-        }
         let mut names = BTreeSet::new();
         names.insert(self.adapter.as_str());
         for name in self.artifacts.values() {
@@ -401,7 +387,9 @@ pub struct IsolationProjectWorkspace {
 
 /// One daemon-owned connected duplex channel delivered at a fixed target
 /// descriptor. The source authority is operational; the target descriptor and
-/// environment name are the complete admitted target-side contract.
+/// environment name are the complete admitted target-side contract. A plan's
+/// collection is target-fd sorted: fd 0 may carry a primary control stream,
+/// while auxiliary channels use descriptors above stderr.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IsolationTargetChannel {
@@ -413,6 +401,13 @@ pub struct IsolationTargetChannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IsolationNetwork {
+    Host,
+    Isolated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationPidNamespace {
     Host,
     Isolated,
 }
@@ -445,13 +440,12 @@ pub struct IsolationPlan {
     pub mounts: Vec<IsolationMount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_workspace: Option<IsolationProjectWorkspace>,
-    #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub target_channel: Option<IsolationTargetChannel>,
+    pub target_channels: Vec<IsolationTargetChannel>,
     pub environment: IsolationEnvironment,
     pub network: IsolationNetwork,
     pub devices: IsolationDeviceSurface,
     pub private_tmp: bool,
-    pub host_pid_namespace: bool,
+    pub pid_namespace: IsolationPidNamespace,
     pub shared_process_group: bool,
 }
 
@@ -580,7 +574,13 @@ impl IsolationPlan {
                 ));
             }
         }
-        if let Some(channel) = &self.target_channel {
+        if self.target_channels.len() > MAX_AUTHORITIES {
+            return Err(ProtocolValidationError::new("too many target channels"));
+        }
+        let mut previous_target_fd = None;
+        let mut channel_sources = BTreeSet::new();
+        let mut channel_environment = BTreeSet::new();
+        for channel in &self.target_channels {
             if authority_ids.get(&channel.source)
                 != Some(&IsolationAuthorityPurpose::TargetDuplexChannel)
             {
@@ -588,21 +588,38 @@ impl IsolationPlan {
                     "target channel authority is missing or has the wrong purpose",
                 ));
             }
-            if channel.target_fd != 0 {
+            if matches!(channel.target_fd, 1 | 2) {
                 return Err(ProtocolValidationError::new(
-                    "target channel descriptor must be stdin (fd 0)",
+                    "target channel cannot replace stdout or stderr",
+                ));
+            }
+            if previous_target_fd.is_some_and(|previous| previous >= channel.target_fd) {
+                return Err(ProtocolValidationError::new(
+                    "target channels must be unique and sorted by target descriptor",
+                ));
+            }
+            previous_target_fd = Some(channel.target_fd);
+            if !channel_sources.insert(channel.source.clone()) {
+                return Err(ProtocolValidationError::new(
+                    "target channel source authority is duplicated",
                 ));
             }
             validate_environment_name(&channel.env_name)?;
+            if !channel_environment.insert(channel.env_name.as_str()) {
+                return Err(ProtocolValidationError::new(
+                    "target channel environment name is duplicated",
+                ));
+            }
+            let expected_target_fd = channel.target_fd.to_string();
             if self
                 .environment
                 .values
                 .get(&channel.env_name)
                 .map(String::as_str)
-                != Some("0")
+                != Some(expected_target_fd.as_str())
             {
                 return Err(ProtocolValidationError::new(
-                    "target channel environment must name target descriptor 0",
+                    "target channel environment must name its exact target descriptor",
                 ));
             }
             if self
@@ -660,7 +677,7 @@ impl IsolationPlan {
             capabilities.insert(IsolationCapability::FilesystemProjectWorkspaceCow);
             capabilities.insert(IsolationCapability::FilesystemWorkspaceDelta);
         }
-        if self.target_channel.is_some() {
+        if !self.target_channels.is_empty() {
             capabilities.insert(IsolationCapability::IpcTargetUnixStream);
         }
         if self.private_tmp {
@@ -670,9 +687,10 @@ impl IsolationPlan {
             IsolationNetwork::Host => IsolationCapability::NetworkHost,
             IsolationNetwork::Isolated => IsolationCapability::NetworkIsolated,
         });
-        if self.host_pid_namespace {
-            capabilities.insert(IsolationCapability::ProcessHostPidNamespace);
-        }
+        capabilities.insert(match self.pid_namespace {
+            IsolationPidNamespace::Host => IsolationCapability::ProcessHostPidNamespace,
+            IsolationPidNamespace::Isolated => IsolationCapability::ProcessIsolatedPidNamespace,
+        });
         if self.shared_process_group {
             capabilities.insert(IsolationCapability::LifecycleSharedProcessGroup);
         }
@@ -711,14 +729,6 @@ impl AdapterInspectionResponse {
         if self.effective_capabilities.is_empty() {
             return Err(ProtocolValidationError::new(
                 "adapter inspection must report capabilities",
-            ));
-        }
-        if !self
-            .artifacts
-            .contains_key(&IsolationArtifactRole::Launcher)
-        {
-            return Err(ProtocolValidationError::new(
-                "adapter inspection must report the launcher artifact",
             ));
         }
         for artifact in self.artifacts.values() {
@@ -1047,6 +1057,26 @@ impl AdapterLaunchRequest {
                 ));
             }
         }
+        for channel in &self.plan.target_channels {
+            let source_fd = self
+                .authorities
+                .iter()
+                .find(|authority| authority.id == channel.source)
+                .map(|authority| authority.inherited_fd)
+                .ok_or_else(|| {
+                    ProtocolValidationError::new(
+                        "target channel source disappeared after plan validation",
+                    )
+                })?;
+            if channel.target_fd > 2
+                && channel.target_fd != source_fd
+                && descriptors.contains(&channel.target_fd)
+            {
+                return Err(ProtocolValidationError::new(
+                    "target channel destination aliases an inherited protocol descriptor",
+                ));
+            }
+        }
         Ok(required)
     }
 }
@@ -1201,11 +1231,6 @@ fn validate_artifact_descriptors(
     artifacts: &BTreeMap<IsolationArtifactRole, u32>,
     reserved: Option<u32>,
 ) -> Result<BTreeSet<u32>, ProtocolValidationError> {
-    if !artifacts.contains_key(&IsolationArtifactRole::Launcher) {
-        return Err(ProtocolValidationError::new(
-            "isolation request is missing the launcher artifact",
-        ));
-    }
     let mut descriptors = reserved.into_iter().collect::<BTreeSet<_>>();
     for descriptor in artifacts.values().copied() {
         if descriptor <= 2 {
@@ -1271,14 +1296,14 @@ mod tests {
                     },
                 ],
                 project_workspace: None,
-                target_channel: None,
+                target_channels: Vec::new(),
                 environment: IsolationEnvironment {
                     values: BTreeMap::from([("PATH".to_string(), "/bin".to_string())]),
                 },
                 network: IsolationNetwork::Isolated,
                 devices: IsolationDeviceSurface::Minimal,
                 private_tmp: true,
-                host_pid_namespace: true,
+                pid_namespace: IsolationPidNamespace::Host,
                 shared_process_group: true,
             },
             vec![
@@ -1297,7 +1322,20 @@ mod tests {
     }
 
     #[test]
-    fn declaration_requires_distinct_launcher() {
+    fn declaration_allows_a_self_contained_adapter() {
+        let declaration = IsolationBackendDeclaration {
+            id: "example".to_string(),
+            protocol: IsolationAdapterProtocolVersion::Current,
+            targets: vec![IsolationTargetTriple::X86_64UnknownLinuxGnu],
+            adapter: "adapter".to_string(),
+            artifacts: BTreeMap::new(),
+            capabilities: BTreeSet::from([IsolationCapability::FilesystemPrivateRoot]),
+        };
+        declaration.validate().unwrap();
+    }
+
+    #[test]
+    fn declaration_requires_external_artifacts_to_be_distinct_from_adapter() {
         let declaration = IsolationBackendDeclaration {
             id: "example".to_string(),
             protocol: IsolationAdapterProtocolVersion::Current,
@@ -1374,8 +1412,8 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_duplicate_keys_at_every_depth() {
-        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v3","protocol":"ryeos.isolation-adapter/v3","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
-        let nested = r#"{"protocol":"ryeos.isolation-adapter/v3","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
+        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v4","protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let nested = r#"{"protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
         for document in [top_level, nested] {
             let error = from_json_str_strict::<AdapterInspectionRequest>(document).unwrap_err();
             assert!(error.to_string().contains("duplicate JSON object key"));
@@ -1384,7 +1422,7 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_unknown_fields_trailing_data_and_excessive_depth() {
-        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v3","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
+        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(unknown)
                 .unwrap_err()
@@ -1392,7 +1430,7 @@ mod tests {
                 .contains("unknown field")
         );
 
-        let valid = r#"{"protocol":"ryeos.isolation-adapter/v3","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let valid = r#"{"protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(&format!("{valid} true"))
                 .unwrap_err()
@@ -1415,7 +1453,7 @@ mod tests {
 
     #[test]
     fn predecessor_adapter_protocol_is_refused() {
-        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v1","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v3","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         let error = from_json_str_strict::<AdapterInspectionRequest>(predecessor).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
@@ -1439,6 +1477,15 @@ mod tests {
                 IsolationCapability::LifecycleSharedProcessGroup,
             ])
         );
+    }
+
+    #[test]
+    fn pid_namespace_choice_is_an_explicit_capability() {
+        let (mut plan, authorities) = complete_plan();
+        plan.pid_namespace = IsolationPidNamespace::Isolated;
+        let capabilities = plan.validate(&authorities).unwrap();
+        assert!(capabilities.contains(&IsolationCapability::ProcessIsolatedPidNamespace));
+        assert!(!capabilities.contains(&IsolationCapability::ProcessHostPidNamespace));
     }
 
     #[test]
@@ -1498,20 +1545,36 @@ mod tests {
     }
 
     #[test]
-    fn target_channel_is_required_nullable_and_derives_exact_ipc_capability() {
+    fn target_channels_are_required_sorted_and_derive_exact_ipc_capability() {
         let (mut plan, mut authorities) = complete_plan();
         let source = IsolationAuthorityId::new("session-channel").unwrap();
-        plan.target_channel = Some(IsolationTargetChannel {
-            source: source.clone(),
-            target_fd: 0,
-            env_name: "RYEOS_SESSION_FD".to_owned(),
-        });
+        let auxiliary = IsolationAuthorityId::new("workload-client-channel").unwrap();
+        plan.target_channels = vec![
+            IsolationTargetChannel {
+                source: source.clone(),
+                target_fd: 0,
+                env_name: "RYEOS_SESSION_FD".to_owned(),
+            },
+            IsolationTargetChannel {
+                source: auxiliary.clone(),
+                target_fd: 3,
+                env_name: "RYEOS_WORKLOAD_CLIENT_FD".to_owned(),
+            },
+        ];
         plan.environment
             .values
             .insert("RYEOS_SESSION_FD".to_owned(), "0".to_owned());
+        plan.environment
+            .values
+            .insert("RYEOS_WORKLOAD_CLIENT_FD".to_owned(), "3".to_owned());
         authorities.push(IsolationAuthority {
             id: source,
             inherited_fd: 6,
+            purpose: IsolationAuthorityPurpose::TargetDuplexChannel,
+        });
+        authorities.push(IsolationAuthority {
+            id: auxiliary,
+            inherited_fd: 7,
             purpose: IsolationAuthorityPurpose::TargetDuplexChannel,
         });
         assert!(
@@ -1521,20 +1584,23 @@ mod tests {
         );
 
         let mut value = serde_json::to_value(&plan).unwrap();
-        assert!(value.get("target_channel").is_some());
-        value.as_object_mut().unwrap().remove("target_channel");
+        assert!(value.get("target_channels").is_some());
+        value.as_object_mut().unwrap().remove("target_channels");
         assert!(serde_json::from_value::<IsolationPlan>(value).is_err());
+
+        plan.target_channels.swap(0, 1);
+        assert!(plan.validate(&authorities).is_err());
     }
 
     #[test]
     fn target_channel_rejects_wrong_target_environment_and_authority_use() {
         let (mut plan, mut authorities) = complete_plan();
         let source = IsolationAuthorityId::new("session-channel").unwrap();
-        plan.target_channel = Some(IsolationTargetChannel {
+        plan.target_channels = vec![IsolationTargetChannel {
             source: source.clone(),
-            target_fd: 3,
+            target_fd: 1,
             env_name: "RYEOS_SESSION_FD".to_owned(),
-        });
+        }];
         plan.environment
             .values
             .insert("RYEOS_SESSION_FD".to_owned(), "3".to_owned());
@@ -1545,7 +1611,7 @@ mod tests {
         });
         assert!(plan.validate(&authorities).is_err());
 
-        plan.target_channel.as_mut().unwrap().target_fd = 0;
+        plan.target_channels[0].target_fd = 0;
         plan.environment
             .values
             .insert("RYEOS_SESSION_FD".to_owned(), "0".to_owned());
@@ -1589,6 +1655,51 @@ mod tests {
                 .to_string()
                 .contains("adapter descriptor overlaps stdio or another isolation protocol role")
         );
+    }
+
+    #[test]
+    fn self_contained_launch_has_no_artifact_descriptor_requirement() {
+        let (plan, authorities) = complete_plan();
+        let request = AdapterLaunchRequest {
+            protocol: IsolationAdapterProtocolVersion::Current,
+            plan,
+            authorities,
+            artifacts: BTreeMap::new(),
+            adapter_fd: 10,
+            status_fd: 6,
+            lifecycle: AdapterLaunchLifecycle::Run,
+        };
+        request.validate().unwrap();
+    }
+
+    #[test]
+    fn target_channel_may_already_occupy_its_exact_target_descriptor() {
+        let (mut plan, mut authorities) = complete_plan();
+        let source = IsolationAuthorityId::new("session-channel").unwrap();
+        plan.target_channels.push(IsolationTargetChannel {
+            source: source.clone(),
+            target_fd: 9,
+            env_name: "RYEOS_SESSION_FD".to_owned(),
+        });
+        plan.environment
+            .values
+            .insert("RYEOS_SESSION_FD".to_owned(), "9".to_owned());
+        authorities.push(IsolationAuthority {
+            id: source,
+            inherited_fd: 9,
+            purpose: IsolationAuthorityPurpose::TargetDuplexChannel,
+        });
+        AdapterLaunchRequest {
+            protocol: IsolationAdapterProtocolVersion::Current,
+            plan,
+            authorities,
+            artifacts: BTreeMap::new(),
+            adapter_fd: 10,
+            status_fd: 6,
+            lifecycle: AdapterLaunchLifecycle::Run,
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]
@@ -1742,6 +1853,22 @@ mod tests {
                 .to_string()
                 .contains("lowercase SHA-256")
         );
+
+        let self_contained_request = AdapterInspectionRequest {
+            protocol: IsolationAdapterProtocolVersion::Current,
+            target: IsolationTargetTriple::X86_64UnknownLinuxGnu,
+            backend_id: "native-linux".to_string(),
+            artifacts: BTreeMap::new(),
+        };
+        self_contained_request.validate().unwrap();
+        AdapterInspectionResponse {
+            protocol: IsolationAdapterProtocolVersion::Current,
+            adapter_build: "0.1.0".to_string(),
+            effective_capabilities: BTreeSet::from([IsolationCapability::FilesystemPrivateRoot]),
+            artifacts: BTreeMap::new(),
+        }
+        .validate()
+        .unwrap();
     }
 
     fn workspace_request(operation: WorkspaceLifecycleOperation) -> AdapterWorkspaceRequest {
@@ -1767,11 +1894,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_v3_exposes_only_project_and_opaque_backend_state() {
+    fn workspace_v4_exposes_only_project_and_opaque_backend_state() {
         let request = workspace_request(WorkspaceLifecycleOperation::Create);
         request.validate().unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v3");
+        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v4");
         let purposes = encoded["authorities"]
             .as_array()
             .unwrap()

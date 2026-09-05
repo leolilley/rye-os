@@ -148,7 +148,7 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
             // daemon's per-connection loop (parallel foreach over tools is
             // only parallel if each iteration gets its own connection).
             self.rpc
-                .request_dedicated("runtime.dispatch_action", params, None)
+                .request_dedicated(crate::RUNTIME_DISPATCH_ACTION_METHOD, params, None)
                 .await
                 .map_err(Self::map_rpc_error)
         } else {
@@ -158,7 +158,7 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
             // everything queued behind it) forever.
             self.rpc
                 .request_with_timeout(
-                    "runtime.dispatch_action",
+                    crate::RUNTIME_DISPATCH_ACTION_METHOD,
                     params,
                     Some(crate::daemon_rpc::DEFAULT_RPC_TIMEOUT),
                 )
@@ -222,7 +222,7 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
         &self,
         request: crate::callback::DedicatedSessionWaitRequest,
     ) -> Result<Value, CallbackError> {
-        let server_wait = std::time::Duration::from_millis(request.timeout_ms);
+        let server_wait = lillux::time::Duration::from_millis(request.timeout_ms);
         let mut params = serde_json::to_value(request).map_err(|error| {
             CallbackError::Transport(anyhow::anyhow!(
                 "serialize dedicated-session wait request: {error}"

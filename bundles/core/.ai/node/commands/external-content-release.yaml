@@ -3,7 +3,7 @@ tokens: [external-content, release]
 description: Release an external-content consumer binding
 forms:
   - slots:
-      - field: binding_id
+      - field: binding_subject_id
 dispatch:
   kind: execute_ref
   execute: service:external-content/release

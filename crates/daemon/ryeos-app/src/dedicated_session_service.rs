@@ -2605,8 +2605,10 @@ pub async fn execute_command(
             }));
         }
     }
-    let _root_operation =
-        begin_hosted_root_operation(&state.state_store, &initial.placement_thread_id)?;
+    let _root_operation = crate::hosted_operation::begin_hosted_root_operation_async(
+        &state.state_store,
+        &initial.placement_thread_id,
+    ).await?;
     let _credential_contact =
         acquire_credential_profile_contact(&initial.credential_profile_id, placement_thread_id)
             .await?;
@@ -4847,10 +4849,21 @@ pub async fn terminate_session_with_bounded_outcome(
     if let Some(outcome) = bounded_outcome.as_ref() {
         validate_bounded_budget_outcome_authority(state, &initial, outcome)?;
     }
-    let root_operation = crate::hosted_operation::begin_hosted_root_operation_if_appendable(
-        &state.state_store,
-        &initial.placement_thread_id,
-    )?;
+    // Session termination is a state transition, not another concurrent root
+    // operation. The exclusive existing root gate first drains any admitted
+    // workload child/capture, then prevents a new one from starting while the
+    // worker is retired. This guard is deliberately not committed: the root
+    // runner owns the later authoritative thread terminalization.
+    let root_terminalization = if initial.state == "terminal" {
+        None
+    } else {
+        // Draining a workload child may require that child's async task to
+        // resume and release its root lease. Never park a Tokio worker here.
+        Some(crate::hosted_operation::begin_hosted_root_terminalization_async(
+            &state.state_store,
+            &initial.placement_thread_id,
+        ).await?)
+    };
     let _credential_operation =
         acquire_credential_profile_operation(&initial.credential_profile_id).await?;
     let session = current_session(state, placement_thread_id)?;
@@ -4891,7 +4904,7 @@ pub async fn terminate_session_with_bounded_outcome(
         }
         return Ok(result);
     }
-    let _root_operation = root_operation
+    let _root_terminalization = root_terminalization
         .ok_or_else(|| anyhow!("nonterminal session has a terminal hosted execution root"))?;
     if session.worker_instance_id.is_none() && session.worker_boot_epoch.is_none() {
         if !matches!(session.state.as_str(), "recovering" | "outcome_unknown") {

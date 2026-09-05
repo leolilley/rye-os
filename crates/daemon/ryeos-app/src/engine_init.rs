@@ -555,6 +555,7 @@ fn inspect_isolation_backend(
                 .chain(artifact_handles.values().cloned())
                 .chain(std::iter::once(request_handle))
                 .collect(),
+            inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         });
         if !result.success {

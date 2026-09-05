@@ -705,6 +705,19 @@ fn links_admitted_launch_capsule(value: &Value) -> Result<ContractLinks, String>
             &mut links.blob_hashes,
         )?;
     }
+    if command
+        .and_then(|command| command.get("authority"))
+        .and_then(Value::as_str)
+        == Some("realization_member")
+    {
+        super::push_required_object_edge(
+            &Value::Object(command.cloned().expect("checked direct command")),
+            "realization_manifest_hash",
+            ExpectedObject::OneOf(EXTERNAL_MANIFEST_KINDS),
+            None,
+            &mut links.object_edges,
+        )?;
+    }
     if let Some(sessions) = execution_closure
         .get("prepared_runtime_launch")
         .and_then(|launch| launch.get("admitted_sessions"))
@@ -796,6 +809,15 @@ fn links_persistent_session_capsule(value: &Value) -> Result<ContractLinks, Stri
             &Value::Object(command.clone()),
             "executable_blob_hash",
             &mut links.blob_hashes,
+        )?;
+    }
+    if command.get("authority").and_then(Value::as_str) == Some("realization_member") {
+        super::push_required_object_edge(
+            &Value::Object(command.clone()),
+            "realization_manifest_hash",
+            ExpectedObject::OneOf(EXTERNAL_MANIFEST_KINDS),
+            None,
+            &mut links.object_edges,
         )?;
     }
     Ok(links)
@@ -993,10 +1015,17 @@ fn links_external_content_binding(value: &Value) -> Result<ContractLinks, String
             _ => return Err("external-content binding has unsupported manifest kind".to_owned()),
         };
         links.object_edges.push(ObjectEdge {
-            hash: binding.manifest_hash,
+            hash: binding.manifest_hash.clone(),
             expected,
             history_graph: None,
         });
+        if let Some(source_closure) = binding.consumer.source_closure() {
+            links.object_edges.push(ObjectEdge {
+                hash: source_closure.binding_hash.clone(),
+                expected: ExpectedObject::Kind(crate::objects::EFFECTIVE_SOURCE_BINDING_KIND),
+                history_graph: None,
+            });
+        }
     }
     Ok(links)
 }
@@ -1124,6 +1153,47 @@ mod tests {
 
         assert_eq!(links.object_edges.len(), 1);
         assert_eq!(links.object_edges[0].hash, "a".repeat(64));
+    }
+
+    #[test]
+    fn project_external_binding_roots_its_manifest_and_source_authority() {
+        let source_binding = "e".repeat(64);
+        let consumer = crate::objects::ExternalContentConsumerAuthority::pinned_project(
+            "tool:project/build".to_owned(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            crate::objects::EffectiveSourceClosureProjection {
+                schema: crate::objects::EFFECTIVE_SOURCE_BINDING_SCHEMA,
+                binding_hash: source_binding.clone(),
+                content_manifest_hash: "f".repeat(64),
+                owner_key: "1".repeat(64),
+                file_count: 1,
+                total_bytes: 1,
+            },
+        )
+        .unwrap();
+        let binding = crate::objects::ExternalContentBinding::active(
+            "a".repeat(64),
+            crate::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
+            consumer,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .unwrap();
+        let links = links_external_content_binding(&binding.to_value().unwrap()).unwrap();
+        assert!(links.object_edges.iter().any(|edge| {
+            edge.hash == "a".repeat(64)
+                && edge.expected
+                    == ExpectedObject::Kind(crate::objects::EXTERNAL_CONTENT_MANIFEST_KIND)
+        }));
+        assert!(links.object_edges.iter().any(|edge| {
+            edge.hash == source_binding
+                && edge.expected
+                    == ExpectedObject::Kind(crate::objects::EFFECTIVE_SOURCE_BINDING_KIND)
+        }));
+        assert_eq!(links.object_edges.len(), 2);
     }
 
     #[test]

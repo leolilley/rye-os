@@ -77,11 +77,16 @@ There are two supported execution shapes:
   `remote run` for long jobs where durable target-local thread/result evidence
   is enough.
 
-The second shape does not currently provide recursive retained-project-result
-materialization back to the source. `remote pull` can fetch caller-known typed
-object/blob hashes into a new directory, but it is not a `pull-result` command.
-Do not promise automatic artifact download for accepted jobs or bypass this
-gap with an implicit shared filesystem.
+The second shape returns a validated retained project candidate through the
+generic owner-bound `remote worker pull-result` operation. The source does not
+supply snapshot hashes: the target reconstructs the current placement, exact
+settled route command and completion fence, admitted project/base, candidate
+capture, and validation from existing authoritative facts, then signs that
+testimony. The source retains it in an idempotent sync job, fetches the exact
+closure through ordinary object transport, and uses the existing atomic
+clean-base result apply. The target candidate remains retained; pulling never
+publishes or discards it. `remote pull` remains the lower-level operation for
+caller-known typed object/blob hashes and is not this authority flow.
 
 `remote bundle-install` is remote-to-caller import: the caller fetches an
 installed bundle from its named remote into the caller's live node. It does
@@ -309,12 +314,24 @@ other exact authority defined by that workload. Do not weaken owner-scoped
 chain APIs to manufacture that evidence for ordinary `remote execute`.
 
 For a long-running accepted workload, use the configured-operator push/run
-policy documented by the remote command reference, retain the returned launch
-and thread IDs, and inspect only that exact thread with `remote thread-status`.
-Treat the retained remote result/log/facets as the phase-one artifact surface.
-If recursive project artifacts must return automatically, that requires a
-separate generic owner-bound `remote pull-result` design and is not implemented
-by this workflow.
+policy documented by the remote command reference, retain the returned chain
+root, launch and placement IDs, and inspect only that exact authority. After a
+completed turn has been fenced, the session is terminated, its candidate is
+validated, and status is `publish_ready`, return it explicitly with:
+
+```bash
+ryeos --project "$PROJECT" remote worker pull-result stronger <chain-root>
+```
+
+The configured target grant must include the exact
+`ryeos.execute.service.worker-executions/candidate-result` and object-read
+scopes. The source caller needs
+`ryeos.execute.service.remote/pull-worker-result`. A retry addresses the same
+source-local job from the owner, route, project, site, and chain tuple. It
+cannot select a newer candidate, silently advance either project HEAD, or
+dispose of the target candidate. The result returns the complete target-signed
+candidate testimony alongside the source-local job ID and apply counts so the
+evidence can be retained without reading node databases.
 
 For a model qualification, retain the exact signed worker/model refs,
 realization receipt/artifact hash, device profile, deterministic prompt/input,

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use ryeos_engine::canonical_ref::CanonicalRef;
 use ryeos_engine::contracts::{EffectivePrincipal, ItemSpace};
 use ryeos_engine::error::EngineError;
 use ryeos_engine::item_resolution::ResolutionRoots;
@@ -64,10 +65,20 @@ pub struct PreparedSecret {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedRuntimeLaunch {
+    /// Effective launch restrictions, sealed with this managed program.
+    /// Fresh admission intersects signed subject projections with the parent;
+    /// restart and cross-site rebinding preserve these exact values.
+    pub filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
+    pub network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling,
     pub runtime_data: BTreeMap<String, Value>,
     pub required_secrets: Vec<PreparedSecret>,
     pub runtime_facts: BTreeMap<String, Value>,
     pub binding_records: BTreeMap<String, RefBindingLaunchRecord>,
+    // This structure is authority for the managed runtime being launched now.
+    // Its dependency names are not a namespace for programs a worker might
+    // dispatch later. Those programs enter through ordinary child resolution
+    // and admission, with their own effective program and capsule. Do not add
+    // a deferred/delegated child context here merely to share toolchain bytes.
     /// Exact composed executable dependencies selected by the kind-owned
     /// preparer and resolved by the engine before the outer capsule is minted.
     /// Generic launch code treats names and payloads mechanically; consumers
@@ -1743,7 +1754,26 @@ fn finish_runtime_launch_preparation_parts(
     let financial_authority = validate_financial_authority(contract, result.financial_authority)?;
     let external_effect_authority =
         validate_external_effect_authority(contract, result.external_effect_authority)?;
+    let primary_ref = CanonicalRef::parse(&inputs.primary.canonical_ref)
+        .map_err(|error| DispatchError::Internal(error.into()))?;
+    let execution = engine
+        .kinds
+        .get(&primary_ref.kind)
+        .and_then(|kind| kind.execution.as_ref())
+        .ok_or_else(|| {
+            preparation_error(
+                "missing_execution_contract",
+                "managed subject has no registered execution contract",
+                LaunchPrepareErrorClass::Configuration,
+            )
+        })?;
     Ok(PreparedRuntimeLaunch {
+        filesystem_authority_ceiling: execution
+            .project_filesystem_authority_ceiling(&inputs.primary.composed.composed)
+            .map_err(|error| DispatchError::Internal(error.into()))?,
+        network_authority_ceiling: execution
+            .project_network_authority_ceiling(&inputs.primary.composed.composed)
+            .map_err(|error| DispatchError::Internal(error.into()))?,
         runtime_data: result.runtime_data,
         required_secrets: result
             .required_secrets

@@ -1237,6 +1237,9 @@ mod tests {
                     realization_derived: ryeos_state::objects::EXTERNAL_REALIZATIONS_DERIVED_KEY
                         .to_owned(),
                     allowed_roots: Vec::new(),
+                    allowed_mount_roots: vec![
+                        ryeos_engine::external_content::ExternalContentMountRoot::Project,
+                    ],
                     max_declarations: 1,
                     large_content: None,
                 },
@@ -1250,6 +1253,7 @@ mod tests {
                     "kind": "file",
                     "mode": "pinned",
                     "digest": "a".repeat(64),
+                    "mount_root": "project",
                     "mount": "runtime"
                 }]
             }),

@@ -216,19 +216,19 @@ async fn revoke(
         .collect::<Vec<_>>();
     placement_thread_ids.sort();
     placement_thread_ids.dedup();
-    let _root_operations = placement_thread_ids
-        .iter()
-        .map(|root| {
-            ryeos_app::hosted_operation::begin_hosted_root_operation_if_appendable(
+    let mut _root_operations = Vec::with_capacity(placement_thread_ids.len());
+    for root in &placement_thread_ids {
+        if let Some(operation) =
+            ryeos_app::hosted_operation::begin_hosted_root_operation_if_appendable_async(
                 &state.state_store,
                 root,
             )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| HandlerError::BadRequest(error.to_string()))?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+            .await
+            .map_err(|error| HandlerError::BadRequest(error.to_string()))?
+        {
+            _root_operations.push(operation);
+        }
+    }
     let _operation_guard =
         ryeos_app::hosted_operation::acquire_credential_profile_operation(&req.profile_id)
             .await

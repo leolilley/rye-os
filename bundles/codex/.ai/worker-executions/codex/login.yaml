@@ -20,6 +20,7 @@ config:
   mode:
     kind: session
   candidate_disposition: owner_decision
+  workload_client_delegation_caps: []
 limits:
   duration_seconds: 1800
 requires:

@@ -5,9 +5,7 @@
 //! cancellation, readiness, reuse, idle retirement, and process teardown.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
-use std::os::fd::AsRawFd as _;
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -190,7 +188,7 @@ impl PersistentSessionContractEligibility {
 
 pub struct StartedPersistentSession {
     pub running: ryeos_engine::dispatch::RunningExecution,
-    pub socket: UnixStream,
+    pub socket: lillux::InheritedDuplexChannel,
     /// Descriptor-backed workspace/content leases owned for exactly the
     /// process lifetime. Their concrete types remain outside pool semantics.
     pub lifelines: Vec<Box<dyn Send + Sync>>,
@@ -213,7 +211,7 @@ struct BudgetedSessionFrame {
 
 struct SessionProcess {
     wire: PersistentSessionWireContract,
-    writer: Mutex<UnixStream>,
+    writer: Mutex<lillux::InheritedDuplexChannel>,
     reader: Mutex<Option<SessionChannel>>,
     pending: Mutex<HashMap<String, SyncSender<std::result::Result<BudgetedSessionFrame, String>>>>,
     observation_sender: Mutex<Option<SyncSender<BudgetedSessionFrame>>>,
@@ -237,7 +235,7 @@ struct SessionProcess {
 const MAX_PENDING_SESSION_REQUESTS: usize = 32;
 
 struct SessionChannel {
-    socket: UnixStream,
+    socket: lillux::InheritedDuplexChannel,
     reader: FrameReader,
 }
 
@@ -316,7 +314,7 @@ impl SessionProcess {
             bail!("persistent-session reader failed: {reason}");
         }
         let mut writer = lock_writer_before_deadline(&self.writer, deadline)?;
-        write_frame(&mut writer, wire, frame, deadline)
+        write_frame(&mut *writer, wire, frame, deadline)
     }
 
     fn install_observation_sink(
@@ -2772,9 +2770,9 @@ fn exclusive_request_deadline(
 }
 
 fn lock_writer_before_deadline(
-    writer: &Mutex<UnixStream>,
+    writer: &Mutex<lillux::InheritedDuplexChannel>,
     deadline: Instant,
-) -> Result<std::sync::MutexGuard<'_, UnixStream>> {
+) -> Result<std::sync::MutexGuard<'_, lillux::InheritedDuplexChannel>> {
     loop {
         if Instant::now() >= deadline {
             bail!("persistent-session frame deadline expired while waiting for its writer");
@@ -2788,7 +2786,7 @@ fn lock_writer_before_deadline(
 }
 
 fn write_frame(
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     wire: &PersistentSessionWireContract,
     frame: &PersistentSessionFrame,
     deadline: Instant,
@@ -2802,23 +2800,9 @@ fn write_frame(
         if Instant::now() >= deadline {
             bail!("persistent-session frame write exceeded its deadline");
         }
-        // Use the descriptor operation directly. This protocol is admitted as
-        // an inherited byte-stream FD; it does not require socket-specific
-        // send authority, which may be deliberately absent in a sandbox.
-        // RyeOS binaries retain Rust's default ignored-SIGPIPE disposition, so
-        // a closed peer remains an ordinary EPIPE error.
-        let sent = unsafe {
-            libc::write(
-                stream.as_raw_fd(),
-                encoded[written..].as_ptr().cast(),
-                encoded.len() - written,
-            )
-        };
-        let outcome = if sent < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(sent as usize)
-        };
+        // The typed Lillux endpoint owns the underlying descriptor operation;
+        // persistent-session protocol code only reads and writes bytes.
+        let outcome = stream.write(&encoded[written..]);
         match outcome {
             Ok(0) => bail!("persistent-session channel closed while writing a frame"),
             Ok(count) => written += count,
@@ -3179,13 +3163,28 @@ mod tests {
 
     #[test]
     fn expired_contact_deadline_prevents_request_and_control_frame_writes() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            writes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let wire = test_wire();
         for kind in [
             PersistentSessionFrameKind::Request,
             PersistentSessionFrameKind::Control,
         ] {
-            let (mut writer, mut peer) = UnixStream::pair().unwrap();
-            peer.set_nonblocking(true).unwrap();
+            let mut writer = RecordingWriter::default();
             let frame = PersistentSessionFrame {
                 protocol: wire.wire_protocol.clone(),
                 version: wire.wire_version,
@@ -3193,15 +3192,19 @@ mod tests {
                 request_id: Some("expired-request".into()),
                 body: Some(serde_json::json!({"kind":"fixture"})),
             };
-            assert!(write_frame(&mut writer, &wire, &frame, Instant::now()).is_err());
-            let error = peer.read(&mut [0_u8; 1]).unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            let error = write_frame(&mut writer, &wire, &frame, Instant::now()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("frame write exceeded its deadline")
+            );
+            assert_eq!(writer.writes, 0);
         }
     }
 
     #[test]
     fn writer_contention_cannot_outlive_the_contact_deadline() {
-        let (writer, _peer) = UnixStream::pair().unwrap();
+        let (writer, _peer) = lillux::inherited_duplex_channel_pair().unwrap();
         let writer = Mutex::new(writer);
         let held = writer.lock().unwrap();
         // A same-thread holder makes an unconditional lock deadlock. The
@@ -3240,7 +3243,6 @@ mod tests {
         observation_sink: Option<PersistentSessionObservationSink>,
     ) -> Result<StartedPersistentSession> {
         use std::collections::HashMap;
-        use std::os::fd::{AsRawFd as _, OwnedFd};
 
         use ryeos_engine::contracts::{
             EffectivePrincipal, EngineContext, ExecutionDecorations, ExecutionPlan, LaunchMode,
@@ -3257,9 +3259,14 @@ mod tests {
         let isolation = Arc::new(ryeos_engine::isolation::IsolationRuntime::load(
             app_root.path(),
         )?);
-        let (daemon_socket, worker_socket) = UnixStream::pair()?;
-        let worker_file = Arc::new(std::fs::File::from(OwnedFd::from(worker_socket)));
-        let worker_fd = worker_file.as_raw_fd();
+        let (daemon_channel, worker_channel) =
+            lillux::inherited_duplex_channel_pair().map_err(anyhow::Error::msg)?;
+        let daemon_socket = daemon_channel;
+        let target_channel = ryeos_engine::isolation::IsolationTargetChannelAuthority::new(
+            worker_channel,
+            0,
+            "RYEOS_SESSION_FD",
+        )?;
         let script = r#"
 import json, os, struct
 fd = int(os.environ['RYEOS_SESSION_FD'])
@@ -3318,7 +3325,7 @@ while True:
             verified_command: None,
             args: vec!["-S".into(), "-c".into(), script.into()],
             cwd: None,
-            env: HashMap::from([("RYEOS_SESSION_FD".to_owned(), worker_fd.to_string())]),
+            env: HashMap::new(),
             env_sources: HashMap::new(),
             stdin: None,
             timeout_secs: 30,
@@ -3338,6 +3345,10 @@ while True:
             entrypoint: PlanNodeId("spawn".to_owned()),
             capabilities: PlanCapabilities::default(),
             materialization_requirements: Vec::new(),
+            network_authority_ceiling:
+                ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             cache_key: "fixture".to_owned(),
             thread_kind: Some("worker".to_owned()),
             executor_chain: Vec::new(),
@@ -3368,10 +3379,10 @@ while True:
             isolation_verified_code: Vec::new(),
             isolation_verified_command: None,
             isolation_external_read_only_mounts: Vec::new(),
-            isolation_target_channel: None,
+            isolation_target_channels: vec![target_channel],
             isolation_workspace: None,
             subprocess_limits: None,
-            inherited_fds: vec![Arc::clone(&worker_file)],
+            inherited_fds: Vec::new(),
             thread_id: "session:fixture".to_owned(),
             chain_root_id: "session:fixture".to_owned(),
             current_site_id: "site:fixture".to_owned(),
@@ -3394,7 +3405,7 @@ while True:
         Ok(StartedPersistentSession {
             running,
             socket: daemon_socket,
-            lifelines: vec![Box::new(app_root), Box::new(worker_file)],
+            lifelines: vec![Box::new(app_root)],
             expected_boot_identity: None,
             observation_sink,
         })
