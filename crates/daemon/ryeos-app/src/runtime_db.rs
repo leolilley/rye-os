@@ -19376,6 +19376,199 @@ mod tests {
         assert!(matches!(retained.mode, RuntimeActionMode::Inline));
     }
 
+    fn runtime_workspace_seed(
+        access: ryeos_engine::kind_registry::WorkspaceAccess,
+    ) -> NewRuntimeWorkspaceOperation<'static> {
+        NewRuntimeWorkspaceOperation {
+            workspace_id: "workspace-parent",
+            access,
+            worker_instance_id: "worker-parent",
+            worker_boot_epoch: 1,
+            worker_boot_identity_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            project_authority_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            workload_client_grant_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        }
+    }
+
+    fn reserve_test_workspace_operation(
+        db: &RuntimeDb,
+        seed: &NewRuntimeWorkspaceOperation<'_>,
+        proposed_child: &str,
+    ) -> Result<String> {
+        db.reserve_runtime_action_intent_with_workspace(
+            &"d".repeat(64),
+            "T-chain",
+            "T-parent",
+            RuntimeActionMode::Inline,
+            &"e".repeat(64),
+            proposed_child,
+            None,
+            Some(seed),
+        )
+    }
+
+    #[test]
+    fn runtime_workspace_reservation_rejects_every_authority_coordinate_drift() {
+        use ryeos_engine::kind_registry::WorkspaceAccess;
+
+        let db = RuntimeDb::new_in_memory().unwrap();
+        let seed = runtime_workspace_seed(WorkspaceAccess::ImmutableCurrentGeneration);
+        reserve_test_workspace_operation(&db, &seed, "T-child").unwrap();
+        for coordinate in 0..7 {
+            let mut changed = seed.clone();
+            match coordinate {
+                0 => changed.workspace_id = "workspace-other",
+                1 => changed.access = WorkspaceAccess::SharedExclusive,
+                2 => changed.worker_instance_id = "worker-other",
+                3 => changed.worker_boot_epoch = 2,
+                4 => changed.worker_boot_identity_hash = seed.project_authority_digest,
+                5 => changed.project_authority_digest = seed.workload_client_grant_digest,
+                6 => changed.workload_client_grant_digest = seed.worker_boot_identity_hash,
+                _ => unreachable!(),
+            }
+            let error = reserve_test_workspace_operation(&db, &changed, "T-retry").unwrap_err();
+            assert!(error.to_string().contains("different workspace authority"));
+        }
+        assert!(
+            db.reserve_runtime_action_intent(
+                &"d".repeat(64),
+                "T-chain",
+                "T-parent",
+                RuntimeActionMode::Inline,
+                &"e".repeat(64),
+                "T-retry",
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reserve_test_workspace_operation(&db, &seed, "T-retry").unwrap(),
+            "T-child"
+        );
+        assert_eq!(db.runtime_action_intents().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn runtime_workspace_phases_and_input_retention_survive_every_restart() {
+        use RuntimeWorkspaceOperationPhase::*;
+        use ryeos_engine::kind_registry::WorkspaceAccess;
+
+        for access in [
+            WorkspaceAccess::ImmutableCurrentGeneration,
+            WorkspaceAccess::SharedExclusive,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("runtime.db");
+            let operation_id = "d".repeat(64);
+            let snapshot = "f".repeat(64);
+            let seed = runtime_workspace_seed(access);
+            {
+                let db = RuntimeDb::open(&path).unwrap();
+                reserve_test_workspace_operation(&db, &seed, "T-child").unwrap();
+                // A reservation is not authority to launch or select input.
+                assert!(
+                    db.bind_runtime_workspace_input_snapshot(&operation_id, &snapshot)
+                        .is_err()
+                );
+                assert!(
+                    db.transition_runtime_workspace_operation(
+                        &operation_id,
+                        &[Reserved],
+                        ChildRunning,
+                    )
+                    .is_err()
+                );
+            }
+            let mut previous = Reserved;
+            for phase in [
+                Reserved,
+                Quiescing,
+                Quiesced,
+                ChildRunning,
+                Settling,
+                Released,
+            ] {
+                {
+                    let db = RuntimeDb::open(&path).unwrap();
+                    if phase == Quiesced && access == WorkspaceAccess::ImmutableCurrentGeneration {
+                        // Input binding and quiesced authority must commit together.
+                        assert!(
+                            db.transition_runtime_workspace_operation(
+                                &operation_id,
+                                &[Quiescing],
+                                Quiesced,
+                            )
+                            .is_err()
+                        );
+                        db.bind_runtime_workspace_input_snapshot(&operation_id, &snapshot)
+                            .unwrap();
+                        db.bind_runtime_workspace_input_snapshot(&operation_id, &snapshot)
+                            .unwrap();
+                        assert!(
+                            db.bind_runtime_workspace_input_snapshot(
+                                &operation_id,
+                                &"a".repeat(64),
+                            )
+                            .is_err()
+                        );
+                    } else {
+                        db.transition_runtime_workspace_operation(
+                            &operation_id,
+                            &[previous],
+                            phase,
+                        )
+                        .unwrap();
+                    }
+                }
+                let db = RuntimeDb::open(&path).unwrap();
+                let retained = db
+                    .get_runtime_action_intent(&operation_id)
+                    .unwrap()
+                    .unwrap();
+                let operation = retained.workspace_operation.unwrap();
+                assert_eq!(operation.phase, phase);
+                assert_eq!(retained.child_thread_id, "T-child");
+                assert_eq!(
+                    reserve_test_workspace_operation(&db, &seed, "T-retry").unwrap(),
+                    "T-child"
+                );
+                let has_input = access == WorkspaceAccess::ImmutableCurrentGeneration
+                    && !matches!(phase, Reserved | Quiescing);
+                assert_eq!(
+                    operation.input_snapshot_hash.as_deref(),
+                    has_input.then_some(snapshot.as_str())
+                );
+                assert_eq!(
+                    db.runtime_child_cas_object_roots()
+                        .unwrap()
+                        .contains(&snapshot),
+                    has_input && phase != Released
+                );
+                if phase == ChildRunning {
+                    assert!(
+                        db.transition_runtime_workspace_operation(
+                            &operation_id,
+                            &[ChildRunning],
+                            Released,
+                        )
+                        .is_err()
+                    );
+                }
+                if phase == Released {
+                    assert!(
+                        db.transition_runtime_workspace_operation(
+                            &operation_id,
+                            &[Released],
+                            Quiescing,
+                        )
+                        .is_err()
+                    );
+                }
+                previous = phase;
+            }
+        }
+    }
+
     #[test]
     fn hook_dispatch_pending_survives_restart_and_completed_replays_to_successor() {
         let tmp = TempDir::new().unwrap();

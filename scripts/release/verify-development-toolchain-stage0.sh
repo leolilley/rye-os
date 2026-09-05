@@ -49,10 +49,10 @@ contract_value() {
     local wanted="$1"
     local value
     value="$(awk -v wanted="$wanted" '
-        $0 ~ "^" wanted ": \\\"[^\\\"]*\\\"$" {
+        $0 ~ "^" wanted ": \"[^\"]*\"$" {
             line=$0
-            sub("^[^:]+: \\\"", "", line)
-            sub("\\\"$", "", line)
+            sub(/^[^:]+: "/, "", line)
+            sub(/"$/, "", line)
             print line
             count++
         }
@@ -323,15 +323,25 @@ actual_runtime_dependencies="$tmp/runtime-dependencies"
 : > "$actual_runtime_dependencies"
 while IFS= read -r -d '' executable; do
     relative="${executable#"$tree/"}"
-    executable_sha="$(sha256sum "$executable" | awk '{print $1}')"
-    if readelf -h "$executable" >/dev/null 2>&1; then
+    # Shared libraries need not have an executable mode bit. Inspect every
+    # regular file so their own DT_NEEDED edges cannot disappear from the
+    # closure testimony; ordinary non-executable data is not a program.
+    # readelf also accepts .a/.rlib archives, which are linker inputs rather
+    # than loadable ELF files. Read at most four bytes (or the first NUL)
+    # before inspecting a loadable file, and fail on malformed ELF.
+    elf_magic=""
+    IFS= read -r -n 4 -d '' elf_magic < "$executable" || true
+    if [[ "$elf_magic" == $'\177ELF' ]]; then
+        readelf -h "$executable" >/dev/null
+        executable_sha="$(sha256sum "$executable" | awk '{print $1}')"
         interpreter="$(readelf -l "$executable" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')"
         needed="$(readelf -d "$executable" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort | awk 'BEGIN { first=1 } { if (!first) printf ","; printf "%s", $0; first=0 } END { printf "\n" }')"
         printf '%s\t%s\telf\t%s\t%s\n' "$executable_sha" "$relative" "${interpreter:--}" "${needed:--}" >> "$actual_runtime_dependencies"
-    else
+    elif [[ -x "$executable" ]]; then
+        executable_sha="$(sha256sum "$executable" | awk '{print $1}')"
         printf '%s\t%s\tnon_elf\t-\t-\n' "$executable_sha" "$relative" >> "$actual_runtime_dependencies"
     fi
-done < <(find "$tree/rust" "$tree/zig" -type f -perm /111 -print0 | sort -z)
+done < <(find "$tree/rust" "$tree/zig" -type f -print0 | sort -z)
 cmp "$actual_runtime_dependencies" "$tree/RYEOS-RUNTIME-DEPENDENCIES" || {
     echo "Stage-0 executable dependency testimony does not match the payload" >&2
     exit 2
