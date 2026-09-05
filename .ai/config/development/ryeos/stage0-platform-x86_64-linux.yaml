@@ -1,5 +1,5 @@
-category: development/ryeos
-name: stage0-platform-x86_64-linux
+category: "development/ryeos"
+name: "stage0-platform-x86_64-linux"
 version: "1.0.0"
 schema: "ryeos.development.stage0-platform-inputs.v1"
 target: "x86_64-unknown-linux-gnu"
