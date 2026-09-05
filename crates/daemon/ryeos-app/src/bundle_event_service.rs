@@ -450,8 +450,8 @@ fn attribution_for_callback(cap: &CallbackCapability) -> ryeos_state::BundleEven
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
     use lillux::time::{Duration, MonotonicDeadline};
+    use std::path::{Path, PathBuf};
 
     use crate::execution_provenance::ExecutionProvenance;
 

@@ -370,9 +370,7 @@ impl IsolationTargetChannelAuthority {
         if matches!(target_fd, 1 | 2) {
             anyhow::bail!("target channel cannot replace stdout or stderr");
         }
-        channel
-            .inherited_descriptor()
-            .map_err(anyhow::Error::msg)?;
+        channel.inherited_descriptor().map_err(anyhow::Error::msg)?;
         Ok(Self {
             channel,
             target_fd,
@@ -386,7 +384,9 @@ impl IsolationTargetChannelAuthority {
             .map_err(anyhow::Error::msg)
     }
 
-    pub(crate) fn target_fd(&self) -> u32 {
+    /// Declared child descriptor slot, used to order typed launch channels.
+    /// This exposes no source descriptor or OS operation authority.
+    pub fn target_fd(&self) -> u32 {
         self.target_fd
     }
 
@@ -403,10 +403,7 @@ impl IsolationTargetChannelAuthority {
             .map_err(anyhow::Error::msg)
     }
 
-    pub(crate) fn retain_for_child(
-        &self,
-        inherited_fds: &mut Vec<Arc<std::fs::File>>,
-    ) {
+    pub(crate) fn retain_for_child(&self, inherited_fds: &mut Vec<Arc<std::fs::File>>) {
         self.channel.retain_for_child(inherited_fds);
     }
 }
@@ -452,30 +449,31 @@ mod tests {
             (CapturedExecution, CapturedExecution, CapturedExecution),
         ] {
             assert_eq!(parent.intersect(child), expected);
-            assert_eq!(serde_json::from_value::<IsolationFilesystemAuthorityCeiling>(
-                serde_json::to_value(expected).unwrap()
-            ).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<IsolationFilesystemAuthorityCeiling>(
+                    serde_json::to_value(expected).unwrap()
+                )
+                .unwrap(),
+                expected
+            );
         }
     }
 
     #[test]
     fn isolated_network_ceiling_is_absorbing() {
         assert_eq!(
-            IsolationNetworkAuthorityCeiling::NodePolicy.intersect(
-                IsolationNetworkAuthorityCeiling::NodePolicy
-            ),
+            IsolationNetworkAuthorityCeiling::NodePolicy
+                .intersect(IsolationNetworkAuthorityCeiling::NodePolicy),
             IsolationNetworkAuthorityCeiling::NodePolicy
         );
         assert_eq!(
-            IsolationNetworkAuthorityCeiling::NodePolicy.intersect(
-                IsolationNetworkAuthorityCeiling::Isolated
-            ),
+            IsolationNetworkAuthorityCeiling::NodePolicy
+                .intersect(IsolationNetworkAuthorityCeiling::Isolated),
             IsolationNetworkAuthorityCeiling::Isolated
         );
         assert_eq!(
-            IsolationNetworkAuthorityCeiling::Isolated.intersect(
-                IsolationNetworkAuthorityCeiling::NodePolicy
-            ),
+            IsolationNetworkAuthorityCeiling::Isolated
+                .intersect(IsolationNetworkAuthorityCeiling::NodePolicy),
             IsolationNetworkAuthorityCeiling::Isolated
         );
     }

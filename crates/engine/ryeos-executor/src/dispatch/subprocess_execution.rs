@@ -712,9 +712,16 @@ async fn dispatch_streaming_subprocess(
             state,
             &ctx.engine,
             &verified_subject.resolved.kind,
-            request.root_admission.as_ref().map(|admission| admission.resolution_output()),
-            request.parent_execution_context.as_ref().map(|parent| parent.parent_thread_id.as_str()),
-        ).map_err(DispatchError::Internal)?;
+            request
+                .root_admission
+                .as_ref()
+                .map(|admission| admission.resolution_output()),
+            request
+                .parent_execution_context
+                .as_ref()
+                .map(|parent| parent.parent_thread_id.as_str()),
+        )
+        .map_err(DispatchError::Internal)?;
     let node_filesystem = filesystem_authority_ceiling
         == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
 
@@ -865,19 +872,22 @@ async fn dispatch_streaming_subprocess(
             ))
         })
         .collect::<Result<Vec<_>, DispatchError>>()?;
-    let envs = ryeos_app::env_contract::EnvContractBuilder::new()
-        .with_base_allowlist(std::env::vars_os().filter(|_| node_filesystem).map(|(key, value)| {
-            (
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        }))
-        .map_err(|error| DispatchError::Internal(error.into()))?
-        .with_daemon_roots(roots)
-        .map_err(|error| DispatchError::Internal(error.into()))?
-        .with_typed_bindings(protocol_bindings)
-        .map_err(|error| DispatchError::Internal(error.into()))?
-        .build();
+    let envs =
+        ryeos_app::env_contract::EnvContractBuilder::new()
+            .with_base_allowlist(std::env::vars_os().filter(|_| node_filesystem).map(
+                |(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                },
+            ))
+            .map_err(|error| DispatchError::Internal(error.into()))?
+            .with_daemon_roots(roots)
+            .map_err(|error| DispatchError::Internal(error.into()))?
+            .with_typed_bindings(protocol_bindings)
+            .map_err(|error| DispatchError::Internal(error.into()))?
+            .build();
     // Streaming execution used to run as an untracked `lillux::run` blocking
     // task. A forced UDS shutdown could therefore drop the request future while
     // leaving a process absent from the daemon's exact-identity drain. Give
@@ -1085,12 +1095,16 @@ async fn dispatch_streaming_subprocess(
                     filesystem_authority_ceiling,
                     network_authority_ceiling,
                     live_access: live_access.as_ref(),
-                    state_root: request.provenance.state_root_override().filter(|_| node_filesystem),
+                    state_root: request
+                        .provenance
+                        .state_root_override()
+                        .filter(|_| node_filesystem),
                     checkpoint_dir: None,
                     checkpoint_authority: None,
                     daemon_socket_path: None,
                     bundle_roots: if node_filesystem { &bundle_roots } else { &[] },
-                    node_trusted_keys_dir: node_filesystem.then_some(&state.config.runtime_root().trusted_keys_dir()),
+                    node_trusted_keys_dir: node_filesystem
+                        .then_some(&state.config.runtime_root().trusted_keys_dir()),
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],

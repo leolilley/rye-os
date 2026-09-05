@@ -750,11 +750,9 @@ pub fn is_project_ai_sync_path(rel_path: &str) -> bool {
 
 /// True when a relative path is exactly one of the managed AI sync roots.
 pub fn is_project_ai_sync_root(rel_path: &str) -> bool {
-    PROJECT_AI_SURFACES
-        .iter()
-        .any(|surface| {
-            surface.shape == ProjectAiSurfaceShape::Directory && rel_path == surface.root
-        })
+    PROJECT_AI_SURFACES.iter().any(|surface| {
+        surface.shape == ProjectAiSurfaceShape::Directory && rel_path == surface.root
+    })
 }
 
 /// Project AI surfaces atomically materialized to the live project during
@@ -991,12 +989,8 @@ mod tests {
             ".ai/manifest.yaml/child",
             ".ai/manifest.yaml.backup",
         ] {
-            validate_project_manifest_paths(
-                &manifest(&[path]),
-                ProjectSyncScope::AiOnly,
-                None,
-            )
-            .expect_err("prefix spoof must be rejected");
+            validate_project_manifest_paths(&manifest(&[path]), ProjectSyncScope::AiOnly, None)
+                .expect_err("prefix spoof must be rejected");
         }
     }
 

@@ -84,7 +84,11 @@ fn dispatch_subprocess(
     ctx: &EngineContext,
 ) -> Result<ExecutionCompletion, EngineError> {
     let request = isolation_plan_request(
-        spec, item_ref, filesystem_authority_ceiling, network_authority_ceiling, ctx,
+        spec,
+        item_ref,
+        filesystem_authority_ceiling,
+        network_authority_ceiling,
+        ctx,
     )?;
     let capture = debug_raw.then(|| DebugCapture::from_spec(spec));
     let result = lillux::run(request);
@@ -536,7 +540,8 @@ fn isolation_plan_request(
 ) -> Result<lillux::SubprocessRequest, EngineError> {
     let (request, project_path, verified_code) = isolation_plan_request_parts(spec, ctx)?;
     let filesystem_authority_ceiling = ctx
-        .isolation_filesystem_authority_ceiling.intersect(filesystem_authority_ceiling);
+        .isolation_filesystem_authority_ceiling
+        .intersect(filesystem_authority_ceiling);
     let node_filesystem = filesystem_authority_ceiling
         == crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
     ctx.isolation.apply(
@@ -549,12 +554,22 @@ fn isolation_plan_request(
                 .isolation_network_authority_ceiling
                 .intersect(network_authority_ceiling),
             live_access: ctx.isolation_live_access_authority.as_ref(),
-            state_root: ctx.isolation_state_root.as_deref().filter(|_| node_filesystem),
+            state_root: ctx
+                .isolation_state_root
+                .as_deref()
+                .filter(|_| node_filesystem),
             checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
             checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
             daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
-            bundle_roots: if node_filesystem { &ctx.isolation_bundle_roots } else { &[] },
-            node_trusted_keys_dir: ctx.isolation_node_trusted_keys_dir.as_deref().filter(|_| node_filesystem),
+            bundle_roots: if node_filesystem {
+                &ctx.isolation_bundle_roots
+            } else {
+                &[]
+            },
+            node_trusted_keys_dir: ctx
+                .isolation_node_trusted_keys_dir
+                .as_deref()
+                .filter(|_| node_filesystem),
             verified_code: &verified_code,
             verified_command: ctx
                 .isolation_verified_command
@@ -582,7 +597,8 @@ fn isolation_plan_request_awaiting_attachment(
 ) -> Result<crate::isolation::IsolationRequestAwaitingAttachment, EngineError> {
     let (request, project_path, verified_code) = isolation_plan_request_parts(spec, ctx)?;
     let filesystem_authority_ceiling = ctx
-        .isolation_filesystem_authority_ceiling.intersect(filesystem_authority_ceiling);
+        .isolation_filesystem_authority_ceiling
+        .intersect(filesystem_authority_ceiling);
     let node_filesystem = filesystem_authority_ceiling
         == crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
     ctx.isolation.apply_awaiting_attachment(
@@ -595,12 +611,22 @@ fn isolation_plan_request_awaiting_attachment(
                 .isolation_network_authority_ceiling
                 .intersect(network_authority_ceiling),
             live_access: ctx.isolation_live_access_authority.as_ref(),
-            state_root: ctx.isolation_state_root.as_deref().filter(|_| node_filesystem),
+            state_root: ctx
+                .isolation_state_root
+                .as_deref()
+                .filter(|_| node_filesystem),
             checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
             checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
             daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
-            bundle_roots: if node_filesystem { &ctx.isolation_bundle_roots } else { &[] },
-            node_trusted_keys_dir: ctx.isolation_node_trusted_keys_dir.as_deref().filter(|_| node_filesystem),
+            bundle_roots: if node_filesystem {
+                &ctx.isolation_bundle_roots
+            } else {
+                &[]
+            },
+            node_trusted_keys_dir: ctx
+                .isolation_node_trusted_keys_dir
+                .as_deref()
+                .filter(|_| node_filesystem),
             verified_code: &verified_code,
             verified_command: ctx
                 .isolation_verified_command

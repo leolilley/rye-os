@@ -1414,9 +1414,10 @@ impl RecoveryStore {
         {
             return Ok(generated);
         }
-        let existing = self.directory.open_pinned_regular(name, false)?.ok_or_else(|| {
-            anyhow::anyhow!("workspace journal key creation raced with removal")
-        })?;
+        let existing = self
+            .directory
+            .open_pinned_regular(name, false)?
+            .ok_or_else(|| anyhow::anyhow!("workspace journal key creation raced with removal"))?;
         read_workspace_journal_key(&existing)
     }
 

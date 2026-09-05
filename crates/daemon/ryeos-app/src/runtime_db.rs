@@ -486,9 +486,9 @@ fn workspace_access_as_str(access: ryeos_engine::kind_registry::WorkspaceAccess)
 
 fn parse_workspace_access(value: &str) -> Result<ryeos_engine::kind_registry::WorkspaceAccess> {
     match value {
-        "immutable_current_generation" => Ok(
-            ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration,
-        ),
+        "immutable_current_generation" => {
+            Ok(ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration)
+        }
         "shared_exclusive" => Ok(ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive),
         other => bail!("invalid runtime workspace-operation access `{other}`"),
     }
@@ -507,19 +507,16 @@ fn decode_runtime_action_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run
     let workspace_id = row.get::<_, Option<String>>(10)?;
     let workspace_operation = workspace_id
         .map(|workspace_id| {
-            let access = parse_workspace_access(row.get::<_, String>(11)?.as_str()).map_err(
-                |error| {
+            let access =
+                parse_workspace_access(row.get::<_, String>(11)?.as_str()).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         11,
                         rusqlite::types::Type::Text,
                         error.into(),
                     )
-                },
-            )?;
-            let phase = RuntimeWorkspaceOperationPhase::parse(
-                row.get::<_, String>(12)?.as_str(),
-            )
-            .map_err(|error| {
+                })?;
+            let phase = RuntimeWorkspaceOperationPhase::parse(row.get::<_, String>(12)?.as_str())
+                .map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     12,
                     rusqlite::types::Type::Text,
@@ -534,7 +531,7 @@ fn decode_runtime_action_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run
                     error.into(),
                 )
             })?;
-            Ok(RuntimeWorkspaceOperation {
+            Ok::<_, rusqlite::Error>(RuntimeWorkspaceOperation {
                 workspace_id,
                 access,
                 phase,
@@ -7756,7 +7753,14 @@ impl RuntimeDb {
                 },
             )
             .optional()?;
-        let Some((capsule_hash, workspace_id, session_state, profile_id, generation, chain_root_id)) = session
+        let Some((
+            capsule_hash,
+            workspace_id,
+            session_state,
+            profile_id,
+            generation,
+            chain_root_id,
+        )) = session
         else {
             bail!("worker process references an unknown dedicated session");
         };
@@ -9131,7 +9135,7 @@ impl RuntimeDb {
             })
             .map(|operation| {
                 validate_runtime_workspace_operation(&operation)?;
-                Ok(operation)
+                Ok::<_, anyhow::Error>(operation)
             })
             .transpose()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -9225,8 +9229,7 @@ impl RuntimeDb {
                     && stored.worker_boot_epoch == proposed.worker_boot_epoch
                     && stored.worker_boot_identity_hash == proposed.worker_boot_identity_hash
                     && stored.project_authority_digest == proposed.project_authority_digest
-                    && stored.workload_client_grant_digest
-                        == proposed.workload_client_grant_digest
+                    && stored.workload_client_grant_digest == proposed.workload_client_grant_digest
             }
             _ => false,
         };
@@ -9458,8 +9461,7 @@ impl RuntimeDb {
                     | RuntimeWorkspaceOperationPhase::Released
             ) | (
                 RuntimeWorkspaceOperationPhase::Quiescing,
-                RuntimeWorkspaceOperationPhase::Quiesced
-                    | RuntimeWorkspaceOperationPhase::Released
+                RuntimeWorkspaceOperationPhase::Quiesced | RuntimeWorkspaceOperationPhase::Released
             ) | (
                 RuntimeWorkspaceOperationPhase::Quiesced,
                 RuntimeWorkspaceOperationPhase::ChildRunning
@@ -9568,8 +9570,7 @@ impl RuntimeDb {
                 (operation.phase != RuntimeWorkspaceOperationPhase::Released)
                     .then_some(operation.input_snapshot_hash.as_ref())
                     .flatten()
-            })
-            {
+            }) {
                 roots.insert(snapshot_hash.clone());
             }
         }

@@ -431,8 +431,7 @@ pub fn begin_hosted_root_terminalization(
         // lease while the existing RuntimeActionIntent still owns a child or
         // exact process quiescence. Durable intent is therefore the final
         // terminalization fence; do not add another workspace gate here.
-        state_store
-            .assert_no_active_runtime_workspace_operation_for_placement(root_thread_id)?;
+        state_store.assert_no_active_runtime_workspace_operation_for_placement(root_thread_id)?;
         Ok(state_store
             .active_source_worker_handoff_for_placement(root_thread_id)?
             .is_none())
@@ -448,8 +447,7 @@ pub fn begin_hosted_root_handoff_recovery(
     operation_id: &str,
 ) -> Result<HostedRootTerminalizationGuard> {
     begin_hosted_root_terminalization_with_check(root_thread_id, || {
-        state_store
-            .assert_no_active_runtime_workspace_operation_for_placement(root_thread_id)?;
+        state_store.assert_no_active_runtime_workspace_operation_for_placement(root_thread_id)?;
         let Some((_job, operation)) =
             state_store.active_source_worker_handoff_for_placement(root_thread_id)?
         else {

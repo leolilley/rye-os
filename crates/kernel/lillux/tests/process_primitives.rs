@@ -70,10 +70,11 @@ fn typed_duplex_channel_is_installed_at_its_exact_child_descriptor() {
     child
         .bind_to_subprocess_request(&mut request, "RYEOS_TEST_CHANNEL_FD", 9)
         .unwrap();
-    assert!(request.envs.contains(&(
-        "RYEOS_TEST_CHANNEL_FD".to_owned(),
-        "9".to_owned()
-    )));
+    assert!(
+        request
+            .envs
+            .contains(&("RYEOS_TEST_CHANNEL_FD".to_owned(), "9".to_owned()))
+    );
     let result = run(request);
     assert!(result.success, "{}", result.stderr);
     let mut message = String::new();
@@ -89,10 +90,11 @@ fn typed_duplex_channel_can_replace_child_standard_input_as_full_duplex() {
     child
         .bind_to_subprocess_request(&mut request, "RYEOS_TEST_CHANNEL_FD", 0)
         .unwrap();
-    assert!(request.envs.contains(&(
-        "RYEOS_TEST_CHANNEL_FD".to_owned(),
-        "0".to_owned()
-    )));
+    assert!(
+        request
+            .envs
+            .contains(&("RYEOS_TEST_CHANNEL_FD".to_owned(), "0".to_owned()))
+    );
     let result = run(request);
     assert!(result.success, "{}", result.stderr);
     let mut message = String::new();

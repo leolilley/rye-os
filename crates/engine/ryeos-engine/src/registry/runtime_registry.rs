@@ -1232,7 +1232,10 @@ fn validate_launch_contract(yaml_path: &Path, yaml: &RuntimeYaml) -> Result<(), 
                 "launch_contract.content_dependencies.external_content.max_declarations is outside the substrate ceiling",
             );
         }
-        let mount_roots = external.allowed_mount_roots.iter().collect::<std::collections::BTreeSet<_>>();
+        let mount_roots = external
+            .allowed_mount_roots
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
         if mount_roots.is_empty() || mount_roots.len() != external.allowed_mount_roots.len() {
             return runtime_yaml_error(
                 yaml_path,

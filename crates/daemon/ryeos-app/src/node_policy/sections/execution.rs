@@ -61,7 +61,9 @@ impl NodeExecutionAdmissionPolicy {
         .map_err(anyhow::Error::from)
         .context("validate node execution host-env allowlist")?;
         if let Some(policy) = &self.workload_client {
-            policy.validate().context("validate node workload-client ceiling")?;
+            policy
+                .validate()
+                .context("validate node workload-client ceiling")?;
         }
         Ok(())
     }

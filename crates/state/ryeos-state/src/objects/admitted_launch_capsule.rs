@@ -505,7 +505,10 @@ impl AdmittedExecutionClosure {
                         execution_path,
                     )?;
                     let expected = realization_mount_root
-                        .destination(Some(std::path::Path::new(ADMITTED_DIRECT_PROJECT_ROOT)), realization_mount)?
+                        .destination(
+                            Some(std::path::Path::new(ADMITTED_DIRECT_PROJECT_ROOT)),
+                            realization_mount,
+                        )?
                         .join(relative_path);
                     if execution_path != &expected {
                         anyhow::bail!(
@@ -1495,7 +1498,8 @@ impl AdmittedLaunchCapsule {
                                 "realization-member command has no exact external-realization set"
                             )
                         })?;
-                    let realizations = ExternalContentRealizationSet::from_value(realization_value)?;
+                    let realizations =
+                        ExternalContentRealizationSet::from_value(realization_value)?;
                     let Some(realization) = realizations
                         .iter()
                         .find(|entry| entry.id == *realization_id)

@@ -204,9 +204,11 @@ pub fn import_dry_run(
         }
     }
     let isolation_context = IsolationLaunchContext {
-        filesystem_authority_ceiling: isolation_context.filesystem_authority_ceiling
+        filesystem_authority_ceiling: isolation_context
+            .filesystem_authority_ceiling
             .intersect(plan.filesystem_authority_ceiling),
-        network_authority_ceiling: isolation_context.network_authority_ceiling
+        network_authority_ceiling: isolation_context
+            .network_authority_ceiling
             .intersect(plan.network_authority_ceiling),
         verified_code: &verified_code,
         verified_command: spec.verified_command.as_ref().map(|command| {

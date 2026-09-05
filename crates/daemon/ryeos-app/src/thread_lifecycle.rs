@@ -954,9 +954,10 @@ impl AdmittedProjectBinding {
                     } => snapshot_hash,
                     _ => unreachable!("pinned provenance already validated pinned authority"),
                 };
-                let workspace_lifeline = provenance.subject_workspace_lifeline().ok_or_else(|| {
-                    anyhow!("pinned execution provenance has no workspace lifeline")
-                })?;
+                let workspace_lifeline =
+                    provenance.subject_workspace_lifeline().ok_or_else(|| {
+                        anyhow!("pinned execution provenance has no workspace lifeline")
+                    })?;
                 AdmittedProjectMaterialization::Pinned {
                     original_project_path: Some(provenance.original_project_path().to_path_buf()),
                     effective_path: Some(provenance.subject_effective_path().to_path_buf()),
@@ -6624,9 +6625,10 @@ pub(super) fn build_execution_plan_for_request(
             )
             .map_err(|e| anyhow!("plan build failed: {e}")),
     }?;
-    plan.network_authority_ceiling =
-        project_execution_network_authority_ceiling(engine, resolved)?;
-    plan.filesystem_authority_ceiling = plan.filesystem_authority_ceiling.intersect(filesystem_ceiling);
+    plan.network_authority_ceiling = project_execution_network_authority_ceiling(engine, resolved)?;
+    plan.filesystem_authority_ceiling = plan
+        .filesystem_authority_ceiling
+        .intersect(filesystem_ceiling);
     Ok(plan)
 }
 
@@ -6686,8 +6688,13 @@ pub fn validate_item(
     resolved: &ResolvedExecutionRequest,
 ) -> Result<ValidatedItem> {
     let verified = verified_execution_subject(engine, resolved)?;
-    let plan = build_execution_plan_for_request(engine, resolved, &verified, None,
-        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy)?;
+    let plan = build_execution_plan_for_request(
+        engine,
+        resolved,
+        &verified,
+        None,
+        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+    )?;
 
     Ok(ValidatedItem {
         trust_class: verified.trust_class,

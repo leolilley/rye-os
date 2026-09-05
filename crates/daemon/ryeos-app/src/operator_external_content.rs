@@ -666,11 +666,10 @@ async fn bind_authorized(
         bail!("resolved external-content consumer contradicts the bind request");
     }
     let target_node_fingerprint = state.identity.fingerprint().to_owned();
-    let authorizer_grant_digest =
-        crate::operator_authority::admitted_operator_authority_digest(
-            &state,
-            &operator_fingerprint,
-        )?;
+    let authorizer_grant_digest = crate::operator_authority::admitted_operator_authority_digest(
+        &state,
+        &operator_fingerprint,
+    )?;
     let binding_subject_id =
         ryeos_state::objects::ExternalContentBinding::derive_binding_subject_id(
             &request.manifest_hash,
@@ -702,9 +701,7 @@ async fn bind_authorized(
 
     if let Some(current) = state
         .state_store
-        .with_state_db(|db| {
-            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
-        })?
+        .with_state_db(|db| db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id))?
     {
         let current_value = cas
             .get_object(&current.target_hash)?
@@ -765,11 +762,9 @@ async fn bind_authorized(
         }
     }
     if let Some(binding_hash) = stage.admitted_target_hash() {
-        let current = state
-            .state_store
-            .with_state_db(|db| {
-                db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
-            })?;
+        let current = state.state_store.with_state_db(|db| {
+            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
+        })?;
         if current.as_ref().map(|head| head.target_hash.as_str()) != Some(binding_hash) {
             bail!("admitted external-content binding receipt is not the current signed head");
         }
@@ -890,8 +885,7 @@ async fn bind_authorized(
     let signer = crate::state_store::NodeIdentitySigner::from_identity(&state.identity);
     state.state_store.with_state_db(|db| {
         db.ensure_current_external_content_binding_epoch(&guard)?;
-        let current =
-            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)?;
+        let current = db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)?;
         if let Some(current) = current.as_ref()
             && current.target_hash == binding_hash
         {
@@ -944,9 +938,7 @@ pub async fn scrub(state: Arc<AppState>, context: HandlerContext) -> anyhow::Res
                 .get_object(&head.target_hash)?
                 .ok_or_else(|| anyhow::anyhow!("binding head target is absent"))?;
             let binding = ryeos_state::objects::ExternalContentBinding::from_value(&value)?;
-            if head.namespace != BINDING_HEAD_NAMESPACE
-                || head.name != binding.binding_subject_id
-            {
+            if head.namespace != BINDING_HEAD_NAMESPACE || head.name != binding.binding_subject_id {
                 bail!("binding head coordinates contradict the retained binding");
             }
             if binding.target_node_fingerprint != state.identity.fingerprint() {
@@ -1096,9 +1088,7 @@ fn release_under_guard(
     let cas = authority.cas_store()?;
     let current = state
         .state_store
-        .with_state_db(|db| {
-            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, binding_subject_id)
-        })?
+        .with_state_db(|db| db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, binding_subject_id))?
         .ok_or_else(|| anyhow::anyhow!("external-content binding does not exist"))?;
     let value = cas
         .get_object(&current.target_hash)?
@@ -1119,10 +1109,7 @@ fn release_under_guard(
         });
     }
     let authorizer_grant_digest =
-        crate::operator_authority::admitted_operator_authority_digest(
-            state,
-            operator_fingerprint,
-        )?;
+        crate::operator_authority::admitted_operator_authority_digest(state, operator_fingerprint)?;
     let released = ryeos_state::objects::ExternalContentBinding::released_from(
         &active,
         operator_fingerprint.to_owned(),
@@ -1196,8 +1183,7 @@ pub fn require_current_binding_authorizer(
         &state.identity,
     )?
     .ok_or_else(|| anyhow::anyhow!("external-content binding authorizer was revoked"))?;
-    if current_grant.principal_class
-        != crate::identity::AuthorizedKeyPrincipalClass::LocalClient
+    if current_grant.principal_class != crate::identity::AuthorizedKeyPrincipalClass::LocalClient
         || current_grant.configured_origin_site_id.is_some()
         || current_grant.source_file_hash != binding.authorizer_grant_digest
     {
@@ -1253,10 +1239,9 @@ pub fn active_binding_from_store(
             consumer,
             target_node_fingerprint,
         )?;
-    let Some(head) = state_store
-        .with_state_db(|db| {
-            db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
-        })?
+    let Some(head) = state_store.with_state_db(|db| {
+        db.read_generic_head_ref(BINDING_HEAD_NAMESPACE, &binding_subject_id)
+    })?
     else {
         return Ok(None);
     };
@@ -1555,14 +1540,13 @@ fn resolve_installed_external_content_consumer(
         state
             .engine
             .effective_resolution_output(ryeos_engine::engine::EffectiveItemRequest {
-            item_ref: canonical,
-            expected_kind: None,
-            project_root: None,
-            subject_resolution_authority:
-                ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
-        })?;
-    if resolution.effective_trust_class
-        != ryeos_engine::resolution::TrustClass::TrustedBundle
+                item_ref: canonical,
+                expected_kind: None,
+                project_root: None,
+                subject_resolution_authority:
+                    ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+            })?;
+    if resolution.effective_trust_class != ryeos_engine::resolution::TrustClass::TrustedBundle
         || resolution.root.source_space != ryeos_engine::contracts::ItemSpace::Bundle
         || !matches!(
             &resolution.root.source_root,

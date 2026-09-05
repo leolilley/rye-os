@@ -149,7 +149,8 @@ fn prepare_workload_workspace_operation(
     {
         anyhow::bail!("workload-client caller is not the authoritative chain placement");
     }
-    let project_authority_digest = canonical_authority_digest(child_provenance.project_authority())?;
+    let project_authority_digest =
+        canonical_authority_digest(child_provenance.project_authority())?;
     if project_authority_digest != grant.project_authority_digest {
         anyhow::bail!("workload-client grant project authority changed after boot");
     }
@@ -939,10 +940,12 @@ fn enforce_callback_caps(
         .get(&canonical.kind)
         .and_then(|schema| schema.inventory_policy.admission.as_ref())
         .map(|admission| admission.required_capability(&canonical))
-        .ok_or_else(|| crate::dispatch_error::DispatchError::SchemaMisconfigured {
-            kind: canonical.kind.clone(),
-            detail: "kind has no signed execution-capability projection".to_owned(),
-        })?;
+        .ok_or_else(
+            || crate::dispatch_error::DispatchError::SchemaMisconfigured {
+                kind: canonical.kind.clone(),
+                detail: "kind has no signed execution-capability projection".to_owned(),
+            },
+        )?;
 
     if effective_caps.is_empty() {
         return Err(crate::dispatch_error::DispatchError::MissingCap { required });
@@ -1190,8 +1193,7 @@ async fn handle_execute(
                             "retained workload action lost its workspace-operation authority",
                         )
                     })?;
-                if retained.phase
-                    != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
+                if retained.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
                 {
                     return Err(runtime_action_outcome_unknown(
                         operation_id,
@@ -1559,7 +1561,8 @@ async fn handle_execute(
                     "post-dispatch runtime-action evidence validation",
                     error,
                 )
-            });
+            })
+            .map_err(crate::dispatch_error::DispatchError::Internal);
         }
         if state
             .state_store
@@ -2006,8 +2009,8 @@ fn parent_execution_context_from_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use lillux::time::{Duration, MonotonicDeadline};
+    use std::sync::Arc;
 
     // ── V5.5 P2: enforce_callback_caps ──────────────────────────────
 
@@ -2327,8 +2330,7 @@ mod tests {
             thread_id: "T-parent".to_string(),
             launch_owner: None,
             runtime_method_surface:
-                ryeos_app::callback_token::CallbackRuntimeMethodSurface::complete_runtime_protocol(
-                ),
+                ryeos_app::callback_token::CallbackRuntimeMethodSurface::complete_runtime_protocol(),
             chain_root_id: "T-parent".to_string(),
             project_path: project.path().to_path_buf(),
             expires_at: MonotonicDeadline::after(Duration::from_secs(300)),

@@ -100,9 +100,7 @@ pub(crate) struct ProjectDeployRecoveryPreparation {
 }
 
 impl ProjectDeployRecoveryPreparation {
-    pub(crate) fn schedule_before_images(
-        &self,
-    ) -> &[schedules::ScheduleRecoveryBeforeImage] {
+    pub(crate) fn schedule_before_images(&self) -> &[schedules::ScheduleRecoveryBeforeImage] {
         self.schedules.before_images()
     }
 }
@@ -121,11 +119,8 @@ pub(crate) fn prepare_commit_with_recovery(
     ctx: &ProjectDeployContext<'_>,
     preparation: ProjectDeployRecoveryPreparation,
 ) -> Result<PreparedProjectDeploy> {
-    let schedules = schedules::prepare_commit_with_recovery(
-        &plan.schedules,
-        ctx,
-        preparation.schedules,
-    )?;
+    let schedules =
+        schedules::prepare_commit_with_recovery(&plan.schedules, ctx, preparation.schedules)?;
     let report = ProjectDeployReport {
         schedules: schedules.report.clone(),
     };

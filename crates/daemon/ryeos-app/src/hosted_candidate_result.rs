@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::dedicated_session_service::HostedCommandCompletionFence;
 
 pub const HOSTED_CANDIDATE_RESULT_CLAIM: &str = "hosted_terminal_candidate_result";
-pub const HOSTED_CANDIDATE_RESULT_POLICY: &str =
-    "ryeos.hosted_terminal_candidate_result.v1";
+pub const HOSTED_CANDIDATE_RESULT_POLICY: &str = "ryeos.hosted_terminal_candidate_result.v1";
 pub const HOSTED_CANDIDATE_RESULT_SCHEMA: &str =
     "ryeos.hosted_terminal_candidate_result_evidence.v1";
 

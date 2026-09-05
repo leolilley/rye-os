@@ -3,8 +3,8 @@ pub mod cas;
 pub mod crypto;
 pub mod exec;
 pub mod identity;
-pub mod locks;
 pub mod local_ipc;
+pub mod locks;
 pub mod process_control;
 pub mod sandbox;
 pub mod secure_fs;
@@ -18,11 +18,10 @@ pub use exec::{
     AbortedProcess, AttachmentAbortError, AttachmentReleaseError, CooperativeChildTermination,
     DEFAULT_MAX_CAPTURE_BYTES, ForkSensitiveDescriptorLease, InheritedDescriptorAuthority,
     InheritedDescriptorMapping, InheritedDuplexChannel, InheritedDuplexChannelChildAuthority,
-    OutputLimitExceeded,
-    PendingCooperativeChildTermination, ProcessAwaitingAttachment, RunningProcess, SpawnResult,
-    SubprocessLimits, SubprocessRequest, SubprocessResult, SupervisedLauncherAttachmentStatusPipe,
-    SupervisedLauncherStatusPipe, SupervisedProcessStatus, configure_command_argv0,
-    configure_inherited_descriptor_authorities, configure_inherited_fds,
+    OutputLimitExceeded, PendingCooperativeChildTermination, ProcessAwaitingAttachment,
+    RunningProcess, SpawnResult, SubprocessLimits, SubprocessRequest, SubprocessResult,
+    SupervisedLauncherAttachmentStatusPipe, SupervisedLauncherStatusPipe, SupervisedProcessStatus,
+    configure_command_argv0, configure_inherited_descriptor_authorities, configure_inherited_fds,
     configure_owner_private_creation_mask, configure_subprocess_limits, disable_process_core_dumps,
     inherited_descriptor_coordinate, inherited_descriptor_path_for, inherited_duplex_channel_pair,
     protect_descriptor_from_exec, sealed_executable_memfd, sealed_memfd,
@@ -39,25 +38,23 @@ pub use cas::{
     CanonicalJsonError, CasPutOutcome, CasStore, StreamedBlobOutcome, atomic_write_batch,
     atomic_write_batch_in_pinned_root, canonical_json, sha256_hex, shard_path, valid_hash,
 };
+pub use local_ipc::{LocalDuplexStream, OwnerPrivateLocalDuplexListener};
 pub use locks::{
     ExactExclusiveFileLock, ExclusiveFileLock, SharedFileLock, with_exclusive_file_lock,
 };
-pub use local_ipc::{LocalDuplexStream, OwnerPrivateLocalDuplexListener};
 pub use process_control::{
     ExactProcessIdentity, QuiescedProcessGroup, quiesce_exact_process_group,
 };
 pub use secure_fs::{
-    DirectoryTraversalBudget, FilesystemCapacity, NoFollowDirectoryTree,
-    OpenFileIdentity, OpenMountEntryKind, OpenRegularFileObservation, PinnedDirectory,
-    PinnedDirectoryEntry,
+    DirectoryTraversalBudget, FilesystemCapacity, NoFollowDirectoryTree, OpenFileIdentity,
+    OpenMountEntryKind, OpenRegularFileObservation, PinnedDirectory, PinnedDirectoryEntry,
     PinnedDirectoryEntryMetadata, PinnedDirectoryIdentity, PinnedDirectoryLock, PinnedEntryType,
-    PinnedRegularFile, ProcessScopedFlatDirectoryGeneration, collect_directory_tree_no_follow,
-    collect_pinned_regular_files_no_follow_bounded, collect_regular_files_no_follow,
-    digest_open_regular_file_stable_exact, ensure_open_regular_file_unchanged,
-    canonicalize_existing_path, current_user_home, inspect_optional_entry_no_follow,
-    matches_regular_file_identity,
-    normalized_portable_regular_mode, observe_open_regular_file,
-    observe_open_file_identity, open_mount_entry_kind, open_pinned_regular_file_no_follow,
+    PinnedRegularFile, ProcessScopedFlatDirectoryGeneration, canonicalize_existing_path,
+    collect_directory_tree_no_follow, collect_pinned_regular_files_no_follow_bounded,
+    collect_regular_files_no_follow, current_user_home, digest_open_regular_file_stable_exact,
+    ensure_open_regular_file_unchanged, inspect_optional_entry_no_follow,
+    matches_regular_file_identity, normalized_portable_regular_mode, observe_open_file_identity,
+    observe_open_regular_file, open_mount_entry_kind, open_pinned_regular_file_no_follow,
     pin_canonical_mount_source, protected_system_write_roots, read_open_regular_file_bounded,
     read_open_regular_file_exact_bounded, read_open_regular_file_stable_bounded,
     read_optional_regular_file_bounded_no_follow, read_optional_regular_file_no_follow,

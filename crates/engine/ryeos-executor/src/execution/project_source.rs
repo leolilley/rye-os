@@ -452,9 +452,7 @@ pub fn prepare_pinned_project_external_consumer(
         || resolution.root.source_content_digest != verified.resolved.content_hash
         || resolution.root.raw_content_digest != verified.resolved.raw_content_digest
     {
-        anyhow::bail!(
-            "project external-content consumer resolution differs from verified subject"
-        );
+        anyhow::bail!("project external-content consumer resolution differs from verified subject");
     }
     let item_kind = verified.resolved.kind.as_str();
     let source_contract = project_context
@@ -509,9 +507,7 @@ pub fn prepare_pinned_project_external_consumer(
         item_kind,
         &mut resolution,
         &roots,
-        project_authority.map(|(root, content)| {
-            (root, content, project_snapshot_hash.to_owned())
-        }),
+        project_authority.map(|(root, content)| (root, content, project_snapshot_hash.to_owned())),
         source_policy.as_ref(),
     )?
     .ok_or_else(|| {

@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::ItemSpace;
 
 pub use ryeos_state::objects::{
-    ExternalContentMountRoot,
     EXTERNAL_CONTENT_MANIFEST_KIND, EXTERNAL_CONTENT_TREE_SCHEMA,
     EXTERNAL_REALIZATIONS_DERIVED_KEY, ExternalContentKind,
     ExternalContentManifestEntry as ManifestEntry, ExternalContentManifestEntryKind,
-    ExternalContentManifestObject, ExternalContentMode, FILE_REALIZATION_ENTRY_PATH,
+    ExternalContentManifestObject, ExternalContentMode, ExternalContentMountRoot,
+    FILE_REALIZATION_ENTRY_PATH,
 };
 
 pub const MAX_DECLARATIONS_PER_ITEM: usize = 8;
@@ -296,7 +296,9 @@ fn validate_declaration_collection(
     let mounts = mounts.into_iter().collect::<Vec<_>>();
     for (index, left) in mounts.iter().enumerate() {
         for right in mounts.iter().skip(index + 1) {
-            if left.0 == right.0 && (path_contains(left.1, right.1) || path_contains(right.1, left.1)) {
+            if left.0 == right.0
+                && (path_contains(left.1, right.1) || path_contains(right.1, left.1))
+            {
                 anyhow::bail!("external content mounts `{left:?}` and `{right:?}` overlap");
             }
         }
@@ -350,10 +352,14 @@ fn validate_kind_contract(
         );
     }
     for declaration in declarations {
-        if !contract.allowed_mount_roots.contains(&declaration.mount_root) {
+        if !contract
+            .allowed_mount_roots
+            .contains(&declaration.mount_root)
+        {
             anyhow::bail!(
                 "external content `{}` names mount root {:?} which its signed kind does not permit",
-                declaration.id, declaration.mount_root,
+                declaration.id,
+                declaration.mount_root,
             );
         }
         if let Some(locator) = &declaration.locator
@@ -488,9 +494,11 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.realization_id, "toolchain");
         assert_eq!(parsed.relative_path, "bin/rustc");
-        assert!(parse_realization_command_ref("/usr/bin/rustc")
-            .unwrap()
-            .is_none());
+        assert!(
+            parse_realization_command_ref("/usr/bin/rustc")
+                .unwrap()
+                .is_none()
+        );
         assert!(parse_realization_command_ref("realization:toolchain/../rustc").is_err());
         assert!(parse_realization_command_ref("realization:toolchain").is_err());
         assert!(parse_realization_command_ref("realization:/bin/rustc").is_err());
@@ -554,11 +562,22 @@ mod tests {
             "digest": "a".repeat(64), "mount_root": "execution_runtime", "mount": "platform"
         }]});
         let mut policy = contract(&[], 1);
-        assert!(declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_err());
-        policy.allowed_mount_roots.push(ExternalContentMountRoot::ExecutionRuntime);
-        assert!(declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_ok());
-        value["external_content"][0].as_object_mut().unwrap().remove("mount_root");
-        assert!(declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_err());
+        assert!(
+            declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_err()
+        );
+        policy
+            .allowed_mount_roots
+            .push(ExternalContentMountRoot::ExecutionRuntime);
+        assert!(
+            declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_ok()
+        );
+        value["external_content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("mount_root");
+        assert!(
+            declarations_from_composed(&value, Some(&policy), DeclaringAuthority::Project).is_err()
+        );
     }
 
     #[test]

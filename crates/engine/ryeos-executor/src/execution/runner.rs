@@ -753,8 +753,7 @@ fn prepare_cas_context(
                     effective_path.display()
                 );
             }
-            let (tree_hash, policy_hash) =
-                read_pre_tree_for_snapshot(state, input_snapshot_hash)?;
+            let (tree_hash, policy_hash) = read_pre_tree_for_snapshot(state, input_snapshot_hash)?;
             tracing::trace!(
                 thread_id = %thread_id,
                 effective_path = %effective_path.display(),
@@ -2259,7 +2258,9 @@ fn retained_resolution_has_filesystem_bindings(
         .contains_key(ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY);
     // Runtime-root realizations are not project fold-back exclusions, but
     // still require exact filesystem binding before this process can launch.
-    let has_external = resolution.composed.derived
+    let has_external = resolution
+        .composed
+        .derived
         .get(ryeos_state::objects::EXTERNAL_REALIZATIONS_DERIVED_KEY)
         .map(ryeos_state::objects::ExternalContentRealizationSet::from_value)
         .transpose()?
@@ -2550,9 +2551,11 @@ fn admitted_root_launch_metadata(
         source_policy,
     } = finalized;
     if let Some(parent_thread_id) = params.parent_thread_id.as_deref() {
-        let (filesystem, network) = super::execution_realization::admitted_parent_isolation_ceilings(
-            state, parent_thread_id,
-        )?;
+        let (filesystem, network) =
+            super::execution_realization::admitted_parent_isolation_ceilings(
+                state,
+                parent_thread_id,
+            )?;
         prepared_plan.restrict_isolation_authority(filesystem, network);
     }
     if let Some(source_policy) = source_policy.as_ref() {
@@ -3100,7 +3103,12 @@ pub async fn run_and_wait(
                 .as_ref()
                 .map(|sealed| sealed as &dyn ryeos_engine::project_content::SealedDependencyBytes),
             match params.parent_thread_id.as_deref() {
-                Some(parent) => super::execution_realization::admitted_parent_isolation_ceilings(&state, parent)?.0,
+                Some(parent) => {
+                    super::execution_realization::admitted_parent_isolation_ceilings(
+                        &state, parent,
+                    )?
+                    .0
+                }
                 None => ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             },
         )?
@@ -4041,7 +4049,12 @@ pub async fn run_detached(
                 .as_ref()
                 .map(|sealed| sealed as &dyn ryeos_engine::project_content::SealedDependencyBytes),
             match params.parent_thread_id.as_deref() {
-                Some(parent) => super::execution_realization::admitted_parent_isolation_ceilings(&state, parent)?.0,
+                Some(parent) => {
+                    super::execution_realization::admitted_parent_isolation_ceilings(
+                        &state, parent,
+                    )?
+                    .0
+                }
                 None => ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             },
         )?

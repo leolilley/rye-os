@@ -1394,6 +1394,7 @@ where
     if retained_session_protocol(&state.engine, &capsule)?.process_mode
         != PersistentSessionProcessMode::PooledRequests
     {
+        let protocol_ref = capsule_protocol_identity(&capsule)?.0;
         bail!(
             "exclusive persistent-session protocol `{protocol_ref}` cannot enter the request pool"
         );
@@ -1436,29 +1437,44 @@ fn retained_session_protocol(
     capsule: &AdmittedPersistentSessionCapsule,
 ) -> Result<ryeos_engine::protocols::descriptor::PersistentSessionProtocol> {
     let ryeos_state::objects::AdmittedLaunchArtifactIdentity::DirectItemExecutor {
-        protocol_ref, protocol_content_hash, protocol_signer_fingerprint, ..
-    } = &capsule.artifact_identity else {
+        protocol_ref,
+        protocol_content_hash,
+        protocol_signer_fingerprint,
+        ..
+    } = &capsule.artifact_identity
+    else {
         bail!("persistent-session protocol has no direct artifact identity");
     };
     let ryeos_state::objects::AdmittedExecutionClosure::DirectItemExecutor {
-        protocol_descriptor_document, execution_plan, ..
-    } = &capsule.execution_closure else {
+        protocol_descriptor_document,
+        execution_plan,
+        ..
+    } = &capsule.execution_closure
+    else {
         bail!("persistent-session protocol has no retained direct closure");
     };
     // The current trust store may revoke the retained signer. It must never
     // replace admitted behavior with a newer descriptor at the same ref.
     let body = super::launch::verify_admitted_signed_descriptor_document(
-        protocol_descriptor_document, protocol_content_hash, protocol_signer_fingerprint,
+        protocol_descriptor_document,
+        protocol_content_hash,
+        protocol_signer_fingerprint,
         &engine.node_trust_store,
-    ).map_err(|error| anyhow!("verify retained session protocol: {error}"))?;
+    )
+    .map_err(|error| anyhow!("verify retained session protocol: {error}"))?;
     let descriptor: ryeos_engine::protocols::ProtocolDescriptor = serde_yaml::from_str(&body)?;
     ryeos_engine::protocols::validate_admitted_protocol_descriptor(protocol_ref, &descriptor)?;
-    let session = validate_persistent_session_protocol(&descriptor)
-        .map_err(|error| anyhow!(error))?;
-    let plan: ryeos_engine::contracts::ExecutionPlan = serde_json::from_value(execution_plan.clone())?;
-    if plan.filesystem_authority_ceiling.intersect(session.workspace_authority.filesystem_ceiling())
+    let session =
+        validate_persistent_session_protocol(&descriptor).map_err(|error| anyhow!(error))?;
+    let plan: ryeos_engine::contracts::ExecutionPlan =
+        serde_json::from_value(execution_plan.clone())?;
+    if plan
+        .filesystem_authority_ceiling
+        .intersect(session.workspace_authority.filesystem_ceiling())
         != plan.filesystem_authority_ceiling
-        || plan.network_authority_ceiling.intersect(session.network_authority.network_ceiling())
+        || plan
+            .network_authority_ceiling
+            .intersect(session.network_authority.network_ceiling())
             != plan.network_authority_ceiling
     {
         bail!("persistent-session plan widens its retained protocol ceilings");
@@ -1589,9 +1605,7 @@ fn spawn_capsule_process_held(
     session_protocol: &ryeos_engine::protocols::descriptor::PersistentSessionProtocol,
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
-    mut extra_target_channels: Vec<
-        ryeos_engine::isolation::IsolationTargetChannelAuthority,
-    >,
+    mut extra_target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
 ) -> Result<HeldPersistentSession> {
     let resolution = exact.resolution_output.restore();
     super::source_closure::validate_external_mount_separation(state, &resolution)?;
@@ -1772,9 +1786,7 @@ pub fn start_exclusive_capsule(
     workspace: &Path,
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
-    extra_target_channels: Vec<
-        ryeos_engine::isolation::IsolationTargetChannelAuthority,
-    >,
+    extra_target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
     identity: &ExclusivePersistentSessionIdentity,
     observation_sink: ryeos_app::persistent_session::PersistentSessionObservationSink,
 ) -> Result<()> {

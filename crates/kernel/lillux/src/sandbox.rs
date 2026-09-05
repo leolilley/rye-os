@@ -234,9 +234,7 @@ pub fn inspect_linux_sandbox() -> Result<LinuxSandboxInspection, String> {
 /// On success the calling process is itself inside the new user/mount/IPC/UTS
 /// namespace and private root. This API is intended for a dedicated adapter
 /// process, not an application daemon.
-pub fn launch_linux_sandbox(
-    request: LinuxSandboxRequest,
-) -> Result<LinuxSandboxProcess, String> {
+pub fn launch_linux_sandbox(request: LinuxSandboxRequest) -> Result<LinuxSandboxProcess, String> {
     imp::launch(request)
 }
 
@@ -405,8 +403,7 @@ mod imp {
         validate_request(&request)?;
         if request.aggregate_limits.is_some() {
             return Err(
-                "aggregate resource isolation requires a delegated cgroup-v2 authority"
-                    .to_string(),
+                "aggregate resource isolation requires a delegated cgroup-v2 authority".to_string(),
             );
         }
         enter_namespaces(request.network)?;
@@ -496,8 +493,7 @@ mod imp {
             if !descriptor_roles.insert(source) {
                 return Err("target-channel descriptor aliases filesystem authority".to_string());
             }
-            if matches!(target, 1 | 2)
-                || previous_target.is_some_and(|previous| previous >= target)
+            if matches!(target, 1 | 2) || previous_target.is_some_and(|previous| previous >= target)
             {
                 return Err(
                     "sandbox target channels must be uniquely target-fd sorted and cannot replace stdout/stderr"
@@ -518,7 +514,7 @@ mod imp {
                     || !descriptor_roles.insert(release_keepalive_fd)
                 {
                     return Err(
-                        "sandbox release descriptors alias another authority role".to_string(),
+                        "sandbox release descriptors alias another authority role".to_string()
                     );
                 }
             }
@@ -544,8 +540,14 @@ mod imp {
         write_proc_mapping("/proc/self/setgroups", "deny\n", true)?;
         write_proc_mapping("/proc/self/uid_map", &format!("0 {uid} 1\n"), false)?;
         write_proc_mapping("/proc/self/gid_map", &format!("0 {gid} 1\n"), false)?;
-        syscall_zero(unsafe { libc::setresgid(0, 0, 0) }, "enter mapped sandbox gid")?;
-        syscall_zero(unsafe { libc::setresuid(0, 0, 0) }, "enter mapped sandbox uid")?;
+        syscall_zero(
+            unsafe { libc::setresgid(0, 0, 0) },
+            "enter mapped sandbox gid",
+        )?;
+        syscall_zero(
+            unsafe { libc::setresuid(0, 0, 0) },
+            "enter mapped sandbox uid",
+        )?;
         let mut flags =
             libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS | libc::CLONE_NEWPID;
         if network == LinuxSandboxNetwork::Isolated {
@@ -597,7 +599,10 @@ mod imp {
     fn descriptor_kind(fd: u32) -> Result<DescriptorKind, String> {
         let fd = raw_fd(fd)?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        syscall_zero(unsafe { libc::fstat(fd, stat.as_mut_ptr()) }, "inspect mount descriptor")?;
+        syscall_zero(
+            unsafe { libc::fstat(fd, stat.as_mut_ptr()) },
+            "inspect mount descriptor",
+        )?;
         let stat = unsafe { stat.assume_init() };
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => Ok(DescriptorKind::Directory),
@@ -623,7 +628,10 @@ mod imp {
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
                 ensure_directory_path(path, "sandbox mount target")
             }
-            Err(error) => Err(format!("create sandbox mount target {}: {error}", path.display())),
+            Err(error) => Err(format!(
+                "create sandbox mount target {}: {error}",
+                path.display()
+            )),
         }
     }
 
@@ -648,7 +656,10 @@ mod imp {
         if error.raw_os_error() == Some(libc::EEXIST) {
             ensure_regular_path(path, "sandbox mount target")
         } else {
-            Err(format!("create sandbox mount target {}: {error}", path.display()))
+            Err(format!(
+                "create sandbox mount target {}: {error}",
+                path.display()
+            ))
         }
     }
 
@@ -666,7 +677,10 @@ mod imp {
                     ensure_directory_path(&current, "sandbox directory")?;
                 }
                 Err(error) => {
-                    return Err(format!("create sandbox directory {}: {error}", current.display()));
+                    return Err(format!(
+                        "create sandbox directory {}: {error}",
+                        current.display()
+                    ));
                 }
             }
         }
@@ -674,7 +688,8 @@ mod imp {
     }
 
     fn mkdir_one(path: &str, mode: libc::mode_t) -> std::io::Result<()> {
-        let path = CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let path =
+            CString::new(path).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         if unsafe { libc::mkdir(path.as_ptr(), mode) } == 0 {
             Ok(())
         } else {
@@ -757,9 +772,8 @@ mod imp {
         for name in ["lower", "upper", "work", "merged", "final"] {
             mkdir_path(&format!("{probe}/{name}"), 0o700)?;
         }
-        let options = format!(
-            "lowerdir={probe}/lower,upperdir={probe}/upper,workdir={probe}/work,userxattr"
-        );
+        let options =
+            format!("lowerdir={probe}/lower,upperdir={probe}/upper,workdir={probe}/work,userxattr");
         mount_raw(
             Some("overlay"),
             &format!("{probe}/merged"),
@@ -895,8 +909,8 @@ mod imp {
             | OPEN_TREE_CLOEXEC
             | libc::AT_EMPTY_PATH as libc::c_uint
             | if recursive { AT_RECURSIVE } else { 0 };
-        let mount_fd = unsafe { libc::syscall(libc::SYS_open_tree, source_fd, c"".as_ptr(), flags) }
-            as RawFd;
+        let mount_fd =
+            unsafe { libc::syscall(libc::SYS_open_tree, source_fd, c"".as_ptr(), flags) } as RawFd;
         if mount_fd < 0 {
             return Err(format!(
                 "clone exact descriptor mount: {}",
@@ -1047,7 +1061,10 @@ mod imp {
 
     fn pivot_into_private_root() -> Result<(), String> {
         let root = CString::new(ROOT).expect("static root");
-        syscall_zero(unsafe { libc::chdir(root.as_ptr()) }, "enter private root mount")?;
+        syscall_zero(
+            unsafe { libc::chdir(root.as_ptr()) },
+            "enter private root mount",
+        )?;
         let dot = c".";
         let old = c".lillux-old-root";
         let result = unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), old.as_ptr()) };
@@ -1179,7 +1196,11 @@ mod imp {
             mapped_channels.push(target);
         }
         let mut keep = vec![ready_fd];
-        keep.extend(mapped_channels.into_iter().filter(|fd| *fd > libc::STDERR_FILENO));
+        keep.extend(
+            mapped_channels
+                .into_iter()
+                .filter(|fd| *fd > libc::STDERR_FILENO),
+        );
         if let LinuxSandboxLifecycle::AwaitRelease {
             release_fd,
             release_keepalive_fd,
@@ -1253,7 +1274,10 @@ mod imp {
             .chain(std::iter::once(std::ptr::null()))
             .collect::<Vec<_>>();
         let cwd = c_string(request.cwd.as_os_str(), "sandbox cwd")?;
-        syscall_zero(unsafe { libc::chdir(cwd.as_ptr()) }, "enter sandbox target cwd")?;
+        syscall_zero(
+            unsafe { libc::chdir(cwd.as_ptr()) },
+            "enter sandbox target cwd",
+        )?;
         unsafe {
             libc::execve(executable.as_ptr(), argv.as_ptr(), envp.as_ptr());
         }
@@ -1344,12 +1368,7 @@ mod imp {
                     SECCOMP_RET_ERRNO | libc::EPERM as u32,
                 ));
             }
-            filter.push(instruction(
-                BPF_JMP_JEQ_K,
-                0,
-                1,
-                libc::SYS_clone3 as u32,
-            ));
+            filter.push(instruction(BPF_JMP_JEQ_K, 0, 1, libc::SYS_clone3 as u32));
             filter.push(instruction(
                 BPF_RET_K,
                 0,
@@ -1410,7 +1429,7 @@ mod imp {
         operation: LinuxOverlayWorkspaceOperation,
         max_mutations: usize,
     ) -> Result<LinuxOverlayWorkspaceObservation, String> {
-        let project = inherited_directory(project_fd, "overlay project")?;
+        let _project = inherited_directory(project_fd, "overlay project")?;
         let state = inherited_directory(state_fd, "overlay state")?;
         let upper = match operation {
             LinuxOverlayWorkspaceOperation::Create => state
@@ -1460,10 +1479,20 @@ mod imp {
                         max_mutations.saturating_add(2),
                         256,
                     ))
-                    .map_err(|error| format!("remove overlay {} contents: {error}", name.to_string_lossy()))?;
+                    .map_err(|error| {
+                        format!(
+                            "remove overlay {} contents: {error}",
+                            name.to_string_lossy()
+                        )
+                    })?;
                 if !state
                     .remove_empty_child_if_same(name, child)
-                    .map_err(|error| format!("remove overlay {} directory: {error}", name.to_string_lossy()))?
+                    .map_err(|error| {
+                        format!(
+                            "remove overlay {} directory: {error}",
+                            name.to_string_lossy()
+                        )
+                    })?
                 {
                     return Err(format!(
                         "overlay {} directory remained non-empty during destroy",
@@ -1543,7 +1572,11 @@ mod imp {
                 libc::S_IFREG => {
                     let (size, sha256) = hash_regular_at(directory_fd, &name_c, &stat, &relative)?;
                     LinuxOverlayMutationKind::UpsertRegular {
-                        normalized_mode: if stat.st_mode & 0o111 != 0 { 0o755 } else { 0o644 },
+                        normalized_mode: if stat.st_mode & 0o111 != 0 {
+                            0o755
+                        } else {
+                            0o644
+                        },
                         size,
                         sha256,
                     }
@@ -1553,10 +1586,7 @@ mod imp {
                         libc::openat(
                             directory_fd,
                             name_c.as_ptr(),
-                            libc::O_RDONLY
-                                | libc::O_DIRECTORY
-                                | libc::O_NOFOLLOW
-                                | libc::O_CLOEXEC,
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                         )
                     };
                     if child < 0 {
@@ -1586,7 +1616,10 @@ mod imp {
                     ));
                 }
             };
-            mutations.push(LinuxOverlayMutation { path: relative, kind });
+            mutations.push(LinuxOverlayMutation {
+                path: relative,
+                kind,
+            });
         }
         Ok(())
     }
@@ -1629,7 +1662,9 @@ mod imp {
         }
         let after = verify_regular_identity(&file, expected, relative)?;
         if total != after.st_size as u64 {
-            return Err(format!("overlay mutation changed size during scan: {relative}"));
+            return Err(format!(
+                "overlay mutation changed size during scan: {relative}"
+            ));
         }
         Ok((total, format!("{:x}", digest.finalize())))
     }
@@ -1650,7 +1685,9 @@ mod imp {
             || observed.st_size != expected.st_size
             || observed.st_mode & libc::S_IFMT != libc::S_IFREG
         {
-            return Err(format!("overlay mutation changed identity during scan: {relative}"));
+            return Err(format!(
+                "overlay mutation changed identity during scan: {relative}"
+            ));
         }
         Ok(observed)
     }
@@ -1819,13 +1856,8 @@ mod imp {
     fn read_exact_fd(fd: RawFd, bytes: &mut [u8]) -> Result<(), String> {
         let mut read = 0;
         while read < bytes.len() {
-            let count = unsafe {
-                libc::read(
-                    fd,
-                    bytes[read..].as_mut_ptr().cast(),
-                    bytes.len() - read,
-                )
-            };
+            let count =
+                unsafe { libc::read(fd, bytes[read..].as_mut_ptr().cast(), bytes.len() - read) };
             if count > 0 {
                 read += count as usize;
                 continue;
@@ -1844,13 +1876,8 @@ mod imp {
     fn write_all_fd(fd: RawFd, bytes: &[u8]) -> Result<(), String> {
         let mut written = 0;
         while written < bytes.len() {
-            let count = unsafe {
-                libc::write(
-                    fd,
-                    bytes[written..].as_ptr().cast(),
-                    bytes.len() - written,
-                )
-            };
+            let count =
+                unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
             if count > 0 {
                 written += count as usize;
                 continue;
@@ -1994,7 +2021,9 @@ mod imp {
     fn validate_inherited_fd(fd: u32, label: &str) -> Result<(), String> {
         let fd = raw_fd(fd)?;
         if fd <= libc::STDERR_FILENO || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-            return Err(format!("{label} descriptor is not a live inherited descriptor"));
+            return Err(format!(
+                "{label} descriptor is not a live inherited descriptor"
+            ));
         }
         Ok(())
     }
@@ -2039,8 +2068,8 @@ mod imp {
             let original = descriptors[index];
             let mut occupied_reservations = Vec::new();
             let replacement = loop {
-                let candidate = duplicate_fd(original)
-                    .map_err(|error| format!("relocate {label}: {error}"))?;
+                let candidate =
+                    duplicate_fd(original).map_err(|error| format!("relocate {label}: {error}"))?;
                 if reserved.contains(&candidate) {
                     // Keep this duplicate open while searching so F_DUPFD
                     // advances past an intentionally reserved target.
@@ -2064,10 +2093,16 @@ mod imp {
         data: Option<&str>,
     ) -> std::io::Result<()> {
         let source = source.map(CString::new).transpose().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "mount source contains NUL")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mount source contains NUL",
+            )
         })?;
         let target = CString::new(target).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "mount target contains NUL")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mount target contains NUL",
+            )
         })?;
         let filesystem = filesystem.map(CString::new).transpose().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "filesystem contains NUL")
@@ -2077,7 +2112,9 @@ mod imp {
         })?;
         let result = unsafe {
             libc::mount(
-                source.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                source
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
                 target.as_ptr(),
                 filesystem
                     .as_ref()
@@ -2197,7 +2234,9 @@ mod tests {
         std::fs::create_dir_all(state_path.join("upper")).unwrap();
         std::fs::create_dir_all(state_path.join("work")).unwrap();
         std::fs::write(state_path.join("upper/result.txt"), b"retained bytes").unwrap();
-        let project = crate::PinnedDirectory::open(&project_path).unwrap().unwrap();
+        let project = crate::PinnedDirectory::open(&project_path)
+            .unwrap()
+            .unwrap();
         let state = crate::PinnedDirectory::open(&state_path).unwrap().unwrap();
         let project_fd = project.try_clone_descriptor().unwrap();
         let state_fd = state.try_clone_descriptor().unwrap();
@@ -2226,7 +2265,9 @@ mod tests {
         std::fs::create_dir_all(state_path.join("upper/nested")).unwrap();
         std::fs::create_dir_all(state_path.join("work")).unwrap();
         std::fs::write(state_path.join("upper/nested/result.txt"), b"bytes").unwrap();
-        let project = crate::PinnedDirectory::open(&project_path).unwrap().unwrap();
+        let project = crate::PinnedDirectory::open(&project_path)
+            .unwrap()
+            .unwrap();
         let state = crate::PinnedDirectory::open(&state_path).unwrap().unwrap();
         let project_fd = project.try_clone_descriptor().unwrap();
         let state_fd = state.try_clone_descriptor().unwrap();

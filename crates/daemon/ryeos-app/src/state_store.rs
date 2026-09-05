@@ -4008,8 +4008,7 @@ fn ensure_current_external_content_bindings(state: &StateDb) -> Result<()> {
             let source_binding =
                 ryeos_state::objects::EffectiveSourceBinding::from_value(&source_value)?;
             if source_binding.digest()? != source_projection.binding_hash
-                || source_binding.content_manifest_hash
-                    != source_projection.content_manifest_hash
+                || source_binding.content_manifest_hash != source_projection.content_manifest_hash
                 || source_binding.owner_key()? != source_projection.owner_key
             {
                 bail!("project external-content source projection is inconsistent");
@@ -14116,8 +14115,7 @@ impl StateStore {
             .ok_or_else(|| anyhow!("workspace operation caller has no hosted session"))?;
         if session.chain_root_id != caller.chain_root_id
             || session.workspace_id != workspace_operation.workspace_id
-            || session.worker_instance_id.as_deref()
-                != Some(workspace_operation.worker_instance_id)
+            || session.worker_instance_id.as_deref() != Some(workspace_operation.worker_instance_id)
             || session.worker_boot_epoch != Some(workspace_operation.worker_boot_epoch)
             || !matches!(
                 session.state.as_str(),
@@ -14170,9 +14168,12 @@ impl StateStore {
             .into_iter()
             .filter(|intent| {
                 intent.chain_root_id == chain_root_id
-                    && intent.workspace_operation.as_ref().is_some_and(|operation| {
-                        operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::Released
-                    })
+                    && intent
+                        .workspace_operation
+                        .as_ref()
+                        .is_some_and(|operation| {
+                            operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::Released
+                        })
             })
             .collect())
     }
@@ -14205,9 +14206,12 @@ impl StateStore {
             .into_iter()
             .filter(|intent| {
                 intent.first_caller_thread_id == placement_thread_id
-                    && intent.workspace_operation.as_ref().is_some_and(|operation| {
-                        operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::Released
-                    })
+                    && intent
+                        .workspace_operation
+                        .as_ref()
+                        .is_some_and(|operation| {
+                            operation.phase != runtime_db::RuntimeWorkspaceOperationPhase::Released
+                        })
             })
             .count();
         if active != 0 {
@@ -14253,19 +14257,17 @@ impl StateStore {
     /// Release an operation only after existing thread/launcher authorities
     /// prove that its exact child is absent or terminal and process-detached.
     /// Signal delivery or terminal status alone is never reap evidence.
-    pub fn begin_runtime_workspace_operation_settlement(
-        &self,
-        operation_id: &str,
-    ) -> Result<bool> {
+    pub fn begin_runtime_workspace_operation_settlement(&self, operation_id: &str) -> Result<bool> {
         let _permit = self.acquire_write_permit()?;
         let g = self.lock()?;
         let intent = g
             .runtime_db
             .get_runtime_action_intent(operation_id)?
             .ok_or_else(|| anyhow!("runtime workspace operation `{operation_id}` is absent"))?;
-        let operation = intent.workspace_operation.as_ref().ok_or_else(|| {
-            anyhow!("runtime action `{operation_id}` has no workspace operation")
-        })?;
+        let operation = intent
+            .workspace_operation
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime action `{operation_id}` has no workspace operation"))?;
         if operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::Settling
             || operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::Released
         {

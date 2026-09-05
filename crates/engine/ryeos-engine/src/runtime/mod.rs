@@ -209,10 +209,7 @@ fn render_compiled_runtime_template(
         "tool_path".to_owned(),
         Value::String(ctx.tool_path.to_string_lossy().into_owned()),
     );
-    roots.insert(
-        "params".to_owned(),
-        ctx.params.clone(),
-    );
+    roots.insert("params".to_owned(), ctx.params.clone());
     roots.insert(
         "params_json".to_owned(),
         Value::String(ctx.params_json.clone()),

@@ -63,8 +63,8 @@ pub use admitted_launch_capsule::{
     ADMITTED_DIRECT_COMMAND_ROOT, ADMITTED_DIRECT_PROJECT_ROOT,
     ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION, AdmittedAccountingScope, AdmittedDirectCommandClosure,
     AdmittedExecutionClosure, AdmittedLaunchArtifactIdentity, AdmittedLaunchAuthority,
-    AdmittedLaunchCapsule, DirectExecutableIdentity, DirectRootSourceIdentity, DirectRuntimeIdentity,
-    DirectRuntimeSourceSpace, admitted_direct_command_execution_path,
+    AdmittedLaunchCapsule, DirectExecutableIdentity, DirectRootSourceIdentity,
+    DirectRuntimeIdentity, DirectRuntimeSourceSpace, admitted_direct_command_execution_path,
 };
 pub use attestation::Attestation;
 pub use bundle_event::{
@@ -114,16 +114,16 @@ pub use external_content_binding::{
     ExternalContentBindingState, ExternalContentConsumerAuthority,
 };
 pub use external_content_manifest::{
-    EXECUTION_RUNTIME_REALIZATIONS_ROOT, ExternalContentMountRoot,
-    EXTERNAL_CONTENT_MANIFEST_KIND, EXTERNAL_CONTENT_TREE_SCHEMA,
-    EXTERNAL_REALIZATIONS_DERIVED_KEY, ExternalContentKind, ExternalContentManifestEntry,
-    ExternalContentManifestEntryKind, ExternalContentManifestObject, ExternalContentMode,
-    ExternalContentRealization, ExternalContentRealizationSet, FILE_REALIZATION_ENTRY_PATH,
-    MAX_EXTERNAL_CONTENT_ENTRIES, MAX_EXTERNAL_CONTENT_FILE_BYTES,
-    MAX_EXTERNAL_CONTENT_MANIFEST_BYTES, MAX_EXTERNAL_CONTENT_PATH_BYTES,
-    MAX_EXTERNAL_CONTENT_TOTAL_BYTES, MAX_INLINE_SYMLINK_TARGET_BYTES,
-    MAX_INTERNAL_SYMLINK_EXPANSIONS, MAX_REALIZATION_CLAIMED_BYTES, MAX_SYMLINK_TARGET_BYTES,
-    validate_internal_symlink_graph, validate_internal_symlink_target,
+    EXECUTION_RUNTIME_REALIZATIONS_ROOT, EXTERNAL_CONTENT_MANIFEST_KIND,
+    EXTERNAL_CONTENT_TREE_SCHEMA, EXTERNAL_REALIZATIONS_DERIVED_KEY, ExternalContentKind,
+    ExternalContentManifestEntry, ExternalContentManifestEntryKind, ExternalContentManifestObject,
+    ExternalContentMode, ExternalContentMountRoot, ExternalContentRealization,
+    ExternalContentRealizationSet, FILE_REALIZATION_ENTRY_PATH, MAX_EXTERNAL_CONTENT_ENTRIES,
+    MAX_EXTERNAL_CONTENT_FILE_BYTES, MAX_EXTERNAL_CONTENT_MANIFEST_BYTES,
+    MAX_EXTERNAL_CONTENT_PATH_BYTES, MAX_EXTERNAL_CONTENT_TOTAL_BYTES,
+    MAX_INLINE_SYMLINK_TARGET_BYTES, MAX_INTERNAL_SYMLINK_EXPANSIONS,
+    MAX_REALIZATION_CLAIMED_BYTES, MAX_SYMLINK_TARGET_BYTES, validate_internal_symlink_graph,
+    validate_internal_symlink_target,
 };
 pub use external_large_content_manifest::{
     EXTERNAL_LARGE_CONTENT_MANIFEST_KIND, EXTERNAL_LARGE_CONTENT_SCHEMA,

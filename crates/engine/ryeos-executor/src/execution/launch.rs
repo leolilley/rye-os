@@ -4676,13 +4676,17 @@ async fn prepare_managed_launch_authority(
         .map_err(BuildAndLaunchError::from)?
     };
     if admitted_capsule.is_none() {
-        let (filesystem, network) = super::execution_realization::project_launch_isolation_ceilings(
-            params.state,
-            engine,
-            &params.resolved.resolved_item.kind,
-            Some(effective_program.resolution()),
-            params.parent_execution_context.map(|parent| parent.parent_thread_id.as_str()),
-        ).map_err(BuildAndLaunchError::Internal)?;
+        let (filesystem, network) =
+            super::execution_realization::project_launch_isolation_ceilings(
+                params.state,
+                engine,
+                &params.resolved.resolved_item.kind,
+                Some(effective_program.resolution()),
+                params
+                    .parent_execution_context
+                    .map(|parent| parent.parent_thread_id.as_str()),
+            )
+            .map_err(BuildAndLaunchError::Internal)?;
         prepared_launch.filesystem_authority_ceiling = filesystem;
         prepared_launch.network_authority_ceiling = network;
     }

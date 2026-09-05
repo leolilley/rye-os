@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use ryeos_engine::canonical_ref::CanonicalRef;
 use ryeos_engine::contracts::{EffectivePrincipal, ItemSpace};
 use ryeos_engine::error::EngineError;
 use ryeos_engine::item_resolution::ResolutionRoots;
@@ -1667,9 +1668,17 @@ fn finish_runtime_launch_preparation_parts(
         validate_external_effect_authority(contract, result.external_effect_authority)?;
     let primary_ref = CanonicalRef::parse(&inputs.primary.canonical_ref)
         .map_err(|error| DispatchError::Internal(error.into()))?;
-    let execution = engine.kinds.get(&primary_ref.kind)
+    let execution = engine
+        .kinds
+        .get(&primary_ref.kind)
         .and_then(|kind| kind.execution.as_ref())
-        .ok_or_else(|| preparation_error("missing_execution_contract", "managed subject has no registered execution contract"))?;
+        .ok_or_else(|| {
+            preparation_error(
+                "missing_execution_contract",
+                "managed subject has no registered execution contract",
+                LaunchPrepareErrorClass::Configuration,
+            )
+        })?;
     Ok(PreparedRuntimeLaunch {
         filesystem_authority_ceiling: execution
             .project_filesystem_authority_ceiling(&inputs.primary.composed.composed)

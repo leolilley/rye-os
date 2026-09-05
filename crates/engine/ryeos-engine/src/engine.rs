@@ -983,8 +983,14 @@ impl CheckedEngineGeneration<'_> {
         sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
         filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
-        self.engine
-            .build_plan_current(ctx, item, parameters, hints, sealed_content, filesystem_authority_ceiling)
+        self.engine.build_plan_current(
+            ctx,
+            item,
+            parameters,
+            hints,
+            sealed_content,
+            filesystem_authority_ceiling,
+        )
     }
 
     /// Resolve independent canonical items concurrently while retaining this
@@ -3124,7 +3130,14 @@ impl Engine {
         filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     ) -> Result<ExecutionPlan, EngineError> {
         self.checked_bundle_generation(|| {
-            self.build_plan_current(ctx, item, parameters, hints, sealed_content, filesystem_authority_ceiling)
+            self.build_plan_current(
+                ctx,
+                item,
+                parameters,
+                hints,
+                sealed_content,
+                filesystem_authority_ceiling,
+            )
         })
     }
 

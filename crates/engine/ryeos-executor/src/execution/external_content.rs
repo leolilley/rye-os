@@ -19,10 +19,12 @@ fn realization_mount_authority(
 ) -> ryeos_engine::isolation::IsolationReadOnlyMountAuthority {
     use ryeos_engine::isolation::IsolationReadOnlyMountAuthority;
     match root {
-        ryeos_state::objects::ExternalContentMountRoot::Project =>
-            IsolationReadOnlyMountAuthority::new(source_path, destination, source),
-        ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime =>
-            IsolationReadOnlyMountAuthority::new_execution_runtime(source_path, destination, source),
+        ryeos_state::objects::ExternalContentMountRoot::Project => {
+            IsolationReadOnlyMountAuthority::new(source_path, destination, source)
+        }
+        ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime => {
+            IsolationReadOnlyMountAuthority::new_execution_runtime(source_path, destination, source)
+        }
     }
 }
 
@@ -86,9 +88,7 @@ impl BoundExternalRealizations {
             );
         }
         let authority = self.mounts.get(index).ok_or_else(|| {
-            anyhow::anyhow!(
-                "realization-member command requires an enforced read-only tree mount"
-            )
+            anyhow::anyhow!("realization-member command requires an enforced read-only tree mount")
         })?;
         Ok(isolation
             .bind_admitted_realization_member_command(
@@ -671,13 +671,11 @@ impl ExternalMaterializationCache {
             if total_bytes <= budget {
                 break;
             }
-            let lock =
-                locks.open_pinned_regular_create(OsStr::new(&name), true, false, 0o600)?;
+            let lock = locks.open_pinned_regular_create(OsStr::new(&name), true, false, 0o600)?;
             if !lock.try_lock_exclusive()? {
                 continue;
             }
-            let lease =
-                leases.open_pinned_regular_create(OsStr::new(&name), true, false, 0o600)?;
+            let lease = leases.open_pinned_regular_create(OsStr::new(&name), true, false, 0o600)?;
             if !lease.try_lock_exclusive()? {
                 drop(lease);
                 drop(lock);
@@ -901,8 +899,7 @@ where
     {
         return Ok(());
     }
-    let (staging_name, staging) =
-        parent.create_unique_child(".external-realization", 0o700)?;
+    let (staging_name, staging) = parent.create_unique_child(".external-realization", 0o700)?;
     let mut published = false;
     let result = (|| {
         populate(&staging)?;
@@ -1082,7 +1079,9 @@ fn bind_external_realizations_with(
         if binding == ExternalRealizationBinding::PrivateWorkspace
             && entry.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
         {
-            anyhow::bail!("execution-runtime realizations require enforced isolation; no project-copy substitute is permitted");
+            anyhow::bail!(
+                "execution-runtime realizations require enforced isolation; no project-copy substitute is permitted"
+            );
         }
         if let Some(manifest) =
             ryeos_state::objects::load_if_large_content_manifest(&cas, &entry.manifest_hash)?
@@ -1176,14 +1175,14 @@ fn bind_external_realizations_with(
                     },
                 )?;
             } else {
-                mounts.push(
-                    realization_mount_authority(
-                        entry.mount_root,
-                        generation.source_path,
-                        entry.mount_root.destination(Some(project_path), &entry.mount)?,
-                        generation.source,
-                    ),
-                );
+                mounts.push(realization_mount_authority(
+                    entry.mount_root,
+                    generation.source_path,
+                    entry
+                        .mount_root
+                        .destination(Some(project_path), &entry.mount)?,
+                    generation.source,
+                ));
             }
             leases.extend(generation.leases);
             continue;
@@ -1247,14 +1246,14 @@ fn bind_external_realizations_with(
                 },
             )?;
         } else {
-            mounts.push(
-                realization_mount_authority(
-                    entry.mount_root,
-                    generation.source_path,
-                    entry.mount_root.destination(Some(project_path), &entry.mount)?,
-                    generation.source,
-                ),
-            );
+            mounts.push(realization_mount_authority(
+                entry.mount_root,
+                generation.source_path,
+                entry
+                    .mount_root
+                    .destination(Some(project_path), &entry.mount)?,
+                generation.source,
+            ));
         }
         leases.extend(generation.leases);
     }
@@ -1522,7 +1521,9 @@ pub(crate) fn sealed_dependency_bytes_for_child_dispatch(
                 })
                 .collect();
             mounts.push(SealedRealizationMount {
-                destination: entry.mount_root.destination(Some(project_root), &entry.mount)?,
+                destination: entry
+                    .mount_root
+                    .destination(Some(project_root), &entry.mount)?,
                 kind: entry.kind,
                 files,
             });
@@ -1561,7 +1562,9 @@ pub(crate) fn sealed_dependency_bytes_for_child_dispatch(
             })
             .collect();
         mounts.push(SealedRealizationMount {
-            destination: entry.mount_root.destination(Some(project_root), &entry.mount)?,
+            destination: entry
+                .mount_root
+                .destination(Some(project_root), &entry.mount)?,
             kind: entry.kind,
             files,
         });

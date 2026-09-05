@@ -103,9 +103,9 @@ async fn run_session(
         }
         previous_capability = Some(capability);
     }
-    let deadline = lillux::time::MonotonicDeadline::after(
-        lillux::time::Duration::from_secs(config.max_lifetime_seconds),
-    );
+    let deadline = lillux::time::MonotonicDeadline::after(lillux::time::Duration::from_secs(
+        config.max_lifetime_seconds,
+    ));
     client
         .mark_running(&thread_id)
         .await

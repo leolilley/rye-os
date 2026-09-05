@@ -538,9 +538,7 @@ pub fn inherited_descriptor_coordinate(file: &std::fs::File) -> Result<u32, Stri
 
 /// Return the Linux descriptor-rooted pathname for one exact inherited file.
 /// The caller must retain the same file through the child launch.
-pub fn inherited_descriptor_path_for(
-    file: &std::fs::File,
-) -> Result<std::path::PathBuf, String> {
+pub fn inherited_descriptor_path_for(file: &std::fs::File) -> Result<std::path::PathBuf, String> {
     let descriptor = inherited_descriptor_coordinate(file)?;
     #[cfg(not(target_os = "linux"))]
     {
@@ -573,10 +571,7 @@ pub(crate) fn inherited_descriptor_path(
     {
         let file = std::sync::Arc::new(file);
         let path = inherited_descriptor_path_for(file.as_ref())?;
-        Ok(InheritedDescriptorAuthority {
-            path,
-            handle: file,
-        })
+        Ok(InheritedDescriptorAuthority { path, handle: file })
     }
 }
 
@@ -704,10 +699,12 @@ impl InheritedDuplexChannelChildAuthority {
         request
             .envs
             .push((descriptor_env_name.to_owned(), target_fd.to_string()));
-        request.inherited_fd_mappings.push(InheritedDescriptorMapping {
-            source: std::sync::Arc::clone(&self.channel),
-            target_fd,
-        });
+        request
+            .inherited_fd_mappings
+            .push(InheritedDescriptorMapping {
+                source: std::sync::Arc::clone(&self.channel),
+                target_fd,
+            });
         Ok(())
     }
 
@@ -2948,7 +2945,9 @@ fn prepare_inherited_fd_mappings(
         if target_flags < 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EBADF) {
-                return Err(format!("inspect mapped target descriptor {target}: {error}"));
+                return Err(format!(
+                    "inspect mapped target descriptor {target}: {error}"
+                ));
             }
             // `Command` owns standard-input setup and protects its private
             // exec-error channel before our pre-exec hook runs. A closed
@@ -3065,10 +3064,8 @@ fn lib_spawn_with_stdio(
     }
 
     #[cfg(target_os = "linux")]
-    let forbidden_mapping_targets = inherited_mapping_control_descriptors(
-        attachment_gate.as_ref(),
-        supervised_status.as_ref(),
-    );
+    let forbidden_mapping_targets =
+        inherited_mapping_control_descriptors(attachment_gate.as_ref(), supervised_status.as_ref());
     #[cfg(all(unix, not(target_os = "linux")))]
     let forbidden_mapping_targets =
         inherited_mapping_control_descriptors(supervised_status.as_ref());

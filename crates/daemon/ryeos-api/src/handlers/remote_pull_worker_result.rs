@@ -264,8 +264,8 @@ async fn execute_operation(
     {
         Some(job) => job,
         None if create_if_absent => {
-            let candidate_result = initial_result
-                .context("new hosted worker-result pull has no target testimony")?;
+            let candidate_result =
+                initial_result.context("new hosted worker-result pull has no target testimony")?;
             let operation = PullOperation::new(proposed_intent.clone(), candidate_result)?;
             resolve_current_route(&state, &proposed_intent)?;
             validate_target_result(&operation)?;
@@ -321,7 +321,9 @@ async fn execute_operation(
         bail!(
             "hosted worker-result pull job {job_id} is terminal in state {}: {}",
             job.state.as_str(),
-            job.last_error.as_deref().unwrap_or("no retained diagnostic")
+            job.last_error
+                .as_deref()
+                .unwrap_or("no retained diagnostic")
         );
     }
     if job.state == SyncJobState::Running {
@@ -362,11 +364,13 @@ async fn execute_operation(
                 "completed",
                 None,
                 Some(value),
-                vec![operation
-                    .candidate_result
-                    .evidence
-                    .candidate_snapshot_hash
-                    .clone()],
+                vec![
+                    operation
+                        .candidate_result
+                        .evidence
+                        .candidate_snapshot_hash
+                        .clone(),
+                ],
             )?;
             response.idempotent = false;
             Ok(response)
@@ -383,7 +387,11 @@ async fn execute_operation(
                 } else {
                     SyncJobState::Failed
                 },
-                if failure.retryable { "retryable" } else { "failed" },
+                if failure.retryable {
+                    "retryable"
+                } else {
+                    "failed"
+                },
                 Some(message),
                 None,
                 Vec::new(),
@@ -402,8 +410,8 @@ async fn run_attempt(
     // Recovery must not depend on the target still exposing mutable session
     // projection after an explicit later disposition; content transport is
     // independently verified by its exact hashes.
-    let (authority, base_tree) = validate_local_base(&state, operation)
-        .map_err(AttemptFailure::permanent)?;
+    let (authority, base_tree) =
+        validate_local_base(&state, operation).map_err(AttemptFailure::permanent)?;
     let client = RemoteClient::from_remote_cfg_as_retained_configured_operator(
         &state,
         remote,
@@ -429,7 +437,10 @@ async fn run_attempt(
     }
     let response = Response {
         schema: RESPONSE_SCHEMA.to_owned(),
-        job_id: operation.intent.job_id().map_err(AttemptFailure::permanent)?,
+        job_id: operation
+            .intent
+            .job_id()
+            .map_err(AttemptFailure::permanent)?,
         remote: operation.intent.remote.clone(),
         local_project_path: operation.intent.local_project_path.clone(),
         candidate_result: operation.candidate_result.clone(),
@@ -440,8 +451,7 @@ async fn run_attempt(
         published: false,
         idempotent: false,
     };
-    validate_response(&response, operation, &response.job_id)
-        .map_err(AttemptFailure::permanent)?;
+    validate_response(&response, operation, &response.job_id).map_err(AttemptFailure::permanent)?;
     Ok(response)
 }
 
@@ -607,7 +617,11 @@ fn resolve_current_route(state: &AppState, intent: &PullIntent) -> Result<Remote
     Ok(loaded.config)
 }
 
-fn validate_job_binding(job: &SyncJobRecord, operation: &PullOperation, job_id: &str) -> Result<()> {
+fn validate_job_binding(
+    job: &SyncJobRecord,
+    operation: &PullOperation,
+    job_id: &str,
+) -> Result<()> {
     let evidence = &operation.candidate_result.evidence;
     let expected_roots = sorted_hashes([
         evidence.base_snapshot_hash.clone(),
@@ -619,8 +633,7 @@ fn validate_job_binding(job: &SyncJobRecord, operation: &PullOperation, job_id: 
         || job.max_attempts != ryeos_state::SYNC_JOB_UNBOUNDED_ATTEMPTS
         || !job.attempt_count_is_valid()
         || job.roots != expected_roots
-        || (!job.heads.is_empty()
-            && job.heads != vec![evidence.candidate_snapshot_hash.clone()])
+        || (!job.heads.is_empty() && job.heads != vec![evidence.candidate_snapshot_hash.clone()])
     {
         bail!("hosted worker-result pull job changed its retained authority binding");
     }
@@ -704,13 +717,11 @@ fn terminalize_without_attempt(
 fn classify_pull_error(error: crate::remote::pull::PullResultsError) -> AttemptFailure {
     use crate::remote::pull::PullResultsError;
     match error {
-        failure
-        @ (PullResultsError::InvalidRemoteSnapshot(_)
+        failure @ (PullResultsError::InvalidRemoteSnapshot(_)
         | PullResultsError::RollbackIncomplete(_)
         | PullResultsError::UnrelatedSnapshot { .. }
         | PullResultsError::MissingSnapshotHash) => AttemptFailure::permanent(failure),
-        failure
-        @ (PullResultsError::LocalConflict(_)
+        failure @ (PullResultsError::LocalConflict(_)
         | PullResultsError::RecoveryRequired(_)
         | PullResultsError::Other(_)) => AttemptFailure::retryable(failure),
     }
@@ -733,7 +744,13 @@ fn validate_hash(label: &str, value: &str) -> Result<()> {
 fn bounded_error(value: &str) -> String {
     let mut result = value
         .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .take(2048)
         .collect::<String>();
     if result.trim().is_empty() {

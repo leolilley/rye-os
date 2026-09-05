@@ -110,92 +110,90 @@ fn prepare(request: ryeos_handler_protocol::LaunchPrepareRequest) -> LaunchPrepa
                 )
             })?;
         let selection = validate_execution_config(&config)?;
-        let (
-            worker_ref,
-            content_dependencies,
-            environment_contributions,
-            workload_client_request,
-        ) = match selection {
-            WorkerSelection::Direct(worker_ref) => {
-                if !request.ref_bindings.is_empty() {
-                    return Err(wire_error(
-                        "worker_execution_environment_unexpected",
-                        "direct worker execution cannot carry an environment binding",
-                    ));
+        let (worker_ref, content_dependencies, environment_contributions, workload_client_request) =
+            match selection {
+                WorkerSelection::Direct(worker_ref) => {
+                    if !request.ref_bindings.is_empty() {
+                        return Err(wire_error(
+                            "worker_execution_environment_unexpected",
+                            "direct worker execution cannot carry an environment binding",
+                        ));
+                    }
+                    (worker_ref, BTreeMap::new(), BTreeMap::new(), None)
                 }
-                (worker_ref, BTreeMap::new(), BTreeMap::new(), None)
-            }
-            WorkerSelection::Environment(binding_name) => {
-                if request.ref_bindings.len() != 1 {
-                    return Err(wire_error(
-                        "worker_execution_environment_missing",
-                        "environment-backed worker execution requires exactly one environment binding",
-                    ));
-                }
-                let environment = request.ref_bindings.get(&binding_name).ok_or_else(|| {
-                    wire_error(
-                        "worker_execution_environment_missing",
-                        "worker execution's declared environment binding is absent",
-                    )
-                })?;
-                let environment = validate_worker_environment(environment)?;
-                let content_dependencies = if environment.has_external_content {
-                    BTreeMap::from([(
-                        ENVIRONMENT_BINDING.to_owned(),
-                        LaunchContentDependencyRequestWire {
-                            binding: ENVIRONMENT_BINDING.to_owned(),
-                            targets: vec![DEPENDENCY_NAME.to_owned()],
-                            executable_search: environment.executable_search,
-                        },
-                    )])
-                } else {
-                    BTreeMap::new()
-                };
-                let variables = environment
-                    .process_environment
-                    .into_iter()
-                    .map(|(name, value)| {
-                        let value = match value {
-                            AuthoredWorkerEnvironmentValue::Literal { value } => {
-                                LaunchEnvironmentValueWire::Literal { value }
-                            }
-                            AuthoredWorkerEnvironmentValue::RealizationPath {
-                                realization_id,
-                                relative_path,
-                                path_kind,
-                            } => LaunchEnvironmentValueWire::ContentPath {
-                                content_dependency: ENVIRONMENT_BINDING.to_owned(),
-                                realization_id,
-                                relative_path,
-                                path_kind,
-                            },
-                            AuthoredWorkerEnvironmentValue::RuntimeViewDirectory {
-                                relative_path,
-                            } => LaunchEnvironmentValueWire::RuntimeViewDirectory { relative_path },
-                        };
-                        (name, value)
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                let environment_contributions = (!variables.is_empty())
-                    .then(|| {
+                WorkerSelection::Environment(binding_name) => {
+                    if request.ref_bindings.len() != 1 {
+                        return Err(wire_error(
+                            "worker_execution_environment_missing",
+                            "environment-backed worker execution requires exactly one environment binding",
+                        ));
+                    }
+                    let environment = request.ref_bindings.get(&binding_name).ok_or_else(|| {
+                        wire_error(
+                            "worker_execution_environment_missing",
+                            "worker execution's declared environment binding is absent",
+                        )
+                    })?;
+                    let environment = validate_worker_environment(environment)?;
+                    let content_dependencies = if environment.has_external_content {
                         BTreeMap::from([(
                             ENVIRONMENT_BINDING.to_owned(),
-                            LaunchEnvironmentContributionRequestWire {
+                            LaunchContentDependencyRequestWire {
+                                binding: ENVIRONMENT_BINDING.to_owned(),
                                 targets: vec![DEPENDENCY_NAME.to_owned()],
-                                variables,
+                                executable_search: environment.executable_search,
                             },
                         )])
-                    })
-                    .unwrap_or_default();
-                let workload_client_request = environment.workload_client;
-                (
-                    environment.worker_ref,
-                    content_dependencies,
-                    environment_contributions,
-                    workload_client_request,
-                )
-            }
-        };
+                    } else {
+                        BTreeMap::new()
+                    };
+                    let variables = environment
+                        .process_environment
+                        .into_iter()
+                        .map(|(name, value)| {
+                            let value = match value {
+                                AuthoredWorkerEnvironmentValue::Literal { value } => {
+                                    LaunchEnvironmentValueWire::Literal { value }
+                                }
+                                AuthoredWorkerEnvironmentValue::RealizationPath {
+                                    realization_id,
+                                    relative_path,
+                                    path_kind,
+                                } => LaunchEnvironmentValueWire::ContentPath {
+                                    content_dependency: ENVIRONMENT_BINDING.to_owned(),
+                                    realization_id,
+                                    relative_path,
+                                    path_kind,
+                                },
+                                AuthoredWorkerEnvironmentValue::RuntimeViewDirectory {
+                                    relative_path,
+                                } => LaunchEnvironmentValueWire::RuntimeViewDirectory {
+                                    relative_path,
+                                },
+                            };
+                            (name, value)
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    let environment_contributions = (!variables.is_empty())
+                        .then(|| {
+                            BTreeMap::from([(
+                                ENVIRONMENT_BINDING.to_owned(),
+                                LaunchEnvironmentContributionRequestWire {
+                                    targets: vec![DEPENDENCY_NAME.to_owned()],
+                                    variables,
+                                },
+                            )])
+                        })
+                        .unwrap_or_default();
+                    let workload_client_request = environment.workload_client;
+                    (
+                        environment.worker_ref,
+                        content_dependencies,
+                        environment_contributions,
+                        workload_client_request,
+                    )
+                }
+            };
         let mut effective_config = config;
         let effective_object = effective_config.as_object_mut().ok_or_else(|| {
             wire_error(

@@ -408,9 +408,7 @@ pub fn observe_open_file_identity(file: &File) -> Result<OpenFileIdentity> {
 
 /// Require the exact open descriptor to remain a current-effective-user-owned
 /// regular executable without group/other write authority.
-pub fn require_effective_user_owned_executable(
-    file: &File,
-) -> Result<OpenFileIdentity> {
+pub fn require_effective_user_owned_executable(file: &File) -> Result<OpenFileIdentity> {
     #[cfg(not(unix))]
     {
         let _ = file;
@@ -883,10 +881,7 @@ pub struct FilesystemModificationTime(SystemTime);
 impl ProcessScopedFlatDirectoryGeneration {
     /// Create a new generation below a descriptor-rooted relative namespace.
     /// Every component is owner-private and no symlink is followed.
-    pub fn create_relative(
-        root: &PinnedDirectory,
-        components: &[&str],
-    ) -> Result<Self> {
+    pub fn create_relative(root: &PinnedDirectory, components: &[&str]) -> Result<Self> {
         #[cfg(not(unix))]
         {
             let _ = (root, components);
@@ -926,26 +921,23 @@ impl ProcessScopedFlatDirectoryGeneration {
             let mut created = None;
             for _ in 0..1_024 {
                 let sequence = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-                let name = OsString::from(format!(
-                    "{}-{created_at}-{sequence}",
-                    std::process::id()
-                ));
+                let name =
+                    OsString::from(format!("{}-{created_at}-{sequence}", std::process::id()));
                 match generations.create_child(&name, 0o700) {
                     Ok(directory) => {
                         created = Some((name, directory));
                         break;
                     }
                     Err(error)
-                        if error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| {
-                                error.kind() == std::io::ErrorKind::AlreadyExists
-                            }) => {}
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::AlreadyExists
+                        }) => {}
                     Err(error) => return Err(error),
                 }
             }
-            let (generation_name, directory) = created
-                .ok_or_else(|| anyhow::anyhow!("could not reserve a unique directory generation"))?;
+            let (generation_name, directory) = created.ok_or_else(|| {
+                anyhow::anyhow!("could not reserve a unique directory generation")
+            })?;
             let setup = (|| -> Result<PinnedRegularFile> {
                 directory.set_mode(0o700)?;
                 let lifetime_lock = directory.open_pinned_regular_create(
@@ -961,14 +953,10 @@ impl ProcessScopedFlatDirectoryGeneration {
 
                 let names = generations.entry_names_bounded(MAX_GENERATIONS + 1)?;
                 if names.len() > MAX_GENERATIONS {
-                    anyhow::bail!(
-                        "flat generation namespace exceeds {MAX_GENERATIONS} entries"
-                    );
+                    anyhow::bail!("flat generation namespace exceeds {MAX_GENERATIONS} entries");
                 }
                 for name in names {
-                    if name == generation_name
-                        || name.as_os_str() == OsStr::new(".cleanup.lock")
-                    {
+                    if name == generation_name || name.as_os_str() == OsStr::new(".cleanup.lock") {
                         continue;
                     }
                     let Some(stale) = generations.open_child_directory(&name)? else {
@@ -977,13 +965,12 @@ impl ProcessScopedFlatDirectoryGeneration {
                             generations.path().join(&name).display()
                         );
                     };
-                    let _stale_lifetime_lock = match stale
-                        .open_pinned_regular(OsStr::new(".lifetime.lock"), true)?
-                    {
-                        Some(lock) if lock.try_lock_exclusive()? => Some(lock),
-                        Some(_) => continue,
-                        None => None,
-                    };
+                    let _stale_lifetime_lock =
+                        match stale.open_pinned_regular(OsStr::new(".lifetime.lock"), true)? {
+                            Some(lock) if lock.try_lock_exclusive()? => Some(lock),
+                            Some(_) => continue,
+                            None => None,
+                        };
                     remove_flat_directory_generation(&generations, &name, &stale)?;
                 }
                 Ok(lifetime_lock)
@@ -2587,9 +2574,8 @@ impl PinnedDirectory {
                 Err(error)
                     if error
                         .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| {
-                            error.kind() == std::io::ErrorKind::AlreadyExists
-                        }) => {}
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -5176,8 +5162,7 @@ pub fn canonicalize_existing_path(path: &Path) -> Result<PathBuf> {
 /// these disappear.
 pub fn protected_system_write_roots() -> Vec<PathBuf> {
     let mut roots = [
-        "/boot", "/dev", "/etc", "/proc", "/run", "/sys", "/usr", "/bin", "/sbin", "/lib",
-        "/lib64",
+        "/boot", "/dev", "/etc", "/proc", "/run", "/sys", "/usr", "/bin", "/sbin", "/lib", "/lib64",
     ]
     .into_iter()
     .filter_map(|path| canonicalize_existing_path(Path::new(path)).ok())
@@ -5190,8 +5175,7 @@ pub fn protected_system_write_roots() -> Vec<PathBuf> {
 /// Canonical current-user home from the process environment, when usable.
 /// This is host diagnostic data only; it never becomes workload authority.
 pub fn current_user_home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .and_then(|home| canonicalize_existing_path(Path::new(&home)).ok())
+    std::env::var_os("HOME").and_then(|home| canonicalize_existing_path(Path::new(&home)).ok())
 }
 
 /// Pin one already-canonical absolute mount source with `O_PATH`, without

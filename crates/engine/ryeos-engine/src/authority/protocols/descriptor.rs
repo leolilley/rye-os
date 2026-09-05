@@ -87,8 +87,12 @@ pub enum PersistentSessionWorkspaceAuthority {
 impl PersistentSessionWorkspaceAuthority {
     pub fn filesystem_ceiling(self) -> crate::isolation::IsolationFilesystemAuthorityCeiling {
         match self {
-            Self::EphemeralScratch => crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution,
-            Self::RuntimeWorkspace => crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            Self::EphemeralScratch => {
+                crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution
+            }
+            Self::RuntimeWorkspace => {
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy
+            }
         }
     }
 }

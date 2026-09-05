@@ -1,7 +1,7 @@
+use lillux::time::{Duration, MonotonicDeadline};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use lillux::time::{Duration, MonotonicDeadline};
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -148,15 +148,24 @@ impl AdmittedWorkloadClientGrant {
             bail!("admitted workload-client grant is outside its closed structural bounds");
         }
         for (label, digest) in [
-            ("worker boot identity", self.worker_boot_identity_hash.as_str()),
-            ("root launch capsule", self.root_launch_capsule_hash.as_str()),
+            (
+                "worker boot identity",
+                self.worker_boot_identity_hash.as_str(),
+            ),
+            (
+                "root launch capsule",
+                self.root_launch_capsule_hash.as_str(),
+            ),
             ("session capsule", self.session_capsule_hash.as_str()),
             ("project authority", self.project_authority_digest.as_str()),
             ("request", self.request_digest.as_str()),
             ("caller scope", self.caller_scope_digest.as_str()),
             ("operator grant", self.operator_grant_digest.as_str()),
             ("root delegation", self.root_delegation_digest.as_str()),
-            ("node policy generation", self.node_policy_generation_digest.as_str()),
+            (
+                "node policy generation",
+                self.node_policy_generation_digest.as_str(),
+            ),
         ] {
             if !lillux::valid_hash(digest) {
                 bail!("admitted workload-client {label} digest is not canonical");
@@ -204,7 +213,9 @@ impl AdmittedWorkloadClientGrant {
             .ok_or_else(|| anyhow::anyhow!("workload-client item is outside the admitted grant"))?;
         for (name, item_ref) in &action.ref_bindings {
             let allowed = execution.ref_bindings.get(name).ok_or_else(|| {
-                anyhow::anyhow!("workload-client ref binding `{name}` is outside the admitted grant")
+                anyhow::anyhow!(
+                    "workload-client ref binding `{name}` is outside the admitted grant"
+                )
             })?;
             if allowed.binary_search(item_ref).is_err() {
                 bail!("workload-client ref binding `{name}` value is outside the admitted grant");
@@ -927,11 +938,7 @@ mod tests {
             ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD.to_owned(),
         ])
         .unwrap();
-        assert!(
-            store
-                .restrict_runtime_methods(&cap.token, surface)
-                .unwrap()
-        );
+        assert!(store.restrict_runtime_methods(&cap.token, surface).unwrap());
 
         let narrowed = store
             .validate_token_and_thread(&cap.token, "T-workload")
@@ -950,10 +957,8 @@ mod tests {
             store
                 .restrict_runtime_methods(
                     &cap.token,
-                    CallbackRuntimeMethodSurface::exact(vec![
-                        "runtime.vault_get".to_owned()
-                    ])
-                    .unwrap(),
+                    CallbackRuntimeMethodSurface::exact(vec!["runtime.vault_get".to_owned()])
+                        .unwrap(),
                 )
                 .is_err(),
             "an exact bearer must never be widened or replaced in place"
@@ -1544,10 +1549,9 @@ mod tests {
         grant.authorize_action(&workload_client_action()).unwrap();
 
         let mut wrong_ref = workload_client_action();
-        wrong_ref.ref_bindings.insert(
-            "input".to_owned(),
-            "knowledge:project/other".to_owned(),
-        );
+        wrong_ref
+            .ref_bindings
+            .insert("input".to_owned(), "knowledge:project/other".to_owned());
         assert!(grant.authorize_action(&wrong_ref).is_err());
 
         let mut wrong_method = workload_client_action();
@@ -1565,7 +1569,9 @@ mod tests {
     #[test]
     fn workload_client_grant_rechecks_resolved_child_effect_class() {
         let grant = workload_client_grant();
-        grant.authorize_effect_class("tool:project/check", None).unwrap();
+        grant
+            .authorize_effect_class("tool:project/check", None)
+            .unwrap();
         grant
             .authorize_effect_class(
                 "tool:project/check",
@@ -1589,9 +1595,7 @@ mod tests {
             grant
                 .authorize_workspace_access(
                     "tool:project/check",
-                    Some(
-                        ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration,
-                    ),
+                    Some(ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration,),
                 )
                 .unwrap(),
             ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration

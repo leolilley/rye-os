@@ -12,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::handler_context::HandlerContext;
 use crate::registry::ServiceDescriptor;
+use lillux::time::Duration;
 use ryeos_app::managed_external_content::{
     ManagedActivationSource, ManagedMemberDisposition, ResolvedManagedExternalContentActivation,
 };
@@ -20,7 +21,6 @@ use ryeos_app::managed_external_content_operation::{
 };
 use ryeos_app::state::AppState;
 use ryeos_executor::executor::ServiceAvailability;
-use lillux::time::Duration;
 
 const CACHE_ENTRY_LIMIT: usize = 4096;
 const CACHE_RECONCILIATION_ENTRY_LIMIT: usize = 65536;
@@ -630,11 +630,10 @@ fn validate_completed_activation_with_authority(
         bail!("completed managed activation receipt has a different component set");
     }
     for component in &activation.components {
-        let consumer =
-            ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
-                activation.document.consumer_ref.clone(),
-                activation.publisher_fingerprint.clone(),
-            )?;
+        let consumer = ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+            activation.document.consumer_ref.clone(),
+            activation.publisher_fingerprint.clone(),
+        )?;
         let binding = ryeos_app::operator_external_content::require_active_binding_from_store(
             authority.state_store,
             &cas,

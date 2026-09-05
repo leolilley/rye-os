@@ -1418,11 +1418,9 @@ impl SealedRootExecutionRequest {
             | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
             | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
                 ..
-            } => {
-                ProjectContext::LocalPath {
-                    path: provenance.subject_effective_path().to_path_buf(),
-                }
-            }
+            } => ProjectContext::LocalPath {
+                path: provenance.subject_effective_path().to_path_buf(),
+            },
         };
         let mut rebound_plan_context = request.plan_context.clone();
         rebound_plan_context.project_context = rebound_project_context;
@@ -1438,9 +1436,7 @@ impl SealedRootExecutionRequest {
             | crate::execution_provenance::ExecutionProvenance::ChildPinnedGeneration { .. }
             | crate::execution_provenance::ExecutionProvenance::ChildImmutableWorkspaceInput {
                 ..
-            } => {
-                Some(provenance.subject_effective_path().to_path_buf())
-            }
+            } => Some(provenance.subject_effective_path().to_path_buf()),
         };
         request.resolved_item.materialized_project_root = rebound_materialized_project_root.clone();
         {

@@ -268,8 +268,9 @@ impl ExternalContentMountRoot {
     ) -> anyhow::Result<std::path::PathBuf> {
         super::validate_canonical_project_relative_path(mount)?;
         let root = match self {
-            Self::Project => project_root
-                .ok_or_else(|| anyhow::anyhow!("project realization requires an admitted project root"))?,
+            Self::Project => project_root.ok_or_else(|| {
+                anyhow::anyhow!("project realization requires an admitted project root")
+            })?,
             Self::ExecutionRuntime => std::path::Path::new(EXECUTION_RUNTIME_REALIZATIONS_ROOT),
         };
         if !root.is_absolute() {
@@ -367,7 +368,9 @@ impl ExternalContentRealizationSet {
         let mounts = mounts.into_iter().collect::<Vec<_>>();
         for (index, left) in mounts.iter().enumerate() {
             for right in mounts.iter().skip(index + 1) {
-                if left.0 == right.0 && (path_contains(left.1, right.1) || path_contains(right.1, left.1)) {
+                if left.0 == right.0
+                    && (path_contains(left.1, right.1) || path_contains(right.1, left.1))
+                {
                     anyhow::bail!("external realization mounts `{left:?}` and `{right:?}` overlap");
                 }
             }
@@ -828,11 +831,30 @@ mod tests {
         assert!(ExternalContentRealizationSet::from_value(&value).is_err());
 
         let project_root = std::path::Path::new("/project");
-        assert_eq!(ExternalContentMountRoot::Project.destination(Some(project_root), "platform").unwrap(), project_root.join("platform"));
-        assert_eq!(ExternalContentMountRoot::ExecutionRuntime.destination(None, "platform").unwrap(), std::path::Path::new(EXECUTION_RUNTIME_REALIZATIONS_ROOT).join("platform"));
-        assert!(ExternalContentMountRoot::Project.destination(None, "platform").is_err());
+        assert_eq!(
+            ExternalContentMountRoot::Project
+                .destination(Some(project_root), "platform")
+                .unwrap(),
+            project_root.join("platform")
+        );
+        assert_eq!(
+            ExternalContentMountRoot::ExecutionRuntime
+                .destination(None, "platform")
+                .unwrap(),
+            std::path::Path::new(EXECUTION_RUNTIME_REALIZATIONS_ROOT).join("platform")
+        );
+        assert!(
+            ExternalContentMountRoot::Project
+                .destination(None, "platform")
+                .is_err()
+        );
         for invalid in ["", "/lib", "../lib", "a/../lib", "a//lib", "a/", "."] {
-            assert!(ExternalContentMountRoot::ExecutionRuntime.destination(None, invalid).is_err(), "{invalid}");
+            assert!(
+                ExternalContentMountRoot::ExecutionRuntime
+                    .destination(None, invalid)
+                    .is_err(),
+                "{invalid}"
+            );
         }
         let mut nested = realization("nested", "platform/lib");
         nested.mount_root = ExternalContentMountRoot::ExecutionRuntime;

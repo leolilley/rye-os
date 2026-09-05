@@ -392,12 +392,8 @@ mod tests {
         )
         .unwrap();
         assert_ne!(foreign_subject, active.binding_subject_id);
-        let released = ExternalContentBinding::released_from(
-            &active,
-            "5".repeat(64),
-            "6".repeat(64),
-        )
-        .unwrap();
+        let released =
+            ExternalContentBinding::released_from(&active, "5".repeat(64), "6".repeat(64)).unwrap();
         assert_eq!(released.binding_subject_id, active.binding_subject_id);
         assert_ne!(released.binding_id, active.binding_id);
         assert_eq!(released.state, ExternalContentBindingState::Released);

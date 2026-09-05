@@ -3135,8 +3135,8 @@ mod tests {
         let isolation = Arc::new(ryeos_engine::isolation::IsolationRuntime::load(
             app_root.path(),
         )?);
-        let (daemon_channel, worker_channel) = lillux::inherited_duplex_channel_pair()
-            .map_err(anyhow::Error::msg)?;
+        let (daemon_channel, worker_channel) =
+            lillux::inherited_duplex_channel_pair().map_err(anyhow::Error::msg)?;
         let daemon_socket = daemon_channel;
         let target_channel = ryeos_engine::isolation::IsolationTargetChannelAuthority::new(
             worker_channel,

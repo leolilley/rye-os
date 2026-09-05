@@ -1142,18 +1142,23 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
     // subsequently freezes projections from its fully composed subject, but
     // standalone/offline plan execution must also honor this root's declared
     // restrictions instead of silently substituting node-policy authority.
-    let execution = root_kind_schema.execution.as_ref().ok_or_else(|| {
-        EngineError::SchemaLoaderError {
-            reason: format!("kind `{}` has no execution schema", resolved.kind),
-        }
-    })?;
+    let execution =
+        root_kind_schema
+            .execution
+            .as_ref()
+            .ok_or_else(|| EngineError::SchemaLoaderError {
+                reason: format!("kind `{}` has no execution schema", resolved.kind),
+            })?;
     let root_value = &terminal.intermediates[0].parsed;
-    let filesystem_authority_ceiling = execution.project_filesystem_authority_ceiling(root_value)?
+    let filesystem_authority_ceiling = execution
+        .project_filesystem_authority_ceiling(root_value)?
         .intersect(admitted_filesystem_ceiling);
     let network_authority_ceiling = execution.project_network_authority_ceiling(root_value)?;
     let no_host_environment = HostEnvBindings::default();
     let host_env = match filesystem_authority_ceiling {
-        crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution => &no_host_environment,
+        crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution => {
+            &no_host_environment
+        }
         crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy => host_env,
     };
     let runtime_spec =
@@ -1706,7 +1711,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -1760,7 +1766,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -1832,7 +1839,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -1880,7 +1888,8 @@ config:
             trust_store: &TrustStore::empty(),
             node_trust_store: &TrustStore::empty(),
             host_env: &HostEnvBindings::default(),
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -2422,7 +2431,8 @@ config:
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &HostEnvBindings::default(),
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -2613,7 +2623,10 @@ category: ryeos/core/subprocess\n";
         // 5. Build plan — this walks the full 3-hop chain
         let host_env = HostEnvBindings {
             allowed: std::collections::HashSet::from(["BUILD_LABEL".to_owned()]),
-            values: std::collections::HashMap::from([("BUILD_LABEL".to_owned(), "host-only".to_owned())]),
+            values: std::collections::HashMap::from([(
+                "BUILD_LABEL".to_owned(),
+                "host-only".to_owned(),
+            )]),
         };
         let plan = build_plan(BuildPlanInput {
             item: &item,
@@ -2628,7 +2641,8 @@ category: ryeos/core/subprocess\n";
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &host_env,
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             project_authority: None,
             sealed_content: None,
         })
@@ -2651,10 +2665,12 @@ category: ryeos/core/subprocess\n";
             trust_store: &ts,
             node_trust_store: &ts,
             host_env: &host_env,
-            filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution,
+            filesystem_authority_ceiling:
+                crate::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution,
             project_authority: None,
             sealed_content: None,
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("BUILD_LABEL"), "{error}");
 
         // 6. Verify the plan structure

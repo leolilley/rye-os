@@ -176,10 +176,7 @@ impl OwnerPrivateLocalDuplexListener {
             use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
             let random = crate::crypto::generate_random_bytes::<32>();
-            let name = OsString::from(format!(
-                "{stem}-{}.sock",
-                &crate::sha256_hex(&random)[..32]
-            ));
+            let name = OsString::from(format!("{stem}-{}.sock", &crate::sha256_hex(&random)[..32]));
             let endpoint = directory.path().join(&name);
             validate_endpoint_path(&endpoint)?;
             let listener = std::os::unix::net::UnixListener::bind(&endpoint)
@@ -336,9 +333,7 @@ fn validate_private_directory_name(name: &str) -> Result<()> {
         || name == "."
         || name == ".."
         || !name.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'-' | b'_')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
         })
     {
         bail!("private local endpoint directory name is not canonical");

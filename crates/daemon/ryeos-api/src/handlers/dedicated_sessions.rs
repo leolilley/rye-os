@@ -462,8 +462,7 @@ async fn candidate_result(
         .get("response_digest")
         .and_then(Value::as_str)
         .filter(|digest| {
-            lillux::valid_hash(digest)
-                && !digest.bytes().any(|byte| byte.is_ascii_uppercase())
+            lillux::valid_hash(digest) && !digest.bytes().any(|byte| byte.is_ascii_uppercase())
         })
         .ok_or_else(|| {
             HandlerError::BadRequest(
@@ -500,7 +499,9 @@ async fn candidate_result(
             != Some(session.placement_thread_id.as_str())
         || capture.get("workspace_id").and_then(Value::as_str)
             != Some(session.workspace_id.as_str())
-        || capture.get("candidate_snapshot_hash").and_then(Value::as_str)
+        || capture
+            .get("candidate_snapshot_hash")
+            .and_then(Value::as_str)
             != Some(candidate.as_str())
         || capture.get("base_snapshot_hash").and_then(Value::as_str)
             != Some(base_snapshot_hash.as_str())
@@ -567,9 +568,13 @@ async fn candidate_result(
             .pointer("/checks/base_ancestry")
             .and_then(Value::as_bool)
             != Some(true)
-        || validation_evidence.get("object_count").and_then(Value::as_u64)
+        || validation_evidence
+            .get("object_count")
+            .and_then(Value::as_u64)
             != u64::try_from(closure.object_hashes.len()).ok()
-        || validation_evidence.get("blob_count").and_then(Value::as_u64)
+        || validation_evidence
+            .get("blob_count")
+            .and_then(Value::as_u64)
             != u64::try_from(closure.blob_hashes.len()).ok()
     {
         return Err(HandlerError::BadRequest(
@@ -591,7 +596,7 @@ async fn candidate_result(
     let evidence = ryeos_app::hosted_candidate_result::HostedCandidateResultEvidence {
         schema: ryeos_app::hosted_candidate_result::HOSTED_CANDIDATE_RESULT_SCHEMA.to_owned(),
         owner_principal: session.owner_principal,
-        source_site_id: req.source_site_id,
+        source_site_id: req.source_site_id.clone(),
         target_site_id: state.threads.site_id().to_owned(),
         chain_root_id: session.chain_root_id,
         placement_thread_id: session.placement_thread_id,
@@ -607,17 +612,13 @@ async fn candidate_result(
         command_response_digest,
         candidate_capture_operation_id: capture_operation_id,
         candidate_validation_operation_id: validation_operation_id,
-        candidate_state:
-            ryeos_app::hosted_candidate_result::HostedCandidateState::PublishReady,
-        disposition:
-            ryeos_app::hosted_candidate_result::HostedCandidateDisposition::Retained,
+        candidate_state: ryeos_app::hosted_candidate_result::HostedCandidateState::PublishReady,
+        disposition: ryeos_app::hosted_candidate_result::HostedCandidateDisposition::Retained,
     };
     let signer = ryeos_app::state_store::NodeIdentitySigner::from_identity(&state.identity);
-    let response = ryeos_app::hosted_candidate_result::HostedCandidateResultResponse::new(
-        evidence,
-        &signer,
-    )
-    .map_err(internal)?;
+    let response =
+        ryeos_app::hosted_candidate_result::HostedCandidateResultResponse::new(evidence, &signer)
+            .map_err(internal)?;
     response
         .validate_against(
             &req,

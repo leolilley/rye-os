@@ -93,10 +93,8 @@ pub(crate) async fn prepare_recovery_before_images(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
-        let tx = ScheduleReconcileTx::new_with_timeout(
-            &schedules_dir,
-            SCHEDULE_DIRECTORY_LOCK_TIMEOUT,
-        )?;
+        let tx =
+            ScheduleReconcileTx::new_with_timeout(&schedules_dir, SCHEDULE_DIRECTORY_LOCK_TIMEOUT)?;
         let before_images = schedule_ids
             .into_iter()
             .map(|schedule_id| {
@@ -152,12 +150,7 @@ pub(crate) async fn restore_recovery_before_images(
     let touched = tokio::task::spawn_blocking(move || {
         let directory = lillux::PinnedDirectory::open_or_create(&schedules_dir)?;
         let _lock = directory.lock_exclusive_with_timeout(SCHEDULE_DIRECTORY_LOCK_TIMEOUT)?;
-        restore_recovery_sources_and_projection(
-            &directory,
-            &scheduler_db,
-            &trust_store,
-            &entries,
-        )
+        restore_recovery_sources_and_projection(&directory, &scheduler_db, &trust_store, &entries)
     })
     .await
     .context("join schedule recovery restoration")??;
@@ -1187,10 +1180,7 @@ impl ScheduleReconcileTx {
         })
     }
 
-    fn new_with_timeout(
-        schedules_dir: &Path,
-        timeout: lillux::time::Duration,
-    ) -> Result<Self> {
+    fn new_with_timeout(schedules_dir: &Path, timeout: lillux::time::Duration) -> Result<Self> {
         let directory = lillux::PinnedDirectory::open_or_create(schedules_dir)?;
         let directory_lock = directory.lock_exclusive_with_timeout(timeout)?;
         Ok(Self {
@@ -1334,13 +1324,11 @@ mod tests {
     fn recovery_test_trust_store(key: &[u8; 32]) -> ryeos_engine::trust::TrustStore {
         let signing_key = lillux::crypto::SigningKey::from_bytes(key);
         let verifying_key = lillux::crypto::VerifyingKey::from(&signing_key);
-        ryeos_engine::trust::TrustStore::from_signers(vec![
-            ryeos_engine::trust::TrustedSigner {
-                fingerprint: lillux::sha256_hex(verifying_key.to_bytes().as_ref()),
-                verifying_key,
-                label: Some("project-apply-recovery-test".to_owned()),
-            },
-        ])
+        ryeos_engine::trust::TrustStore::from_signers(vec![ryeos_engine::trust::TrustedSigner {
+            fingerprint: lillux::sha256_hex(verifying_key.to_bytes().as_ref()),
+            verifying_key,
+            label: Some("project-apply-recovery-test".to_owned()),
+        }])
     }
 
     fn verified(fp: &str) -> HandlerContext {
@@ -1400,23 +1388,15 @@ mod tests {
     #[test]
     fn recovery_restores_exact_schedule_sources_and_their_projection() {
         let root = tempfile::tempdir().unwrap();
-        let directory = lillux::PinnedDirectory::open(root.path())
-            .unwrap()
-            .unwrap();
+        let directory = lillux::PinnedDirectory::open(root.path()).unwrap().unwrap();
         let _lock = directory.lock_exclusive().unwrap();
         let db = ryeos_scheduler::db::SchedulerDb::new_in_memory().unwrap();
         let key = [37_u8; 32];
         let trust = recovery_test_trust_store(&key);
 
         let restore_id = "restore-after-projection-crash";
-        let before = signed_recovery_test_source(
-            &recovery_test_source(restore_id, "60"),
-            &key,
-        );
-        let projected = signed_recovery_test_source(
-            &recovery_test_source(restore_id, "120"),
-            &key,
-        );
+        let before = signed_recovery_test_source(&recovery_test_source(restore_id, "60"), &key);
+        let projected = signed_recovery_test_source(&recovery_test_source(restore_id, "120"), &key);
         let restore_path = root.path().join(format!("{restore_id}.yaml"));
         std::fs::write(&restore_path, &projected).unwrap();
         let projected = ryeos_scheduler::projection::verify_schedule_source_content(
@@ -1425,13 +1405,11 @@ mod tests {
             &trust,
         )
         .unwrap();
-        db.upsert_spec(&projected.to_spec_record().unwrap()).unwrap();
+        db.upsert_spec(&projected.to_spec_record().unwrap())
+            .unwrap();
 
         let delete_id = "delete-after-projection-crash";
-        let created = signed_recovery_test_source(
-            &recovery_test_source(delete_id, "180"),
-            &key,
-        );
+        let created = signed_recovery_test_source(&recovery_test_source(delete_id, "180"), &key);
         let delete_path = root.path().join(format!("{delete_id}.yaml"));
         std::fs::write(&delete_path, &created).unwrap();
         let created = ryeos_scheduler::projection::verify_schedule_source_content(

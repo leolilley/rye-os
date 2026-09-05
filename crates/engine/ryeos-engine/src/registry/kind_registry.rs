@@ -13,7 +13,7 @@
 //! and a hardcoded signature envelope (`#` prefix). Every kind schema must
 //! be signed by a trusted key. Unsigned or tampered schemas are rejected.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
@@ -2944,14 +2944,14 @@ fn parse_execution_schema(
 
     let filesystem_authority_ceiling = match execution_value.get("filesystem_authority_ceiling") {
         Some(value) => {
-            let declaration =
-                serde_yaml::from_value::<FilesystemAuthorityCeilingDecl>(value.clone()).map_err(
-                    |error| EngineError::SchemaLoaderError {
-                        reason: format!(
-                            "{display}: invalid execution.filesystem_authority_ceiling declaration: {error}"
-                        ),
-                    },
-                )?;
+            let declaration = serde_yaml::from_value::<FilesystemAuthorityCeilingDecl>(
+                value.clone(),
+            )
+            .map_err(|error| EngineError::SchemaLoaderError {
+                reason: format!(
+                    "{display}: invalid execution.filesystem_authority_ceiling declaration: {error}"
+                ),
+            })?;
             if declaration.path.is_empty()
                 || declaration.path.iter().any(|segment| {
                     segment.trim().is_empty() || segment.trim() != segment || segment.contains('.')
@@ -3236,7 +3236,10 @@ fn validate_execution_external_content_decl(
     display: &str,
     field: &str,
 ) -> Result<(), EngineError> {
-    let mount_roots = declaration.allowed_mount_roots.iter().collect::<BTreeSet<_>>();
+    let mount_roots = declaration
+        .allowed_mount_roots
+        .iter()
+        .collect::<BTreeSet<_>>();
     if mount_roots.is_empty() || mount_roots.len() != declaration.allowed_mount_roots.len() {
         return Err(EngineError::SchemaLoaderError {
             reason: format!("{display}: {field}.allowed_mount_roots must be nonempty and unique"),
@@ -4636,18 +4639,43 @@ execution:
 
     #[test]
     fn filesystem_projection_uses_only_signed_defaults_and_closed_values() {
-        use crate::isolation::IsolationFilesystemAuthorityCeiling::{CapturedExecution, NodePolicy};
-        for (default, expected) in [("node_policy", NodePolicy), ("captured_execution", CapturedExecution)] {
-            let yaml = format!("execution:\n  filesystem_authority_ceiling:\n    path: [filesystem_authority]\n    default: {default}\n  delegate:\n    via: runtime_registry\n");
+        use crate::isolation::IsolationFilesystemAuthorityCeiling::{
+            CapturedExecution, NodePolicy,
+        };
+        for (default, expected) in [
+            ("node_policy", NodePolicy),
+            ("captured_execution", CapturedExecution),
+        ] {
+            let yaml = format!(
+                "execution:\n  filesystem_authority_ceiling:\n    path: [filesystem_authority]\n    default: {default}\n  delegate:\n    via: runtime_registry\n"
+            );
             let execution = parse_exec(&yaml).unwrap().unwrap();
-            assert_eq!(execution.project_filesystem_authority_ceiling(&serde_json::json!({})).unwrap(), expected);
-            assert_eq!(execution.project_filesystem_authority_ceiling(&serde_json::json!({
-                "filesystem_authority": "captured_execution"
-            })).unwrap(), CapturedExecution);
-            for invalid in [serde_json::json!("host"), serde_json::json!(null), serde_json::json!({})] {
-                assert!(execution.project_filesystem_authority_ceiling(&serde_json::json!({
-                    "filesystem_authority": invalid
-                })).is_err());
+            assert_eq!(
+                execution
+                    .project_filesystem_authority_ceiling(&serde_json::json!({}))
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                execution
+                    .project_filesystem_authority_ceiling(&serde_json::json!({
+                        "filesystem_authority": "captured_execution"
+                    }))
+                    .unwrap(),
+                CapturedExecution
+            );
+            for invalid in [
+                serde_json::json!("host"),
+                serde_json::json!(null),
+                serde_json::json!({}),
+            ] {
+                assert!(
+                    execution
+                        .project_filesystem_authority_ceiling(&serde_json::json!({
+                            "filesystem_authority": invalid
+                        }))
+                        .is_err()
+                );
             }
             assert!(parse_exec(&yaml.replace(&format!("    default: {default}\n"), "")).is_err());
         }

@@ -430,8 +430,7 @@ fn capture_and_finalize_fresh_effective_program_once(
         materialization,
     )?;
     let mut resolution = resolution;
-    let projectless_authority =
-        ryeos_engine::contracts::SubjectResolutionAuthority::Projectless;
+    let projectless_authority = ryeos_engine::contracts::SubjectResolutionAuthority::Projectless;
     let subject_resolution_authority = materialization
         .map(|binding| binding.subject_authority())
         .unwrap_or(&projectless_authority);
@@ -498,8 +497,7 @@ pub(crate) fn validate_admitted_effective_program(
                 content as &dyn ryeos_engine::project_content::AuthoritativeProjectContent,
             )
         });
-    let projectless_authority =
-        ryeos_engine::contracts::SubjectResolutionAuthority::Projectless;
+    let projectless_authority = ryeos_engine::contracts::SubjectResolutionAuthority::Projectless;
     let subject_resolution_authority = materialization
         .map(|binding| binding.subject_authority())
         .unwrap_or(&projectless_authority);

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v4";
@@ -1864,9 +1864,7 @@ mod tests {
         AdapterInspectionResponse {
             protocol: IsolationAdapterProtocolVersion::Current,
             adapter_build: "0.1.0".to_string(),
-            effective_capabilities: BTreeSet::from([
-                IsolationCapability::FilesystemPrivateRoot,
-            ]),
+            effective_capabilities: BTreeSet::from([IsolationCapability::FilesystemPrivateRoot]),
             artifacts: BTreeMap::new(),
         }
         .validate()

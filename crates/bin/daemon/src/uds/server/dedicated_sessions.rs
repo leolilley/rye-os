@@ -851,8 +851,9 @@ pub(super) async fn start(
         lifecycle_generation: credential_generation,
         control_channel_identity,
     };
-    let workload_client_channel =
-        match super::workload_client::prepare_for_dedicated_boot(state, cap, &identity) {
+    let workload_client_channel = match super::workload_client::prepare_for_dedicated_boot(
+        state, cap, &identity,
+    ) {
         Ok(channel) => channel,
         Err(error) => {
             let detail = format!("{error:#}");

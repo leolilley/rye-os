@@ -1351,7 +1351,8 @@ fn resolve_session_process_environment(
                     })?;
                 if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
                     || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
-                    || realization.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
+                    || realization.mount_root
+                        != ryeos_state::objects::ExternalContentMountRoot::Project
                 {
                     bail!("session process environment requires a pinned tree realization");
                 }

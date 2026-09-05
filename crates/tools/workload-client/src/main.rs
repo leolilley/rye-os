@@ -28,11 +28,9 @@ struct EmbeddedBuildTestimony([u8; BUILD_TESTIMONY_LEN]);
 
 #[used]
 #[unsafe(link_section = ".ryeos_workload_client_build")]
-static EMBEDDED_BUILD_TESTIMONY: EmbeddedBuildTestimony =
-    EmbeddedBuildTestimony(*include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/ryeos-workload-client-build"
-    )));
+static EMBEDDED_BUILD_TESTIMONY: EmbeddedBuildTestimony = EmbeddedBuildTestimony(*include_bytes!(
+    concat!(env!("OUT_DIR"), "/ryeos-workload-client-build")
+));
 
 fn main() {
     // Keep the exact-build section reachable as data as well as marking it
@@ -115,9 +113,8 @@ fn parse_invocation(
                     bail!("--method-args was supplied more than once");
                 }
                 let raw = utf8(args.next(), "--method-args value")?;
-                method_args = Some(
-                    serde_json::from_str(&raw).context("decode --method-args JSON")?,
-                );
+                method_args =
+                    Some(serde_json::from_str(&raw).context("decode --method-args JSON")?);
             }
             "--ref" => {
                 let binding = utf8(args.next(), "--ref value")?;

@@ -612,9 +612,7 @@ impl ExecutionProvenance {
         } = &self
         {
             if !subject_workspace_lifeline.owns_effective_path(subject_effective_path) {
-                anyhow::bail!(
-                    "immutable-input provenance lost its sealed subject materialization"
-                );
+                anyhow::bail!("immutable-input provenance lost its sealed subject materialization");
             }
             if let Some(materialization) = subject_pinned_materialization.verified() {
                 if materialization.snapshot_hash() != base_snapshot_hash
@@ -1110,7 +1108,8 @@ impl ExecutionProvenance {
     pub fn immutable_workspace_input_snapshot_hash(&self) -> Option<&str> {
         match self {
             Self::ChildImmutableWorkspaceInput {
-                input_snapshot_hash, ..
+                input_snapshot_hash,
+                ..
             } => Some(input_snapshot_hash),
             _ => None,
         }
@@ -1125,9 +1124,7 @@ impl ExecutionProvenance {
             }
             Self::RootPinnedGeneration { .. }
             | Self::ChildPinnedGeneration { .. }
-            | Self::ChildImmutableWorkspaceInput { .. } => {
-                ProjectSourceKind::PushedHead
-            }
+            | Self::ChildImmutableWorkspaceInput { .. } => ProjectSourceKind::PushedHead,
         }
     }
 

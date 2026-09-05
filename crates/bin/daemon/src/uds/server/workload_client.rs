@@ -99,7 +99,9 @@ pub(super) fn prepare_for_dedicated_boot(
     request.validate()?;
 
     require_private_workload_client_isolation(state)?;
-    let execution_policy = state.node_policy.require::<NodeExecutionAdmissionPolicy>()?;
+    let execution_policy = state
+        .node_policy
+        .require::<NodeExecutionAdmissionPolicy>()?;
     let node_policy = execution_policy
         .workload_client
         .as_ref()
@@ -117,7 +119,9 @@ pub(super) fn prepare_for_dedicated_boot(
         .map(serde_json::from_value::<Vec<String>>)
         .transpose()
         .context("decode workload-client root delegation ceiling")?
-        .ok_or_else(|| anyhow!("worker-execution config has no workload-client delegation ceiling"))?;
+        .ok_or_else(|| {
+            anyhow!("worker-execution config has no workload-client delegation ceiling")
+        })?;
     validate_delegation_ceiling("worker root", &root_delegation_caps)?;
 
     let ingress = sealed
@@ -166,7 +170,12 @@ pub(super) fn prepare_for_dedicated_boot(
             capability,
             state,
         )?;
-        require_capability("worker root delegation", &root_delegation_caps, capability, state)?;
+        require_capability(
+            "worker root delegation",
+            &root_delegation_caps,
+            capability,
+            state,
+        )?;
         require_capability(
             "node workload-client policy",
             &node_policy.delegation_cap_ceiling,
@@ -208,9 +217,7 @@ pub(super) fn prepare_for_dedicated_boot(
 
     state
         .state_store
-        .assert_no_active_runtime_workspace_operation_for_chain(
-            &root_capability.chain_root_id,
-        )?;
+        .assert_no_active_runtime_workspace_operation_for_chain(&root_capability.chain_root_id)?;
 
     let ttl = lillux::time::Duration::from_secs(request.max_lifetime_seconds);
     let callback = state.callback_tokens.generate_with_context(
@@ -229,16 +236,17 @@ pub(super) fn prepare_for_dedicated_boot(
     let callback_token = callback.token.clone();
     let mut minted_thread_auth_token = None;
     let setup = (|| {
-        if !state.callback_tokens.set_chain_root(
-            &callback_token,
-            &root_capability.chain_root_id,
-        ) || !state.callback_tokens.set_launch_owner(
-            &callback_token,
-            root_capability
-                .launch_owner
-                .clone()
-                .ok_or_else(|| anyhow!("workload-client root callback has no launch owner"))?,
-        ) {
+        if !state
+            .callback_tokens
+            .set_chain_root(&callback_token, &root_capability.chain_root_id)
+            || !state.callback_tokens.set_launch_owner(
+                &callback_token,
+                root_capability
+                    .launch_owner
+                    .clone()
+                    .ok_or_else(|| anyhow!("workload-client root callback has no launch owner"))?,
+            )
+        {
             bail!("workload-client callback disappeared during boot admission");
         }
         if !state.callback_tokens.restrict_runtime_methods(
@@ -335,17 +343,22 @@ fn validate_delegation_ceiling(label: &str, capabilities: &[String]) -> Result<(
     Ok(())
 }
 
-fn required_execute_capability(engine: &ryeos_engine::engine::Engine, item_ref: &str) -> Result<String> {
+fn required_execute_capability(
+    engine: &ryeos_engine::engine::Engine,
+    item_ref: &str,
+) -> Result<String> {
     // This registered kind projection is the single capability constructor
     // for both workload-client admission and the downstream callback action.
     // Do not reconstruct `ryeos.execute.{kind}.{id}` here or branch on a kind:
     // a kind schema may own different signed capability vocabulary.
     let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(item_ref)
         .with_context(|| format!("parse workload-client item ref `{item_ref}`"))?;
-    let schema = engine
-        .kinds
-        .get(&canonical.kind)
-        .ok_or_else(|| anyhow!("workload-client item kind `{}` is not registered", canonical.kind))?;
+    let schema = engine.kinds.get(&canonical.kind).ok_or_else(|| {
+        anyhow!(
+            "workload-client item kind `{}` is not registered",
+            canonical.kind
+        )
+    })?;
     let admission = schema.inventory_policy.admission.as_ref().ok_or_else(|| {
         anyhow!(
             "workload-client item kind `{}` has no signed execution-capability projection",
@@ -503,7 +516,13 @@ fn dispatch_request(
     let outcome = (|| -> Result<Value> {
         request.validate()?;
         grant.validate()?;
-        validate_live_boot(state, grant, grant_digest, callback_token, thread_auth_token)?;
+        validate_live_boot(
+            state,
+            grant,
+            grant_digest,
+            callback_token,
+            thread_auth_token,
+        )?;
         let WorkloadClientOperation::Execute(execute) = request.operation;
         // The request id is the runtime-asserted occurrence coordinate. Keep
         // behavior out of this identity: runtime.dispatch_action separately

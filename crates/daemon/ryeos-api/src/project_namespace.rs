@@ -9,8 +9,7 @@ use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
 
-const PROJECT_MUTATION_LOCK_TIMEOUT: lillux::time::Duration =
-    lillux::time::Duration::from_secs(5);
+const PROJECT_MUTATION_LOCK_TIMEOUT: lillux::time::Duration = lillux::time::Duration::from_secs(5);
 
 pub(crate) fn relative_parent(
     root: &lillux::PinnedDirectory,
@@ -71,9 +70,7 @@ mod tests {
     #[test]
     fn traversal_rejects_parent_escape_before_creating_any_entry() {
         let root = tempfile::TempDir::new().unwrap();
-        let pinned = lillux::PinnedDirectory::open(root.path())
-            .unwrap()
-            .unwrap();
+        let pinned = lillux::PinnedDirectory::open(root.path()).unwrap().unwrap();
         assert!(relative_parent(&pinned, "../outside", true).is_err());
         assert!(!root.path().parent().unwrap().join("outside").exists());
     }
@@ -87,9 +84,7 @@ mod tests {
             let root = tempfile::TempDir::new().unwrap();
             let outside = tempfile::TempDir::new().unwrap();
             std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
-            let pinned = lillux::PinnedDirectory::open(root.path())
-                .unwrap()
-                .unwrap();
+            let pinned = lillux::PinnedDirectory::open(root.path()).unwrap().unwrap();
             assert!(relative_parent(&pinned, "linked/value", true).is_err());
             assert!(!outside.path().join("value").exists());
         }

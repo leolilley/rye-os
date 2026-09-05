@@ -1,6 +1,6 @@
 //! `project/apply-snapshot` — apply an AI-only snapshot to a live project.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs;
@@ -20,11 +20,11 @@ use crate::registry::ServiceDescriptor;
 use ryeos_app::state::AppState;
 use ryeos_executor::executor::ServiceAvailability;
 use ryeos_state::objects::{ProjectFile, ProjectSnapshot, ProjectSnapshotPolicy, ProjectTree};
+use ryeos_state::project_sync::ProjectSyncScope;
 use ryeos_state::{
     FinishSyncJobAttempt, NewSyncJob, NewSyncJobAttempt, SyncJobAttemptState, SyncJobRecord,
     SyncJobState, SyncJobUpdate,
 };
-use ryeos_state::project_sync::ProjectSyncScope;
 
 #[derive(serde::Deserialize)]
 #[serde(transparent)]
@@ -108,8 +108,7 @@ struct ApplyJournal {
     schema: u32,
     operation: ApplyOperation,
     surfaces: Vec<JournalSurface>,
-    schedule_before_images:
-        Vec<crate::project_deploy::schedules::ScheduleRecoveryBeforeImage>,
+    schedule_before_images: Vec<crate::project_deploy::schedules::ScheduleRecoveryBeforeImage>,
     auth_tag: String,
 }
 
@@ -263,9 +262,9 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
         Ok(staging) => staging,
         Err(error) => {
             if open_transaction_root(&project_directory, &transaction_id)?.is_some() {
-                return Err(error.context(
-                    "project apply workspace creation requires startup recovery",
-                ));
+                return Err(
+                    error.context("project apply workspace creation requires startup recovery")
+                );
             }
             let diagnostic = format!("{error:#}");
             settle_apply_job(
@@ -328,87 +327,86 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
         // behind large applies (per-project serialization is handled
         // by `project_apply_lock` above).
         let _scheduler_guard = state.scheduler_runtime_gate.clone().write_owned().await;
-        let _cas_publish_guard = authority.acquire_shared_guard()?;
-        let _permit = state
-            .write_barrier
-            .acquire_with_timeout(ryeos_app::write_barrier::ONLINE_WRITE_PERMIT_TIMEOUT)
-            .map_err(|e| anyhow!("cannot acquire CAS write permit: {e}"))?;
-
         let deploy_plan = project_deploy::plan(&deploy_ctx)?;
-        project_directory.ensure_path_binding()?;
-        let journal_surfaces = capture_journal_surfaces(
-            &cas,
-            &tree,
-            &project_directory,
-            staging.directory(),
-        )?;
         let recovery_preparation =
             project_deploy::prepare_recovery_before_images(&deploy_plan, &deploy_ctx).await?;
         let schedule_before_images = recovery_preparation.schedule_before_images().to_vec();
-        let journal_key = authority
-            .require_recovery()?
-            .workspace_journal_auth_key()?;
-        write_apply_journal(
-            &staging,
-            &journal_key,
-            ApplyJournal {
-                kind: APPLY_JOURNAL_KIND.to_owned(),
-                schema: APPLY_JOURNAL_SCHEMA,
-                operation: operation.clone(),
-                surfaces: journal_surfaces.clone(),
-                schedule_before_images: schedule_before_images.clone(),
-                auth_tag: String::new(),
-            },
-        )?;
-        journal_prepared = true;
-        let mut surface_swap = match replace_managed_surfaces(
-            &project_directory,
-            &staging,
-            &journal_surfaces,
-            tree.files.len(),
-        ) {
-            Ok(surface_swap) => surface_swap,
-            Err(error) => {
-                rollback_journal_surfaces(
-                    &project_directory,
-                    &staging,
-                    &journal_surfaces,
-                )?;
-                durable_resolution_complete = true;
-                return Err(error);
-            }
-        };
-        let mut deploy_tx = match project_deploy::prepare_commit_with_recovery(
-            &deploy_plan,
-            &deploy_ctx,
-            recovery_preparation,
-        ) {
-            Ok(tx) => tx,
-            Err(err) => {
-                surface_swap.retain_for_recovery();
-                rollback_journal_surfaces(
-                    &project_directory,
-                    &staging,
-                    &journal_surfaces,
-                )?;
-                project_deploy::restore_recovery_before_images(
-                    &state,
-                    &schedule_before_images,
-                )
-                .await?;
-                durable_resolution_complete = true;
-                return Err(err);
-            }
-        };
-
-        let commit_surface_validation = (|| -> Result<()> {
+        let mut schedule_restore_required = false;
+        // CAS mutation guards are deliberately thread-local. Keep the whole
+        // surface/ref transaction synchronous under its guard; schedule
+        // preparation and restoration may await only outside that lifetime.
+        let result = (|| -> Result<ApplyReport> {
+            let _cas_publish_guard = authority.acquire_shared_guard()?;
+            let _permit = state
+                .write_barrier
+                .acquire_with_timeout(ryeos_app::write_barrier::ONLINE_WRITE_PERMIT_TIMEOUT)
+                .map_err(|e| anyhow!("cannot acquire CAS write permit: {e}"))?;
             project_directory.ensure_path_binding()?;
-            verify_live_journal_surfaces(&project_directory, &journal_surfaces, true)?;
-            // Recheck after the potentially large content walk. The pinned
-            // descriptor remains exact, but the pathname is the subject the
-            // deployed ref names and must still resolve to this inode at the
-            // publication boundary.
-            project_directory.ensure_path_binding()
+            let journal_surfaces = capture_journal_surfaces(
+                &cas,
+                &tree,
+                &project_directory,
+                staging.directory(),
+            )?;
+            let journal_key = authority
+                .require_recovery()?
+                .workspace_journal_auth_key()?;
+            write_apply_journal(
+                &staging,
+                &journal_key,
+                ApplyJournal {
+                    kind: APPLY_JOURNAL_KIND.to_owned(),
+                    schema: APPLY_JOURNAL_SCHEMA,
+                    operation: operation.clone(),
+                    surfaces: journal_surfaces.clone(),
+                    schedule_before_images: schedule_before_images.clone(),
+                    auth_tag: String::new(),
+                },
+            )?;
+            journal_prepared = true;
+            let mut surface_swap = match replace_managed_surfaces(
+                &project_directory,
+                &staging,
+                &journal_surfaces,
+                tree.files.len(),
+            ) {
+                Ok(surface_swap) => surface_swap,
+                Err(error) => {
+                    rollback_journal_surfaces(
+                        &project_directory,
+                        &staging,
+                        &journal_surfaces,
+                    )?;
+                    durable_resolution_complete = true;
+                    return Err(error);
+                }
+            };
+            let mut deploy_tx = match project_deploy::prepare_commit_with_recovery(
+                &deploy_plan,
+                &deploy_ctx,
+                recovery_preparation,
+            ) {
+                Ok(tx) => tx,
+                Err(err) => {
+                    surface_swap.retain_for_recovery();
+                    rollback_journal_surfaces(
+                        &project_directory,
+                        &staging,
+                        &journal_surfaces,
+                    )?;
+                    schedule_restore_required = true;
+                    return Err(err);
+                }
+            };
+
+            let commit_surface_validation = (|| -> Result<()> {
+                project_directory.ensure_path_binding()?;
+                verify_live_journal_surfaces(&project_directory, &journal_surfaces, true)?;
+                // Recheck after the potentially large content walk. The pinned
+                // descriptor remains exact, but the pathname is the subject the
+                // deployed ref names and must still resolve to this inode at the
+                // publication boundary.
+                project_directory.ensure_path_binding()
         })();
         if let Err(error) = commit_surface_validation {
             deploy_tx.rollback(&deploy_ctx);
@@ -419,13 +417,7 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
                 &journal_surfaces,
             )
             .context("project apply commit-fence failure also failed surface rollback")?;
-            project_deploy::restore_recovery_before_images(
-                &state,
-                &schedule_before_images,
-            )
-            .await
-            .context("project apply commit-fence failure also failed schedule rollback")?;
-            durable_resolution_complete = true;
+            schedule_restore_required = true;
             return Err(error);
         }
 
@@ -489,12 +481,7 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
                     &staging,
                     &journal_surfaces,
                 )?;
-                project_deploy::restore_recovery_before_images(
-                    &state,
-                    &schedule_before_images,
-                )
-                .await?;
-                durable_resolution_complete = true;
+                schedule_restore_required = true;
                 return Err(err);
             }
             deploy_tx.retain_for_recovery();
@@ -532,11 +519,24 @@ pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> 
         let mut report = surface_swap.report.clone();
         report.deploy = deploy_report;
         Ok(report)
+        })();
+        if schedule_restore_required {
+            if let Err(rollback_error) = project_deploy::restore_recovery_before_images(
+                &state,
+                &schedule_before_images,
+            ).await {
+                return Err(rollback_error.context(format!(
+                    "project apply failed ({:#}); schedule restoration requires startup recovery",
+                    result.as_ref().expect_err("schedule restoration only follows a failed apply"),
+                )));
+            }
+            durable_resolution_complete = true;
+        }
+        result
     }
     .await;
-    let retain_for_recovery = apply_result.is_err()
-        && journal_prepared
-        && !durable_resolution_complete;
+    let retain_for_recovery =
+        apply_result.is_err() && journal_prepared && !durable_resolution_complete;
     let cleanup = if retain_for_recovery {
         Ok(())
     } else {
@@ -723,8 +723,7 @@ impl StagingDirectory {
     }
 
     fn open(project: &PinnedDirectory, transaction_id: &str) -> Result<Option<Self>> {
-        let Some((parent, transaction, name)) =
-            open_transaction_root(project, transaction_id)?
+        let Some((parent, transaction, name)) = open_transaction_root(project, transaction_id)?
         else {
             return Ok(None);
         };
@@ -830,8 +829,7 @@ fn expected_target_surface_identities_for_snapshot(
     cas: &CasStore,
     snapshot_hash: &str,
 ) -> Result<HashMap<String, Option<SurfaceContentIdentity>>> {
-    let limits =
-        ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
+    let limits = ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
     let snapshot_value = ryeos_state::object_closure::load_exact_cas_object_with_cas(
         cas,
         snapshot_hash,
@@ -848,11 +846,13 @@ fn expected_target_surface_identities_for_snapshot(
 }
 
 fn validate_surface_content_identity(identity: &SurfaceContentIdentity) -> Result<()> {
-    let limits =
-        ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
+    let limits = ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
     if identity.schema != SURFACE_CONTENT_SCHEMA
         || !lillux::valid_hash(&identity.digest)
-        || identity.digest.bytes().any(|byte| byte.is_ascii_uppercase())
+        || identity
+            .digest
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
         || identity.regular_files
             > u64::try_from(ryeos_state::project_sync::MAX_PROJECT_TREE_FILES)
                 .expect("project file limit fits u64")
@@ -911,8 +911,7 @@ fn expected_target_surface_identities(
     cas: &CasStore,
     tree: &ProjectTree,
 ) -> Result<HashMap<String, Option<SurfaceContentIdentity>>> {
-    let limits =
-        ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
+    let limits = ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
     let mut identities = HashMap::new();
     for surface in ryeos_state::project_sync::materialized_project_ai_surfaces() {
         let mut directories = BTreeSet::new();
@@ -977,8 +976,7 @@ fn observe_surface_content(
     let Some(entry) = parent.entry_no_follow(&name)? else {
         return Ok(None);
     };
-    let limits =
-        ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
+    let limits = ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport();
     let mut directories = BTreeSet::new();
     let mut files = Vec::new();
     match surface.shape {
@@ -1109,10 +1107,7 @@ fn write_apply_journal(
 }
 
 #[cfg(test)]
-fn read_apply_journal(
-    workspace: &StagingDirectory,
-    key: &[u8; 32],
-) -> Result<ApplyJournal> {
+fn read_apply_journal(workspace: &StagingDirectory, key: &[u8; 32]) -> Result<ApplyJournal> {
     read_apply_journal_from_transaction(&workspace.transaction, key)
 }
 
@@ -1176,7 +1171,10 @@ fn validate_apply_operation(operation: &ApplyOperation) -> Result<()> {
     if transaction.to_string() != operation.transaction_id
         || operation.job_id != format!("project-snapshot-apply:{}", operation.transaction_id)
         || operation.attempt_id
-            != format!("project-snapshot-apply-attempt:{}", operation.transaction_id)
+            != format!(
+                "project-snapshot-apply-attempt:{}",
+                operation.transaction_id
+            )
     {
         anyhow::bail!("project apply operation has non-canonical durable coordinates");
     }
@@ -1184,6 +1182,12 @@ fn validate_apply_operation(operation: &ApplyOperation) -> Result<()> {
     let canonical_components = path.components().collect::<PathBuf>();
     if path.components().count() < 2
         || !path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
         || canonical_components.to_str() != Some(operation.project_path.as_str())
         || operation.project_hash
             != ryeos_state::refs::deployed_project_key(&operation.project_path)
@@ -1203,11 +1207,7 @@ fn validate_apply_operation(operation: &ApplyOperation) -> Result<()> {
 }
 
 fn validate_canonical_object_hash(label: &str, value: &str) -> Result<()> {
-    if !lillux::valid_hash(value)
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_uppercase())
-    {
+    if !lillux::valid_hash(value) || value.bytes().any(|byte| byte.is_ascii_uppercase()) {
         anyhow::bail!("{label} is not a canonical lowercase SHA-256 digest");
     }
     Ok(())
@@ -1349,13 +1349,9 @@ fn write_staged_regular_file(
     let relative = relative
         .to_str()
         .ok_or_else(|| anyhow!("project path is not valid UTF-8"))?;
-    let (parent, name) = crate::project_namespace::relative_parent_with_mode(
-        staging_root,
-        relative,
-        true,
-        0o755,
-    )?
-    .ok_or_else(|| anyhow!("staging path has no filename"))?;
+    let (parent, name) =
+        crate::project_namespace::relative_parent_with_mode(staging_root, relative, true, 0o755)?
+            .ok_or_else(|| anyhow!("staging path has no filename"))?;
     let copied = cas.materialize_blob_to_new_regular(
         blob_hash,
         &parent,
@@ -1363,9 +1359,7 @@ fn write_staged_regular_file(
         mode.unwrap_or(ProjectFile::REGULAR_MODE),
     )?;
     if copied != expected_size {
-        anyhow::bail!(
-            "project blob {blob_hash} has {copied} bytes, expected {expected_size}"
-        );
+        anyhow::bail!("project blob {blob_hash} has {copied} bytes, expected {expected_size}");
     }
     Ok(())
 }
@@ -1458,8 +1452,8 @@ fn replace_managed_surfaces(
         finalized: false,
     };
     let result = (|| -> Result<()> {
-        let declared = ryeos_state::project_sync::materialized_project_ai_surfaces()
-            .collect::<Vec<_>>();
+        let declared =
+            ryeos_state::project_sync::materialized_project_ai_surfaces().collect::<Vec<_>>();
         if declared.len() != journal_surfaces.len() {
             anyhow::bail!("project apply journal has the wrong managed-surface count");
         }
@@ -1467,16 +1461,10 @@ fn replace_managed_surfaces(
             if frozen.relative != surface.root {
                 anyhow::bail!("project apply journal managed-surface order changed");
             }
-            let live = crate::project_namespace::relative_parent(
-                &prepared.project,
-                surface.root,
-                false,
-            )?;
-            let staged = crate::project_namespace::relative_parent(
-                &prepared.staging,
-                surface.root,
-                false,
-            )?;
+            let live =
+                crate::project_namespace::relative_parent(&prepared.project, surface.root, false)?;
+            let staged =
+                crate::project_namespace::relative_parent(&prepared.staging, surface.root, false)?;
             let prior_content = observe_surface_content(&prepared.project, surface)?;
             let target_content = observe_surface_content(&prepared.staging, surface)?;
             if prior_content != frozen.prior_content || target_content != frozen.target_content {
@@ -1494,9 +1482,7 @@ fn replace_managed_surfaces(
                 .last_mut()
                 .expect("surface swap was just appended");
             if prior_present {
-                let (live_parent, name) = live
-                    .as_ref()
-                    .expect("present live surface has a parent");
+                let (live_parent, name) = live.as_ref().expect("present live surface has a parent");
                 let (backup_parent, _) = crate::project_namespace::relative_parent(
                     &prepared.backup,
                     surface.root,
@@ -1553,20 +1539,14 @@ fn rollback_swaps(
             && let Some((live_parent, name)) = live.as_ref()
             && live_parent.entry_no_follow(name)?.is_some()
         {
-            let (discard_parent, _) = crate::project_namespace::relative_parent(
-                discard,
-                &swap.relative,
-                true,
-            )?
-            .ok_or_else(|| anyhow!("discard surface path has no filename"))?;
+            let (discard_parent, _) =
+                crate::project_namespace::relative_parent(discard, &swap.relative, true)?
+                    .ok_or_else(|| anyhow!("discard surface path has no filename"))?;
             move_exact_child(live_parent, &discard_parent, name)?;
         }
         if swap.prior_present {
-            let backup_entry = crate::project_namespace::relative_parent(
-                backup,
-                &swap.relative,
-                false,
-            )?;
+            let backup_entry =
+                crate::project_namespace::relative_parent(backup, &swap.relative, false)?;
             if let Some((backup_parent, name)) = backup_entry
                 && backup_parent.entry_no_follow(&name)?.is_some()
             {
@@ -1605,8 +1585,8 @@ fn move_exact_child(
 }
 
 fn validate_journal_surfaces(surfaces: &[JournalSurface]) -> Result<()> {
-    let declared = ryeos_state::project_sync::materialized_project_ai_surfaces()
-        .collect::<Vec<_>>();
+    let declared =
+        ryeos_state::project_sync::materialized_project_ai_surfaces().collect::<Vec<_>>();
     if declared.len() != surfaces.len() {
         anyhow::bail!("project apply journal has the wrong managed-surface count");
     }
@@ -1711,16 +1691,13 @@ fn rollback_journal_surfaces(
     workspace: &StagingDirectory,
     surfaces: &[JournalSurface],
 ) -> Result<()> {
-    let declared = ryeos_state::project_sync::materialized_project_ai_surfaces()
-        .collect::<Vec<_>>();
+    let declared =
+        ryeos_state::project_sync::materialized_project_ai_surfaces().collect::<Vec<_>>();
     validate_journal_surfaces(surfaces)?;
     for (surface, frozen) in declared.into_iter().zip(surfaces).rev() {
         let live = crate::project_namespace::relative_parent(project, surface.root, false)?;
-        let backup = crate::project_namespace::relative_parent(
-            &workspace.backup,
-            surface.root,
-            false,
-        )?;
+        let backup =
+            crate::project_namespace::relative_parent(&workspace.backup, surface.root, false)?;
         let live_content = observe_surface_content(project, surface)?;
         let backup_content = observe_surface_content(&workspace.backup, surface)?;
         if let Some(backup_content) = backup_content {
@@ -1734,9 +1711,7 @@ fn rollback_journal_surfaces(
                         surface.root
                     );
                 }
-                let (live_parent, name) = live
-                    .as_ref()
-                    .expect("present live surface has a parent");
+                let (live_parent, name) = live.as_ref().expect("present live surface has a parent");
                 let (discard_parent, _) = crate::project_namespace::relative_parent(
                     &workspace.discard,
                     surface.root,
@@ -1771,15 +1746,10 @@ fn rollback_journal_surfaces(
                     surface.root
                 );
             }
-            let (live_parent, name) = live
-                .as_ref()
-                .expect("present live surface has a parent");
-            let (discard_parent, _) = crate::project_namespace::relative_parent(
-                &workspace.discard,
-                surface.root,
-                true,
-            )?
-            .context("discard surface path has no filename")?;
+            let (live_parent, name) = live.as_ref().expect("present live surface has a parent");
+            let (discard_parent, _) =
+                crate::project_namespace::relative_parent(&workspace.discard, surface.root, true)?
+                    .context("discard surface path has no filename")?;
             move_exact_child(live_parent, &discard_parent, name)?;
         }
     }
@@ -1795,7 +1765,11 @@ fn validate_job_operation(job: &SyncJobRecord) -> Result<ApplyOperation> {
     if operation.job_id != job.job_id {
         anyhow::bail!("project apply sync job identity does not match its operation");
     }
-    if job.roots.iter().all(|hash| hash != &operation.target_snapshot_hash) {
+    if job
+        .roots
+        .iter()
+        .all(|hash| hash != &operation.target_snapshot_hash)
+    {
         anyhow::bail!("project apply sync job does not root its target snapshot");
     }
     if operation
@@ -1881,10 +1855,8 @@ async fn recover_apply_job(state: &AppState, job: &SyncJobRecord) -> Result<()> 
         .with_state_db(|db| db.pinned_authority())?;
     let _cas_guard = authority.acquire_shared_guard()?;
     let cas = authority.cas_store()?;
-    let expected_targets = expected_target_surface_identities_for_snapshot(
-        &cas,
-        &operation.target_snapshot_hash,
-    )?;
+    let expected_targets =
+        expected_target_surface_identities_for_snapshot(&cas, &operation.target_snapshot_hash)?;
     let visible = state
         .state_store
         .with_state_db(|db| db.read_deployed_project_ref(&operation.project_hash))?
@@ -1896,9 +1868,7 @@ async fn recover_apply_job(state: &AppState, job: &SyncJobRecord) -> Result<()> 
                 .entry_no_follow(OsStr::new("journal.json"))?
                 .is_some() =>
         {
-            let key = authority
-                .require_recovery()?
-                .workspace_journal_auth_key()?;
+            let key = authority.require_recovery()?.workspace_journal_auth_key()?;
             let journal = read_apply_journal_from_transaction(transaction, &key)?;
             if journal.operation != operation {
                 anyhow::bail!("project apply journal is bound to another operation");
@@ -1915,9 +1885,7 @@ async fn recover_apply_job(state: &AppState, job: &SyncJobRecord) -> Result<()> 
     )? {
         ApplyRecoveryDecision::Commit => {
             if transaction.is_some() && journal.is_none() {
-                anyhow::bail!(
-                    "committed project apply transaction has no authenticated journal"
-                );
+                anyhow::bail!("committed project apply transaction has no authenticated journal");
             }
             verify_live_target_identities(&project, &expected_targets)?;
             project.ensure_path_binding()?;
@@ -1931,16 +1899,10 @@ async fn recover_apply_job(state: &AppState, job: &SyncJobRecord) -> Result<()> 
             if let Some((parent, transaction, name)) = transaction.as_ref() {
                 if let Some(journal) = journal.as_ref() {
                     if !live_journal_surfaces_match(&project, &journal.surfaces, false)? {
-                        let workspace = StagingDirectory::open(
-                            &project,
-                            &operation.transaction_id,
-                        )?
-                        .context("prepared project apply has an incomplete transaction")?;
-                        rollback_journal_surfaces(
-                            &project,
-                            &workspace,
-                            &journal.surfaces,
-                        )?;
+                        let workspace =
+                            StagingDirectory::open(&project, &operation.transaction_id)?
+                                .context("prepared project apply has an incomplete transaction")?;
+                        rollback_journal_surfaces(&project, &workspace, &journal.surfaces)?;
                     }
                     // Schedule restoration is independently idempotent and
                     // remains required when a predecessor crashed after
@@ -2055,38 +2017,36 @@ mod tests {
             decide_apply_recovery(Some(&target), Some(&previous), &target).unwrap(),
             ApplyRecoveryDecision::Commit
         );
-        assert!(
-            decide_apply_recovery(Some(&"c".repeat(64)), Some(&previous), &target).is_err()
-        );
+        assert!(decide_apply_recovery(Some(&"c".repeat(64)), Some(&previous), &target).is_err());
     }
 
     #[test]
     fn operation_coordinates_and_project_path_must_be_canonical() {
         let project = TempDir::new().unwrap();
         let project_path = project.path().canonicalize().unwrap();
-        let mut operation = test_operation(
-            &project_path,
-            "ad49cb84-a1b7-49b8-aab1-a66f27b4eb68",
-        );
+        let mut operation = test_operation(&project_path, "ad49cb84-a1b7-49b8-aab1-a66f27b4eb68");
         assert!(validate_apply_operation(&operation).is_ok());
         operation.transaction_id = "../../outside".to_owned();
         operation.job_id = "project-snapshot-apply:../../outside".to_owned();
         operation.attempt_id = "project-snapshot-apply-attempt:../../outside".to_owned();
         assert!(validate_apply_operation(&operation).is_err());
 
-        let mut operation = test_operation(
-            &project_path,
-            "6d180259-f3e0-4551-b13b-d95a8b384080",
-        );
-        operation.project_path = "/tmp/../etc".to_owned();
-        operation.project_hash =
-            ryeos_state::refs::deployed_project_key(&operation.project_path);
-        assert!(validate_apply_operation(&operation).is_err());
+        for invalid in [
+            "/tmp/../etc",
+            "/tmp/./project",
+            "/tmp//project",
+            "/tmp/project/",
+            "/",
+        ] {
+            let mut operation =
+                test_operation(&project_path, "6d180259-f3e0-4551-b13b-d95a8b384080");
+            operation.project_path = invalid.to_owned();
+            operation.project_hash =
+                ryeos_state::refs::deployed_project_key(&operation.project_path);
+            assert!(validate_apply_operation(&operation).is_err(), "{invalid}");
+        }
 
-        let operation = test_operation(
-            &project_path,
-            "b0e32f74-a8e3-4b13-89da-fc97469e9a40",
-        );
+        let operation = test_operation(&project_path, "b0e32f74-a8e3-4b13-89da-fc97469e9a40");
         let mut value = serde_json::to_value(&operation).unwrap();
         value
             .as_object_mut()
@@ -2132,7 +2092,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_apply_journal(&workspace, &key).unwrap().schedule_before_images[0]
+            read_apply_journal(&workspace, &key)
+                .unwrap()
+                .schedule_before_images[0]
                 .signed_yaml
                 .as_deref(),
             Some("signed: before\n")
@@ -2140,12 +2102,7 @@ mod tests {
         let path = workspace.transaction.path().join("journal.json");
         let bytes = std::fs::read(&path).unwrap();
         let mut value: Value = serde_json::from_slice(&bytes).unwrap();
-        value["auth_tag"] = Value::String(
-            value["auth_tag"]
-                .as_str()
-                .unwrap()
-                .to_ascii_uppercase(),
-        );
+        value["auth_tag"] = Value::String(value["auth_tag"].as_str().unwrap().to_ascii_uppercase());
         std::fs::write(&path, lillux::canonical_json(&value).unwrap()).unwrap();
         assert!(read_apply_journal(&workspace, &key).is_err());
 
@@ -2162,17 +2119,14 @@ mod tests {
         surfaces: &[JournalSurface],
         count: usize,
     ) {
-        let declared = ryeos_state::project_sync::materialized_project_ai_surfaces()
-            .collect::<Vec<_>>();
+        let declared =
+            ryeos_state::project_sync::materialized_project_ai_surfaces().collect::<Vec<_>>();
         for (surface, frozen) in declared.into_iter().zip(surfaces).take(count) {
             if frozen.prior_content.is_some() {
-                let (live_parent, name) = crate::project_namespace::relative_parent(
-                    project,
-                    surface.root,
-                    false,
-                )
-                .unwrap()
-                .unwrap();
+                let (live_parent, name) =
+                    crate::project_namespace::relative_parent(project, surface.root, false)
+                        .unwrap()
+                        .unwrap();
                 let (backup_parent, _) = crate::project_namespace::relative_parent(
                     &workspace.backup,
                     surface.root,
@@ -2214,28 +2168,23 @@ mod tests {
         std::fs::write(project.path().join(".ai/manifest.yaml"), "old-file").unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let project_directory = PinnedDirectory::open(&project_path).unwrap().unwrap();
-        let workspace = StagingDirectory::create(
-            &project_directory,
-            "d386534f-16ed-45ca-9a42-214b62c7466f",
-        )
-        .unwrap();
+        let workspace =
+            StagingDirectory::create(&project_directory, "d386534f-16ed-45ca-9a42-214b62c7466f")
+                .unwrap();
         std::fs::create_dir_all(workspace.directory.path().join(".ai")).unwrap();
         std::fs::write(
             workspace.directory.path().join(".ai/manifest.yaml"),
             "new-file",
         )
         .unwrap();
-        let surfaces =
-            observe_journal_surfaces(&project_directory, workspace.directory()).unwrap();
+        let surfaces = observe_journal_surfaces(&project_directory, workspace.directory()).unwrap();
         apply_surface_prefix(&project_directory, &workspace, &surfaces, 2);
         std::fs::write(
             workspace.backup.path().join(".ai/manifest.yaml"),
             "changed-old-file",
         )
         .unwrap();
-        assert!(
-            rollback_journal_surfaces(&project_directory, &workspace, &surfaces).is_err()
-        );
+        assert!(rollback_journal_surfaces(&project_directory, &workspace, &surfaces).is_err());
     }
 
     #[test]
@@ -2249,8 +2198,7 @@ mod tests {
             let project_path = project.path().canonicalize().unwrap();
             let project_directory = PinnedDirectory::open(&project_path).unwrap().unwrap();
             let transaction_id = format!("00000000-0000-4000-8000-{prefix:012x}");
-            let workspace =
-                StagingDirectory::create(&project_directory, &transaction_id).unwrap();
+            let workspace = StagingDirectory::create(&project_directory, &transaction_id).unwrap();
             std::fs::create_dir_all(workspace.directory.path().join(".ai/directives")).unwrap();
             std::fs::write(
                 workspace.directory.path().join(".ai/manifest.yaml"),
@@ -2287,7 +2235,11 @@ mod tests {
         std::fs::create_dir_all(project.path().join(".ai/config/schedules")).unwrap();
         std::fs::create_dir_all(project.path().join(".ai/node/schedules")).unwrap();
         std::fs::create_dir_all(project.path().join("src")).unwrap();
-        std::fs::write(project.path().join(".ai/manifest.source.yaml"), "old source").unwrap();
+        std::fs::write(
+            project.path().join(".ai/manifest.source.yaml"),
+            "old source",
+        )
+        .unwrap();
         std::fs::write(project.path().join(".ai/manifest.yaml"), "old generated").unwrap();
         std::fs::write(project.path().join(".ai/directives/old.md"), "old").unwrap();
         std::fs::write(project.path().join(".ai/tools/old.sh"), "old").unwrap();
@@ -2310,15 +2262,21 @@ mod tests {
             "new source",
         )
         .unwrap();
-        std::fs::write(staging.directory.path().join(".ai/directives/new.md"), "new").unwrap();
         std::fs::write(
-            staging.directory.path().join(".ai/config/schedules/new.yaml"),
+            staging.directory.path().join(".ai/directives/new.md"),
+            "new",
+        )
+        .unwrap();
+        std::fs::write(
+            staging
+                .directory
+                .path()
+                .join(".ai/config/schedules/new.yaml"),
             "new",
         )
         .unwrap();
 
-        let surfaces =
-            observe_journal_surfaces(&project_directory, staging.directory()).unwrap();
+        let surfaces = observe_journal_surfaces(&project_directory, staging.directory()).unwrap();
         let mut prepared =
             replace_managed_surfaces(&project_directory, &staging, &surfaces, 3).unwrap();
         prepared.finalize();
@@ -2372,10 +2330,21 @@ mod tests {
         let project_directory = PinnedDirectory::open(&project_root).unwrap().unwrap();
         let staging = StagingDirectory::create(&project_directory, "test-apply-two").unwrap();
         std::fs::create_dir_all(staging.directory.path().join(".ai/directives")).unwrap();
-        std::fs::write(staging.directory.path().join(".ai/directives/new.md"), "new").unwrap();
+        std::fs::write(
+            staging.directory.path().join(".ai/directives/new.md"),
+            "new",
+        )
+        .unwrap();
         let err = observe_journal_surfaces(&project_directory, staging.directory())
             .expect_err("symlink surface must be rejected");
-        assert!(format!("{err:#}").contains("symlink"));
+        assert!(format!("{err:#}").contains("not a directory"), "{err:#}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(
+            std::fs::symlink_metadata(project.path().join(".ai/directives"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -2402,7 +2371,17 @@ mod tests {
         std::fs::write(staging.directory.path().join(".ai/manifest.yaml"), "new").unwrap();
         let err = observe_journal_surfaces(&project_directory, staging.directory())
             .expect_err("symlinked file surface must be rejected");
-        assert!(format!("{err:#}").contains("symlink"));
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("manifest.yaml")).unwrap(),
+            "outside"
+        );
+        assert!(
+            std::fs::symlink_metadata(project.path().join(".ai/manifest.yaml"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -2424,7 +2403,7 @@ mod tests {
             normalized_mode: 0o755,
         };
         let file_hash = cas.store_object(&file.to_value()).unwrap();
-        let mut map = BTreeMap::new();
+        let mut map = std::collections::BTreeMap::new();
         map.insert(".ai/tools/run.sh".to_string(), file_hash);
         let tree = ProjectTree { files: map };
         let staging = TempDir::new().unwrap();

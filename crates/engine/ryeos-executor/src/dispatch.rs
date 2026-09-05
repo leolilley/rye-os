@@ -1967,13 +1967,19 @@ pub(crate) async fn dispatch_method(
             &ctx.engine,
             kind,
             Some(root_admission.resolution_output()),
-            request.parent_execution_context.as_ref().map(|parent| parent.parent_thread_id.as_str()),
-        ).map_err(DispatchError::Internal)?;
+            request
+                .parent_execution_context
+                .as_ref()
+                .map(|parent| parent.parent_thread_id.as_str()),
+        )
+        .map_err(DispatchError::Internal)?;
     if filesystem_authority_ceiling
         == ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::CapturedExecution
     {
         return Err(DispatchError::CapabilityRejected {
-            reason: "captured execution cannot grant the method runtime's daemon callback authority".to_owned(),
+            reason:
+                "captured execution cannot grant the method runtime's daemon callback authority"
+                    .to_owned(),
         });
     }
 
@@ -4632,10 +4638,8 @@ pub async fn prepare_admitted_launch_contract(
     // captured read-only generation, but launch-contract resolution remains
     // bound to the already-admitted subject generation. Treating the input
     // materialization as a project definition would create a second authority.
-    let resolution_project_root = resolution_project_root(
-        &subject_authority,
-        provenance.subject_effective_path(),
-    );
+    let resolution_project_root =
+        resolution_project_root(&subject_authority, provenance.subject_effective_path());
     let roots = ctx
         .engine
         .resolution_roots(resolution_project_root.map(Path::to_path_buf));
@@ -5010,7 +5014,11 @@ fn workspace_access_for_admission(
     admission: &ryeos_app::thread_lifecycle::RootExecutionAdmission,
 ) -> Result<Option<ryeos_engine::kind_registry::WorkspaceAccess>, DispatchError> {
     let kind = &admission.verified_subject().resolved.canonical_ref.kind;
-    let Some(execution) = engine.kinds.get(kind).and_then(|schema| schema.execution.as_ref()) else {
+    let Some(execution) = engine
+        .kinds
+        .get(kind)
+        .and_then(|schema| schema.execution.as_ref())
+    else {
         return Ok(None);
     };
     execution

@@ -8,12 +8,12 @@
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::path::Path;
-use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use ryeos_runtime::workload_client::{
     WORKLOAD_CLIENT_PROTOCOL, WorkloadClientBootFrame, WorkloadClientOutcome,
     WorkloadClientReadyFrame, WorkloadClientRequestFrame, WorkloadClientResponseFrame,
@@ -53,7 +53,10 @@ struct SlotPool {
 
 impl SlotPool {
     fn acquire(self: &Arc<Self>, stopping: &AtomicBool) -> Option<SlotGuard> {
-        let mut available = self.available.lock().unwrap_or_else(|error| error.into_inner());
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         while *available == 0 && !stopping.load(Ordering::Acquire) {
             available = self
                 .ready
@@ -142,33 +145,35 @@ pub fn start(
     let accept_slots = Arc::clone(&slots);
     let accept_thread = thread::Builder::new()
         .name("ryeos-workload-client-accept".to_owned())
-        .spawn(move || loop {
-            let Some(slot) = accept_slots.acquire(&accept_stopping) else {
-                return;
-            };
-            let stream = match listener.accept_isolated_descendant() {
-                Ok(stream) => stream,
-                Err(_) if accept_stopping.load(Ordering::Acquire) => return,
-                // Refuse an outside peer without retiring the endpoint for
-                // valid descendants. Lillux already consumed and closed the
-                // unauthorized connection before returning this error.
-                Err(_) => continue,
-            };
-            if accept_stopping.load(Ordering::Acquire) {
-                return;
-            }
-            let writer = Arc::clone(&accept_writer);
-            let pending = Arc::clone(&accept_pending);
-            if thread::Builder::new()
-                .name("ryeos-workload-client-invocation".to_owned())
-                .spawn(move || {
-                    handle_local_invocation(stream, writer, pending, slot, max_request_bytes)
-                })
-                .is_err()
-            {
-                // A failed spawn drops the closure and therefore its stream
-                // and slot guard without forwarding the request.
-                return;
+        .spawn(move || {
+            loop {
+                let Some(slot) = accept_slots.acquire(&accept_stopping) else {
+                    return;
+                };
+                let stream = match listener.accept_isolated_descendant() {
+                    Ok(stream) => stream,
+                    Err(_) if accept_stopping.load(Ordering::Acquire) => return,
+                    // Refuse an outside peer without retiring the endpoint for
+                    // valid descendants. Lillux already consumed and closed the
+                    // unauthorized connection before returning this error.
+                    Err(_) => continue,
+                };
+                if accept_stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                let writer = Arc::clone(&accept_writer);
+                let pending = Arc::clone(&accept_pending);
+                if thread::Builder::new()
+                    .name("ryeos-workload-client-invocation".to_owned())
+                    .spawn(move || {
+                        handle_local_invocation(stream, writer, pending, slot, max_request_bytes)
+                    })
+                    .is_err()
+                {
+                    // A failed spawn drops the closure and therefore its stream
+                    // and slot guard without forwarding the request.
+                    return;
+                }
             }
         })
         .context("start workload-client accept loop")?;

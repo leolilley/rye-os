@@ -104,7 +104,10 @@ impl WorkloadClientRequestContract {
         if self.protocol != WORKLOAD_CLIENT_PROTOCOL {
             anyhow::bail!("workload-client request protocol is not current");
         }
-        validate_identifier("workload-client realization id", &self.client.realization_id)?;
+        validate_identifier(
+            "workload-client realization id",
+            &self.client.realization_id,
+        )?;
         ryeos_state::objects::validate_session_process_environment_relative_path(
             &self.client.relative_path,
         )?;
@@ -137,8 +140,9 @@ pub fn validate_execution_ceilings(
     }
     let mut previous_item: Option<&str> = None;
     for execution in executions {
-        ryeos_engine::canonical_ref::CanonicalRef::parse(&execution.item_ref)
-            .map_err(|error| anyhow::anyhow!("workload-client execution ref is invalid: {error}"))?;
+        ryeos_engine::canonical_ref::CanonicalRef::parse(&execution.item_ref).map_err(|error| {
+            anyhow::anyhow!("workload-client execution ref is invalid: {error}")
+        })?;
         if previous_item.is_some_and(|previous| previous >= execution.item_ref.as_str()) {
             anyhow::bail!("workload-client execution refs must be sorted and unique");
         }
@@ -193,8 +197,7 @@ impl WorkloadClientNodePolicy {
             256,
         )?;
         for capability in &self.delegation_cap_ceiling {
-            crate::authorizer::validate_scope_pattern(capability)
-                .map_err(anyhow::Error::msg)?;
+            crate::authorizer::validate_scope_pattern(capability).map_err(anyhow::Error::msg)?;
             if !capability.starts_with("ryeos.execute.") {
                 anyhow::bail!(
                     "node workload-client ceiling may contain only execution capabilities"
@@ -308,7 +311,9 @@ fn validate_sorted_strings(label: &str, values: &[String], max: usize) -> anyhow
     for value in values {
         if value.is_empty()
             || value.len() > 256
-            || value.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
             || previous.is_some_and(|prior| prior >= value.as_str())
         {
             anyhow::bail!("{label} must be bounded, sorted, and unique");
@@ -388,7 +393,12 @@ pub struct WorkloadClientExecuteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "method", content = "request", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "method",
+    content = "request",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum WorkloadClientOperation {
     Execute(WorkloadClientExecuteRequest),
 }
@@ -437,7 +447,9 @@ impl WorkloadClientRequestFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkloadClientOutcome {
-    Completed { value: Value },
+    Completed {
+        value: Value,
+    },
     Failed {
         code: String,
         message: String,
@@ -463,7 +475,9 @@ impl WorkloadClientResponseFrame {
             if code.is_empty()
                 || code.len() > 128
                 || !code.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
                 })
                 || message.len() > 2_048
                 || message.bytes().any(|byte| byte == 0)

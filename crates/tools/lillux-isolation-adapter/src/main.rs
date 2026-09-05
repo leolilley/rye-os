@@ -123,12 +123,13 @@ fn translate_launch(request: &AdapterLaunchRequest) -> Result<lillux::LinuxSandb
     // Launch translates against the same fixed Lillux contract and lets each
     // namespace/mount/seccomp operation fail closed; it must not create a
     // second throwaway sandbox for every target process.
-    let supported = supported_capabilities(
-        &lillux::LinuxSandboxInspection::declared_native_contract(),
-    );
+    let supported =
+        supported_capabilities(&lillux::LinuxSandboxInspection::declared_native_contract());
     let missing = required.difference(&supported).collect::<Vec<_>>();
     if !missing.is_empty() {
-        return Err(format!("native Lillux backend lacks capabilities {missing:?}"));
+        return Err(format!(
+            "native Lillux backend lacks capabilities {missing:?}"
+        ));
     }
     let authorities = request
         .authorities
@@ -171,7 +172,7 @@ fn translate_launch(request: &AdapterLaunchRequest) -> Result<lillux::LinuxSandb
             let state = authorities
                 .get(&workspace.backend_state)
                 .ok_or_else(|| "workspace state authority disappeared".to_string())?;
-            Ok(lillux::LinuxSandboxOverlay {
+            Ok::<_, String>(lillux::LinuxSandboxOverlay {
                 lower_fd: project.inherited_fd,
                 state_fd: state.inherited_fd,
                 destination: PathBuf::from(workspace.destination.as_str()),
@@ -282,13 +283,13 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
                 ),
                 lillux::LinuxOverlayMutationKind::DeletePath => {
                     (WorkspaceMutationKind::DeletePath, None, None, None)
-                },
+                }
                 lillux::LinuxOverlayMutationKind::EnsureDirectory => {
                     (WorkspaceMutationKind::EnsureDirectory, None, None, None)
-                },
+                }
                 lillux::LinuxOverlayMutationKind::OpaqueDirectory => {
                     (WorkspaceMutationKind::OpaqueDirectory, None, None, None)
-                },
+                }
             };
             WorkspaceMutation {
                 path: mutation.path,
@@ -301,7 +302,10 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
         .collect::<Vec<_>>();
     let mut pinned_root_identities = BTreeMap::new();
     pinned_root_identities.insert("project".to_string(), observation.project_identity.clone());
-    pinned_root_identities.insert("backend_state".to_string(), observation.state_identity.clone());
+    pinned_root_identities.insert(
+        "backend_state".to_string(),
+        observation.state_identity.clone(),
+    );
     let response = AdapterWorkspaceResponse {
         protocol: IsolationAdapterProtocolVersion::Current,
         operation: request.operation,
@@ -439,9 +443,8 @@ mod tests {
 
     #[test]
     fn capability_projection_does_not_claim_aggregate_resources() {
-        let capabilities = supported_capabilities(
-            &lillux::LinuxSandboxInspection::declared_native_contract(),
-        );
+        let capabilities =
+            supported_capabilities(&lillux::LinuxSandboxInspection::declared_native_contract());
         assert!(capabilities.contains(&IsolationCapability::FilesystemPrivateRoot));
         assert!(capabilities.contains(&IsolationCapability::NetworkIsolated));
         assert!(capabilities.contains(&IsolationCapability::FilesystemWorkspaceDelta));

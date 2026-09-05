@@ -294,9 +294,7 @@ async fn pull_results_staged(
 
     let (files_updated, files_deleted) = match local_project_root {
         Some(root) => {
-            let journal_auth_key = authority
-                .require_recovery()?
-                .workspace_journal_auth_key()?;
+            let journal_auth_key = authority.require_recovery()?.workspace_journal_auth_key()?;
             apply_tree_diff(local_cas, root, base_tree, &remote_tree, &journal_auth_key).await?
         }
         None => (0, 0),
@@ -2323,15 +2321,9 @@ mod tests {
             ("d.txt", &hash_d),
         ]);
 
-        let (updated, deleted) = apply_tree_diff(
-            &cas,
-            project_root,
-            &base,
-            &remote,
-            &[7_u8; 32],
-        )
-        .await
-        .unwrap();
+        let (updated, deleted) = apply_tree_diff(&cas, project_root, &base, &remote, &[7_u8; 32])
+            .await
+            .unwrap();
         assert_eq!(updated, 2); // a.txt + d.txt
         assert_eq!(deleted, 1); // b.txt
 
@@ -2355,15 +2347,9 @@ mod tests {
         // Simulate a durable caller crashing after the atomic apply but
         // before settling its sync-job attempt. The admitted base no longer
         // matches, yet replay of the exact result must settle as a no-op.
-        let replay = apply_tree_diff(
-            &cas,
-            project_root,
-            &base,
-            &remote,
-            &[7_u8; 32],
-        )
-        .await
-        .unwrap();
+        let replay = apply_tree_diff(&cas, project_root, &base, &remote, &[7_u8; 32])
+            .await
+            .unwrap();
         assert_eq!(replay, (0, 0));
     }
 

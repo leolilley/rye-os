@@ -266,8 +266,7 @@ mod linux {
         let mut prior_stopped_members = None;
         loop {
             match pin_stopped_members(identity, &mut retained) {
-                Ok((true, observed))
-                    if prior_stopped_members.as_ref() == Some(&observed) => {
+                Ok((true, observed)) if prior_stopped_members.as_ref() == Some(&observed) => {
                     return Ok(QuiescedProcessGroup {
                         members: retained.into_values().collect(),
                         settled: false,
@@ -279,7 +278,9 @@ mod linux {
                     let cleanup = resume_failed_quiesce(&retained, identity.group_leader_pid);
                     return Err(match cleanup {
                         Ok(()) => error,
-                        Err(cleanup) => format!("{error}; stopped-group recovery failed: {cleanup}"),
+                        Err(cleanup) => {
+                            format!("{error}; stopped-group recovery failed: {cleanup}")
+                        }
                     });
                 }
             }
@@ -345,7 +346,9 @@ mod linux {
                     return Ok((false, observed_live));
                 }
                 Err(error) => {
-                    return Err(format!("reinspect pinned process-group member {pid}: {error}"));
+                    return Err(format!(
+                        "reinspect pinned process-group member {pid}: {error}"
+                    ));
                 }
             };
             if after.start_time_ticks != stat.start_time_ticks
@@ -394,9 +397,7 @@ mod linux {
             return member_result;
         }
         let group = if group_failures.is_empty() {
-            format!(
-                "all retained pidfds, including leader {group_leader_pid}, had exited"
-            )
+            format!("all retained pidfds, including leader {group_leader_pid}, had exited")
         } else {
             group_failures.join(", ")
         };
@@ -423,7 +424,9 @@ mod linux {
         if before.start_time_ticks != expected_start_time_ticks
             || before.process_group != expected_process_group
         {
-            return Err(format!("exact process {pid} birth identity changed before pin"));
+            return Err(format!(
+                "exact process {pid} birth identity changed before pin"
+            ));
         }
         let pidfd = open_pidfd(pid)?;
         pidfd_signal(pidfd.as_raw_fd(), 0, 0)
@@ -434,7 +437,9 @@ mod linux {
             || before.start_time_ticks != after.start_time_ticks
             || before.process_group != after.process_group
         {
-            return Err(format!("exact process {pid} birth identity changed while pinned"));
+            return Err(format!(
+                "exact process {pid} birth identity changed while pinned"
+            ));
         }
         Ok(PinnedMember { pid, pidfd })
     }
@@ -448,7 +453,10 @@ mod linux {
     fn read_process_stat(pid: u32) -> std::io::Result<ProcessStat> {
         let raw = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let close = raw.rfind(')').ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed procfs stat comm")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed procfs stat comm",
+            )
         })?;
         let fields: Vec<_> = raw[close + 1..].split_whitespace().collect();
         let state = fields

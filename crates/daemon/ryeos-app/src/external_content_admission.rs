@@ -61,19 +61,12 @@ fn consumer_authority(
     resolution: &ryeos_engine::resolution::ResolutionOutput,
     subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
 ) -> anyhow::Result<ryeos_state::objects::ExternalContentConsumerAuthority> {
-    let publisher = resolution
-        .root
-        .signer_fingerprint
-        .clone()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "locator-free external-content consumer has no verified publisher fingerprint"
-            )
-        })?;
-    match (
-        resolution.root.source_space,
-        &resolution.root.source_root,
-    ) {
+    let publisher = resolution.root.signer_fingerprint.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "locator-free external-content consumer has no verified publisher fingerprint"
+        )
+    })?;
+    match (resolution.root.source_space, &resolution.root.source_root) {
         (
             ryeos_engine::contracts::ItemSpace::Bundle,
             ryeos_engine::contracts::ItemSourceRoot::Bundle { .. },
@@ -278,14 +271,13 @@ pub fn preview_portable_content_dependency_with_realizations(
                 declaration.id
             );
         }
-        let (observed_digest, binding_digest, status, ready) =
-            preview_retained_external_content(
-                state,
-                Some(&contract),
-                resolution,
-                &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
-                declaration,
-            )?;
+        let (observed_digest, binding_digest, status, ready) = preview_retained_external_content(
+            state,
+            Some(&contract),
+            resolution,
+            &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+            declaration,
+        )?;
         ready_for_admission &= ready;
         previews.push(ExternalContentPinPreview {
             id: declaration.id.clone(),
@@ -512,10 +504,7 @@ fn preview_retained_external_content(
     drop(guard);
     match binding {
         Some((binding_digest, binding)) => {
-            crate::operator_external_content::require_current_binding_authorizer(
-                state,
-                &binding,
-            )?;
+            crate::operator_external_content::require_current_binding_authorizer(state, &binding)?;
             Ok((Some(digest.to_owned()), Some(binding_digest), "ready", true))
         }
         None => Ok((Some(digest.to_owned()), None, "missing_binding", false)),

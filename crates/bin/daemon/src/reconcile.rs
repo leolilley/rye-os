@@ -2093,11 +2093,16 @@ async fn reconcile_active_threads_inner(
         // authority. A later startup pass may then resume the root without
         // racing a current-daemon callback task.
         for intent in state.state_store.runtime_action_intents()? {
-            if intent.workspace_operation.as_ref().is_some_and(|operation| {
-                operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
-            }) && state
-                .state_store
-                .settle_runtime_workspace_operation(&intent.operation_id)?
+            if intent
+                .workspace_operation
+                .as_ref()
+                .is_some_and(|operation| {
+                    operation.phase
+                        != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
+                })
+                && state
+                    .state_store
+                    .settle_runtime_workspace_operation(&intent.operation_id)?
             {
                 tracing::warn!(
                     operation_id = %intent.operation_id,
@@ -2446,9 +2451,13 @@ fn repair_detached_runtime_action_links(state: &AppState) -> Result<()> {
         if intent.mode != ryeos_app::runtime_db::RuntimeActionMode::Detached {
             continue;
         }
-        if intent.workspace_operation.as_ref().is_some_and(|operation| {
-            operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
-        }) {
+        if intent
+            .workspace_operation
+            .as_ref()
+            .is_some_and(|operation| {
+                operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Released
+            })
+        {
             // Workspace-operation recovery owns cancellation/settlement. The
             // generic detached replay path must never relaunch a child while
             // its parent root remains fenced by the same durable intent.

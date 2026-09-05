@@ -19,7 +19,7 @@ use ryeos_isolation_protocol::{
     IsolationAuthorityId, IsolationAuthorityPurpose, IsolationDeviceSurface, IsolationEnvironment,
     IsolationMount, IsolationMountAccess, IsolationNetwork, IsolationPath, IsolationPidNamespace,
     IsolationPlan, IsolationProjectWorkspace, IsolationTarget, IsolationTargetChannel,
-    WorkspaceLifecycleOperation, MAX_AUTHORITIES,
+    MAX_AUTHORITIES, WorkspaceLifecycleOperation,
 };
 
 mod authority;
@@ -34,9 +34,8 @@ pub use authority::{
     IsolationAdmittedCommand, IsolationCommandAuthority, IsolationCommandAuthorityRef,
     IsolationDescriptorBoundCommand, IsolationDescriptorFileIdentity,
     IsolationFilesystemAuthorityCeiling, IsolationLaunchContext, IsolationLiveAccessAuthority,
-    IsolationNetworkAuthorityCeiling, IsolationProjectAuthority,
-    IsolationReadOnlyMountAuthority, IsolationRealizationMemberCommand,
-    IsolationTargetChannelAuthority, IsolationVerifiedCode,
+    IsolationNetworkAuthorityCeiling, IsolationProjectAuthority, IsolationReadOnlyMountAuthority,
+    IsolationRealizationMemberCommand, IsolationTargetChannelAuthority, IsolationVerifiedCode,
 };
 pub use backend::ResolvedIsolationBackend;
 pub use inspection::{IsolationBackendInspection, IsolationBackendStatus, IsolationInspection};
@@ -272,7 +271,11 @@ impl VerifiedArtifactStore {
             app_root,
             &[crate::AI_DIR, "state", "cache", "verified-code"],
         )
-        .map_err(|error| refused(format!("verified-code generation cannot be created: {error}")))?;
+        .map_err(|error| {
+            refused(format!(
+                "verified-code generation cannot be created: {error}"
+            ))
+        })?;
         let root = generation.directory().try_clone().map_err(|error| {
             refused(format!(
                 "verified-code generation authority cannot be retained: {error}"
@@ -896,15 +899,17 @@ impl IsolationRuntime {
                 IsolationAuthority {
                     id: IsolationAuthorityId::new("workspace-project")
                         .map_err(|error| refused(error.to_string()))?,
-                    inherited_fd: lillux::inherited_descriptor_coordinate(&project)
-                        .map_err(|error| refused(format!("inspect workspace project descriptor: {error}")))?,
+                    inherited_fd: lillux::inherited_descriptor_coordinate(&project).map_err(
+                        |error| refused(format!("inspect workspace project descriptor: {error}")),
+                    )?,
                     purpose: IsolationAuthorityPurpose::WorkspaceProject,
                 },
                 IsolationAuthority {
                     id: IsolationAuthorityId::new("workspace-backend-state")
                         .map_err(|error| refused(error.to_string()))?,
-                    inherited_fd: lillux::inherited_descriptor_coordinate(&backend_state)
-                        .map_err(|error| refused(format!("inspect workspace state descriptor: {error}")))?,
+                    inherited_fd: lillux::inherited_descriptor_coordinate(&backend_state).map_err(
+                        |error| refused(format!("inspect workspace state descriptor: {error}")),
+                    )?,
                     purpose: IsolationAuthorityPurpose::WorkspaceBackendState,
                 },
             ];
@@ -938,7 +943,9 @@ impl IsolationRuntime {
                 args: vec![
                     "workspace".to_string(),
                     lillux::inherited_descriptor_coordinate(&request_handle)
-                        .map_err(|error| refused(format!("inspect workspace request descriptor: {error}")))?
+                        .map_err(|error| {
+                            refused(format!("inspect workspace request descriptor: {error}"))
+                        })?
                         .to_string(),
                 ],
                 cwd: Some("/".to_string()),
@@ -1488,7 +1495,9 @@ impl IsolationRuntime {
         };
 
         if !metadata.is_executable().map_err(|error| {
-            refused(format!("captured command mode cannot be inspected: {error}"))
+            refused(format!(
+                "captured command mode cannot be inspected: {error}"
+            ))
         })? {
             return Err(refused(format!(
                 "captured command {} is not executable",
@@ -1580,9 +1589,10 @@ impl IsolationRuntime {
         #[cfg(target_os = "linux")]
         let executable = {
             let mut source = source;
-            let before = lillux::require_effective_user_owned_regular(&source).map_err(|error| {
-                refused(format!("admitted command source is not protected: {error}"))
-            })?;
+            let before =
+                lillux::require_effective_user_owned_regular(&source).map_err(|error| {
+                    refused(format!("admitted command source is not protected: {error}"))
+                })?;
             let max_bytes = self.inspection.limits.verified_artifact_file_bytes;
             if before.size() > max_bytes {
                 return Err(refused(format!(
@@ -1591,20 +1601,16 @@ impl IsolationRuntime {
                     before.size(),
                 )));
             }
-            let observation = lillux::observe_open_regular_file(&source).map_err(|error| {
-                refused(format!("observe admitted command source: {error}"))
-            })?;
-            let content = lillux::read_open_regular_file_stable_bounded(
-                &mut source,
-                &observation,
-                max_bytes,
-            )
-            .map_err(|error| {
-                refused(format!(
-                    "read admitted command source {}: {error}",
-                    identity.source_path.display()
-                ))
-            })?;
+            let observation = lillux::observe_open_regular_file(&source)
+                .map_err(|error| refused(format!("observe admitted command source: {error}")))?;
+            let content =
+                lillux::read_open_regular_file_stable_bounded(&mut source, &observation, max_bytes)
+                    .map_err(|error| {
+                        refused(format!(
+                            "read admitted command source {}: {error}",
+                            identity.source_path.display()
+                        ))
+                    })?;
             let observed_hash = lillux::cas::sha256_hex(&content);
             if observed_hash != identity.content_hash {
                 return Err(refused(format!(
@@ -1617,11 +1623,7 @@ impl IsolationRuntime {
                 .map_err(|error| refused(format!("seal admitted command executable: {error}")))?
         };
         let file_identity = descriptor_file_identity(&executable)?;
-        let command = IsolationDescriptorBoundCommand::new(
-            identity,
-            executable,
-            file_identity,
-        );
+        let command = IsolationDescriptorBoundCommand::new(identity, executable, file_identity);
         validate_descriptor_bound_command(&command)?;
         Ok(command)
     }
@@ -1643,17 +1645,20 @@ impl IsolationRuntime {
                     .to_string(),
             ));
         }
-        if !matches!(mount.scope(), IsolationReadOnlyMountScope::ProjectRealization
-            | IsolationReadOnlyMountScope::ExecutionRuntimeRealization)
-        {
+        if !matches!(
+            mount.scope(),
+            IsolationReadOnlyMountScope::ProjectRealization
+                | IsolationReadOnlyMountScope::ExecutionRuntimeRealization
+        ) {
             return Err(refused(
-                "realization-member command does not name an admitted content realization".to_string(),
+                "realization-member command does not name an admitted content realization"
+                    .to_string(),
             ));
         }
         if relative_path.components().count() == 0
-            || relative_path.components().any(|component| {
-                !matches!(component, std::path::Component::Normal(_))
-            })
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
         {
             return Err(refused(format!(
                 "realization-member command path is not normalized: {}",
@@ -1701,27 +1706,24 @@ impl IsolationRuntime {
                 "realization command member mode is {mode:#o}, expected 0o755"
             )));
         }
-        let observed_hash = member.digest_stable_exact(&observed).map_err(|error| {
-            refused(format!("digest realization command member: {error}"))
-        })?;
+        let observed_hash = member
+            .digest_stable_exact(&observed)
+            .map_err(|error| refused(format!("digest realization command member: {error}")))?;
         if observed_hash != expected_hash {
             return Err(refused(format!(
                 "realization command member failed its content check (expected {expected_hash}, got {observed_hash})"
             )));
         }
-        let executable = std::sync::Arc::new(member.try_clone_descriptor().map_err(|error| {
-            refused(format!("retain realization command descriptor: {error}"))
-        })?);
+        let executable =
+            std::sync::Arc::new(member.try_clone_descriptor().map_err(|error| {
+                refused(format!("retain realization command descriptor: {error}"))
+            })?);
         let file_identity = descriptor_file_identity(&executable)?;
         let identity = IsolationVerifiedCode {
             source_path: mount.destination().join(relative_path),
             content_hash: expected_hash.to_owned(),
         };
-        let command = IsolationDescriptorBoundCommand::new(
-            identity,
-            executable,
-            file_identity,
-        );
+        let command = IsolationDescriptorBoundCommand::new(identity, executable, file_identity);
         validate_descriptor_bound_command(&command)?;
         Ok(IsolationRealizationMemberCommand::new(
             command,
@@ -1917,11 +1919,13 @@ impl IsolationRuntime {
             _ => {}
         }
         if self.state == IsolationRuntimeState::Disabled {
-            if context.filesystem_authority_ceiling == IsolationFilesystemAuthorityCeiling::CapturedExecution
+            if context.filesystem_authority_ceiling
+                == IsolationFilesystemAuthorityCeiling::CapturedExecution
                 || context.network_authority_ceiling == IsolationNetworkAuthorityCeiling::Isolated
             {
                 return Err(refused(
-                    "captured filesystem or isolated network authority requires enforced isolation".to_string(),
+                    "captured filesystem or isolated network authority requires enforced isolation"
+                        .to_string(),
                 ));
             }
             if !context.external_read_only_mounts.is_empty() {
@@ -2080,8 +2084,8 @@ impl IsolationRuntime {
                         }
                         _ => self.seal_verified_code_for_disabled(identity, is_command)?,
                     };
-                    let destination = lillux::inherited_descriptor_path_for(&handle)
-                        .map_err(|error| {
+                    let destination =
+                        lillux::inherited_descriptor_path_for(&handle).map_err(|error| {
                             refused(format!("resolve verified-code descriptor path: {error}"))
                         })?;
                     if descriptor_bound {
@@ -2733,7 +2737,10 @@ impl IsolationRuntime {
                         command.command().identity().source_path.display()
                     )));
                 }
-                (command.command().identity().source_path.clone(), Some(cmd.clone()))
+                (
+                    command.command().identity().source_path.clone(),
+                    Some(cmd.clone()),
+                )
             }
             _ => {
                 let canonical_command = canonicalize_context_mount("command", &lexical_command)?;
@@ -2919,16 +2926,19 @@ impl IsolationRuntime {
                     if destination == root || !destination.starts_with(root) {
                         return Err(refused(format!(
                             "execution-runtime realization {} is not a strict child of {}",
-                            destination.display(), root.display(),
+                            destination.display(),
+                            root.display(),
                         )));
                     }
                     if destination.starts_with(&project_destination)
                         || project_destination.starts_with(destination)
                         || readable_mounts.iter().any(|mount| {
-                            destination.starts_with(&mount.destination) || mount.destination.starts_with(destination)
+                            destination.starts_with(&mount.destination)
+                                || mount.destination.starts_with(destination)
                         })
                         || writable_mounts.iter().any(|mount| {
-                            destination.starts_with(&mount.destination) || mount.destination.starts_with(destination)
+                            destination.starts_with(&mount.destination)
+                                || mount.destination.starts_with(destination)
                         })
                     {
                         return Err(refused("execution-runtime realization overlaps another launch mount or workspace".to_string()));
@@ -3248,9 +3258,11 @@ impl IsolationRuntime {
                 verified_command_authority
             {
                 let matching_root = context.external_read_only_mounts.iter().find(|mount| {
-                    matches!(mount.scope(), IsolationReadOnlyMountScope::ProjectRealization
-                        | IsolationReadOnlyMountScope::ExecutionRuntimeRealization)
-                        && mount.destination() == command.realization_destination()
+                    matches!(
+                        mount.scope(),
+                        IsolationReadOnlyMountScope::ProjectRealization
+                            | IsolationReadOnlyMountScope::ExecutionRuntimeRealization
+                    ) && mount.destination() == command.realization_destination()
                 });
                 let matching_root = matching_root.ok_or_else(|| {
                     refused(
@@ -3265,10 +3277,9 @@ impl IsolationRuntime {
                     })?,
                 )
                 .map_err(|error| refused(format!("adopt realization command root: {error}")))?;
-                if current_root
-                    .identity()
-                    .map_err(|error| refused(format!("identify realization command root: {error}")))?
-                    != command.realization_root()
+                if current_root.identity().map_err(|error| {
+                    refused(format!("identify realization command root: {error}"))
+                })? != command.realization_root()
                 {
                     return Err(refused(
                         "realization-member command tree authority changed before launch"
@@ -3440,9 +3451,7 @@ impl IsolationRuntime {
         let artifact_fds = backend
             .artifact_handles
             .iter()
-            .map(|(role, handle)| {
-                inherited_fd(handle).map(|fd| (*role, fd))
-            })
+            .map(|(role, handle)| inherited_fd(handle).map(|fd| (*role, fd)))
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let launch_request = AdapterLaunchRequest {
             protocol: IsolationAdapterProtocolVersion::Current,
@@ -3847,12 +3856,12 @@ impl IsolationRuntime {
                 )));
             }
 
-            let mut executable = command.executable().try_clone().map_err(|error| {
-                refused(format!("clone descriptor-bound command: {error}"))
-            })?;
-            let observation = lillux::observe_open_regular_file(&executable).map_err(|error| {
-                refused(format!("observe descriptor-bound command: {error}"))
-            })?;
+            let mut executable = command
+                .executable()
+                .try_clone()
+                .map_err(|error| refused(format!("clone descriptor-bound command: {error}")))?;
+            let observation = lillux::observe_open_regular_file(&executable)
+                .map_err(|error| refused(format!("observe descriptor-bound command: {error}")))?;
             let content = lillux::read_open_regular_file_stable_bounded(
                 &mut executable,
                 &observation,
@@ -3932,10 +3941,10 @@ impl IsolationRuntime {
                 refused(format!("verified-code mode cannot be inspected: {error}"))
             })?
         {
-                return Err(refused(format!(
-                    "verified code {} is not executable",
-                    canonical_source.display()
-                )));
+            return Err(refused(format!(
+                "verified code {} is not executable",
+                canonical_source.display()
+            )));
         }
         let actual_hash = lillux::cas::sha256_hex(&content);
         if actual_hash != verified.content_hash {
@@ -3972,9 +3981,10 @@ impl IsolationRuntime {
             .as_deref()
             .expect("enforced isolation runtime has a verified artifact store");
         let (content, metadata) = artifacts.read_source("command", command)?;
-        if !metadata.is_executable().map_err(|error| {
-            refused(format!("command mode cannot be inspected: {error}"))
-        })? {
+        if !metadata
+            .is_executable()
+            .map_err(|error| refused(format!("command mode cannot be inspected: {error}")))?
+        {
             return Err(refused(format!(
                 "command {} is not executable",
                 command.display()
@@ -4116,7 +4126,9 @@ fn validate_descriptor_bound_command(
     #[cfg(unix)]
     {
         lillux::require_effective_user_owned_executable(command.executable()).map_err(|error| {
-            refused(format!("descriptor-bound command is not protected: {error}"))
+            refused(format!(
+                "descriptor-bound command is not protected: {error}"
+            ))
         })?;
         let observed = descriptor_file_identity(command.executable())?;
         if observed != command.file_identity() {
@@ -4637,7 +4649,10 @@ fn read_regular_file_bytes_limited(
         ))
     })?;
     let file = file.try_clone_descriptor().map_err(|error| {
-        refused(format!("{kind} {} cannot be retained: {error}", path.display()))
+        refused(format!(
+            "{kind} {} cannot be retained: {error}",
+            path.display()
+        ))
     })?;
     read_regular_file_handle_limited(kind, path, file, max_bytes)
 }
@@ -4661,12 +4676,8 @@ fn read_regular_file_handle_limited(
             observation.size()
         )));
     }
-    let content = lillux::read_open_regular_file_stable_bounded(
-        &mut file,
-        &observation,
-        max_bytes,
-    )
-    .map_err(|error| refused(format!("{kind} {} cannot be read: {error}", path.display())))?;
+    let content = lillux::read_open_regular_file_stable_bounded(&mut file, &observation, max_bytes)
+        .map_err(|error| refused(format!("{kind} {} cannot be read: {error}", path.display())))?;
     Ok((content, observation))
 }
 
@@ -4686,7 +4697,12 @@ fn canonicalize_launch_path(kind: &str, path: &Path) -> Result<PathBuf, EngineEr
 fn pin_mount_source(kind: &str, path: &Path) -> Result<Arc<std::fs::File>, EngineError> {
     lillux::pin_canonical_mount_source(path)
         .map(Arc::new)
-        .map_err(|error| refused(format!("{kind} {} cannot be pinned: {error}", path.display())))
+        .map_err(|error| {
+            refused(format!(
+                "{kind} {} cannot be pinned: {error}",
+                path.display()
+            ))
+        })
 }
 
 fn inherited_fd(handle: &Arc<std::fs::File>) -> Result<u32, EngineError> {
@@ -5829,6 +5845,7 @@ mod tests {
             IsolationCapability::NetworkIsolated,
             IsolationCapability::NetworkHost,
             IsolationCapability::ProcessHostPidNamespace,
+            IsolationCapability::ProcessIsolatedPidNamespace,
             IsolationCapability::ProcessTargetPidReporting,
             IsolationCapability::LifecycleSharedProcessGroup,
         ]);
@@ -5845,11 +5862,14 @@ mod tests {
             .open_or_create_child(std::ffi::OsStr::new("captured-plan"), 0o700)
             .unwrap();
         let content_directory = tempfile::tempdir().unwrap();
-        let content = lillux::PinnedDirectory::open(content_directory.path()).unwrap().unwrap();
-        let runtime_destination = Path::new(ryeos_state::objects::EXECUTION_RUNTIME_REALIZATIONS_ROOT)
-            .join("fixture");
+        let content = lillux::PinnedDirectory::open(content_directory.path())
+            .unwrap()
+            .unwrap();
+        let runtime_destination =
+            Path::new(ryeos_state::objects::EXECUTION_RUNTIME_REALIZATIONS_ROOT).join("fixture");
         let runtime_mount = IsolationReadOnlyMountAuthority::new_execution_runtime(
-            content.path().to_path_buf(), runtime_destination.clone(),
+            content.path().to_path_buf(),
+            runtime_destination.clone(),
             content.try_clone_descriptor().unwrap(),
         );
         let applied = runtime
@@ -5902,7 +5922,11 @@ mod tests {
         let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
         assert_eq!(request["plan"]["network"], "isolated");
         let mounts = request["plan"]["mounts"].as_array().unwrap();
-        assert!(mounts.iter().any(|mount| mount["destination"].as_str() == runtime_destination.to_str()));
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["destination"].as_str() == runtime_destination.to_str())
+        );
         for mount in mounts {
             let destination = mount["destination"].as_str().unwrap();
             assert!(
@@ -6158,8 +6182,7 @@ mod tests {
         write_policy(app_root.path(), &IsolationPolicy::disabled_for_authoring());
         let runtime = IsolationRuntime::load(app_root.path()).unwrap();
         let (_daemon, worker) = lillux::inherited_duplex_channel_pair().unwrap();
-        let channel =
-            IsolationTargetChannelAuthority::new(worker, 0, "RYEOS_SESSION_FD").unwrap();
+        let channel = IsolationTargetChannelAuthority::new(worker, 0, "RYEOS_SESSION_FD").unwrap();
         let request = lillux::SubprocessRequest {
             cmd: "/bin/true".to_string(),
             argv0: None,

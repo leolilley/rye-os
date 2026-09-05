@@ -178,7 +178,11 @@ impl PendingProjectResult {
 
     pub(crate) fn into_unpublished_snapshot_and_quiesced(
         mut self,
-    ) -> Result<(String, Option<PendingCasPublication>, QuiescedExecutionGroup)> {
+    ) -> Result<(
+        String,
+        Option<PendingCasPublication>,
+        QuiescedExecutionGroup,
+    )> {
         // The caller must publish while it still owns the quiesced process
         // group. Returning both move-only authorities together prevents a
         // failed publication from implicitly resuming the root while the
@@ -979,8 +983,7 @@ pub(crate) fn capture_runtime_workspace_input_generation(
         .workspace_operation
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("runtime action has no workspace-operation authority"))?;
-    if operation.access
-        != ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+    if operation.access != ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
         || operation.phase != ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved
         || intent.first_caller_thread_id != thread_id
     {
