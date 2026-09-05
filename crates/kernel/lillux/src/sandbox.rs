@@ -363,26 +363,56 @@ mod imp {
     const RESOLVE_BENEATH: u64 = 0x08;
 
     pub fn inspect() -> Result<LinuxSandboxInspection, String> {
+        // Real launches inherit authorities from before CLONE_NEWNS. A probe
+        // that opens every source afterwards misses the kernel's rejection of
+        // bind mounts belonging to the former mount namespace.
+        let inherited_directory =
+            crate::secure_fs::pin_canonical_mount_source(std::path::Path::new(ROOT))
+                .map_err(|error| format!("pin inherited namespace probe: {error}"))?;
+        let inherited_bytes = crate::sealed_memfd(c"lillux-mount-probe", b"exact sealed bytes")?;
+        let mut report = [0; 2];
+        syscall_zero(
+            unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
+            "create sandbox probe report",
+        )?;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
+            close_fd(report[0]);
+            close_fd(report[1]);
             return Err(format!(
                 "fork native sandbox inspection: {}",
                 std::io::Error::last_os_error()
             ));
         }
         if pid == 0 {
+            close_fd(report[0]);
             let result = (|| {
                 enter_namespaces(LinuxSandboxNetwork::Isolated)?;
+                let directory = reanchor_mount_source(inherited_directory.as_raw_fd())?;
                 mount_private_root()?;
-                probe_descriptor_mount()?;
-                probe_overlay()?;
                 create_minimal_devices()?;
                 create_private_tmp()?;
+                let bytes = materialize_sealed_mount_source(inherited_bytes.as_raw_fd())?;
+                probe_inherited_descriptor_mounts(&directory, &bytes)?;
+                remove_sealed_mount_source(inherited_bytes.as_raw_fd(), &bytes)?;
+                probe_descriptor_mount()?;
+                probe_overlay()?;
                 probe_isolated_pid_child()?;
                 Ok::<(), String>(())
             })();
+            match &result {
+                Ok(()) => {
+                    let _ = write_all_fd(report[1], &[CHILD_READY]);
+                }
+                Err(error) => {
+                    let _ = write_child_error(report[1], error);
+                }
+            }
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
         }
+        close_fd(report[1]);
+        let outcome = read_child_ready(report[0]);
+        close_fd(report[0]);
         let mut status = 0;
         if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
             return Err(format!(
@@ -391,15 +421,18 @@ mod imp {
             ));
         }
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-            return Err(
-                "native sandbox kernel probe refused user/mount/network namespaces, descriptor mounts, overlay, pivot_root, or seccomp"
-                    .to_string(),
-            );
+            return Err(format!(
+                "native sandbox kernel probe refused: {}",
+                outcome.err().unwrap_or_else(
+                    || "probe child terminated without a failure report".to_string()
+                )
+            ));
         }
+        outcome?;
         Ok(LinuxSandboxInspection::declared_native_contract())
     }
 
-    pub fn launch(request: LinuxSandboxRequest) -> Result<LinuxSandboxProcess, String> {
+    pub fn launch(mut request: LinuxSandboxRequest) -> Result<LinuxSandboxProcess, String> {
         validate_request(&request)?;
         if request.aggregate_limits.is_some() {
             return Err(
@@ -407,14 +440,40 @@ mod imp {
             );
         }
         enter_namespaces(request.network)?;
+        // Re-prove the same inherited filesystem objects in the cloned
+        // namespace before the private root hides /tmp. The retained original
+        // descriptors remain the identity authority, never a caller pathname.
+        let mut sources = reanchor_request_sources(&request)?;
         mount_private_root()?;
-        prepare_mount_targets(&request)?;
+        let mut sealed_sources = Vec::new();
+        for mount in &request.mounts {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                sources.entry(mount.source_fd)
+            {
+                if mount.access != LinuxSandboxMountAccess::ReadOnly {
+                    return Err("sealed mount source cannot grant writable access".to_string());
+                }
+                entry.insert(materialize_sealed_mount_source(raw_fd(mount.source_fd)?)?);
+                sealed_sources.push(mount.source_fd);
+            }
+        }
+        for mount in &mut request.mounts {
+            mount.source_fd = sources[&mount.source_fd].as_raw_fd() as u32;
+        }
+        if let Some(overlay) = &mut request.overlay {
+            overlay.lower_fd = sources[&overlay.lower_fd].as_raw_fd() as u32;
+            overlay.state_fd = sources[&overlay.state_fd].as_raw_fd() as u32;
+        }
         if request.minimal_devices {
             create_minimal_devices()?;
         }
         if request.private_tmp {
             create_private_tmp()?;
         }
+        // Prepare children only after their private parent mounts exist.
+        // Otherwise mounting /tmp hides every previously created destination
+        // below it, including installed bundles on disposable target nodes.
+        prepare_mount_targets(&request)?;
         if let Some(overlay) = &request.overlay {
             mount_overlay(overlay)?;
         }
@@ -425,7 +484,11 @@ mod imp {
                 .then_with(|| left.destination.cmp(&right.destination))
         });
         for mount in &mounts {
-            bind_descriptor_mount(mount)?;
+            bind_descriptor_mount(mount)
+                .map_err(|error| format!("mount {}: {error}", mount.destination.display()))?;
+        }
+        for source in sealed_sources {
+            remove_sealed_mount_source(raw_fd(source)?, &sources[&source])?;
         }
         let executable = rooted(&request.executable)?;
         ensure_regular_path(&executable, "sandbox executable")?;
@@ -594,6 +657,201 @@ mod imp {
     enum DescriptorKind {
         Directory,
         Regular,
+    }
+
+    fn mount_source_stat(fd: RawFd) -> Result<libc::stat, String> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        syscall_zero(
+            unsafe { libc::fstat(fd, stat.as_mut_ptr()) },
+            "inspect mount source",
+        )?;
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    fn reanchor_mount_source(fd: RawFd) -> Result<File, String> {
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .map_err(|error| format!("locate inherited mount descriptor: {error}"))?;
+        reanchor_mount_source_at(fd, &path)
+    }
+
+    fn reanchor_mount_source_at(fd: RawFd, path: &std::path::Path) -> Result<File, String> {
+        let expected = mount_source_stat(fd)?;
+        let source = crate::secure_fs::pin_canonical_mount_source(path)
+            .map_err(|error| format!("pin mount source in cloned namespace: {error}"))?;
+        let observed = mount_source_stat(source.as_raw_fd())?;
+        // open_tree cannot clone a vfsmount owned by the former namespace.
+        // A kernel-reported path is only a locator: a replacement, symlink,
+        // deleted object, or inaccessible source must fail, not authorize new
+        // bytes. The original fd pins the inode against reuse throughout this
+        // comparison; only this newly proven fd is subsequently mounted.
+        if expected.st_dev != observed.st_dev
+            || expected.st_ino != observed.st_ino
+            || expected.st_mode & libc::S_IFMT != observed.st_mode & libc::S_IFMT
+        {
+            return Err("mount source changed across namespace transition".to_string());
+        }
+        Ok(source)
+    }
+
+    fn mount_source_is_sealed(fd: RawFd) -> Result<bool, String> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(format!(
+                "inspect mount source flags: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if flags & libc::O_PATH != 0 {
+            return Ok(false);
+        }
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        if seals < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(false);
+            }
+            return Err(format!("inspect mount source seals: {error}"));
+        }
+        let required =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        Ok(seals & required == required)
+    }
+
+    fn reanchor_request_sources(
+        request: &LinuxSandboxRequest,
+    ) -> Result<BTreeMap<u32, File>, String> {
+        let mut descriptors = request
+            .mounts
+            .iter()
+            .map(|mount| mount.source_fd)
+            .collect::<BTreeSet<_>>();
+        if let Some(overlay) = &request.overlay {
+            descriptors.extend([overlay.lower_fd, overlay.state_fd]);
+        }
+        let mut sources = BTreeMap::new();
+        for descriptor in descriptors {
+            let fd = raw_fd(descriptor)?;
+            if descriptor_kind(descriptor)? == DescriptorKind::Regular
+                && mount_source_is_sealed(fd)?
+            {
+                // One source may have several destinations. Check every use
+                // before deduplication: a preceding read-only alias must not
+                // let a later writable alias reuse the private byte copy.
+                if request.mounts.iter().any(|mount| {
+                    mount.source_fd == descriptor
+                        && mount.access != LinuxSandboxMountAccess::ReadOnly
+                }) {
+                    return Err("sealed mount source cannot grant writable access".to_string());
+                }
+                continue;
+            }
+            sources.insert(descriptor, reanchor_mount_source(fd)?);
+        }
+        Ok(sources)
+    }
+
+    fn materialize_sealed_mount_source(fd: RawFd) -> Result<File, String> {
+        use std::os::unix::fs::FileExt as _;
+
+        if !mount_source_is_sealed(fd)? {
+            return Err("private byte materialization requires a sealed source".to_string());
+        }
+        let source = unsafe { File::from_raw_fd(duplicate_fd(fd)?) };
+        let metadata = source
+            .metadata()
+            .map_err(|error| format!("inspect sealed mount: {error}"))?;
+        if !metadata.is_file() {
+            return Err("sealed mount source is not a regular file".to_string());
+        }
+        let root = crate::PinnedDirectory::open(std::path::Path::new(ROOT))
+            .map_err(|error| format!("open private materialization root: {error}"))?
+            .ok_or_else(|| "private materialization root is missing".to_string())?;
+        let name = OsString::from(format!(".lillux-sealed-source-{fd}"));
+        let root_fd = root
+            .try_clone_descriptor()
+            .map_err(|error| format!("retain private materialization root: {error}"))?;
+        let encoded = c_string(&name, "private sealed source")?;
+        let output_fd = unsafe {
+            libc::openat(
+                root_fd.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if output_fd < 0 {
+            return Err(format!(
+                "create private sealed source: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut output = unsafe { File::from_raw_fd(output_fd) };
+        // Copy only the immutable, already-admitted length with bounded memory.
+        // Positional reads do not consume the sender's shared file offset.
+        let mut offset = 0;
+        let mut buffer = [0_u8; 64 * 1024];
+        while offset < metadata.len() {
+            let limit = (metadata.len() - offset).min(buffer.len() as u64) as usize;
+            let count = source
+                .read_at(&mut buffer[..limit], offset)
+                .map_err(|error| format!("read sealed mount bytes: {error}"))?;
+            if count == 0 {
+                return Err("sealed mount source ended before its exact length".to_string());
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("write private sealed mount: {error}"))?;
+            offset += count as u64;
+        }
+        let mode = mount_source_stat(fd)?.st_mode & 0o555;
+        syscall_zero(
+            unsafe { libc::fchmod(output.as_raw_fd(), mode) },
+            "restrict private sealed mount",
+        )?;
+        let pinned_fd = unsafe {
+            libc::openat(
+                root_fd.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if pinned_fd < 0 {
+            return Err(format!(
+                "retain private sealed source: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let pinned = unsafe { File::from_raw_fd(pinned_fd) };
+        // No write-open handle may survive into exec, including in the adapter
+        // parent: Linux correctly refuses ETXTBSY while such a handle exists.
+        drop(output);
+        // Keep the source name until move_mount: the kernel refuses attaching
+        // an unlinked source. The caller removes this private alias immediately
+        // after mounting and before releasing any workload.
+        Ok(pinned)
+    }
+
+    fn remove_sealed_mount_source(original_fd: RawFd, source: &File) -> Result<(), String> {
+        let root = crate::PinnedDirectory::open(std::path::Path::new(ROOT))
+            .map_err(|error| format!("open private materialization cleanup root: {error}"))?
+            .ok_or_else(|| "private materialization root disappeared".to_string())?;
+        let name = OsString::from(format!(".lillux-sealed-source-{original_fd}"));
+        let pinned = root
+            .open_pinned_regular(&name, false)
+            .map_err(|error| format!("pin private materialization cleanup: {error}"))?
+            .ok_or_else(|| "private materialization disappeared before attachment".to_string())?;
+        let expected = mount_source_stat(source.as_raw_fd())?;
+        let observed = mount_source_stat(
+            pinned
+                .try_clone_descriptor()
+                .map_err(|error| error.to_string())?
+                .as_raw_fd(),
+        )?;
+        if expected.st_dev != observed.st_dev || expected.st_ino != observed.st_ino {
+            return Err("private materialization cleanup identity changed".to_string());
+        }
+        root.remove_pinned_regular_if_same(&pinned)
+            .map_err(|error| format!("remove private materialization alias: {error}"))
     }
 
     fn descriptor_kind(fd: u32) -> Result<DescriptorKind, String> {
@@ -787,6 +1045,41 @@ mod imp {
         let final_target = open_mount_target_no_symlinks(&PathBuf::from("/.overlay-probe/final"))?;
         move_path_mount_to_target(&merged, final_target.as_raw_fd())?;
         unmount_path(&PathBuf::from(format!("{probe}/final")))
+    }
+
+    fn probe_inherited_descriptor_mounts(directory: &File, bytes: &File) -> Result<(), String> {
+        for (source, destination) in [
+            (directory, "/.inherited-directory-probe"),
+            (bytes, "/tmp/.sealed-bytes-probe"),
+        ] {
+            create_target(
+                &rooted(&PathBuf::from(destination))?,
+                descriptor_kind(source.as_raw_fd() as u32)?,
+            )?;
+            bind_descriptor_mount(&LinuxSandboxMount {
+                source_fd: source.as_raw_fd() as u32,
+                destination: PathBuf::from(destination),
+                access: LinuxSandboxMountAccess::ReadOnly,
+                layer: 0,
+            })
+            .map_err(|error| format!("probe mount {destination}: {error}"))?;
+        }
+        let path = format!("{ROOT}/tmp/.sealed-bytes-probe");
+        if std::fs::read(&path).map_err(|error| format!("read sealed mount probe: {error}"))?
+            != b"exact sealed bytes"
+        {
+            return Err("sealed mount probe changed bytes".to_string());
+        }
+        let encoded = CString::new(path).expect("static probe path");
+        let writable = unsafe { libc::open(encoded.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if writable >= 0 {
+            close_fd(writable);
+            return Err("sealed mount probe admitted a writable handle".to_string());
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EROFS) {
+            return Err("sealed mount probe did not prove read-only mount enforcement".to_string());
+        }
+        Ok(())
     }
 
     fn probe_descriptor_mount() -> Result<(), String> {
@@ -2153,6 +2446,80 @@ mod imp {
             unsafe { libc::close(fd) };
         }
     }
+
+    #[cfg(test)]
+    mod namespace_source_tests {
+        use super::*;
+
+        #[test]
+        fn namespace_reanchor_refuses_a_replacement_inode() {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("source");
+            std::fs::write(&path, b"admitted").unwrap();
+            let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
+            assert!(reanchor_mount_source_at(original.as_raw_fd(), &path).is_ok());
+            std::fs::rename(&path, temporary.path().join("retained")).unwrap();
+            std::fs::write(&path, b"substitute").unwrap();
+            assert!(
+                reanchor_mount_source_at(original.as_raw_fd(), &path)
+                    .unwrap_err()
+                    .contains("changed across namespace")
+            );
+        }
+
+        #[test]
+        fn namespace_reanchor_refuses_symlink_substitution() {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("source");
+            std::fs::create_dir(&path).unwrap();
+            let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
+            std::fs::rename(&path, temporary.path().join("retained")).unwrap();
+            std::os::unix::fs::symlink("retained", &path).unwrap();
+            assert!(reanchor_mount_source_at(original.as_raw_fd(), &path).is_err());
+        }
+
+        #[test]
+        fn private_mount_copy_refuses_unsealed_source() {
+            let temporary = tempfile::tempfile().unwrap();
+            assert!(!mount_source_is_sealed(temporary.as_raw_fd()).unwrap());
+            assert!(
+                materialize_sealed_mount_source(temporary.as_raw_fd())
+                    .unwrap_err()
+                    .contains("requires a sealed source")
+            );
+        }
+
+        #[test]
+        fn sealed_source_cannot_gain_a_writable_second_alias() {
+            let sealed = crate::sealed_memfd(c"mount-alias-test", b"immutable").unwrap();
+            let mut request = super::super::tests::minimal_request();
+            request.mounts = vec![
+                LinuxSandboxMount {
+                    source_fd: sealed.as_raw_fd() as u32,
+                    destination: PathBuf::from("/read-only"),
+                    access: LinuxSandboxMountAccess::ReadOnly,
+                    layer: 0,
+                },
+                LinuxSandboxMount {
+                    source_fd: sealed.as_raw_fd() as u32,
+                    destination: PathBuf::from("/writable"),
+                    access: LinuxSandboxMountAccess::Writable,
+                    layer: 0,
+                },
+            ];
+            assert!(
+                reanchor_request_sources(&request)
+                    .unwrap_err()
+                    .contains("cannot grant writable")
+            );
+        }
+
+        #[test]
+        #[ignore = "requires the supported Linux user/mount/network namespace floor"]
+        fn inherited_sources_cross_the_real_namespace_boundary() {
+            inspect().unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2162,7 +2529,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd as _;
 
-    fn minimal_request() -> LinuxSandboxRequest {
+    pub(super) fn minimal_request() -> LinuxSandboxRequest {
         LinuxSandboxRequest {
             executable: PathBuf::from("/bin/tool"),
             argv0: OsString::from("tool"),

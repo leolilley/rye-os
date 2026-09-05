@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T00:45:29Z:2a839cbf31f15c6e1e767ea80499fb4b33144a0dc8155de57d77b46e134428ba:kMJZCazicVgFzkhIhSSZrtYa/APSFyFJB2q1KSlvxStjYobeALyD7bQtRCSwOOdOcAhX86cq2ekp1qDoM1CsDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T05:00:33Z:15c88dd27a8598edc877cfc78c34e1522390dd43f10b0dbf940c03bff5189fa5:wsF86gn/5+cMCDFVr5CX6yxFka/D2BKmLpBzjEQekJ9OAeM0zBw6vt4oMsIxth02jyS/h8xFFF7y2dLhgtZ6CA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.8.0"
+version: "1.9.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -46,6 +46,24 @@ are never reinterpreted. Each channel has one exact child descriptor and hidden
 environment binding in both disabled and enforced modes; fd 0 is a deliberate
 full-duplex primary channel, not a sentinel. Parent protocol code retains a
 typed Lillux byte-stream endpoint and never recovers a raw Unix socket.
+
+The native backend's kernel probe includes sources inherited from **before**
+the namespace transition, not just files created inside the sandbox. Linux
+cannot bind-clone an inherited source's former-namespace mount directly.
+Lillux uses the descriptor's kernel-reported location only to find its exact
+counterpart in the cloned namespace, then compares device, inode and file type
+against the still-retained original descriptor. Missing, replaced or symlinked
+sources refuse; the location does not independently authorize a mount. This
+reproof happens before the private root obscures host locations.
+
+Fully sealed anonymous regular files have immutable bytes but no bindable
+filesystem mount. Lillux streams exactly their admitted length into its private
+tmpfs, preserving only read/execute mode bits and leaving the sender's offset
+unchanged. It closes every write handle, attaches read-only descriptor mounts,
+and removes each exact staging alias before any workload starts. Unsealed bytes
+cannot use this materialization path, and sealed sources cannot grant writable
+mounts. These are backend mechanics, not a new realization, host-path fallback,
+or permission to weaken the node policy.
 
 The engine also keeps node trust separate from project/request trust. The
 `node_trust_store` is loaded only from persistent node configuration and is the
