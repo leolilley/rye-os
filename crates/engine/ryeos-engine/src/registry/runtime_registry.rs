@@ -53,7 +53,9 @@ const MAX_LAUNCH_ENVIRONMENT_CONTRIBUTIONS: usize = 8;
 const MAX_LAUNCH_ENVIRONMENT_TARGETS: usize = 8;
 const MAX_LAUNCH_ENVIRONMENT_VARIABLES: usize = 32;
 const MAX_LAUNCH_SECRET_NAMES: usize = 32;
-const MAX_LAUNCH_FACT_BYTES: u32 = 16 * 1024;
+/// Maximum retained size of any one launch runtime fact. Fact producers must
+/// use this ceiling rather than declaring a larger, independently valid wire payload.
+pub const MAX_LAUNCH_FACT_BYTES: u32 = 16 * 1024;
 const MAX_LAUNCH_NAME_BYTES: usize = 64;
 const MAX_CONFIG_IDENTITY_BYTES: usize = 512;
 const MAX_CONFIG_SEGMENT_BYTES: usize = 128;
@@ -1547,6 +1549,29 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn bundled_runtime_descriptors_obey_launch_contract_bounds() {
+        let bundle_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../bundles");
+        let mut checked = 0;
+        for bundle in std::fs::read_dir(&bundle_root).unwrap() {
+            let runtimes = bundle.unwrap().path().join(".ai/runtimes");
+            if !runtimes.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(runtimes).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).unwrap();
+                let yaml = parse_runtime_yaml(&path, &body).unwrap();
+                validate_runtime_yaml(&path, &yaml).unwrap();
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no bundled runtime descriptors were checked");
+    }
+
     fn minimal_yaml() -> RuntimeYaml {
         RuntimeYaml {
             kind: "runtime".to_owned(),
@@ -1836,9 +1861,7 @@ mod tests {
             max_total_bytes: 1024,
             target: Some("worker".to_owned()),
             destination_prefix: Some(".ai/evidence".to_owned()),
-            allowed_access: vec![
-                ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly,
-            ],
+            allowed_access: vec![ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly],
         };
         let error = validate_runtime_yaml(&test_path(), &reserved)
             .expect_err("evidence must not overlap the control namespace");

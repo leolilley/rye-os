@@ -94,9 +94,11 @@ impl Drop for SlotGuard {
 pub fn start(
     mut daemon_channel: lillux::InheritedDuplexChannel,
 ) -> Result<RunningWorkloadClientBroker> {
-    let boot: WorkloadClientBootFrame =
-        ryeos_runtime::workload_client::read_frame(&mut daemon_channel)
-            .context("read workload-client boot contract")?;
+    let boot: WorkloadClientBootFrame = ryeos_runtime::workload_client::read_frame_bounded(
+        &mut daemon_channel,
+        ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
+    )
+    .context("read workload-client boot contract")?;
     boot.validate()?;
 
     // Lillux binds this below the native sandbox's private tmpfs and proves
@@ -117,8 +119,12 @@ pub fn start(
         grant_digest: boot.grant_digest.clone(),
     };
     ready.validate()?;
-    ryeos_runtime::workload_client::write_frame(&mut daemon_channel, &ready)
-        .context("publish workload-client bridge readiness")?;
+    ryeos_runtime::workload_client::write_frame_bounded(
+        &mut daemon_channel,
+        &ready,
+        ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
+    )
+    .context("publish workload-client bridge readiness")?;
 
     let reader = daemon_channel
         .try_clone()
@@ -306,11 +312,7 @@ fn failure_response(request_id: &str, code: &str, message: String) -> WorkloadCl
         request_id,
         outcome: WorkloadClientOutcome::Failed {
             code: code.to_owned(),
-            message: message
-                .chars()
-                .filter(|character| *character != '\0')
-                .take(2_048)
-                .collect(),
+            message: ryeos_runtime::workload_client::bounded_error_message(&message),
             retryable: false,
         },
     }

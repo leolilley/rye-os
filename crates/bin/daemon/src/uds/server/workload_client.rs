@@ -328,7 +328,7 @@ fn require_private_workload_client_isolation(state: &AppState) -> Result<()> {
 
 fn validate_delegation_ceiling(label: &str, capabilities: &[String]) -> Result<()> {
     if capabilities.is_empty()
-        || capabilities.len() > 256
+        || capabilities.len() > ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_DELEGATION_CAPS
         || capabilities.windows(2).any(|pair| pair[0] >= pair[1])
     {
         bail!("{label} workload-client delegation ceiling is not finite and canonical");
@@ -466,9 +466,15 @@ fn serve_daemon_broker(
         max_request_bytes: grant.max_request_bytes,
     };
     boot.validate()?;
-    ryeos_runtime::workload_client::write_frame(&mut channel, &boot)?;
-    let ready: WorkloadClientReadyFrame =
-        ryeos_runtime::workload_client::read_frame_bounded(&mut channel, 64 * 1024)?;
+    ryeos_runtime::workload_client::write_frame_bounded(
+        &mut channel,
+        &boot,
+        ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
+    )?;
+    let ready: WorkloadClientReadyFrame = ryeos_runtime::workload_client::read_frame_bounded(
+        &mut channel,
+        ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
+    )?;
     ready.validate()?;
     if ready.grant_digest != grant_digest {
         bail!("workload-client bridge acknowledged a different boot grant");
@@ -682,9 +688,5 @@ fn bounded_error(error: &anyhow::Error) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    normalized
-        .chars()
-        .filter(|character| *character != '\0')
-        .take(2_048)
-        .collect()
+    ryeos_runtime::workload_client::bounded_error_message(&normalized)
 }

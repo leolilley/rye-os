@@ -26,7 +26,25 @@ pub const WORKLOAD_CLIENT_BROKER_DIRECTORY_NAME: &str = ".ryeos-wc";
 pub const WORKLOAD_CLIENT_ENDPOINT_ENV: &str =
     ryeos_engine::protocol_vocabulary::WORKLOAD_CLIENT_ENDPOINT_ENV;
 pub const MAX_WORKLOAD_CLIENT_FRAME_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_WORKLOAD_CLIENT_REQUEST_CONTRACT_BYTES: u32 = 64 * 1024;
+/// Boot/ready frames carry only protocol and grant bounds, not execution data.
+pub const MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+// Closed protocol ceilings, not node defaults. Signed policy may select less.
+pub const MAX_WORKLOAD_CLIENT_EXECUTIONS: u16 = 256;
+pub const MAX_WORKLOAD_CLIENT_REF_BINDINGS: u16 = 32;
+pub const MAX_WORKLOAD_CLIENT_BINDING_VALUES: usize = 32;
+pub const MAX_WORKLOAD_CLIENT_CALLS: u16 = 32;
+pub const MAX_WORKLOAD_CLIENT_DELEGATION_CAPS: usize = 256;
+pub const MAX_WORKLOAD_CLIENT_IN_FLIGHT: u16 = 64;
+pub const MAX_WORKLOAD_CLIENT_INVOCATIONS_PER_BOOT: u32 = 1_000_000;
+pub const MAX_WORKLOAD_CLIENT_LIFETIME_SECONDS: u64 = 604_800;
+pub const MAX_WORKLOAD_CLIENT_ERROR_MESSAGE_BYTES: usize = 2_048;
+const MAX_WORKLOAD_CLIENT_ERROR_CODE_BYTES: usize = 128;
+const MAX_WORKLOAD_CLIENT_IDENTIFIER_BYTES: usize = 256;
+const MAX_WORKLOAD_CLIENT_BINDING_NAME_BYTES: usize = 128;
+// This declaration is retained as one ordinary launch fact, not a transport
+// frame. Keep its producer bound within the registry's existing fact ceiling.
+pub const MAX_WORKLOAD_CLIENT_REQUEST_CONTRACT_BYTES: u32 =
+    ryeos_engine::runtime_registry::MAX_LAUNCH_FACT_BYTES;
 pub const MAX_WORKLOAD_CLIENT_REQUEST_ID_BYTES: usize = 128;
 pub const WORKLOAD_CLIENT_REQUEST_FACT: &str = "workload_client_request";
 
@@ -135,7 +153,7 @@ impl WorkloadClientRequestContract {
 pub fn validate_execution_ceilings(
     executions: &[WorkloadClientExecutionCeiling],
 ) -> anyhow::Result<()> {
-    if executions.is_empty() || executions.len() > 256 {
+    if executions.is_empty() || executions.len() > usize::from(MAX_WORKLOAD_CLIENT_EXECUTIONS) {
         anyhow::bail!("workload-client request has no finite execution surface");
     }
     let mut previous_item: Option<&str> = None;
@@ -147,12 +165,12 @@ pub fn validate_execution_ceilings(
             anyhow::bail!("workload-client execution refs must be sorted and unique");
         }
         previous_item = Some(&execution.item_ref);
-        if execution.ref_bindings.len() > 32 {
+        if execution.ref_bindings.len() > usize::from(MAX_WORKLOAD_CLIENT_REF_BINDINGS) {
             anyhow::bail!("workload-client execution exceeds its ref-binding bound");
         }
         for (name, refs) in &execution.ref_bindings {
             validate_binding_name(name)?;
-            if refs.is_empty() || refs.len() > 32 {
+            if refs.is_empty() || refs.len() > MAX_WORKLOAD_CLIENT_BINDING_VALUES {
                 anyhow::bail!("workload-client ref binding `{name}` has no finite value surface");
             }
             let mut previous: Option<&str> = None;
@@ -168,7 +186,9 @@ pub fn validate_execution_ceilings(
                 previous = Some(item_ref);
             }
         }
-        if execution.calls.is_empty() || execution.calls.len() > 32 {
+        if execution.calls.is_empty()
+            || execution.calls.len() > usize::from(MAX_WORKLOAD_CLIENT_CALLS)
+        {
             anyhow::bail!("workload-client execution has no finite call surface");
         }
         let mut previous_call: Option<&WorkloadClientCallCeiling> = None;
@@ -194,7 +214,7 @@ impl WorkloadClientNodePolicy {
         validate_sorted_strings(
             "node workload-client delegation capability ceiling",
             &self.delegation_cap_ceiling,
-            256,
+            MAX_WORKLOAD_CLIENT_DELEGATION_CAPS,
         )?;
         for capability in &self.delegation_cap_ceiling {
             crate::authorizer::validate_scope_pattern(capability).map_err(anyhow::Error::msg)?;
@@ -216,10 +236,10 @@ impl WorkloadClientNodePolicy {
             );
         }
         if self.max_executions == 0
-            || self.max_executions > 256
-            || self.max_ref_bindings_per_execution > 32
+            || self.max_executions > MAX_WORKLOAD_CLIENT_EXECUTIONS
+            || self.max_ref_bindings_per_execution > MAX_WORKLOAD_CLIENT_REF_BINDINGS
             || self.max_calls_per_execution == 0
-            || self.max_calls_per_execution > 32
+            || self.max_calls_per_execution > MAX_WORKLOAD_CLIENT_CALLS
             || self.max_request_bytes == 0
             || self.max_request_bytes as usize > MAX_WORKLOAD_CLIENT_FRAME_BYTES
         {
@@ -268,11 +288,11 @@ pub fn validate_workload_client_limits(
     max_lifetime_seconds: u64,
 ) -> anyhow::Result<()> {
     if max_in_flight == 0
-        || max_in_flight > 64
+        || max_in_flight > MAX_WORKLOAD_CLIENT_IN_FLIGHT
         || max_invocations_per_boot == 0
-        || max_invocations_per_boot > 1_000_000
+        || max_invocations_per_boot > MAX_WORKLOAD_CLIENT_INVOCATIONS_PER_BOOT
         || max_lifetime_seconds == 0
-        || max_lifetime_seconds > 604_800
+        || max_lifetime_seconds > MAX_WORKLOAD_CLIENT_LIFETIME_SECONDS
     {
         anyhow::bail!("workload-client lifetime or invocation bounds are not canonical");
     }
@@ -281,7 +301,7 @@ pub fn validate_workload_client_limits(
 
 fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
-        || value.len() > 256
+        || value.len() > MAX_WORKLOAD_CLIENT_IDENTIFIER_BYTES
         || !value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
         })
@@ -293,7 +313,7 @@ fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
 
 fn validate_binding_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty()
-        || name.len() > 128
+        || name.len() > MAX_WORKLOAD_CLIENT_BINDING_NAME_BYTES
         || name.bytes().any(|byte| {
             byte.is_ascii_control() || byte.is_ascii_whitespace() || matches!(byte, b'/' | b'=')
         })
@@ -310,7 +330,7 @@ fn validate_sorted_strings(label: &str, values: &[String], max: usize) -> anyhow
     let mut previous: Option<&str> = None;
     for value in values {
         if value.is_empty()
-            || value.len() > 256
+            || value.len() > MAX_WORKLOAD_CLIENT_IDENTIFIER_BYTES
             || value
                 .bytes()
                 .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
@@ -354,7 +374,7 @@ impl WorkloadClientBootFrame {
         if self.protocol != WORKLOAD_CLIENT_PROTOCOL
             || !lillux::valid_hash(&self.grant_digest)
             || self.max_in_flight == 0
-            || self.max_in_flight > 64
+            || self.max_in_flight > MAX_WORKLOAD_CLIENT_IN_FLIGHT
             || self.max_request_bytes == 0
             || self.max_request_bytes as usize > MAX_WORKLOAD_CLIENT_FRAME_BYTES
         {
@@ -420,18 +440,11 @@ impl WorkloadClientRequestFrame {
         let WorkloadClientOperation::Execute(request) = &self.operation;
         ryeos_engine::canonical_ref::CanonicalRef::parse(&request.item_ref)
             .map_err(|error| anyhow::anyhow!("workload-client item ref is invalid: {error}"))?;
-        if request.ref_bindings.len() > 32 {
+        if request.ref_bindings.len() > usize::from(MAX_WORKLOAD_CLIENT_REF_BINDINGS) {
             anyhow::bail!("workload-client request exceeds its ref-binding bound");
         }
         for (name, item_ref) in &request.ref_bindings {
-            if name.is_empty()
-                || name.len() > 128
-                || name.bytes().any(|byte| {
-                    byte.is_ascii_control() || byte.is_ascii_whitespace() || byte == b'/'
-                })
-            {
-                anyhow::bail!("workload-client ref-binding name is not canonical");
-            }
+            validate_binding_name(name)?;
             ryeos_engine::canonical_ref::CanonicalRef::parse(item_ref).map_err(|error| {
                 anyhow::anyhow!("workload-client ref binding `{name}` is invalid: {error}")
             })?;
@@ -473,13 +486,13 @@ impl WorkloadClientResponseFrame {
         validate_request_id(&self.request_id)?;
         if let WorkloadClientOutcome::Failed { code, message, .. } = &self.outcome {
             if code.is_empty()
-                || code.len() > 128
+                || code.len() > MAX_WORKLOAD_CLIENT_ERROR_CODE_BYTES
                 || !code.bytes().all(|byte| {
                     byte.is_ascii_lowercase()
                         || byte.is_ascii_digit()
                         || matches!(byte, b'_' | b'-')
                 })
-                || message.len() > 2_048
+                || message.len() > MAX_WORKLOAD_CLIENT_ERROR_MESSAGE_BYTES
                 || message.bytes().any(|byte| byte == 0)
             {
                 anyhow::bail!("workload-client error is not canonical");
@@ -503,6 +516,19 @@ pub fn validate_request_id(request_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("workload-client request id is not canonical");
     }
     Ok(())
+}
+
+/// Produce error text accepted by the wire validator. The ceiling counts
+/// UTF-8 bytes, not characters; never split a code point or retain NUL.
+pub fn bounded_error_message(message: &str) -> String {
+    let mut result = String::new();
+    for character in message.chars().filter(|character| *character != '\0') {
+        if result.len() + character.len_utf8() > MAX_WORKLOAD_CLIENT_ERROR_MESSAGE_BYTES {
+            break;
+        }
+        result.push(character);
+    }
+    result
 }
 
 pub fn read_frame<R: std::io::Read, T: serde::de::DeserializeOwned>(
@@ -535,8 +561,19 @@ pub fn write_frame<W: std::io::Write, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> anyhow::Result<()> {
+    write_frame_bounded(writer, value, MAX_WORKLOAD_CLIENT_FRAME_BYTES)
+}
+
+pub fn write_frame_bounded<W: std::io::Write, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    max_bytes: usize,
+) -> anyhow::Result<()> {
+    if max_bytes == 0 || max_bytes > MAX_WORKLOAD_CLIENT_FRAME_BYTES {
+        anyhow::bail!("workload-client frame ceiling is outside the protocol bound");
+    }
     let encoded = serde_json::to_vec(value)?;
-    if encoded.is_empty() || encoded.len() > MAX_WORKLOAD_CLIENT_FRAME_BYTES {
+    if encoded.is_empty() || encoded.len() > max_bytes {
         anyhow::bail!("workload-client frame exceeds its byte bound");
     }
     writer.write_all(&(encoded.len() as u32).to_be_bytes())?;
@@ -580,6 +617,141 @@ mod tests {
             execution("directive:project/check"),
             execution("tool:project/format"),
         ])
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn bundled_workload_fact_matches_producer_and_registry_ceiling() {
+        let descriptor: ryeos_engine::runtime_registry::RuntimeYaml =
+            serde_yaml::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../bundles/core/.ai/runtimes/worker-execution-runtime.yaml"
+            )))
+            .unwrap();
+        ryeos_engine::runtime_registry::validate_admitted_runtime_descriptor(
+            &ryeos_engine::canonical_ref::CanonicalRef::parse(
+                "runtime:core/worker-execution-runtime",
+            )
+            .unwrap(),
+            &descriptor,
+        )
+        .unwrap();
+        assert_eq!(
+            descriptor.launch_contract.runtime_facts[WORKLOAD_CLIENT_REQUEST_FACT].max_bytes,
+            MAX_WORKLOAD_CLIENT_REQUEST_CONTRACT_BYTES,
+        );
+    }
+
+    #[test]
+    fn request_and_boot_share_the_in_flight_ceiling() {
+        let mut requested = request(vec![execution("tool:project/check")]);
+        let mut boot = WorkloadClientBootFrame {
+            protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+            grant_digest: "a".repeat(64),
+            max_in_flight: MAX_WORKLOAD_CLIENT_IN_FLIGHT,
+            max_request_bytes: MAX_WORKLOAD_CLIENT_FRAME_BYTES as u32,
+        };
+        for maximum in [
+            0,
+            MAX_WORKLOAD_CLIENT_IN_FLIGHT,
+            MAX_WORKLOAD_CLIENT_IN_FLIGHT + 1,
+        ] {
+            requested.max_in_flight = maximum;
+            boot.max_in_flight = maximum;
+            assert_eq!(
+                requested.validate().is_ok(),
+                maximum == MAX_WORKLOAD_CLIENT_IN_FLIGHT
+            );
+            assert_eq!(
+                boot.validate().is_ok(),
+                maximum == MAX_WORKLOAD_CLIENT_IN_FLIGHT
+            );
+        }
+        validate_workload_client_limits(
+            MAX_WORKLOAD_CLIENT_IN_FLIGHT,
+            MAX_WORKLOAD_CLIENT_INVOCATIONS_PER_BOOT,
+            MAX_WORKLOAD_CLIENT_LIFETIME_SECONDS,
+        )
+        .unwrap();
+        assert!(
+            validate_workload_client_limits(1, MAX_WORKLOAD_CLIENT_INVOCATIONS_PER_BOOT + 1, 1)
+                .is_err()
+        );
+        assert!(
+            validate_workload_client_limits(1, 1, MAX_WORKLOAD_CLIENT_LIFETIME_SECONDS + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn binding_names_have_one_contract_for_declaration_and_invocation() {
+        for name in ["valid", "bad=name", "bad/name", "bad name", ""] {
+            let mut route = execution("tool:project/check");
+            route
+                .ref_bindings
+                .insert(name.to_owned(), vec!["tool:project/format".to_owned()]);
+            let frame = WorkloadClientRequestFrame {
+                protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+                request_id: "test".to_owned(),
+                operation: WorkloadClientOperation::Execute(WorkloadClientExecuteRequest {
+                    item_ref: route.item_ref.clone(),
+                    ref_bindings: BTreeMap::from([(
+                        name.to_owned(),
+                        "tool:project/format".to_owned(),
+                    )]),
+                    params: Value::Null,
+                    call: None,
+                }),
+            };
+            assert_eq!(
+                validate_execution_ceilings(&[route]).is_ok(),
+                name == "valid"
+            );
+            assert_eq!(frame.validate().is_ok(), name == "valid");
+        }
+    }
+
+    #[test]
+    fn control_frame_bounds_are_symmetric_and_reject_before_write() {
+        let value = "x".repeat(MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES - 2);
+        let mut bytes = Vec::new();
+        write_frame_bounded(&mut bytes, &value, MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES).unwrap();
+        let decoded: String = read_frame_bounded(
+            &mut bytes.as_slice(),
+            MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
+        )
+        .unwrap();
+        assert_eq!(decoded, value);
+        bytes.clear();
+        assert!(
+            write_frame_bounded(
+                &mut bytes,
+                &(value + "x"),
+                MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES
+            )
+            .is_err()
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn error_producers_bound_utf8_bytes_not_character_count() {
+        let message = bounded_error_message(&format!(
+            "\0{}",
+            "界".repeat(MAX_WORKLOAD_CLIENT_ERROR_MESSAGE_BYTES)
+        ));
+        assert!(message.len() <= MAX_WORKLOAD_CLIENT_ERROR_MESSAGE_BYTES);
+        assert!(message.len() + '界'.len_utf8() > MAX_WORKLOAD_CLIENT_ERROR_MESSAGE_BYTES);
+        WorkloadClientResponseFrame {
+            protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+            request_id: "test".to_owned(),
+            outcome: WorkloadClientOutcome::Failed {
+                code: "refused".to_owned(),
+                message,
+                retryable: false,
+            },
+        }
         .validate()
         .unwrap();
     }

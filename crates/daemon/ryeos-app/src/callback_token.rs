@@ -136,11 +136,6 @@ impl AdmittedWorkloadClientGrant {
             || self.worker_instance_id.is_empty()
             || self.worker_instance_id.len() > 256
             || self.worker_boot_epoch == 0
-            || self.max_in_flight == 0
-            || self.max_in_flight > 64
-            || self.max_invocations_per_boot == 0
-            || self.max_lifetime_seconds == 0
-            || self.max_lifetime_seconds > 604_800
             || self.max_request_bytes == 0
             || self.max_request_bytes as usize
                 > ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_FRAME_BYTES

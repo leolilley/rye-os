@@ -66,7 +66,6 @@ pub fn validate_execution_process_identity_shape(
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessStat {
-    state: char,
     pgrp: i64,
     start_time_ticks: i64,
 }
@@ -759,7 +758,9 @@ fn read_process_stat(pid: i64) -> std::io::Result<ProcessStat> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed /proc stat comm")
     })?;
     let fields = raw[close + 1..].split_whitespace().collect::<Vec<_>>();
-    let state = fields
+    // Validate the field without retaining it: identity uses group/start time,
+    // and liveness is proved by the pinned pidfd, not this transient state.
+    fields
         .first()
         .and_then(|value| value.chars().next())
         .ok_or_else(|| {
@@ -789,7 +790,6 @@ fn read_process_stat(pid: i64) -> std::io::Result<ProcessStat> {
         ));
     }
     Ok(ProcessStat {
-        state,
         pgrp,
         start_time_ticks,
     })
