@@ -1340,7 +1340,7 @@ mod tests {
         expression: &str,
     ) -> ryeos_scheduler::types::ScheduleSourceRecord {
         ryeos_scheduler::types::ScheduleSourceRecord {
-            spec_version: 1,
+            spec_version: 2,
             schedule_id: schedule_id.to_owned(),
             item_ref: "directive:test/hello".to_owned(),
             ref_bindings: std::collections::BTreeMap::new(),
@@ -1355,8 +1355,14 @@ mod tests {
             project_root: None,
             registered_at: 1_700_000_000_000,
             execution: ryeos_scheduler::types::ScheduleExecution {
-                requester_fingerprint: "requester:test".to_owned(),
+                authority: ryeos_scheduler::types::ScheduleExecutionAuthority::Node {
+                    principal_id: format!("fp:{}", "33".repeat(32)),
+                    effective_origin_site_id: "site:test".to_owned(),
+                },
                 capabilities: vec!["ryeos.execute.*".to_owned()],
+                policy: ryeos_engine::execution_contract::ExecutionPolicy::projectless(
+                    ryeos_engine::execution_contract::ExecutionResponse::Accepted,
+                ),
             },
             managed_by: None,
         }
@@ -1438,7 +1444,9 @@ mod tests {
     #[test]
     fn recovery_restores_exact_schedule_sources_and_their_projection() {
         let root = tempfile::tempdir().unwrap();
-        let directory = lillux::PinnedDirectory::open(root.path()).unwrap().unwrap();
+        let schedule_root = root.path().join(".ai/node/schedules");
+        std::fs::create_dir_all(&schedule_root).unwrap();
+        let directory = lillux::PinnedDirectory::open(&schedule_root).unwrap().unwrap();
         let _lock = directory.lock_exclusive().unwrap();
         let db = ryeos_scheduler::db::SchedulerDb::new_in_memory().unwrap();
         let key = [37_u8; 32];
@@ -1447,7 +1455,7 @@ mod tests {
         let restore_id = "restore-after-projection-crash";
         let before = signed_recovery_test_source(&recovery_test_source(restore_id, "60"), &key);
         let projected = signed_recovery_test_source(&recovery_test_source(restore_id, "120"), &key);
-        let restore_path = root.path().join(format!("{restore_id}.yaml"));
+        let restore_path = schedule_root.join(format!("{restore_id}.yaml"));
         std::fs::write(&restore_path, &projected).unwrap();
         let projected = ryeos_scheduler::projection::verify_schedule_source_content(
             &restore_path,
@@ -1460,7 +1468,7 @@ mod tests {
 
         let delete_id = "delete-after-projection-crash";
         let created = signed_recovery_test_source(&recovery_test_source(delete_id, "180"), &key);
-        let delete_path = root.path().join(format!("{delete_id}.yaml"));
+        let delete_path = schedule_root.join(format!("{delete_id}.yaml"));
         std::fs::write(&delete_path, &created).unwrap();
         let created = ryeos_scheduler::projection::verify_schedule_source_content(
             &delete_path,

@@ -7718,8 +7718,10 @@ fn frozen_candidate_closure_evidence(
             candidate.tree().tree().files.get(path) != base.tree().tree().files.get(path)
         })
         .collect::<Vec<_>>();
-    let changed_paths_digest =
-        ryeos_state::objects::canonical_value_digest(&changed_paths).map_err(internal)?;
+    let changed_paths_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&changed_paths).map_err(internal)?,
+    )
+    .map_err(internal)?;
     let evidence = json!({
         "schema":"ryeos.hosted_candidate_closure_and_base_validation.v2",
         "checks":{
@@ -8890,7 +8892,9 @@ fn immutable_base_program_evidence(
     Ok(json!({
         "authority_kind":authority_kind,
         "resolution_subject_authority":sealed.resolution_subject_authority(),
-        "resolution_digest":ryeos_state::objects::canonical_value_digest(resolution)
+        "resolution_digest":ryeos_state::objects::canonical_value_digest(
+            &serde_json::to_value(resolution).map_err(internal)?,
+        )
             .map_err(internal)?,
         "contributor_count":contributors.len(),
         "bundles":bundles,

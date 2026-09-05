@@ -613,7 +613,10 @@ mod tests {
         assert!(!index.bloom_may_contain(&key));
 
         let payload = json!({"operation_id":key.operation_id,"value":"observed"});
-        index.observe(&key.event_type, &payload, 7).unwrap();
+        let first_event_ts = "2026-09-05T00:00:00.000Z";
+        index
+            .observe(&key.event_type, &payload, 7, first_event_ts)
+            .unwrap();
         assert!(index.bloom_may_contain(&key));
         assert!(!index.recent.get(&key).unwrap().complete);
 
@@ -626,6 +629,7 @@ mod tests {
                 payload: Some(payload),
                 first_chain_seq: 7,
                 last_chain_seq: 7,
+                first_event_ts: first_event_ts.to_owned(),
                 complete: true,
             },
         );
@@ -634,12 +638,16 @@ mod tests {
                 &key.event_type,
                 &json!({"operation_id":key.operation_id,"value":"duplicate"}),
                 9,
+                "2026-09-05T00:00:01.000Z",
             )
             .unwrap();
         let duplicate = index.recent.get(&key).unwrap();
         assert_eq!(duplicate.count, 2);
         assert!(duplicate.complete);
         assert!(duplicate.payload.is_none());
+        assert_eq!(duplicate.first_chain_seq, 7);
+        assert_eq!(duplicate.last_chain_seq, 9);
+        assert_eq!(duplicate.first_event_ts, first_event_ts);
 
         for ordinal in 0..=RECENT_FACTS {
             index
@@ -647,6 +655,7 @@ mod tests {
                     "hosted.bounded",
                     &json!({"operation_id":format!("{ordinal:064x}"),"ordinal":ordinal}),
                     i64::try_from(ordinal).unwrap() + 10,
+                    "2026-09-05T00:00:02.000Z",
                 )
                 .unwrap();
         }

@@ -587,7 +587,7 @@ pub(super) async fn command(
         .dedicated_session_command_by_key(&request.thread_id, &request.idempotency_key)?
         .is_none()
     {
-        super::enforce_aggregate_deadline(state, Some(cap))?;
+        super::enforce_aggregate_deadline(state, Some(cap), lillux::time::timestamp_millis())?;
     }
     ryeos_app::dedicated_session_service::execute_command(
         state,

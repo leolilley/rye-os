@@ -5290,6 +5290,7 @@ async fn dispatch_detached_bg_task(
                                     thread_id = %bg_thread_id,
                                     error = %cleanup_error,
                                     "fold-back failure cleanup did not settle"
+                                );
                             }
                             drop(bg_temp_dir.take());
                             return;

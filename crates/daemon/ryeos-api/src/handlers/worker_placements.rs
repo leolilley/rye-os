@@ -5183,6 +5183,7 @@ mod authority_tests {
             candidate_validation_hash: None,
             candidate_evaluation_hash: None,
             candidate_evaluation: None,
+            candidate_qualification: None,
             candidate_disposition_root_id: None,
             candidate_disposition_operation_id: None,
             publication_result: None,

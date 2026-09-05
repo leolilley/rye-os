@@ -428,6 +428,7 @@ pub fn prepare_pinned_project_external_consumer(
         current_site_id: site_id.clone(),
         origin_site_id: site_id,
         execution_hints: Default::default(),
+        scheduled_fire: None,
         validate_only: true,
     };
     let verified = crate::executor::resolve_and_verify(

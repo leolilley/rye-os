@@ -1,4 +1,4 @@
-# ryeos:signed:2026-08-11T02:28:20Z:a45402925c9d0a2c0f6a7c3d06a27ea71cce4730f3977225e2a320a79dd56b51:lm/8wa1r5iR3BonPdJddZbVZVOuf90c+1O4pfr3UxXMekYRNWBbTZZO3kfoGUm8pQ8qrqPmi5HS87w4NgzzZBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-05T00:45:20Z:5a2b97da2a4a34f55bbb015e1d9cf619d0b8207a90e65231457e84b2876fbf84:QZLJajJbeUe9eX/gHscI07E8tNiVl04QNSHD6dNtZCET2+ulr0UMsdonPhz0Pa9YCEgOUkN9K5FuDSd4BmSaDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "ryeos/core/bundle"
 name: "verify"
 executor_id: "@subprocess"

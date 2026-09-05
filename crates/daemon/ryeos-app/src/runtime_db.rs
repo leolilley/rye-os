@@ -18291,7 +18291,7 @@ mod tests {
                 params![
                     "c".repeat(64),
                     "a".repeat(64),
-                    fake_process_identity(127, 127)
+                    serde_json::to_string(&fake_process_identity(127, 127)).unwrap()
                 ],
             )
             .unwrap();

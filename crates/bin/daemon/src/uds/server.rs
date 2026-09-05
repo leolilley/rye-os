@@ -407,7 +407,9 @@ pub(crate) async fn dispatch_runtime_method(
 
     match method {
         ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD => {
-            ryeos_executor::execution::runtime_dispatch::handle(params, state).await
+            // Launch preparation retains a large future. Keep it out of the
+            // inline dispatcher used by every callback, including small reads.
+            Box::pin(ryeos_executor::execution::runtime_dispatch::handle(params, state)).await
         }
         "runtime.spawn_follow_child" => {
             Box::pin(ryeos_executor::execution::spawn_follow_child::handle(
@@ -513,7 +515,8 @@ pub(crate) async fn dispatch_runtime_method(
         }
         "runtime.mark_running" => handle_mark_running(&clean_params, state),
         "runtime.request_continuation" => {
-            let (result, prepared) = handle_request_continuation(&clean_params, state).await?;
+            let (result, prepared) =
+                Box::pin(handle_request_continuation(&clean_params, state)).await?;
             spawn_machine_continuation_launch(state, &result, prepared);
             Ok(result)
         }
@@ -5794,6 +5797,23 @@ mod tests {
                 "wildcard caps must pass UDS cap enforcement; downstream errors are fine: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_dispatch_future_has_bounded_inline_size() {
+        let (_tmp, state) = setup_app_state();
+        let params = json!({});
+        let dispatch = dispatch_runtime_method(
+            "runtime.dedicated_session_command_observation",
+            &params,
+            &state,
+            None,
+        );
+        let inline_bytes = std::mem::size_of_val(&dispatch);
+        assert!(
+            inline_bytes <= 64 * 1024,
+            "runtime dispatcher retains {inline_bytes} inline bytes for every method"
+        );
     }
 
     #[tokio::test]

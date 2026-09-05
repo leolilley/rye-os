@@ -1,3 +1,4 @@
+# ryeos:signed:2026-09-05T01:24:56Z:d14ace6ad9fe56a3d4a4d1d2a86daf17de29154eec213efabf2957cfded25a7c:WCPJ7fabSZeO7lIe+Ho5bw4Xo1uNV3s6qPgozlVhv0PeqaRjMy0ELtEGU8yC62ynE7qUoSBhqEVz+5uP6cDeDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 version: "1.0.0"
 category: codex
 description: Run one completion-fenced Codex turn and retain its private candidate for owner review.

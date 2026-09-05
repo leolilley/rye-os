@@ -719,19 +719,26 @@ mod tests {
 
     #[test]
     fn fire_record_requires_every_nullable_wire_key() {
-        let complete = serde_json::json!({
-            "fire_id": "sched@1",
-            "schedule_id": "sched",
-            "scheduled_at": 1,
-            "fired_at": 1,
-            "completed_at": null,
-            "thread_id": "T-a",
-            "status": "dispatched",
-            "trigger_reason": "normal",
-            "outcome": null,
-            "signer_fingerprint": "11".repeat(32),
-        });
-        for key in ["fired_at", "completed_at", "thread_id", "outcome"] {
+        let complete: serde_json::Value = serde_json::from_str(&fire_snapshot_line(
+            "sched@1",
+            "sched",
+            1,
+            None,
+            "dispatched",
+        ))
+        .unwrap();
+        serde_json::from_value::<FireRecord>(complete.clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        for key in [
+            "dispatched_at",
+            "completed_at",
+            "thread_id",
+            "outcome",
+            "project_authority",
+            "admitted_capsule_hash",
+        ] {
             let mut missing = complete.clone();
             missing.as_object_mut().unwrap().remove(key);
             assert!(
@@ -761,7 +768,8 @@ mod tests {
             fire_id: fire_id.to_owned(),
             schedule_id: schedule_id.to_owned(),
             scheduled_at,
-            fired_at: Some(scheduled_at),
+            reserved_at: scheduled_at,
+            dispatched_at: (status != "skipped").then_some(scheduled_at),
             completed_at,
             thread_id: (status != "skipped").then_some(thread_id),
             status: status.to_owned(),
@@ -774,6 +782,14 @@ mod tests {
                 _ => Some("thread_failed".to_owned()),
             },
             signer_fingerprint: "11".repeat(32),
+            schedule_spec_hash: "22".repeat(32),
+            project_authority: (status != "skipped").then(|| {
+                crate::objects::ExecutionProjectAuthority::projectless(
+                    crate::objects::EnvironmentAuthority::None,
+                )
+                .unwrap()
+            }),
+            admitted_capsule_hash: (status != "skipped").then(|| "33".repeat(32)),
         }
         .canonical_json_line()
         .unwrap()

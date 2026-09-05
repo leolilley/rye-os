@@ -326,9 +326,7 @@ pub struct AggregateExecutionLimits {
 
 impl AggregateExecutionLimits {
     pub fn is_unlimited(&self) -> bool {
-        self.duration_seconds == 0
-            && self.worker_executions == 0
-            && self.provider_contacts == 0
+        self.duration_seconds == 0 && self.worker_executions == 0 && self.provider_contacts == 0
     }
 }
 

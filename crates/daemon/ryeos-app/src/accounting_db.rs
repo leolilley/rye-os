@@ -1342,9 +1342,11 @@ fn validate_execution_resource_budgets(conn: &Connection) -> Result<()> {
         validate_resource_claim_coordinate(&coordinate).with_context(|| {
             format!("aggregate resource claim {execution_budget_id}/{dimension} coordinate")
         })?;
-        HexDigest::new(request_digest).with_context(|| {
-            format!("aggregate resource claim {execution_budget_id}/{dimension} request digest")
-        })?;
+        HexDigest::new(request_digest)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!("aggregate resource claim {execution_budget_id}/{dimension} request digest")
+            })?;
         let budget = load_execution_resource_budget(conn, &execution_budget_id)?
             .ok_or_else(|| anyhow::anyhow!("aggregate resource claim lost its budget"))?;
         let budget_created_at_ms: i64 = conn.query_row(
@@ -1945,6 +1947,7 @@ impl AccountingDb {
     ) -> Result<Option<ExecutionResourceClaimOutcome>> {
         validate_resource_claim_coordinate(coordinate)?;
         HexDigest::new(request_digest.to_owned())
+            .map_err(anyhow::Error::msg)
             .context("aggregate resource claim request digest is not canonical sha256")?;
         let conn = self.lock_conn()?;
         let recorded: Option<(String, String, Option<String>)> = conn
@@ -1984,6 +1987,7 @@ impl AccountingDb {
     ) -> Result<ExecutionResourceClaimOutcome> {
         validate_resource_claim_coordinate(coordinate)?;
         HexDigest::new(request_digest.to_string())
+            .map_err(anyhow::Error::msg)
             .context("aggregate resource claim request digest is not canonical sha256")?;
         let conn = self.lock_conn()?;
         immediate_transaction(&conn, "aggregate execution resource claim", || {
@@ -2114,6 +2118,7 @@ impl AccountingDb {
     ) -> Result<bool> {
         validate_resource_claim_coordinate(coordinate)?;
         HexDigest::new(request_digest.to_string())
+            .map_err(anyhow::Error::msg)
             .context("aggregate resource release request digest is not canonical sha256")?;
         let conn = self.lock_conn()?;
         immediate_transaction(&conn, "aggregate provider-contact release", || {
