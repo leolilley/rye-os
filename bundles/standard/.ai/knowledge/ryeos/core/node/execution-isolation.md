@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T05:16:12Z:676c7af9bc6c5f70990d6df974f277cfb73a4a35027ab26db09faf1638d6bda5:vkZX/d2gMbOM36OONFaKddlMOX3Tn4XZJMkLGhFFlRL+pcbeWY9lifgSa60y5e+qLDYzHN4jhzw+RHX+WDeyDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T07:07:23Z:de67b53d3156d49e3fdfe9f11b09a255df89d47ba63d0f521aa76d8920ba633a:M5ToRvTsiifzCmwwlGwoauxpyEJ+i9Ru9f2qdlJx2SmnheHvtWZ2dNoYh1KidoLwXrwWf6vxVDA2Eycq+3xLCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.10.0"
+version: "1.11.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -160,6 +160,12 @@ effective capabilities, and inspected artifact versions and digests. Backend
 status is the typed value `disabled`, `available`, `unavailable`, or
 `incompatible`. `ryeos node status` is the narrower local lifecycle probe.
 Doctor derives the same facts from the shared immutable runtime snapshot.
+
+When the adapter refuses target setup, Lillux retains its bounded refusal
+document separately from workload stderr. Ordinary execution propagates that
+diagnostic just as parser/composer and launch-preparer execution do; it must
+not replace the cause with a generic supervised-launcher failure. A launch
+refusal is not an executed workload's nonzero exit result.
 
 ## Strict schema
 

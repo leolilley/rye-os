@@ -525,9 +525,19 @@ fn spawn_subprocess(
 
     match request.spawn() {
         Ok(pending) => Ok(SpawnedExecutionAwaitingAttachment { pending, debug }),
-        Err(err_result) => Err(EngineError::ExecutionFailed {
-            reason: format!("subprocess spawn failed: {}", err_result.stderr),
-        }),
+        Err(err_result) => Err(subprocess_spawn_error(err_result)),
+    }
+}
+
+fn subprocess_spawn_error(result: lillux::SubprocessResult) -> EngineError {
+    // Lillux retains the bounded, structured launcher refusal separately from
+    // workload stderr. Preserve it just as handler/preparer launch does; the
+    // generic stderr placeholder is not an actionable isolation diagnosis.
+    EngineError::ExecutionFailed {
+        reason: match result.launcher_refusal {
+            Some(refusal) => format!("isolation adapter refused launch: {refusal}"),
+            None => format!("subprocess spawn failed: {}", result.stderr),
+        },
     }
 }
 
@@ -1015,6 +1025,33 @@ mod tests {
             .to_owned();
         assert!(retained.starts_with("… (truncated,"));
         assert!(retained.ends_with("FINAL_EXCEPTION"));
+    }
+
+    #[test]
+    fn spawn_failure_preserves_separate_launcher_refusal() {
+        for refusal in [Some("exact mount source changed".to_owned()), None] {
+            let error = subprocess_spawn_error(lillux::SubprocessResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "generic spawn failure".to_owned(),
+                exit_code: -1,
+                duration_ms: 1.0,
+                pid: 0,
+                timed_out: false,
+                launcher_refusal: refusal.clone(),
+                output_limit_exceeded: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+            let text = error.to_string();
+            match refusal {
+                Some(detail) => {
+                    assert!(text.contains(&detail));
+                    assert!(!text.contains("generic spawn failure"));
+                }
+                None => assert!(text.contains("generic spawn failure")),
+            }
+        }
     }
 
     #[test]
