@@ -71,11 +71,35 @@ cmp "$checksum" "$reproduction_checksum" || {
     --materialize "$tmp/toolchain"
 [[ -x "$tmp/toolchain/rust/bin/cargo" && -x "$tmp/toolchain/zig/zig" ]]
 
-"$verifier" \
-    --inputs "$inputs" \
-    --producer "$producer" \
-    --archive "$reproduction_archive" \
-    --checksum "$reproduction_checksum"
+# Mutations are confined to this test's fresh, verifier-produced copy. No
+# installed or caller-owned tree is edited. Exercise the shared recursive
+# verifier directly so refusal tests do not repeatedly decompress 300 MB.
+runtime_test="$root/scripts/release/test-development-toolchain-stage0-runtime.sh"
+bash "$runtime_test"
+mv "$tmp/toolchain/lib/libz.so.1" "$tmp/libz.so.1"
+if bash "$runtime_test" --verify-tree "$tmp/toolchain" >/dev/null 2>&1; then
+    echo "Stage-0 accepted a missing runtime library" >&2
+    exit 1
+fi
+mv "$tmp/libz.so.1" "$tmp/toolchain/lib/libz.so.1"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/toolchain/native/bin/undeclared-launcher"
+chmod 0755 "$tmp/toolchain/native/bin/undeclared-launcher"
+if bash "$runtime_test" --verify-tree "$tmp/toolchain" >/dev/null 2>&1; then
+    echo "Stage-0 accepted an undeclared script interpreter" >&2
+    exit 1
+fi
+rm -- "$tmp/toolchain/native/bin/undeclared-launcher"
+cp "$tmp/toolchain/RYEOS-ELF-TRANSFORMS" "$tmp/transforms"
+sed '1d' "$tmp/transforms" > "$tmp/toolchain/RYEOS-ELF-TRANSFORMS"
+if bash "$runtime_test" --verify-tree "$tmp/toolchain" >/dev/null 2>&1; then
+    echo "Stage-0 accepted incomplete ELF transformation testimony" >&2
+    exit 1
+fi
+mv "$tmp/transforms" "$tmp/toolchain/RYEOS-ELF-TRANSFORMS"
+
+# Both archive and checksum bytes were compared before materialization. Full
+# verification of that identical content once is sufficient; do not walk and
+# hash another 20,000-file extraction just to establish the same proposition.
 
 if "$verifier" \
     --inputs "$inputs" \

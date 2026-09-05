@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # Transparent Stage-0 publisher for the source-local development toolchain
-# payload. No package manager runs here and no file from the publisher image is
-# copied into the result. The signed input contract selects every upstream
-# byte. Runtime loader/library authority is a separate realization gate.
+# payload. No package manager runs here. The signed contract selects upstream
+# archives and exact members of this pinned image; it never mines an execution
+# host. Target-local import, binding and isolation qualification remain gates.
 
 FROM --platform=linux/amd64 docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c AS stage0-platform-publisher
 
@@ -11,6 +11,7 @@ WORKDIR /publisher
 ENV RYEOS_STAGE0_PUBLISHER_IMAGE=docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c
 COPY .ai/config/development/ryeos/stage0-platform-x86_64-linux.yaml /publisher/inputs.yaml
 COPY scripts/release/produce-development-toolchain-stage0.sh /publisher/produce.sh
+COPY scripts/release/development-toolchain-stage0-runtime.sh /publisher/development-toolchain-stage0-runtime.sh
 
 RUN --mount=type=cache,id=ryeos-development-stage0-downloads,target=/publisher/downloads,sharing=locked \
     mkdir /publisher/out && \

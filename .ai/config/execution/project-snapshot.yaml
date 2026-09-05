@@ -1,0 +1,40 @@
+# ryeos:signed:2026-09-05T03:44:28Z:d099f1645271e9a7e06d75fc3b67d99858d39bbed0a173c7e96bbb02154d81c3:zJ5OaUD2UUYEf2ZdcPwpHCKfobxiQO51sdYxNNqt5wGAMGWl88NbZVRXdiOiC9uMqeUy96EWINU0mWPk1O91Dw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# Repository capture intent, composed with the target's signed node patterns.
+# Git ignores are not snapshot authority. Keep source and the public developer
+# signing fixture, but never send local artifacts or nested worktrees as source.
+schema: 1
+exclusions:
+  - "/.local/"
+  - "/.tmp/"
+  - "/.worktrees/"
+  # These are literal anchored prefixes in RyeOS's existing policy language,
+  # not Git-style path globs. Add a source bundle's generated roots here when
+  # adding that bundle; retain its authored descriptors and implementation.
+  - "/bundles/.publisher-locks/"
+  - "/bundles/browser/.ai/bin/"
+  - "/bundles/browser/.ai/objects/"
+  - "/bundles/browser/.ai/refs/"
+  - "/bundles/central-auth/.ai/bin/"
+  - "/bundles/central-auth/.ai/objects/"
+  - "/bundles/central-auth/.ai/refs/"
+  - "/bundles/codex/.ai/bin/"
+  - "/bundles/codex/.ai/objects/"
+  - "/bundles/codex/.ai/refs/"
+  - "/bundles/core/.ai/bin/"
+  - "/bundles/core/.ai/objects/"
+  - "/bundles/core/.ai/refs/"
+  - "/bundles/hosted-node/.ai/bin/"
+  - "/bundles/hosted-node/.ai/objects/"
+  - "/bundles/hosted-node/.ai/refs/"
+  - "/bundles/local-inference/.ai/bin/"
+  - "/bundles/local-inference/.ai/objects/"
+  - "/bundles/local-inference/.ai/refs/"
+  - "/bundles/ryeos-ui/.ai/bin/"
+  - "/bundles/ryeos-ui/.ai/objects/"
+  - "/bundles/ryeos-ui/.ai/refs/"
+  - "/bundles/standard/.ai/bin/"
+  - "/bundles/standard/.ai/objects/"
+  - "/bundles/standard/.ai/refs/"
+  - "/bundles/web/.ai/bin/"
+  - "/bundles/web/.ai/objects/"
+  - "/bundles/web/.ai/refs/"

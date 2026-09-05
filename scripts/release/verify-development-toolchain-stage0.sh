@@ -37,7 +37,7 @@ for path in "$inputs" "$producer" "$archive"; do
         exit 2
     }
 done
-for command in awk basename cat cmp dirname find mkdir mktemp mv readelf rm rmdir \
+for command in awk basename cat cmp dirname find grep mkdir mktemp mv readelf rm rmdir \
     sed sha256sum sort stat tar uniq wc; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Stage-0 verification requires $command" >&2
@@ -64,7 +64,7 @@ contract_value() {
     printf '%s' "$value"
 }
 
-allowed_keys='category name version schema target source_date_epoch publisher_image rust_version rust_host rust_manifest_url rust_manifest_sha256 rust_manifest_bytes cargo_url cargo_sha256 cargo_bytes clippy_url clippy_sha256 clippy_bytes rust_std_url rust_std_sha256 rust_std_bytes rustc_url rustc_sha256 rustc_bytes rustfmt_url rustfmt_sha256 rustfmt_bytes zig_version zig_url zig_sha256 zig_bytes output_name maximum_output_bytes maximum_tree_bytes maximum_tree_entries execution_gate'
+allowed_keys='category name version schema target source_date_epoch publisher_image rust_version rust_host rust_manifest_url rust_manifest_sha256 rust_manifest_bytes cargo_url cargo_sha256 cargo_bytes clippy_url clippy_sha256 clippy_bytes rust_std_url rust_std_sha256 rust_std_bytes rustc_url rustc_sha256 rustc_bytes rustfmt_url rustfmt_sha256 rustfmt_bytes zig_version zig_url zig_sha256 zig_bytes output_name maximum_output_bytes maximum_tree_bytes maximum_tree_entries execution_gate runtime_mount patchelf_url patchelf_sha256 patchelf_bytes patchelf_program_sha256'
 while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     [[ ! "$line" =~ [[:cntrl:]] ]] || {
@@ -76,6 +76,10 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         exit 2
     }
     key="${BASH_REMATCH[1]}"
+    if [[ "$key" =~ ^(image_member|runtime_alias)_[a-z_]+$ ]]; then
+        contract_value "$key" >/dev/null
+        continue
+    fi
     case " $allowed_keys " in
         *" $key "*) ;;
         *) echo "Stage-0 input contract contains unknown field: $key" >&2; exit 2 ;;
@@ -97,10 +101,10 @@ maximum_output_bytes="$(contract_value maximum_output_bytes)"
 maximum_tree_bytes="$(contract_value maximum_tree_bytes)"
 maximum_tree_entries="$(contract_value maximum_tree_entries)"
 execution_gate="$(contract_value execution_gate)"
-[[ "$schema" == ryeos.development.stage0-platform-inputs.v2 ]]
+[[ "$schema" == ryeos.development.stage0-platform-inputs.v3 ]]
 [[ "$(contract_value category)" == development/ryeos ]]
 [[ "$(contract_value name)" == stage0-platform-x86_64-linux ]]
-[[ "$(contract_value version)" == 2.0.0 ]]
+[[ "$(contract_value version)" == 3.0.0 ]]
 [[ "$target" == x86_64-unknown-linux-gnu && "$rust_host" == "$target" ]]
 [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 [[ "$zig_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -124,7 +128,12 @@ rust_dist_base="${rust_manifest_url%/*}"
 [[ "$maximum_output_bytes" =~ ^[1-9][0-9]*$ ]]
 [[ "$maximum_tree_bytes" =~ ^[1-9][0-9]*$ ]]
 [[ "$maximum_tree_entries" =~ ^[1-9][0-9]*$ ]]
-[[ "$execution_gate" == exact_runtime_root_mount_required ]]
+[[ "$execution_gate" == target_local_binding_and_isolated_acceptance_required ]]
+runtime_helper="$(dirname "$0")/development-toolchain-stage0-runtime.sh"
+[[ -f "$runtime_helper" && ! -L "$runtime_helper" ]]
+# shellcheck source=development-toolchain-stage0-runtime.sh
+source "$runtime_helper"
+runtime_contract_validate
 expected_output_name="ryeos-development-toolchain-stage0-rust-${rust_version}-zig-${zig_version}-${target}.tar.gz"
 [[ "$output_name" == "$expected_output_name" ]] || {
     echo "Stage-0 output name does not match its exact toolchain coordinate" >&2
@@ -283,8 +292,8 @@ retained="$tree/UPSTREAM-RUST-MANIFEST.toml"
 inputs_sha="$(awk 'NF && $0 !~ /^#/' "$inputs" | sha256sum | awk '{print $1}')"
 producer_sha="$(sha256sum "$producer" | awk '{print $1}')"
 cat > "$tmp/expected-bootstrap" <<EOF
-schema=ryeos.development-toolchain-bootstrap.v1
-artifact_class=compiler_payload
+schema=ryeos.development-toolchain-bootstrap.v2
+artifact_class=runtime_closed_platform_candidate
 execution_gate=$execution_gate
 target=$target
 rust_version=$rust_version
@@ -294,6 +303,7 @@ source_date_epoch=$epoch
 publisher_image=$publisher_image
 input_contract_body_sha256=$inputs_sha
 producer_sha256=$producer_sha
+runtime_helper_sha256=$(sha256sum "$runtime_helper" | awk '{print $1}')
 EOF
 cmp "$tmp/expected-bootstrap" "$tree/RYEOS-BOOTSTRAP" || {
     echo "Stage-0 bootstrap testimony contradicts its source contract" >&2
@@ -321,6 +331,8 @@ awk -F '\t' '
 }
 [[ -s "$tree/RYEOS-RUNTIME-DEPENDENCIES" ]]
 
+runtime_verify "$tree" "$tmp"
+
 actual_runtime_dependencies="$tmp/runtime-dependencies"
 : > "$actual_runtime_dependencies"
 while IFS= read -r -d '' executable; do
@@ -343,7 +355,7 @@ while IFS= read -r -d '' executable; do
         executable_sha="$(sha256sum "$executable" | awk '{print $1}')"
         printf '%s\t%s\tnon_elf\t-\t-\n' "$executable_sha" "$relative" >> "$actual_runtime_dependencies"
     fi
-done < <(find "$tree/rust" "$tree/zig" -type f -print0 | sort -z)
+done < <(find "$tree/rust" "$tree/zig" "$tree/lib" "$tree/native" -type f -print0 | sort -z)
 cmp "$actual_runtime_dependencies" "$tree/RYEOS-RUNTIME-DEPENDENCIES" || {
     echo "Stage-0 executable dependency testimony does not match the payload" >&2
     exit 2
@@ -376,8 +388,8 @@ tree_entries="$(find "$tree" -mindepth 1 -printf '.\n' | awk 'END {print NR + 0}
 if [[ -n "$materialize" ]]; then
     mv "$tree" "$materialize"
 fi
-echo "verified exact Stage-0 compiler payload: $archive"
+echo "verified exact Stage-0 runtime-closed platform candidate: $archive"
 if [[ -n "$materialize" ]]; then
     echo "materialized verified tree: $materialize"
 fi
-echo "execution remains gated on a separately bound exact runtime-root realization"
+echo "execution remains gated on target-local binding and isolated acceptance"

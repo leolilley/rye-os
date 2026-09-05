@@ -84,6 +84,9 @@ logs/
 !/.ai/manifest.yaml
 !/.ai/config/
 /.ai/config/*
+!/.ai/config/execution/
+/.ai/config/execution/*
+!/.ai/config/execution/project-snapshot.yaml
 !/.ai/config/development/
 /.ai/config/development/*
 !/.ai/config/development/ryeos/

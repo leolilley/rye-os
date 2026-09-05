@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-05T02:49:20Z:b4d86c4c82023f0567a275be33ff4b4e3b3b8505f1d11b9fe01c7725e8c2bdde:21PRqMdxVFkL/o24tonGJ4fJekcxvQtSupcR8kQC/7Kr2dVuXFsjVvk3BYEnFBIdkBHVOCa7h3CcRqRCpGUUDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T03:44:28Z:db20af25bb4944106eab7f07db910d1811ab3e9a0fcfce484930a87134fab1d4:/cmqxtrGHxIaeq0Hu6sdoqQcuhYGwPKlHzDPBbeBb8/Fp37yJNT0d7yxde4CtKnKK5gK8apcDFQx7+JuPHxJCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.5.0"
+version: "1.6.0"
 ```
 
 # Source-Local Bundle Development
@@ -45,6 +45,17 @@ set. There are no engine-provided `.git`, build-directory, `.env`, or project-
 specific defaults. RyeOS separately rejects its own identity, auth, vault,
 signing-key, state, cache, bundle-registry lock, and pull-transaction paths as
 a non-bypassable structural floor.
+
+Repository-specific exclusions are authored in the existing
+`.ai/config/execution/project-snapshot.yaml` contract. It excludes local
+qualification artifacts, nested worktrees, local nodes and each active source
+bundle's generated `bin`, `objects` and `refs` trees. These compose with node
+patterns; `.gitignore` is not capture authority. RyeOS's current anchored-path
+patterns are literal prefixes, so Git-style `bundles/*/...` patterns must not
+be pasted into this policy. The focused source-policy test checks every bundle
+in the development profile while retaining source, Tools and the public key
+fixture. Preflight must still inspect the actual manifest for retired/untracked
+directories before a real project is exposed to a worker.
 
 `.dev-keys/PUBLISHER_DEV.pem` is deliberately public, Git-tracked development
 fixture material and remains part of a `full_project` snapshot. Its signature
@@ -247,7 +258,7 @@ target and source-date epoch. It deliberately contains no output manifest
 digest: that digest does not exist until the real tree is produced and
 imported.
 
-Stage-0 input schema v2 removes the live Zig download catalog from acquisition.
+Stage-0 input schema v3 excludes the live Zig download catalog from acquisition.
 That catalog is discovery evidence when selecting a version, not a reproducible
 build input: unrelated nightly releases change its bytes. The authored versioned
 archive URL, exact size and SHA-256 remain unchanged and mandatory. Never update
@@ -258,10 +269,16 @@ silently interpreted under the new contract.
 `Dockerfile.development-realizations` runs the transparent publisher without a
 package-manager step. The producer downloads only the selected upstream
 archives, verifies exact sizes and digests, runs the upstream Rust component
-installers into a private tree, extracts Zig into that same compiler payload,
+installers into a private tree, extracts Zig into that same platform payload,
 records the publisher/input/producer/program coordinates, inventories every
-file, normalizes timestamps and emits one deterministic archive. No compiler,
-loader, library or other runtime byte is copied from the publisher image.
+file, normalizes timestamps and emits one deterministic archive. Its signed
+`image_member_*` rows additionally name exact canonical members of the pinned
+publisher image: source path, destination member, mode, size and SHA-256.
+These are explicit authoring sources, not execution-host discovery. They supply
+the loader, glibc, libgcc, zlib, native linker support and license notices.
+`runtime_alias_*` rows make regular copies of already verified tree members;
+they do not introduce symlinks or custom executables. Zig is the native C
+compiler/archiver; the upstream GCC driver and Rust LLD provide linking.
 The producer explicitly retains the Rust archive-level license/copyright
 notices that its component installer does not install. Installer logs,
 uninstall scripts and installed-component manifests are excluded: they describe
@@ -271,18 +288,32 @@ The retained input digest covers the canonical flat contract body, not its
 replaceable signature header, so re-signing unchanged semantics does not alter
 the produced tree.
 
-The official GNU Rust host executables are dynamically linked. The retained
-`RYEOS-RUNTIME-DEPENDENCIES` evidence says exactly which interpreter and
-libraries each executable requires. Consequently this compiler payload is not
-yet executable authority inside the Lillux private root. Its signed
-`execution_gate` remains `exact_runtime_root_mount_required` until an exact
-runtime-library closure is produced, verified and bound under
-`/ryeos/realizations/platform`. Generic runtime-root mount support already
-exists; it does not supply these bytes. Mounting ambient host `/lib`, `/lib64`,
-`/usr` or `/bin`, copying undeclared publisher-image libraries, or inserting a
-Rust/Zig-specific wrapper would violate the contract. Any future image-sourced
-library must be an explicitly selected, digest-verified member of a pinned
-authoring source, not discovered from the execution host.
+The official GNU Rust host executables are dynamically linked. The separately
+pinned upstream ELF authoring tool rewrites their interpreter and library paths
+to `/ryeos/realizations/platform`, with default-library search disabled. The
+shared publisher/verifier helper is bootstrap code, never a worker dispatcher.
+It records every pre/post digest in `RYEOS-ELF-TRANSFORMS`, records selected image
+members in `RYEOS-RUNTIME-SOURCES`, and inventories final interpreter/DT_NEEDED
+edges in `RYEOS-RUNTIME-DEPENDENCIES`. The verifier resolves every such edge
+inside the final tree and refuses undeclared executable scripts. Upstream
+GDB/GDBGUI/LLDB launchers are omitted from the finite development operation set.
+
+The selected ELF tool must preserve section order (`--no-sort`). Qualification
+found that its ordinary section sorting changed libgcc symbol section
+references despite a passing execution smoke test. Every transformed ELF is
+therefore also checked for unchanged symbol ownership and function coordinates;
+the tool's exit status alone is insufficient. This is an authoring check, not
+permission to repair arbitrary worker executables.
+
+The artifact class is `runtime_closed_platform_candidate`, not launch authority.
+Its signed `execution_gate` is
+`target_local_binding_and_isolated_acceptance_required`. The ordinary target
+import/binding and actual Lillux execution proof remain mandatory. Generic
+runtime-root support supplies the mount boundary, not implicit bytes. Ambient
+host `/lib`, `/lib64`, `/usr` or `/bin`, undeclared image members, and custom
+compiler wrappers remain forbidden. Produced build-script/test executables must
+use this same loader/library closure through declared compiler arguments;
+checking the compiler's own ELF edges alone does not prove its descendants.
 
 The verifier checks the closed archive shape, complete retained tree
 inventory, dated Rust-manifest hash, build testimony, executable dependency
@@ -301,7 +332,7 @@ scripts/release/verify-development-toolchain-stage0.sh \
 Qualifying Stage 0 runs the pinned publisher twice into distinct output
 directories (and preferably distinct empty caches), then passes both archive /
 checksum pairs to `test-development-toolchain-stage0.sh`. The test requires
-byte-identical archives and checksums before applying the verifier to both; it
+byte-identical archives and checksums before applying the full verifier once; it
 does not build or acquire anything itself. The tracked artifact tests consume
 already-built archives, do not compile RyeOS, and never manufacture substitute
 binaries. Artifact production and those tests remain explicit qualification

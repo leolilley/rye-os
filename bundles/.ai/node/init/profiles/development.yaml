@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T00:45:04Z:aea2f6c00f1a23092c69784a1d01a2babe3580ebb85403b5556509dd80de848b:WxGu4jPwScrgJTmtQLQOmErZrVqqhXOcBbVVcj3OWK3yDt9pUXymz32z3IEiQfsyD8e07WmvC4Ir5frpBA96Ag==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-05T03:35:48Z:57b352bf8d29032d0bf5125a6c5395fd8ebdaa7d89cc8df46283ea81dcd6ba65:E0FEJ/LY2U5hWsU8l1rjgwhjbmo1K/dAL6f9QukN2iUUWpCpDEHn2DJnLMeP6L+lYcdL/iOslZttaqBQIk11Aw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -224,7 +224,9 @@ policies:
     roots: {}
     limits:
       max_depth: 11
-      max_entries: 4480
+      # The declared development platform contains about 19,500 entries. This
+      # opt-in profile admits its bounded tree; ordinary profiles stay unchanged.
+      max_entries: 65536
       max_file_bytes: 1503300328
       max_total_bytes: 1514745854
       store_budget_bytes: 4294967296
