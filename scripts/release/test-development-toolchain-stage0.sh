@@ -35,6 +35,25 @@ verifier="$root/scripts/release/verify-development-toolchain-stage0.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Discovery is not acquisition authority. Neither endpoint may accept a live
+# catalog field, even alongside an otherwise complete pinned input contract.
+sed '$a zig_index_url: "https://ziglang.org/download/index.json"' \
+    "$inputs" > "$tmp/mutable-input.yaml"
+if "$producer" --inputs "$tmp/mutable-input.yaml" \
+    --cache "$tmp/cache" --output "$tmp/output.tar.gz" \
+    > "$tmp/producer-refusal" 2>&1; then
+    echo "Stage-0 producer accepted a mutable catalog dependency" >&2
+    exit 1
+fi
+grep -Fq 'unknown field: zig_index_url' "$tmp/producer-refusal"
+if "$verifier" --inputs "$tmp/mutable-input.yaml" \
+    --producer "$producer" --archive "$archive" \
+    > "$tmp/verifier-refusal" 2>&1; then
+    echo "Stage-0 verifier accepted a mutable catalog dependency" >&2
+    exit 1
+fi
+grep -Fq 'unknown field: zig_index_url' "$tmp/verifier-refusal"
+
 cmp "$archive" "$reproduction_archive" || {
     echo "independent Stage-0 productions emitted different archive bytes" >&2
     exit 1

@@ -1,7 +1,8 @@
+# ryeos:signed:2026-09-05T02:34:52Z:fef0792a99bc83c31f1db0dadc3220e1d89ac3f6dfd5a7bd06d38043621b09af:km4nEmVbzcl7CCFO9zYORwV6c3KJ/1pqe7RVNRgcI/4EMRJzHb86oSfvEmb95t/WFLLy9YAR0pCEDo3ZHicqDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "development/ryeos"
 name: "stage0-platform-x86_64-linux"
-version: "1.0.0"
-schema: "ryeos.development.stage0-platform-inputs.v1"
+version: "2.0.0"
+schema: "ryeos.development.stage0-platform-inputs.v2"
 target: "x86_64-unknown-linux-gnu"
 source_date_epoch: "1776297600"
 publisher_image: "docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c"
@@ -26,9 +27,8 @@ rustfmt_url: "https://static.rust-lang.org/dist/2026-04-16/rustfmt-1.95.0-x86_64
 rustfmt_sha256: "f1b2a7301513ffdd95ebf22ebbdd932e4d17fc806f748d93924740d0297b1396"
 rustfmt_bytes: "2164880"
 zig_version: "0.15.2"
-zig_index_url: "https://ziglang.org/download/index.json"
-zig_index_sha256: "2159dd43b42e0f1ccd0ace6b31fd17b1f8aada773d7566b24aa74c21e988b17d"
-zig_index_bytes: "76660"
+# The live upstream catalog is used when selecting these pins, never while
+# reproducing them. Unrelated nightly releases must not invalidate this input.
 zig_url: "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz"
 zig_sha256: "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
 zig_bytes: "53733924"

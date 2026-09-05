@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-04T09:13:19Z:2a2d23ee558c93d4ba47301cadcbdb71fe6f99396c2200754b4b0bb93c231753:ZCKpENZ0l4uw/vL7Y4DfHL7U/MjFOm+0LGNoGwntydqdVTNLE7F782BgNNfvUMVTSpn6FFY/Tx8TPKFS4dMlCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T02:49:20Z:b4d86c4c82023f0567a275be33ff4b4e3b3b8505f1d11b9fe01c7725e8c2bdde:21PRqMdxVFkL/o24tonGJ4fJekcxvQtSupcR8kQC/7Kr2dVuXFsjVvk3BYEnFBIdkBHVOCa7h3CcRqRCpGUUDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.4.0"
+version: "1.5.0"
 ```
 
 # Source-Local Bundle Development
@@ -178,6 +178,21 @@ toolchain and dependency trees remain read-only realizations. Do not add a
 durable runtime-view/cache authority merely to improve first-run performance;
 such reuse requires an explicit lifecycle, recovery, quota and GC contract.
 
+Multiple independent workers may consume the same immutable definitions,
+toolchain/dependency identities and base project generation. Each owns its
+writable workspace, command history and candidate. Identical content permits
+storage reuse; it does not imply that every materializer already deduplicates
+physical storage. Within one session, immutable child operations capture a
+stable current generation and exclusive operations use its existing workspace
+quiescence protocol. That protocol is not concurrent shared-directory editing
+authority for unrelated workers. Cargo target directories remain private; there
+is no implicit cross-worker writable build cache or automatic candidate merge.
+
+RyeOS-specific environment composition belongs to this repository's development
+configuration and Tools. Provider protocol and generic Codex integration remain
+in the Codex bundle. Neither may supply node policy, target identity or
+credential authority.
+
 ## Exact workload-client realization
 
 The restricted workload client is an external realization, not a Core bundle
@@ -227,10 +242,18 @@ scripts/release/verify-workload-client-realization.sh \
 `.ai/config/development/ryeos/stage0-platform-x86_64-linux.yaml` is the
 source-local signed input contract for the first compiler payload. It selects
 the exact linux/amd64 publisher-image manifest, immutable dated Rust 1.95.0
-component archives, Zig 0.15.2 archive, upstream indexes, byte bounds, hashes,
+component archives, Zig 0.15.2 archive, dated Rust manifest, byte bounds, hashes,
 target and source-date epoch. It deliberately contains no output manifest
 digest: that digest does not exist until the real tree is produced and
 imported.
+
+Stage-0 input schema v2 removes the live Zig download catalog from acquisition.
+That catalog is discovery evidence when selecting a version, not a reproducible
+build input: unrelated nightly releases change its bytes. The authored versioned
+archive URL, exact size and SHA-256 remain unchanged and mandatory. Never update
+a catalog digest to whatever a build happens to download or consult a latest
+catalog to replace a pinned archive. The old input schema is rejected, not
+silently interpreted under the new contract.
 
 `Dockerfile.development-realizations` runs the transparent publisher without a
 package-manager step. The producer downloads only the selected upstream
@@ -239,6 +262,11 @@ installers into a private tree, extracts Zig into that same compiler payload,
 records the publisher/input/producer/program coordinates, inventories every
 file, normalizes timestamps and emits one deterministic archive. No compiler,
 loader, library or other runtime byte is copied from the publisher image.
+The producer explicitly retains the Rust archive-level license/copyright
+notices that its component installer does not install. Installer logs,
+uninstall scripts and installed-component manifests are excluded: they describe
+a mutable installation and embed random authoring-directory paths. The verifier
+requires the notices and rejects that bookkeeping in the immutable payload.
 The retained input digest covers the canonical flat contract body, not its
 replaceable signature header, so re-signing unchanged semantics does not alter
 the produced tree.
@@ -247,14 +275,17 @@ The official GNU Rust host executables are dynamically linked. The retained
 `RYEOS-RUNTIME-DEPENDENCIES` evidence says exactly which interpreter and
 libraries each executable requires. Consequently this compiler payload is not
 yet executable authority inside the Lillux private root. Its signed
-`execution_gate` remains `exact_runtime_root_mount_required` until generic
-effective-program data can bind descriptor-pinned external-content runtime
-roots at their exact absolute namespace destinations. Mounting ambient host
-`/lib`, `/lib64`, `/usr` or `/bin`, copying those paths from the publisher
-image, or inserting a Rust/Zig-specific wrapper would violate the contract.
+`execution_gate` remains `exact_runtime_root_mount_required` until an exact
+runtime-library closure is produced, verified and bound under
+`/ryeos/realizations/platform`. Generic runtime-root mount support already
+exists; it does not supply these bytes. Mounting ambient host `/lib`, `/lib64`,
+`/usr` or `/bin`, copying undeclared publisher-image libraries, or inserting a
+Rust/Zig-specific wrapper would violate the contract. Any future image-sourced
+library must be an explicitly selected, digest-verified member of a pinned
+authoring source, not discovered from the execution host.
 
 The verifier checks the closed archive shape, complete retained tree
-inventory, upstream-index hashes, build testimony, executable dependency
+inventory, dated Rust-manifest hash, build testimony, executable dependency
 evidence and signed bounds before optionally publishing one sibling-staged
 directory. It does not clear the execution gate:
 

@@ -64,7 +64,7 @@ contract_value() {
     printf '%s' "$value"
 }
 
-allowed_keys='category name version schema target source_date_epoch publisher_image rust_version rust_host rust_manifest_url rust_manifest_sha256 rust_manifest_bytes cargo_url cargo_sha256 cargo_bytes clippy_url clippy_sha256 clippy_bytes rust_std_url rust_std_sha256 rust_std_bytes rustc_url rustc_sha256 rustc_bytes rustfmt_url rustfmt_sha256 rustfmt_bytes zig_version zig_index_url zig_index_sha256 zig_index_bytes zig_url zig_sha256 zig_bytes output_name maximum_output_bytes maximum_tree_bytes maximum_tree_entries execution_gate'
+allowed_keys='category name version schema target source_date_epoch publisher_image rust_version rust_host rust_manifest_url rust_manifest_sha256 rust_manifest_bytes cargo_url cargo_sha256 cargo_bytes clippy_url clippy_sha256 clippy_bytes rust_std_url rust_std_sha256 rust_std_bytes rustc_url rustc_sha256 rustc_bytes rustfmt_url rustfmt_sha256 rustfmt_bytes zig_version zig_url zig_sha256 zig_bytes output_name maximum_output_bytes maximum_tree_bytes maximum_tree_entries execution_gate'
 while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     [[ ! "$line" =~ [[:cntrl:]] ]] || {
@@ -97,10 +97,10 @@ maximum_output_bytes="$(contract_value maximum_output_bytes)"
 maximum_tree_bytes="$(contract_value maximum_tree_bytes)"
 maximum_tree_entries="$(contract_value maximum_tree_entries)"
 execution_gate="$(contract_value execution_gate)"
-[[ "$schema" == ryeos.development.stage0-platform-inputs.v1 ]]
+[[ "$schema" == ryeos.development.stage0-platform-inputs.v2 ]]
 [[ "$(contract_value category)" == development/ryeos ]]
 [[ "$(contract_value name)" == stage0-platform-x86_64-linux ]]
-[[ "$(contract_value version)" == 1.0.0 ]]
+[[ "$(contract_value version)" == 2.0.0 ]]
 [[ "$target" == x86_64-unknown-linux-gnu && "$rust_host" == "$target" ]]
 [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 [[ "$zig_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -117,9 +117,8 @@ rust_dist_base="${rust_manifest_url%/*}"
     echo "Stage-0 Rust inputs do not match their exact version/host manifest coordinate" >&2
     exit 2
 }
-[[ "$(contract_value zig_index_url)" == https://ziglang.org/download/index.json \
-    && "$(contract_value zig_url)" == "https://ziglang.org/download/${zig_version}/zig-x86_64-linux-${zig_version}.tar.xz" ]] || {
-    echo "Stage-0 Zig inputs do not match their exact version/target index coordinate" >&2
+[[ "$(contract_value zig_url)" == "https://ziglang.org/download/${zig_version}/zig-x86_64-linux-${zig_version}.tar.xz" ]] || {
+    echo "Stage-0 Zig input does not match its exact version/target coordinate" >&2
     exit 2
 }
 [[ "$maximum_output_bytes" =~ ^[1-9][0-9]*$ ]]
@@ -259,24 +258,27 @@ done < <(find "$tree" -mindepth 1 -print0 | sort -z)
 [[ -f "$tree/rust/share/doc/rust/COPYRIGHT" \
     && -f "$tree/rust/share/doc/rust/LICENSE-APACHE" \
     && -f "$tree/rust/share/doc/rust/LICENSE-MIT" \
-    && -f "$tree/zig/LICENSE" ]]
+    && -f "$tree/zig/LICENSE" ]] || {
+    echo "Stage-0 payload is missing required Rust/Zig license notices" >&2
+    exit 2
+}
+for metadata in components install.log rust-installer-version uninstall.sh \
+    manifest-cargo manifest-clippy-preview "manifest-rust-std-$rust_host" \
+    manifest-rustc manifest-rustfmt-preview; do
+    [[ ! -e "$tree/rust/lib/rustlib/$metadata" ]] || {
+        echo "Stage-0 payload contains mutable installer bookkeeping: $metadata" >&2
+        exit 2
+    }
+done
 [[ -f "$tree/UPSTREAM-RUST-MANIFEST.toml" \
-    && -f "$tree/UPSTREAM-ZIG-INDEX.json" \
     && -f "$tree/RYEOS-BOOTSTRAP" \
     && -f "$tree/RYEOS-AUTHORING-PROGRAMS" \
     && -f "$tree/RYEOS-RUNTIME-DEPENDENCIES" \
     && -f "$tree/RYEOS-TREE-SHA256" ]]
 
-for id in rust_manifest zig_index; do
-    expected_sha="$(contract_value "${id}_sha256")"
-    expected_bytes="$(contract_value "${id}_bytes")"
-    case "$id" in
-        rust_manifest) retained="$tree/UPSTREAM-RUST-MANIFEST.toml" ;;
-        zig_index) retained="$tree/UPSTREAM-ZIG-INDEX.json" ;;
-    esac
-    [[ "$(stat -c '%s' "$retained")" == "$expected_bytes" \
-        && "$(sha256sum "$retained" | awk '{print $1}')" == "$expected_sha" ]]
-done
+retained="$tree/UPSTREAM-RUST-MANIFEST.toml"
+[[ "$(stat -c '%s' "$retained")" == "$(contract_value rust_manifest_bytes)" \
+    && "$(sha256sum "$retained" | awk '{print $1}')" == "$(contract_value rust_manifest_sha256)" ]]
 
 inputs_sha="$(awk 'NF && $0 !~ /^#/' "$inputs" | sha256sum | awk '{print $1}')"
 producer_sha="$(sha256sum "$producer" | awk '{print $1}')"

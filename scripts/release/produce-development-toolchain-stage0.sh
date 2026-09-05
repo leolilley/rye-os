@@ -41,7 +41,7 @@ for command in awk basename bash cat chmod cmp cp curl dirname find grep gzip \
     }
 done
 
-allowed_keys='category name version schema target source_date_epoch publisher_image rust_version rust_host rust_manifest_url rust_manifest_sha256 rust_manifest_bytes cargo_url cargo_sha256 cargo_bytes clippy_url clippy_sha256 clippy_bytes rust_std_url rust_std_sha256 rust_std_bytes rustc_url rustc_sha256 rustc_bytes rustfmt_url rustfmt_sha256 rustfmt_bytes zig_version zig_index_url zig_index_sha256 zig_index_bytes zig_url zig_sha256 zig_bytes output_name maximum_output_bytes maximum_tree_bytes maximum_tree_entries execution_gate'
+allowed_keys='category name version schema target source_date_epoch publisher_image rust_version rust_host rust_manifest_url rust_manifest_sha256 rust_manifest_bytes cargo_url cargo_sha256 cargo_bytes clippy_url clippy_sha256 clippy_bytes rust_std_url rust_std_sha256 rust_std_bytes rustc_url rustc_sha256 rustc_bytes rustfmt_url rustfmt_sha256 rustfmt_bytes zig_version zig_url zig_sha256 zig_bytes output_name maximum_output_bytes maximum_tree_bytes maximum_tree_entries execution_gate'
 
 contract_value() {
     local wanted="$1"
@@ -95,10 +95,10 @@ maximum_tree_bytes="$(contract_value maximum_tree_bytes)"
 maximum_tree_entries="$(contract_value maximum_tree_entries)"
 execution_gate="$(contract_value execution_gate)"
 
-[[ "$schema" == ryeos.development.stage0-platform-inputs.v1 ]]
+[[ "$schema" == ryeos.development.stage0-platform-inputs.v2 ]]
 [[ "$(contract_value category)" == development/ryeos ]]
 [[ "$(contract_value name)" == stage0-platform-x86_64-linux ]]
-[[ "$(contract_value version)" == 1.0.0 ]]
+[[ "$(contract_value version)" == 2.0.0 ]]
 [[ "$target" == x86_64-unknown-linux-gnu && "$rust_host" == "$target" ]]
 [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 [[ "$zig_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
@@ -115,9 +115,10 @@ rust_dist_base="${rust_manifest_url%/*}"
     echo "Stage-0 Rust inputs do not match their exact version/host manifest coordinate" >&2
     exit 2
 }
-[[ "$(contract_value zig_index_url)" == https://ziglang.org/download/index.json \
-    && "$(contract_value zig_url)" == "https://ziglang.org/download/${zig_version}/zig-x86_64-linux-${zig_version}.tar.xz" ]] || {
-    echo "Stage-0 Zig inputs do not match their exact version/target index coordinate" >&2
+# Discovery catalogs are mutable. Only the versioned archive selected by the
+# authored URL/size/digest contract belongs in a reproducible acquisition.
+[[ "$(contract_value zig_url)" == "https://ziglang.org/download/${zig_version}/zig-x86_64-linux-${zig_version}.tar.xz" ]] || {
+    echo "Stage-0 Zig input does not match its exact version/target coordinate" >&2
     exit 2
 }
 [[ "${RYEOS_STAGE0_PUBLISHER_IMAGE:-}" == "$publisher_image" ]] || {
@@ -215,7 +216,7 @@ fetch_input() {
     cp "$destination" "$tmp/${id}.input"
 }
 
-for id in rust_manifest cargo clippy rust_std rustc rustfmt zig_index zig; do
+for id in rust_manifest cargo clippy rust_std rustc rustfmt zig; do
     fetch_input "$id"
 done
 
@@ -223,8 +224,6 @@ for id in cargo clippy rust_std rustc rustfmt; do
     grep -Fq "$(contract_value "${id}_url")" "$tmp/rust_manifest.input"
     grep -Fq "$(contract_value "${id}_sha256")" "$tmp/rust_manifest.input"
 done
-grep -Fq "$(contract_value zig_url)" "$tmp/zig_index.input"
-grep -Fq "$(contract_value zig_sha256)" "$tmp/zig_index.input"
 
 stage="$tmp/tree"
 mkdir "$stage"
@@ -241,6 +240,31 @@ for id in cargo clippy rust_std rustc rustfmt; do
         --prefix=/rust \
         --destdir="$stage" \
         --disable-ldconfig
+    if [[ "$id" == rustc ]]; then
+        # The component installer omits the archive-level Rust notices. Keep
+        # them from the exact verified archive, not from the publisher image.
+        for notice in COPYRIGHT LICENSE-APACHE LICENSE-MIT; do
+            [[ -f "${roots[0]}/$notice" && ! -L "${roots[0]}/$notice" ]] || {
+                echo "Rust archive is missing required notice: $notice" >&2
+                exit 2
+            }
+            install -D -m 0644 "${roots[0]}/$notice" "$stage/rust/share/doc/rust/$notice"
+        done
+    fi
+done
+
+# Installer state records random destdir paths and offers mutation operations
+# that do not belong in an immutable realization. Remove only this exact
+# bookkeeping set; compiler files, libraries and notices remain untouched.
+for metadata in components install.log rust-installer-version uninstall.sh \
+    manifest-cargo manifest-clippy-preview "manifest-rust-std-$rust_host" \
+    manifest-rustc manifest-rustfmt-preview; do
+    path="$stage/rust/lib/rustlib/$metadata"
+    [[ -f "$path" && ! -L "$path" ]] || {
+        echo "Rust installer bookkeeping does not match the selected components: $metadata" >&2
+        exit 2
+    }
+    rm -- "$path"
 done
 
 zig_extract="$tmp/zig-extract"
@@ -252,7 +276,6 @@ zig_root="$zig_extract/zig-x86_64-linux-$zig_version"
 mv "$zig_root" "$stage/zig"
 
 cp "$tmp/rust_manifest.input" "$stage/UPSTREAM-RUST-MANIFEST.toml"
-cp "$tmp/zig_index.input" "$stage/UPSTREAM-ZIG-INDEX.json"
 inputs_sha="$(awk 'NF && $0 !~ /^#/' "$inputs" | sha256sum | awk '{print $1}')"
 producer_sha="$(sha256sum "$0" | awk '{print $1}')"
 cat > "$stage/RYEOS-BOOTSTRAP" <<EOF
