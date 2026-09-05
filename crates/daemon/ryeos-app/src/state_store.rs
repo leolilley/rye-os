@@ -25,11 +25,12 @@ use crate::runtime_db;
 use crate::write_barrier::{WriteBarrier, WritePermit};
 pub use runtime_db::{
     CommandRecord, CredentialProfileRecord, CredentialProfileReservationRecord,
-    DedicatedSessionApprovalRecord, DedicatedSessionCommandRecord, DedicatedSessionRecord,
-    HookDispatchReservation, LaunchPlanningAlreadyReserved, LaunchPlanningCapacityExceeded,
-    LaunchPlanningRecord, NewCommandRecord, NewCredentialProfile, NewCredentialProfileReservation,
-    NewDedicatedSession, NewDedicatedSessionApproval, NewDedicatedSessionCommand, NewHookDispatch,
-    ObservationBatchReservation, RuntimeInfo, StopIntent, WorkerProcessRecord,
+    DedicatedCandidateDisposition, DedicatedSessionApprovalRecord, DedicatedSessionCommandRecord,
+    DedicatedSessionRecord, HookDispatchReservation, LaunchPlanningAlreadyReserved,
+    LaunchPlanningCapacityExceeded, LaunchPlanningRecord, NewCommandRecord, NewCredentialProfile,
+    NewCredentialProfileReservation, NewDedicatedSession, NewDedicatedSessionApproval,
+    NewDedicatedSessionCommand, NewHookDispatch, ObservationBatchReservation, RuntimeInfo,
+    StopIntent, WorkerProcessRecord,
 };
 
 mod projection_access;
@@ -5258,6 +5259,30 @@ impl StateStore {
         g.runtime_db.reserve_dedicated_session_command(command)
     }
 
+    pub fn reserve_dedicated_session_bounded_outcome(
+        &self,
+        placement_thread_id: &str,
+        outcome: &ryeos_runtime::callback::DedicatedSessionBoundedOutcome,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db
+            .reserve_dedicated_session_bounded_outcome(placement_thread_id, outcome)
+    }
+
+    pub fn require_bounded_route_contact_admission(
+        &self,
+        placement_thread_id: &str,
+        worker_boot_epoch: u64,
+        command_kind: &str,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.require_bounded_route_contact_admission(
+            placement_thread_id,
+            worker_boot_epoch,
+            command_kind,
+        )
+    }
+
     pub fn settled_dedicated_session_command_replay(
         &self,
         placement_thread_id: &str,
@@ -5286,6 +5311,24 @@ impl StateStore {
             .dedicated_session_command(placement_thread_id, command_sequence)
     }
 
+    pub fn dedicated_session_command_by_key(
+        &self,
+        placement_thread_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<DedicatedSessionCommandRecord>> {
+        let g = self.lock()?;
+        g.runtime_db
+            .dedicated_session_command_by_key(placement_thread_id, idempotency_key)
+    }
+
+    pub fn dedicated_session_commands(
+        &self,
+        placement_thread_id: &str,
+    ) -> Result<Vec<DedicatedSessionCommandRecord>> {
+        let g = self.lock()?;
+        g.runtime_db.dedicated_session_commands(placement_thread_id)
+    }
+
     pub fn dedicated_session_checkpoint_settlement_digest(
         &self,
         placement_thread_id: &str,
@@ -5311,6 +5354,38 @@ impl StateStore {
             placement_thread_id,
             command_sequence,
             worker_boot_epoch,
+        )
+    }
+
+    pub fn settle_dedicated_command_uncontacted(
+        &self,
+        placement_thread_id: &str,
+        command_sequence: u64,
+        worker_boot_epoch: u64,
+        result: &Value,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.settle_dedicated_command_uncontacted(
+            placement_thread_id,
+            command_sequence,
+            worker_boot_epoch,
+            result,
+        )
+    }
+
+    pub fn repair_fenced_dedicated_command_budget_refusal(
+        &self,
+        placement_thread_id: &str,
+        command_sequence: u64,
+        worker_boot_epoch: u64,
+        result: &Value,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.repair_fenced_dedicated_command_budget_refusal(
+            placement_thread_id,
+            command_sequence,
+            worker_boot_epoch,
+            result,
         )
     }
 
@@ -5376,6 +5451,21 @@ impl StateStore {
             command_sequence,
             worker_boot_epoch,
         )
+    }
+
+    pub fn mark_committed_dedicated_command_contact_unknown(
+        &self,
+        placement_thread_id: &str,
+        command_sequence: u64,
+        worker_boot_epoch: u64,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db
+            .mark_committed_dedicated_command_contact_unknown(
+                placement_thread_id,
+                command_sequence,
+                worker_boot_epoch,
+            )
     }
 
     pub fn reserve_dedicated_observation_batch(
@@ -5494,6 +5584,16 @@ impl StateStore {
             .pending_dedicated_session_approvals(placement_thread_id)
     }
 
+    pub fn dedicated_session_approval(
+        &self,
+        placement_thread_id: &str,
+        approval_id: &str,
+    ) -> Result<Option<runtime_db::DedicatedSessionApprovalRecord>> {
+        let g = self.lock()?;
+        g.runtime_db
+            .dedicated_session_approval(placement_thread_id, approval_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn dedicated_approval_has_exact_state(
         &self,
@@ -5554,13 +5654,29 @@ impl StateStore {
         &self,
         placement_thread_id: &str,
         worker_boot_epoch: u64,
-        expected_route_command_sequence: Option<u64>,
+        completion_fence: &ryeos_runtime::callback::HostedCommandCompletionFence,
     ) -> Result<()> {
         let g = self.lock()?;
         g.runtime_db.reserve_dedicated_session_completion(
             placement_thread_id,
             worker_boot_epoch,
-            expected_route_command_sequence,
+            completion_fence,
+        )
+    }
+
+    pub fn reserve_dedicated_session_bounded_completion(
+        &self,
+        placement_thread_id: &str,
+        worker_boot_epoch: u64,
+        completion_fence: &ryeos_runtime::callback::HostedCommandCompletionFence,
+        outcome: &ryeos_runtime::callback::DedicatedSessionBoundedOutcome,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.reserve_dedicated_session_bounded_completion(
+            placement_thread_id,
+            worker_boot_epoch,
+            completion_fence,
+            outcome,
         )
     }
 
@@ -5804,26 +5920,46 @@ impl StateStore {
             .bind_dedicated_session_candidate(placement_thread_id, snapshot_hash)
     }
 
+    pub fn settle_dedicated_candidate_retained_for_review(
+        &self,
+        placement_thread_id: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db
+            .settle_dedicated_candidate_retained_for_review(placement_thread_id, snapshot_hash)
+    }
+
     pub fn reserve_dedicated_candidate_publication(
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        publication_root_id: &str,
+        publication_operation_id: &str,
     ) -> Result<()> {
         let g = self.lock()?;
-        g.runtime_db
-            .reserve_dedicated_candidate_publication(placement_thread_id, candidate_snapshot_hash)
+        g.runtime_db.reserve_dedicated_candidate_publication(
+            placement_thread_id,
+            candidate_snapshot_hash,
+            publication_root_id,
+            publication_operation_id,
+        )
     }
 
     pub fn settle_dedicated_candidate_publication(
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        publication_root_id: &str,
+        publication_operation_id: &str,
         publication_result: &str,
     ) -> Result<()> {
         let g = self.lock()?;
         g.runtime_db.settle_dedicated_candidate_publication(
             placement_thread_id,
             candidate_snapshot_hash,
+            publication_root_id,
+            publication_operation_id,
             publication_result,
         )
     }
@@ -5858,24 +5994,123 @@ impl StateStore {
         )
     }
 
+    pub fn reserve_dedicated_candidate_evaluation(
+        &self,
+        placement_thread_id: &str,
+        candidate_snapshot_hash: &str,
+        candidate_validation_hash: &str,
+        expected_previous_evaluation_hash: Option<&str>,
+        candidate_evaluation_hash: &str,
+        candidate_evaluation: &serde_json::Value,
+        qualification_root_id: &str,
+        qualification_operation_id: &str,
+        reserved_integration_launch: Option<(&str, &str, &str)>,
+    ) -> Result<()> {
+        if reserved_integration_launch
+            .is_some_and(|(launch_id, _, _)| !is_canonical_launch_id(launch_id))
+        {
+            bail!("candidate integration launch id is not canonical");
+        }
+        let g = self.lock()?;
+        g.runtime_db.reserve_dedicated_candidate_evaluation(
+            placement_thread_id,
+            candidate_snapshot_hash,
+            candidate_validation_hash,
+            expected_previous_evaluation_hash,
+            candidate_evaluation_hash,
+            candidate_evaluation,
+            qualification_root_id,
+            qualification_operation_id,
+            reserved_integration_launch,
+        )
+    }
+
+    pub fn settle_dedicated_candidate_evaluation(
+        &self,
+        placement_thread_id: &str,
+        candidate_snapshot_hash: &str,
+        candidate_validation_hash: &str,
+        expected_previous_evaluation_hash: Option<&str>,
+        candidate_evaluation_hash: &str,
+        candidate_evaluation: &serde_json::Value,
+        qualification_root_id: &str,
+        qualification_operation_id: &str,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.settle_dedicated_candidate_evaluation(
+            placement_thread_id,
+            candidate_snapshot_hash,
+            candidate_validation_hash,
+            expected_previous_evaluation_hash,
+            candidate_evaluation_hash,
+            candidate_evaluation,
+            qualification_root_id,
+            qualification_operation_id,
+        )
+    }
+
+    pub fn rollback_dedicated_candidate_evaluation(
+        &self,
+        placement_thread_id: &str,
+        qualification_root_id: &str,
+        qualification_operation_id: &str,
+        reserved_integration_launch: Option<(&str, &str, &str)>,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.rollback_dedicated_candidate_evaluation(
+            placement_thread_id,
+            qualification_root_id,
+            qualification_operation_id,
+            reserved_integration_launch,
+        )
+    }
+
     pub fn reserve_dedicated_candidate_discard(
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        disposition_root_id: &str,
+        disposition_operation_id: &str,
     ) -> Result<()> {
         let g = self.lock()?;
-        g.runtime_db
-            .reserve_dedicated_candidate_discard(placement_thread_id, candidate_snapshot_hash)
+        g.runtime_db.reserve_dedicated_candidate_discard(
+            placement_thread_id,
+            candidate_snapshot_hash,
+            disposition_root_id,
+            disposition_operation_id,
+        )
+    }
+
+    pub fn rollback_dedicated_candidate_discard(
+        &self,
+        placement_thread_id: &str,
+        candidate_snapshot_hash: &str,
+        disposition_root_id: &str,
+        disposition_operation_id: &str,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        g.runtime_db.rollback_dedicated_candidate_discard(
+            placement_thread_id,
+            candidate_snapshot_hash,
+            disposition_root_id,
+            disposition_operation_id,
+        )
     }
 
     pub fn settle_dedicated_candidate_discard(
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        disposition_root_id: &str,
+        disposition_operation_id: &str,
     ) -> Result<()> {
         let g = self.lock()?;
-        g.runtime_db
-            .settle_dedicated_candidate_discard(placement_thread_id, candidate_snapshot_hash)
+        g.runtime_db.settle_dedicated_candidate_discard(
+            placement_thread_id,
+            candidate_snapshot_hash,
+            disposition_root_id,
+            disposition_operation_id,
+        )
     }
 
     /// Run a state publication while the exact execution launch owner remains
@@ -10396,7 +10631,7 @@ impl StateStore {
                 }
                 Some(bound_thread_id)
             }
-            "planning" | "cancelled" | "failed" | "expired" => None,
+            "qualified" | "planning" | "cancelled" | "failed" | "expired" => None,
             other => bail!("launch planning record `{launch_id}` has unknown state `{other}`"),
         };
         Ok(Some(LaunchPlanningStatus {
@@ -10405,6 +10640,38 @@ impl StateStore {
             status: record.state,
             outcome_code: record.outcome_code,
         }))
+    }
+
+    /// Read one owner-bound launch-planning row without hiding its pre-minted
+    /// thread coordinate. Candidate integration uses this only after the same
+    /// coordinate was atomically committed with owner qualification.
+    pub fn launch_planning_record_for_owner(
+        &self,
+        launch_id: &str,
+        requested_by: &str,
+    ) -> Result<Option<runtime_db::LaunchPlanningRecord>> {
+        let g = self.lock()?;
+        Ok(g.runtime_db
+            .launch_planning_by_id(launch_id)?
+            .filter(|record| record.requested_by == requested_by))
+    }
+
+    pub fn activate_qualified_launch_planning(
+        &self,
+        launch_id: &str,
+        reserved_thread_id: &str,
+        requested_by: &str,
+    ) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        if !g.runtime_db.activate_qualified_launch_planning(
+            launch_id,
+            reserved_thread_id,
+            requested_by,
+        )? {
+            bail!("qualified launch planning coordinate is no longer startable");
+        }
+        Ok(())
     }
 
     pub fn ensure_launch_planning_active(&self, reserved_thread_id: &str) -> Result<()> {
@@ -10544,6 +10811,16 @@ impl StateStore {
         };
         if record.requested_by != requested_by {
             return Ok(None);
+        }
+        if record.state == "qualified" {
+            if g.state_db.get_thread(&record.reserved_thread_id)?.is_some() {
+                bail!(
+                    "qualified launch planning record `{launch_id}` unexpectedly has an authoritative thread"
+                );
+            }
+            if g.runtime_db.cancel_unbound_launch_planning(launch_id)? {
+                return Ok(Some(LaunchCancellationResolution::Cancelled));
+            }
         }
         if record.state == "planning" {
             if let Some(thread) = g.state_db.get_thread(&record.reserved_thread_id)? {
@@ -10823,6 +11100,9 @@ impl StateStore {
         let mut pins = g
             .runtime_db
             .inspect_chain_recovery_pins(&chain.chain_root_id, &chain.thread_ids)?;
+        pins.candidate_evidence = g
+            .runtime_db
+            .candidate_evidence_pin_count(&chain.chain_root_id)?;
         let members = chain
             .thread_ids
             .iter()
@@ -12714,6 +12994,7 @@ impl StateStore {
                 roots.insert(frozen);
             }
         }
+        roots.extend(g.runtime_db.retained_candidate_snapshot_roots()?);
         roots.extend(g.runtime_db.handoff_cas_object_roots()?);
         Ok(roots.into_iter().collect())
     }
@@ -13835,6 +14116,35 @@ impl StateStore {
         let g = self.lock()?;
         let _admission = Self::authorize_runtime_pin_for_thread(&g, thread_id)?;
         g.runtime_db.bind_frozen_workspace_generation(
+            workspace_id,
+            thread_id,
+            launch_owner,
+            snapshot_hash,
+        )
+    }
+
+    /// Finish a callback freeze during startup after the dead generation's
+    /// launch claim has been cleared. This does not relax the live bind path:
+    /// the old owner must be inactive, no replacement claim may exist, and the
+    /// runtime database additionally requires an exact dead-generation owner
+    /// and workspace tuple.
+    pub fn bind_abandoned_frozen_execution_workspace(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        let _admission = Self::authorize_runtime_pin_for_thread(&g, thread_id)?;
+        if self.is_launch_owner_active(launch_owner) {
+            bail!("active launch owner cannot use abandoned freeze recovery");
+        }
+        if g.runtime_db.get_launch_claim(thread_id)?.is_some() {
+            bail!("abandoned freeze recovery refuses a replacement launch claim");
+        }
+        g.runtime_db.bind_abandoned_frozen_workspace_generation(
             workspace_id,
             thread_id,
             launch_owner,
@@ -19682,6 +19992,7 @@ mod tests {
                 scopes: vec!["execute".to_string()],
             }),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: Vec::new(),
             parent_delegation_caps: None,
             executor_ref: Some("native:test".to_string()),

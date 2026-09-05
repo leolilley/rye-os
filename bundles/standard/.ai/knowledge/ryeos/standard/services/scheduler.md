@@ -15,7 +15,27 @@ Services: `scheduler/register`, `scheduler/list`, `scheduler/deregister`, `sched
 `scheduler/register` requires an explicit complete schedule contract:
 `schedule_id`, `item_ref`, `schedule_type`, `expression`, object `params`,
 `timezone`, `misfire_policy`, `overlap_policy`, positive
-`lateness_grace_secs`, and boolean `enabled`. `project_root` is optional.
-No scheduling or policy field is defaulted by the daemon.
+`lateness_grace_secs`, boolean `enabled`, a sorted unique non-empty
+`capabilities` subset, and a complete `execution_policy`. `project_root` must
+be absent for projectless execution and present for both explicit
+`live_direct` and `pinned` project execution. No scheduling or execution-policy
+field is defaulted by the daemon.
+
+Registration seals the authenticated principal's current grant generation
+into the schedule authority. Every fire revalidates that exact grant and the
+declared capability subset before launching. A `live_direct` fire intentionally
+resolves the live project again at each fire and recovery and is never
+implicitly snapshotted. A `pinned` fire binds one durable
+`current_head` or explicit `snapshot` authority and retains it through recovery;
+it never falls back to the live tree. Scheduled execution does not permit
+interactive `capture_live`.
+
+The admitted fire context is exposed without changing ordinary item
+parameters: graph and directive expressions use `execution.schedule`, while a
+direct subprocess tool reads the identical canonical JSON projection from the
+protected `RYEOS_EXECUTION_CONTEXT` environment variable. Recovery preserves
+that exact context; a later fire receives a different `fire_id`. External
+observation actions should bind that ID explicitly so recovery replays the same
+fire while a later fire receives a fresh observation coordinate.
 
 Scheduler descriptors live in standard because scheduled work is a workflow-layer feature that launches directives/graphs through the normal execution runner.

@@ -71,6 +71,7 @@ fn local_plan_ctx() -> PlanContext {
         current_site_id: "site:local".into(),
         origin_site_id: "site:local".into(),
         execution_hints: ryeos_engine::contracts::ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: true,
     }
 }

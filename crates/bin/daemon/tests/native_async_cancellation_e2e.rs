@@ -132,6 +132,7 @@ fn plan_ctx(project_dir: &Path) -> PlanContext {
         current_site_id: "site:test".into(),
         origin_site_id: "site:test".into(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     }
 }

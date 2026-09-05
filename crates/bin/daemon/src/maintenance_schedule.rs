@@ -9,8 +9,8 @@
 //! other schedule.
 //!
 //! Why policy + init-time reconcile instead of storing only the final spec:
-//! the node spec must carry `execution.requester_fingerprint` (the acting
-//! principal at dispatch) and a node signature. Those are per-install, so they
+//! the node spec must carry the acting node authority and a node signature.
+//! Those are per-install, so they
 //! cannot be supplied by an init profile — the daemon fills its own identity.
 //!
 //! Ownership & operator control: generated specs carry a specific `managed_by`
@@ -357,7 +357,7 @@ fn maintenance_spec_body(
 ) -> Value {
     // The node is both signer and acting principal for its own maintenance.
     serde_json::json!({
-        "spec_version": 1,
+        "spec_version": 2,
         "schedule_id": decl.schedule_id,
         "item_ref": decl.item_ref,
         "ref_bindings": decl.ref_bindings,
@@ -372,8 +372,15 @@ fn maintenance_spec_body(
         "params": decl.params,
         "project_root": Value::Null,
         "execution": {
-            "requester_fingerprint": identity.fingerprint(),
+            "authority": {
+                "kind": "node",
+                "principal_id": identity.principal_id(),
+                "effective_origin_site_id": identity.site_id(),
+            },
             "capabilities": decl.capabilities,
+            "policy": ryeos_engine::execution_contract::ExecutionPolicy::projectless(
+                ryeos_engine::execution_contract::ExecutionResponse::Accepted,
+            ),
         },
         "managed_by": {
             "type": MANAGED_BY_TYPE,
@@ -437,7 +444,7 @@ mod tests {
             "schedules",
             schedule_id,
             &serde_json::json!({
-                "spec_version": 1,
+                "spec_version": 2,
                 "schedule_id": schedule_id,
                 "item_ref": "service:operator/task",
                 "ref_bindings": {},
@@ -452,8 +459,15 @@ mod tests {
                 "project_root": null,
                 "registered_at": 1234,
                 "execution": {
-                    "requester_fingerprint": identity.fingerprint(),
+                    "authority": {
+                        "kind": "node",
+                        "principal_id": identity.principal_id(),
+                        "effective_origin_site_id": identity.site_id(),
+                    },
                     "capabilities": ["ryeos.execute.service.operator/task"],
+                    "policy": ryeos_engine::execution_contract::ExecutionPolicy::projectless(
+                        ryeos_engine::execution_contract::ExecutionResponse::Accepted,
+                    ),
                 },
                 "managed_by": null,
             }),
@@ -512,8 +526,8 @@ schedules:
         assert_eq!(parsed["params"]["sync_job_retention_days"], 14);
         assert_eq!(parsed["params"]["seat_lease_grace_seconds"], 600);
         assert_eq!(
-            parsed["execution"]["requester_fingerprint"],
-            id.fingerprint()
+            parsed["execution"]["authority"]["principal_id"],
+            id.principal_id()
         );
         assert_eq!(
             parsed["execution"]["capabilities"][0],

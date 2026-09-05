@@ -746,6 +746,12 @@ fn links_admitted_launch_capsule(value: &Value) -> Result<ContractLinks, String>
             }
         }
     }
+    push_evidence_attachment_event_edges(
+        execution_closure
+            .get("prepared_runtime_launch")
+            .and_then(|launch| launch.get("evidence_attachments")),
+        &mut links,
+    )?;
     Ok(links)
 }
 
@@ -773,6 +779,10 @@ fn links_persistent_session_capsule(value: &Value) -> Result<ContractLinks, Stri
             &mut links.object_edges,
         )?;
     }
+    push_evidence_attachment_event_edges(
+        value.pointer("/exact_program/evidence_attachments"),
+        &mut links,
+    )?;
     let execution_closure = value
         .get("execution_closure")
         .and_then(Value::as_object)
@@ -789,6 +799,28 @@ fn links_persistent_session_capsule(value: &Value) -> Result<ContractLinks, Stri
         )?;
     }
     Ok(links)
+}
+
+fn push_evidence_attachment_event_edges(
+    attachments: Option<&Value>,
+    links: &mut ContractLinks,
+) -> Result<(), String> {
+    let Some(attachments) = attachments else {
+        return Ok(());
+    };
+    let attachments = attachments
+        .as_array()
+        .ok_or_else(|| "evidence_attachments must be an array".to_owned())?;
+    for attachment in attachments {
+        super::push_required_object_edge(
+            attachment,
+            "event_hash",
+            ExpectedObject::Kind(crate::objects::BUNDLE_EVENT_KIND),
+            None,
+            &mut links.object_edges,
+        )?;
+    }
+    Ok(())
 }
 
 fn links_thread_event(value: &Value) -> Result<ContractLinks, String> {
@@ -1146,5 +1178,26 @@ mod tests {
         let links = links_external_content_activation(&receipt.to_value().unwrap()).unwrap();
         assert_eq!(links.object_edges.len(), 1);
         assert_eq!(links.object_edges[0].hash, "3".repeat(64));
+    }
+
+    #[test]
+    fn evidence_attachment_binding_roots_its_exact_bundle_event() {
+        let event_hash = "9".repeat(64);
+        let mut links = ContractLinks::leaf();
+        push_evidence_attachment_event_edges(
+            Some(&serde_json::json!([{
+                "binding_id": "observations",
+                "event_hash": event_hash,
+            }])),
+            &mut links,
+        )
+        .unwrap();
+
+        assert_eq!(links.object_edges.len(), 1);
+        assert_eq!(links.object_edges[0].hash, "9".repeat(64));
+        assert_eq!(
+            links.object_edges[0].expected,
+            ExpectedObject::Kind(crate::objects::BUNDLE_EVENT_KIND)
+        );
     }
 }

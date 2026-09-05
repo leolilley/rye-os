@@ -150,6 +150,10 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
         .ok_or_else(|| {
             anyhow::anyhow!("follow: parent {parent_thread_id} has no sealed lifecycle authority")
         })?;
+    let scheduled_fire = parent_launch_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.resume_context.as_ref())
+        .and_then(|resume| resume.scheduled_fire.clone());
     if !parent_lifecycle_authority.permits_durable_handoff() {
         bail!("follow: request-scoped execution cannot suspend or spawn a durable cohort");
     }
@@ -426,6 +430,7 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
         current_site_id: parent.current_site_id.clone(),
         origin_site_id: parent.origin_site_id.clone(),
         execution_hints: ryeos_engine::contracts::ExecutionHints::default(),
+        scheduled_fire: scheduled_fire.clone(),
         validate_only: false,
     };
     let child_project_binding =
@@ -442,6 +447,7 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
         &spec_hashes,
         &follow_key,
         resolution_engine,
+        &admission_provenance,
         &child_plan_context,
         &child_project_binding,
         &parent.current_site_id,
@@ -612,6 +618,7 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
         &parent_thread_id,
         &parent.current_site_id,
         &parent.origin_site_id,
+        scheduled_fire.as_ref(),
         parent_lifecycle_authority,
         &thread_auth.acting_principal,
         child_handler_context,
@@ -1018,6 +1025,7 @@ fn admit_follow_child_requests(
     spec_hashes: &[String],
     follow_key: &str,
     resolution_engine: &std::sync::Arc<ryeos_engine::engine::Engine>,
+    admission_provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
     child_plan_context: &ryeos_engine::contracts::PlanContext,
     child_project_binding: &ryeos_app::thread_lifecycle::AdmittedProjectBinding,
     parent_current_site_id: &str,
@@ -1056,7 +1064,8 @@ fn admit_follow_child_requests(
                     )
                 })?;
             let child_runtime_ref = child_runtime.canonical_ref.to_string();
-            let child_preflight = ryeos_app::thread_lifecycle::preflight_root_execution(
+            let child_preflight =
+                ryeos_app::thread_lifecycle::preflight_root_execution_for_provenance(
                 ryeos_app::thread_lifecycle::ResolveRootExecutionParams {
                     engine: resolution_engine,
                     plan_context: child_plan_context.clone(),
@@ -1070,6 +1079,7 @@ fn admit_follow_child_requests(
                     usage_subject_asserted_by: None,
                     creates_chain_root: true,
                 },
+                admission_provenance,
             )
             .with_context(|| {
                 format!(
@@ -1131,6 +1141,7 @@ async fn prepare_follow_children(
     parent_thread_id: &str,
     parent_current_site_id: &str,
     parent_origin_site_id: &str,
+    scheduled_fire: Option<&ryeos_engine::contracts::ScheduledFireContext>,
     parent_lifecycle_authority: ryeos_state::objects::ExecutionLifecycleAuthority,
     acting_principal: &str,
     child_handler_context: Option<ryeos_app::handler_context::HandlerContext>,
@@ -1183,8 +1194,13 @@ async fn prepare_follow_children(
                     )
                     .join("admission-capsules")
                     .join(format!("follow-{item_index}"));
+                    let persisted_provenance = cap.provenance.clone_for_borrowed_child();
                     (
-                        sealed.restore(resolution_engine, &capsule_root)?,
+                        sealed.restore_for_reconstructed_provenance(
+                            resolution_engine,
+                            &capsule_root,
+                            &persisted_provenance,
+                        )?,
                         sealed.runtime_ref().to_string(),
                         Some(sealed.clone()),
                     )
@@ -1242,6 +1258,7 @@ async fn prepare_follow_children(
                     origin_site_id: parent_origin_site_id.to_owned(),
                     requested_by: requested_by.clone(),
                     execution_hints: ExecutionHints::default(),
+                    scheduled_fire: scheduled_fire.cloned(),
                     effective_caps: Vec::new(),
                     parent_delegation_caps: Some(
                         cap.effective_caps
@@ -1411,7 +1428,7 @@ fn readmit_fresh_follow_child_for_launch(
         &plan_context,
         launch_provenance,
     )?;
-    let preflight = ryeos_app::thread_lifecycle::preflight_root_execution(
+    let preflight = ryeos_app::thread_lifecycle::preflight_root_execution_for_provenance(
         ryeos_app::thread_lifecycle::ResolveRootExecutionParams {
             engine,
             plan_context,
@@ -1425,6 +1442,7 @@ fn readmit_fresh_follow_child_for_launch(
             usage_subject_asserted_by: None,
             creates_chain_root: true,
         },
+        launch_provenance,
     )?;
     let launch_request = preflight.root_admission.execution_request(
         ryeos_app::thread_lifecycle::RootExecutionRoute::ManagedRuntimeForKind(

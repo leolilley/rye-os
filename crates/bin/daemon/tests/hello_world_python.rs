@@ -228,6 +228,7 @@ fn daemon_executes_python_hello_world_end_to_end() {
         current_site_id: "site:test".into(),
         origin_site_id: "site:test".into(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
 
@@ -365,6 +366,7 @@ fn python_script_runtime_supports_bundle_local_imports_without_pythonpath() {
         current_site_id: "site:test".into(),
         origin_site_id: "site:test".into(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
 
@@ -489,6 +491,7 @@ fn python_function_runtime_supports_bundle_local_imports_without_pythonpath() {
         current_site_id: "site:test".into(),
         origin_site_id: "site:test".into(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
 
@@ -623,6 +626,7 @@ fn engine_pipeline_emits_resolve_verify_build_plan_span_tree() {
         current_site_id: "site:test".into(),
         origin_site_id: "site:test".into(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
     let item = CanonicalRef::parse("tool:hello/hello").expect("canonical ref parses");

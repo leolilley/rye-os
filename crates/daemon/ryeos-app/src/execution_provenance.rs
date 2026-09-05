@@ -66,6 +66,8 @@ pub enum ExecutionProvenance {
         effective_path: PathBuf,
         workspace_lifeline: Arc<TempDirGuard>,
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+        candidate_evaluation:
+            Option<Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>>,
         is_child: bool,
         __seal: ProvenanceSeal,
     },
@@ -88,6 +90,8 @@ pub enum ExecutionProvenance {
         /// authority. `None` = state lives under the project as usual.
         state_root: Option<PathBuf>,
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+        candidate_evaluation:
+            Option<Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>>,
         __seal: ProvenanceSeal,
     },
 
@@ -105,6 +109,8 @@ pub enum ExecutionProvenance {
         snapshot_hash: String,
         pinned_materialization: PinnedMaterializationAuthority,
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+        candidate_evaluation:
+            Option<Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>>,
         __seal: ProvenanceSeal,
     },
 
@@ -120,6 +126,8 @@ pub enum ExecutionProvenance {
         /// state was redirected keep writing state to the same place.
         state_root: Option<PathBuf>,
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+        candidate_evaluation:
+            Option<Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>>,
         __seal: ProvenanceSeal,
     },
 
@@ -134,6 +142,8 @@ pub enum ExecutionProvenance {
         base_snapshot_hash: String,
         pinned_materialization: PinnedMaterializationAuthority,
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+        candidate_evaluation:
+            Option<Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>>,
         __seal: ProvenanceSeal,
     },
 }
@@ -276,6 +286,7 @@ impl ExecutionProvenance {
             workspace_lifeline: None,
             state_root: None,
             project_authority,
+            candidate_evaluation: None,
             __seal: ProvenanceSeal(()),
         };
         Ok(provenance)
@@ -308,6 +319,7 @@ impl ExecutionProvenance {
             effective_path,
             workspace_lifeline,
             project_authority,
+            candidate_evaluation: None,
             is_child: false,
             __seal: ProvenanceSeal(()),
         })
@@ -452,6 +464,7 @@ impl ExecutionProvenance {
                 pinned_materialization,
             ),
             project_authority,
+            candidate_evaluation: None,
             __seal: ProvenanceSeal(()),
         }
         .validate_project_authority_binding()
@@ -481,6 +494,7 @@ impl ExecutionProvenance {
             snapshot_hash,
             pinned_materialization: PinnedMaterializationAuthority::Fixture,
             project_authority,
+            candidate_evaluation: None,
             __seal: ProvenanceSeal(()),
         }
         .validate_project_authority_binding()
@@ -716,6 +730,50 @@ impl ExecutionProvenance {
         Ok(root)
     }
 
+    /// Select the private workspace root for daemon-mediated item authoring
+    /// inside an explicitly admitted candidate-integration operation.
+    ///
+    /// This is additive to normal live publication: ordinary provenance still
+    /// uses [`Self::durable_item_publication_root`]. A candidate evaluator has
+    /// no authoring root, and borrowed children cannot inherit one because
+    /// child authority drops retain-current-HEAD publication.
+    pub fn candidate_item_authoring_root(&self) -> anyhow::Result<Option<&Path>> {
+        let Some(scope) = self.candidate_evaluation_scope() else {
+            return Ok(None);
+        };
+        if !matches!(
+            &scope.authority().purpose,
+            crate::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+        ) {
+            return Ok(None);
+        }
+        let matches_scope = matches!(
+            self.project_authority(),
+            ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+                base_snapshot_hash,
+                snapshot_hash,
+                realization:
+                    ryeos_state::objects::PinnedProjectRealization::Cow {
+                        terminal_publication:
+                            ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
+                                expected_hash,
+                                ..
+                            }
+                    },
+                environment: ryeos_state::objects::EnvironmentAuthority::None,
+                ..
+            } if base_snapshot_hash == &scope.authority().base_snapshot_hash
+                && snapshot_hash == &scope.authority().candidate_snapshot_hash
+                && expected_hash == &scope.authority().base_snapshot_hash
+        );
+        if !matches_scope || !self.effective_path().is_absolute() {
+            anyhow::bail!(
+                "candidate item authoring provenance contradicts its retained integration workspace"
+            );
+        }
+        Ok(Some(self.effective_path()))
+    }
+
     pub fn advances_project_head(&self) -> bool {
         matches!(
             self.project_authority(),
@@ -733,6 +791,114 @@ impl ExecutionProvenance {
         self.project_authority().environment().clone()
     }
 
+    /// Attach the narrow independently-authorized candidate-operation scope.
+    /// Ordinary live and pinned execution never calls this; the owner service
+    /// constructs it after independently materializing the trusted base and
+    /// candidate generations.
+    pub fn with_candidate_evaluation_scope(
+        mut self,
+        scope: Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>,
+    ) -> anyhow::Result<Self> {
+        let candidate = scope.authority().candidate_snapshot_hash.as_str();
+        let authority_matches = match (
+            &scope.authority().purpose,
+            self.project_authority(),
+        ) {
+            (
+                crate::thread_lifecycle::CandidateOperationPurpose::Evaluate,
+                ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+                    base_snapshot_hash,
+                    snapshot_hash,
+                    realization:
+                        ryeos_state::objects::PinnedProjectRealization::ReadOnly
+                        | ryeos_state::objects::PinnedProjectRealization::Cow {
+                            terminal_publication:
+                                ryeos_state::objects::PinnedTerminalPublication::Discard
+                        },
+                    environment: ryeos_state::objects::EnvironmentAuthority::None,
+                    ..
+                },
+            ) => base_snapshot_hash == candidate && snapshot_hash == candidate,
+            (
+                crate::thread_lifecycle::CandidateOperationPurpose::Integrate { .. },
+                ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+                    base_snapshot_hash,
+                    snapshot_hash,
+                    realization:
+                        ryeos_state::objects::PinnedProjectRealization::Cow {
+                            terminal_publication:
+                                ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
+                                    expected_hash,
+                                    ..
+                                }
+                        },
+                    environment: ryeos_state::objects::EnvironmentAuthority::None,
+                    ..
+                },
+            ) => {
+                base_snapshot_hash == &scope.authority().base_snapshot_hash
+                    && snapshot_hash == candidate
+                    && expected_hash == &scope.authority().base_snapshot_hash
+            }
+            _ => false,
+        };
+        if !authority_matches || !Arc::ptr_eq(self.request_engine(), scope.request_engine()) {
+            anyhow::bail!(
+                "candidate operation provenance contradicts its candidate/base execution scope"
+            );
+        }
+        match &mut self {
+            Self::Projectless {
+                candidate_evaluation,
+                ..
+            }
+            | Self::RootLiveProject {
+                candidate_evaluation,
+                ..
+            }
+            | Self::RootPinnedGeneration {
+                candidate_evaluation,
+                ..
+            }
+            | Self::ChildLiveProject {
+                candidate_evaluation,
+                ..
+            }
+            | Self::ChildPinnedGeneration {
+                candidate_evaluation,
+                ..
+            } => *candidate_evaluation = Some(scope),
+        }
+        Ok(self)
+    }
+
+    pub fn candidate_evaluation_scope(
+        &self,
+    ) -> Option<&Arc<crate::thread_lifecycle::CandidateEvaluationExecutionScope>> {
+        match self {
+            Self::Projectless {
+                candidate_evaluation,
+                ..
+            }
+            | Self::RootLiveProject {
+                candidate_evaluation,
+                ..
+            }
+            | Self::RootPinnedGeneration {
+                candidate_evaluation,
+                ..
+            }
+            | Self::ChildLiveProject {
+                candidate_evaluation,
+                ..
+            }
+            | Self::ChildPinnedGeneration {
+                candidate_evaluation,
+                ..
+            } => candidate_evaluation.as_ref(),
+        }
+    }
+
     /// Derive borrowed-callback-child provenance from this parent.
     pub fn clone_for_borrowed_child(&self) -> Self {
         match self {
@@ -741,12 +907,14 @@ impl ExecutionProvenance {
                 effective_path,
                 workspace_lifeline,
                 project_authority,
+                candidate_evaluation,
                 ..
             } => Self::Projectless {
                 request_engine: request_engine.clone(),
                 effective_path: effective_path.clone(),
                 workspace_lifeline: workspace_lifeline.clone(),
                 project_authority: child_authority(project_authority),
+                candidate_evaluation: candidate_evaluation.clone(),
                 is_child: true,
                 __seal: ProvenanceSeal(()),
             },
@@ -757,6 +925,7 @@ impl ExecutionProvenance {
                 workspace_lifeline,
                 state_root,
                 project_authority,
+                candidate_evaluation,
                 ..
             }
             | Self::ChildLiveProject {
@@ -766,6 +935,7 @@ impl ExecutionProvenance {
                 workspace_lifeline,
                 state_root,
                 project_authority,
+                candidate_evaluation,
                 ..
             } => Self::ChildLiveProject {
                 request_engine: request_engine.clone(),
@@ -774,6 +944,7 @@ impl ExecutionProvenance {
                 workspace_lifeline: workspace_lifeline.clone(),
                 state_root: state_root.clone(),
                 project_authority: child_authority(project_authority),
+                candidate_evaluation: candidate_evaluation.clone(),
                 __seal: ProvenanceSeal(()),
             },
             Self::RootPinnedGeneration {
@@ -784,6 +955,7 @@ impl ExecutionProvenance {
                 snapshot_hash,
                 pinned_materialization,
                 project_authority,
+                candidate_evaluation,
                 ..
             } => Self::ChildPinnedGeneration {
                 request_engine: request_engine.clone(),
@@ -793,6 +965,7 @@ impl ExecutionProvenance {
                 base_snapshot_hash: snapshot_hash.clone(),
                 pinned_materialization: pinned_materialization.clone(),
                 project_authority: child_authority(project_authority),
+                candidate_evaluation: candidate_evaluation.clone(),
                 __seal: ProvenanceSeal(()),
             },
             Self::ChildPinnedGeneration {
@@ -803,6 +976,7 @@ impl ExecutionProvenance {
                 base_snapshot_hash,
                 pinned_materialization,
                 project_authority,
+                candidate_evaluation,
                 ..
             } => Self::ChildPinnedGeneration {
                 request_engine: request_engine.clone(),
@@ -812,6 +986,7 @@ impl ExecutionProvenance {
                 base_snapshot_hash: base_snapshot_hash.clone(),
                 pinned_materialization: pinned_materialization.clone(),
                 project_authority: child_authority(project_authority),
+                candidate_evaluation: candidate_evaluation.clone(),
                 __seal: ProvenanceSeal(()),
             },
         }
@@ -854,6 +1029,7 @@ impl ExecutionProvenance {
                 pinned_materialization,
             ),
             project_authority,
+            candidate_evaluation: self.candidate_evaluation_scope().cloned(),
             __seal: ProvenanceSeal(()),
         };
         provenance.project_authority().validate()?;
@@ -1399,6 +1575,7 @@ mod tests {
             workspace_lifeline: Some(lifeline),
             state_root: None,
             project_authority: authority,
+            candidate_evaluation: None,
             __seal: ProvenanceSeal(()),
         };
 

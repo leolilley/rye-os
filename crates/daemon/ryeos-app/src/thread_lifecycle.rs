@@ -902,6 +902,283 @@ pub struct AdmittedProjectBinding {
     materialization: AdmittedProjectMaterialization,
 }
 
+/// Exact purpose admitted for one two-generation candidate operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateOperationPurpose {
+    /// Resolve a trusted evaluator from the base and execute it against the
+    /// candidate without retaining evaluator writes.
+    Evaluate,
+    /// Resolve a narrowly-authorized item-authoring wrapper from the base and
+    /// execute it in a retained private integration workspace. The candidate
+    /// must already have independent accepted evaluator testimony.
+    Integrate { accepted_evaluation_hash: String },
+}
+
+/// Exact two-generation authority for one independently authorized frozen
+/// candidate operation. This is deliberately narrower than a general
+/// dual-project execution mode: only the owner-authorized candidate services
+/// may construct the runtime scope that pairs this durable coordinate with two
+/// independently verified project bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateEvaluationAuthority {
+    pub schema_version: u32,
+    pub source_chain_root_id: String,
+    pub source_placement_thread_id: String,
+    pub owner_principal: String,
+    pub base_snapshot_hash: String,
+    pub candidate_snapshot_hash: String,
+    pub candidate_validation_hash: String,
+    /// Canonical testimony hash for the isolated integration operation that
+    /// produced `candidate_snapshot_hash`. It is absent when evaluating the
+    /// worker's directly retained candidate and present when independently
+    /// evaluating an integrated descendant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_operation_hash: Option<String>,
+    /// Caller-retained launch coordinate reserved by the accepted source
+    /// evaluation. Present only for the one integration operation it admits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_launch_id: Option<String>,
+    pub purpose: CandidateOperationPurpose,
+}
+
+impl CandidateEvaluationAuthority {
+    pub const SCHEMA_VERSION: u32 = 3;
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            bail!("unsupported candidate-evaluation authority schema");
+        }
+        validate_thread_id_format(&self.source_chain_root_id)?;
+        validate_thread_id_format(&self.source_placement_thread_id)?;
+        validate_principal_identifier("candidate evaluator owner", &self.owner_principal)?;
+        for (label, hash) in [
+            ("base snapshot", &self.base_snapshot_hash),
+            ("candidate snapshot", &self.candidate_snapshot_hash),
+            ("candidate validation", &self.candidate_validation_hash),
+        ] {
+            if !lillux::valid_hash(hash)
+                || hash.bytes().any(|byte| byte.is_ascii_uppercase())
+            {
+                bail!("candidate-evaluation {label} hash is not canonical");
+            }
+        }
+        if let Some(integration_operation_hash) = &self.integration_operation_hash
+            && (!lillux::valid_hash(integration_operation_hash)
+                || integration_operation_hash
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase()))
+        {
+            bail!("candidate integration operation hash is not canonical");
+        }
+        if self
+            .integration_launch_id
+            .as_deref()
+            .is_some_and(|launch_id| !crate::state_store::is_canonical_launch_id(launch_id))
+        {
+            bail!("candidate integration launch id is not canonical");
+        }
+        if let CandidateOperationPurpose::Integrate {
+            accepted_evaluation_hash,
+        } = &self.purpose
+            && (!lillux::valid_hash(accepted_evaluation_hash)
+                || accepted_evaluation_hash
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase()))
+        {
+            bail!("candidate-integration evaluation hash is not canonical");
+        }
+        match (
+            &self.purpose,
+            &self.integration_operation_hash,
+            &self.integration_launch_id,
+        ) {
+            (CandidateOperationPurpose::Integrate { .. }, Some(_), _) => {
+                bail!("candidate integration may not claim a predecessor integration operation")
+            }
+            (CandidateOperationPurpose::Integrate { .. }, None, None) => {
+                bail!("candidate integration has no reserved launch identity")
+            }
+            (CandidateOperationPurpose::Evaluate, _, Some(_)) => {
+                bail!("candidate evaluator may not claim an integration launch identity")
+            }
+            (CandidateOperationPurpose::Evaluate, _, None)
+            | (CandidateOperationPurpose::Integrate { .. }, None, Some(_)) => {}
+        }
+        Ok(())
+    }
+}
+
+pub const CANDIDATE_INTEGRATION_PROCESS_COMPLETED_EVENT: &str =
+    "hosted_candidate.integration_process_completed";
+
+/// Durable proof that the one capsule-sealed integration process exited
+/// successfully before its retained COW workspace entered the freeze journal.
+/// The process result itself is diagnostic; the daemon later derives the
+/// public terminal result from this fact plus the journaled frozen generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateIntegrationProcessCompletionFact {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub root_thread_id: String,
+    pub admitted_capsule_hash: String,
+    pub integration_launch_id: String,
+    pub accepted_evaluation_hash: String,
+    pub base_snapshot_hash: String,
+    pub source_candidate_snapshot_hash: String,
+    pub source_candidate_validation_hash: String,
+    pub process_completion_digest: String,
+    pub terminal_status: String,
+    pub terminal_outcome_code: String,
+}
+
+impl CandidateIntegrationProcessCompletionFact {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn operation_id(
+        authority: &CandidateEvaluationAuthority,
+        root_thread_id: &str,
+        admitted_capsule_hash: &str,
+    ) -> Result<String> {
+        authority.validate()?;
+        validate_thread_id_format(root_thread_id)?;
+        if !lillux::valid_hash(admitted_capsule_hash) {
+            bail!("candidate integration admitted capsule hash is not canonical");
+        }
+        let CandidateOperationPurpose::Integrate {
+            accepted_evaluation_hash,
+        } = &authority.purpose
+        else {
+            bail!("candidate evaluator has no integration completion operation");
+        };
+        let integration_launch_id = authority.integration_launch_id.as_deref().ok_or_else(|| {
+            anyhow!("candidate integration has no sealed launch identity")
+        })?;
+        ryeos_state::objects::canonical_value_digest(&json!({
+            "schema":"ryeos.hosted_candidate_integration_process_operation.v1",
+            "root_thread_id":root_thread_id,
+            "admitted_capsule_hash":admitted_capsule_hash,
+            "integration_launch_id":integration_launch_id,
+            "accepted_evaluation_hash":accepted_evaluation_hash,
+            "base_snapshot_hash":authority.base_snapshot_hash,
+            "source_candidate_snapshot_hash":authority.candidate_snapshot_hash,
+            "source_candidate_validation_hash":authority.candidate_validation_hash,
+        }))
+    }
+
+    pub fn new(
+        authority: &CandidateEvaluationAuthority,
+        root_thread_id: &str,
+        admitted_capsule_hash: &str,
+        process_completion_digest: String,
+    ) -> Result<Self> {
+        let CandidateOperationPurpose::Integrate {
+            accepted_evaluation_hash,
+        } = &authority.purpose
+        else {
+            bail!("candidate evaluator cannot author an integration completion fact");
+        };
+        let fact = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            operation_id: Self::operation_id(
+                authority,
+                root_thread_id,
+                admitted_capsule_hash,
+            )?,
+            root_thread_id: root_thread_id.to_owned(),
+            admitted_capsule_hash: admitted_capsule_hash.to_owned(),
+            integration_launch_id: authority
+                .integration_launch_id
+                .clone()
+                .ok_or_else(|| anyhow!("candidate integration has no sealed launch identity"))?,
+            accepted_evaluation_hash: accepted_evaluation_hash.clone(),
+            base_snapshot_hash: authority.base_snapshot_hash.clone(),
+            source_candidate_snapshot_hash: authority.candidate_snapshot_hash.clone(),
+            source_candidate_validation_hash: authority.candidate_validation_hash.clone(),
+            process_completion_digest,
+            terminal_status: ThreadTerminalStatus::Completed.as_str().to_owned(),
+            terminal_outcome_code: "success".to_owned(),
+        };
+        fact.validate_for(authority, root_thread_id, admitted_capsule_hash)?;
+        Ok(fact)
+    }
+
+    pub fn validate_for(
+        &self,
+        authority: &CandidateEvaluationAuthority,
+        root_thread_id: &str,
+        admitted_capsule_hash: &str,
+    ) -> Result<()> {
+        let CandidateOperationPurpose::Integrate {
+            accepted_evaluation_hash,
+        } = &authority.purpose
+        else {
+            bail!("candidate evaluator cannot carry integration completion testimony");
+        };
+        if self.schema_version != Self::SCHEMA_VERSION
+            || self.operation_id
+                != Self::operation_id(authority, root_thread_id, admitted_capsule_hash)?
+            || self.root_thread_id != root_thread_id
+            || self.admitted_capsule_hash != admitted_capsule_hash
+            || self.integration_launch_id
+                != authority
+                    .integration_launch_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("candidate integration has no sealed launch identity"))?
+            || self.accepted_evaluation_hash != *accepted_evaluation_hash
+            || self.base_snapshot_hash != authority.base_snapshot_hash
+            || self.source_candidate_snapshot_hash != authority.candidate_snapshot_hash
+            || self.source_candidate_validation_hash != authority.candidate_validation_hash
+            || !lillux::valid_hash(&self.process_completion_digest)
+            || self.terminal_status != ThreadTerminalStatus::Completed.as_str()
+            || self.terminal_outcome_code != "success"
+        {
+            bail!("candidate integration completion fact contradicts its sealed authority");
+        }
+        Ok(())
+    }
+
+    pub fn canonical_completion(&self, result_snapshot_hash: &str) -> Result<ExecutionCompletion> {
+        if !lillux::valid_hash(result_snapshot_hash) {
+            bail!("candidate integration result snapshot hash is not canonical");
+        }
+        Ok(ExecutionCompletion {
+            status: ThreadTerminalStatus::Completed,
+            outcome_code: Some("success".to_owned()),
+            result: Some(json!({
+                "schema_version":1,
+                "operation":"candidate_integration",
+                "integration_launch_id":self.integration_launch_id,
+                "accepted_evaluation_hash":self.accepted_evaluation_hash,
+                "base_snapshot_hash":self.base_snapshot_hash,
+                "source_candidate_snapshot_hash":self.source_candidate_snapshot_hash,
+                "source_candidate_validation_hash":self.source_candidate_validation_hash,
+                "result_candidate_snapshot_hash":result_snapshot_hash,
+                "result_candidate_validation_hash":candidate_validation_identity(result_snapshot_hash)?,
+                "process_completion_digest":self.process_completion_digest,
+            })),
+            error: None,
+            artifacts: Vec::new(),
+            final_cost: None,
+            continuation_request: None,
+            metadata: None,
+        })
+    }
+}
+
+pub fn candidate_validation_identity(candidate_snapshot_hash: &str) -> Result<String> {
+    if !lillux::valid_hash(candidate_snapshot_hash) {
+        bail!("candidate snapshot hash is not canonical");
+    }
+    ryeos_state::objects::canonical_value_digest(&json!({
+        "schema":"ryeos.dedicated_candidate_verification.v1",
+        "candidate_snapshot_hash":candidate_snapshot_hash,
+        "checks":["canonical_snapshot_manifest","base_ancestry_at_publication"]
+    }))
+}
+
 impl std::fmt::Debug for AdmittedProjectBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdmittedProjectBinding")
@@ -1450,6 +1727,209 @@ impl AdmittedProjectBinding {
     }
 }
 
+/// In-memory half of [`CandidateEvaluationAuthority`].  The base binding owns
+/// the exact read-only materialization and overlay engine from which evaluator
+/// definitions are resolved.  The candidate execution binding remains on the
+/// ordinary root admission; keeping the two bindings typed prevents a caller
+/// from pairing a base digest with an unrelated filesystem path.
+#[derive(Clone)]
+pub struct CandidateEvaluationExecutionScope {
+    authority: CandidateEvaluationAuthority,
+    base_plan_context: PlanContext,
+    base_project_binding: AdmittedProjectBinding,
+}
+
+impl std::fmt::Debug for CandidateEvaluationExecutionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CandidateEvaluationExecutionScope")
+            .field("authority", &self.authority)
+            .field("base_plan_context", &self.base_plan_context)
+            .field("base_project_binding", &self.base_project_binding)
+            .finish()
+    }
+}
+
+impl CandidateEvaluationExecutionScope {
+    pub fn admit(
+        authority: CandidateEvaluationAuthority,
+        base_plan_context: PlanContext,
+        base_project_binding: AdmittedProjectBinding,
+    ) -> Result<Self> {
+        authority.validate()?;
+        base_project_binding.validate_for(
+            &base_project_binding.request_engine,
+            &base_plan_context,
+        )?;
+        let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+            stable_project_identity,
+            base_snapshot_hash,
+            snapshot_hash,
+            realization: ryeos_state::objects::PinnedProjectRealization::ReadOnly,
+            environment: ryeos_state::objects::EnvironmentAuthority::None,
+            ..
+        } = base_project_binding.exact_authority()
+        else {
+            bail!("candidate evaluator base must be a read-only pinned generation without environment authority");
+        };
+        if base_snapshot_hash != &authority.base_snapshot_hash
+            || snapshot_hash != &authority.base_snapshot_hash
+            || base_project_binding.subject_resolution_authority()
+                != &(ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+                    snapshot_hash: authority.base_snapshot_hash.clone(),
+                })
+            || plan_principal_identifier(&base_plan_context) != authority.owner_principal
+        {
+            bail!("candidate evaluator base binding contradicts its durable authority");
+        }
+        // Keep this read so the stable identity is part of construction-time
+        // validation rather than an unchecked field carried to the rebind.
+        if stable_project_identity.is_empty() {
+            bail!("candidate evaluator base has no stable project identity");
+        }
+        Ok(Self {
+            authority,
+            base_plan_context,
+            base_project_binding,
+        })
+    }
+
+    pub fn authority(&self) -> &CandidateEvaluationAuthority {
+        &self.authority
+    }
+
+    pub fn base_plan_context(&self) -> &PlanContext {
+        &self.base_plan_context
+    }
+
+    pub fn resolution_plan_context_for(&self, execution: &PlanContext) -> Result<PlanContext> {
+        if plan_principal_identifier(execution) != self.authority.owner_principal
+            || execution.current_site_id != self.base_plan_context.current_site_id
+            || execution.origin_site_id != self.base_plan_context.origin_site_id
+        {
+            bail!("candidate evaluator child changed owner or site authority");
+        }
+        let mut resolution = execution.clone();
+        resolution.project_context = self.base_plan_context.project_context.clone();
+        resolution.subject_resolution_authority = self
+            .base_plan_context
+            .subject_resolution_authority
+            .clone();
+        Ok(resolution)
+    }
+
+    pub fn base_project_binding(&self) -> &AdmittedProjectBinding {
+        &self.base_project_binding
+    }
+
+    pub fn request_engine(&self) -> &Arc<Engine> {
+        &self.base_project_binding.request_engine
+    }
+
+    fn validate_candidate_binding(
+        &self,
+        candidate_plan_context: &PlanContext,
+        candidate_binding: &AdmittedProjectBinding,
+    ) -> Result<()> {
+        self.authority.validate()?;
+        self.base_project_binding.validate_for(
+            &self.base_project_binding.request_engine,
+            &self.base_plan_context,
+        )?;
+        candidate_binding.validate_for(
+            &self.base_project_binding.request_engine,
+            candidate_plan_context,
+        )?;
+        if !Arc::ptr_eq(
+            &self.base_project_binding.request_engine,
+            &candidate_binding.request_engine,
+        ) {
+            bail!("candidate evaluator base and execution bindings use different admitted engines");
+        }
+        let (
+            base_project_identity,
+            base_snapshot,
+            candidate_project_identity,
+            candidate_base,
+            candidate_snapshot,
+            candidate_realization,
+            candidate_environment,
+            candidate_caps,
+        ) = match (
+            self.base_project_binding.exact_authority(),
+            candidate_binding.exact_authority(),
+        ) {
+            (
+                ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+                    stable_project_identity: base_project_identity,
+                    snapshot_hash: base_snapshot,
+                    ..
+                },
+                ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+                    stable_project_identity: candidate_project_identity,
+                    base_snapshot_hash: candidate_base,
+                    snapshot_hash: candidate_snapshot,
+                    realization: candidate_realization,
+                    environment: candidate_environment,
+                    capability_ceiling: candidate_caps,
+                    ..
+                },
+            ) => (
+                base_project_identity,
+                base_snapshot,
+                candidate_project_identity,
+                candidate_base,
+                candidate_snapshot,
+                candidate_realization,
+                candidate_environment,
+                candidate_caps,
+            ),
+            _ => bail!("candidate evaluator requires two pinned project generations"),
+        };
+        let execution_authority_matches = match &self.authority.purpose {
+            CandidateOperationPurpose::Evaluate => {
+                candidate_base == &self.authority.candidate_snapshot_hash
+                    && matches!(
+                        candidate_realization,
+                        ryeos_state::objects::PinnedProjectRealization::ReadOnly
+                            | ryeos_state::objects::PinnedProjectRealization::Cow {
+                                terminal_publication:
+                                    ryeos_state::objects::PinnedTerminalPublication::Discard
+                            }
+                    )
+                    && !candidate_caps.iter().any(|cap| {
+                        cap == crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+                    })
+            }
+            CandidateOperationPurpose::Integrate { .. } => {
+                candidate_base == &self.authority.base_snapshot_hash
+                    && matches!(
+                        candidate_realization,
+                        ryeos_state::objects::PinnedProjectRealization::Cow {
+                            terminal_publication:
+                                ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
+                                    expected_hash,
+                                    ..
+                                }
+                        } if expected_hash == &self.authority.base_snapshot_hash
+                    )
+                    && !candidate_caps.iter().any(|cap| {
+                        cap == crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+                    })
+            }
+        };
+        if base_project_identity != candidate_project_identity
+            || base_snapshot != &self.authority.base_snapshot_hash
+            || candidate_snapshot != &self.authority.candidate_snapshot_hash
+            || plan_principal_identifier(candidate_plan_context) != self.authority.owner_principal
+            || !matches!(candidate_environment, ryeos_state::objects::EnvironmentAuthority::None)
+            || !execution_authority_matches
+        {
+            bail!("candidate operation execution binding contradicts its admitted purpose");
+        }
+        Ok(())
+    }
+}
+
 /// Exact verified subject and destructive-history authority admitted for one
 /// new execution root. The verified item is intentionally carried as data:
 /// background dispatch must not turn an already-admitted canonical ref back
@@ -1574,6 +2054,7 @@ pub struct RootExecutionAdmission {
     resolved_result_policy: ryeos_engine::history_policy::ResolvedThreadResultPolicy,
     captured_history_policy: ryeos_state::objects::CapturedThreadHistoryPolicy,
     project_binding: AdmittedProjectBinding,
+    candidate_evaluation: Option<Arc<CandidateEvaluationExecutionScope>>,
     admitted_request_snapshot: Option<Arc<ryeos_engine::engine::AdmittedRequestAuthoritySnapshot>>,
     selected_executor_route: Option<AdmittedExecutorRoute>,
 }
@@ -1633,6 +2114,26 @@ impl RootExecutionAdmission {
         &self.project_binding.request_engine
     }
 
+    pub fn candidate_evaluation_scope(
+        &self,
+    ) -> Option<&Arc<CandidateEvaluationExecutionScope>> {
+        self.candidate_evaluation.as_ref()
+    }
+
+    fn resolution_project_binding(&self) -> &AdmittedProjectBinding {
+        self.candidate_evaluation
+            .as_deref()
+            .map(CandidateEvaluationExecutionScope::base_project_binding)
+            .unwrap_or(&self.project_binding)
+    }
+
+    pub fn resolution_plan_context(&self) -> &PlanContext {
+        self.candidate_evaluation
+            .as_deref()
+            .map(CandidateEvaluationExecutionScope::base_plan_context)
+            .unwrap_or(&self.plan_context)
+    }
+
     pub fn admitted_request_snapshot(
         &self,
     ) -> Option<&Arc<ryeos_engine::engine::AdmittedRequestAuthoritySnapshot>> {
@@ -1642,13 +2143,14 @@ impl RootExecutionAdmission {
     /// Current trust-policy narrowing for recovery, without rebuilding parser,
     /// kind, runtime, or launch-preparer registries.
     pub fn current_policy_trust_store(&self) -> Result<ryeos_engine::trust::TrustStore> {
-        let subject_authority = self.project_binding.subject_resolution_authority();
+        let resolution_binding = self.resolution_project_binding();
+        let subject_authority = resolution_binding.subject_resolution_authority();
         let project_root = (!matches!(
             subject_authority,
             ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
         ))
         .then(|| {
-            self.project_binding
+            resolution_binding
                 .execution_workspace()
                 .ok_or_else(|| anyhow!("admitted project trust policy has no execution workspace"))
         })
@@ -1657,7 +2159,7 @@ impl RootExecutionAdmission {
             .effective_trust_store_for_current_policy(
                 project_root,
                 subject_authority,
-                self.project_binding.pinned_materialization_proof(),
+                resolution_binding.pinned_materialization_proof(),
             )
             .map_err(anyhow::Error::new)
     }
@@ -1682,6 +2184,16 @@ impl RootExecutionAdmission {
         )?;
         if self.project_binding.execution_workspace() != rebound.execution_workspace() {
             bail!("execution provenance workspace differs from the sealed root materialization");
+        }
+        if provenance
+            .candidate_evaluation_scope()
+            .map(|scope| scope.authority())
+            != self
+                .candidate_evaluation
+                .as_deref()
+                .map(CandidateEvaluationExecutionScope::authority)
+        {
+            bail!("execution provenance candidate-evaluation scope differs from the sealed root admission");
         }
         Ok(())
     }
@@ -1744,10 +2256,70 @@ impl RootExecutionAdmission {
         self.project_binding.execution_workspace()
     }
 
+    pub fn resolution_workspace(&self) -> Option<&Path> {
+        self.resolution_project_binding().execution_workspace()
+    }
+
+    pub fn resolution_subject_authority(
+        &self,
+    ) -> &ryeos_engine::contracts::SubjectResolutionAuthority {
+        self.resolution_project_binding()
+            .subject_resolution_authority()
+    }
+
     pub fn resolution_materialization_binding(
         &self,
     ) -> Result<crate::resolution_cache::ResolutionMaterializationBinding> {
-        self.project_binding.resolution_materialization_binding()
+        self.resolution_project_binding()
+            .resolution_materialization_binding()
+    }
+
+    /// Rebind a root admitted entirely from the immutable trusted base onto
+    /// the separately materialized frozen candidate execution filesystem.
+    /// This is the sole intentional project/project authority split; ordinary
+    /// root admission continues to require one binding.
+    pub fn for_candidate_evaluation(
+        mut self,
+        candidate_provenance: &crate::execution_provenance::ExecutionProvenance,
+        scope: Arc<CandidateEvaluationExecutionScope>,
+    ) -> Result<Self> {
+        if self.candidate_evaluation.is_some() {
+            bail!("candidate evaluator admission is already rebound");
+        }
+        if candidate_provenance
+            .candidate_evaluation_scope()
+            .map(|candidate_scope| candidate_scope.authority())
+            != Some(scope.authority())
+        {
+            bail!("candidate evaluator provenance does not carry the supplied execution scope");
+        }
+        let base = scope.base_project_binding();
+        if !Arc::ptr_eq(self.request_engine(), scope.request_engine())
+            || self.project_binding.exact_authority() != base.exact_authority()
+            || self.project_binding.subject_resolution_authority()
+                != base.subject_resolution_authority()
+            || self.project_binding.execution_workspace() != base.execution_workspace()
+        {
+            bail!("candidate evaluator root was not admitted from its exact trusted base binding");
+        }
+        let candidate_project_context = ProjectContext::LocalPath {
+            path: candidate_provenance.effective_path().to_path_buf(),
+        };
+        let mut candidate_plan_context = self.plan_context.clone();
+        candidate_plan_context.project_context = candidate_project_context;
+        candidate_plan_context.subject_resolution_authority =
+            candidate_provenance.subject_resolution_authority();
+        let candidate_binding = AdmittedProjectBinding::from_provenance(
+            scope.request_engine(),
+            &candidate_plan_context,
+            candidate_provenance,
+        )?;
+        scope.validate_candidate_binding(&candidate_plan_context, &candidate_binding)?;
+        self.plan_context = candidate_plan_context;
+        self.project_binding = candidate_binding;
+        self.candidate_evaluation = Some(scope);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn base_project_snapshot_hash(&self) -> Option<&str> {
@@ -2028,9 +2600,29 @@ impl RootExecutionAdmission {
             "admitted root planning principal",
             plan_principal_identifier(&self.plan_context),
         )?;
+        if let Some(scheduled_fire) = &self.plan_context.scheduled_fire {
+            scheduled_fire
+                .validate()
+                .context("validate admitted scheduled fire context")?;
+        }
         self.project_binding.validate_sealed(&self.plan_context)?;
-        self.project_binding
-            .validate_resolution_closure(&self.resolution_closure)?;
+        match self.candidate_evaluation.as_deref() {
+            Some(scope) => {
+                scope.validate_candidate_binding(&self.plan_context, &self.project_binding)?;
+                let resolution_plan =
+                    scope.resolution_plan_context_for(&self.plan_context)?;
+                scope.base_project_binding().validate_for(
+                    scope.request_engine(),
+                    &resolution_plan,
+                )?;
+                scope
+                    .base_project_binding()
+                    .validate_resolution_closure(&self.resolution_closure)?;
+            }
+            None => self
+                .project_binding
+                .validate_resolution_closure(&self.resolution_closure)?,
+        }
         if self.verified_subject.resolved.subject_resolution_authority
             != *self.resolution_closure.subject_authority()
         {
@@ -2293,9 +2885,9 @@ impl RootExecutionAdmission {
     /// the already-loaded verified kind registry. The mutable item source is
     /// deliberately not re-resolved or re-read after admission.
     fn validate_for_persistence(&self) -> Result<()> {
-        self.project_binding.validate_sealed(&self.plan_context)?;
+        self.validate()?;
         self.ensure_matches_subject(
-            &self.project_binding.request_engine,
+            self.request_engine(),
             &self.verified_subject,
             &self.thread_profile,
         )
@@ -2408,6 +3000,9 @@ fn plan_context_mismatches(left: &PlanContext, right: &PlanContext) -> Vec<&'sta
     }
     if left.execution_hints != right.execution_hints {
         mismatches.push("execution_hints");
+    }
+    if left.scheduled_fire != right.scheduled_fire {
+        mismatches.push("scheduled_fire");
     }
     if left.validate_only != right.validate_only {
         mismatches.push("validate_only");
@@ -4677,13 +5272,50 @@ impl ThreadLifecycleService {
                 outcome_code,
             );
             let now = lillux::time::timestamp_millis();
-            let completed_fired_at = fire.fired_at.unwrap_or(now);
-
+            // A very short execution can terminalize after the launch capsule
+            // is durable but before the scheduler task persists its handoff.
+            // Close that crash window from the exact thread/capsule authority;
+            // never jump directly from `reserved` to a terminal state.
+            let fire = if fire.status == "reserved" {
+                let capsule_hash = match self.state_store.admitted_launch_capsule_hash(thread_id) {
+                    Ok(Some(hash)) if fire.project_authority.is_some() => hash,
+                    Ok(_) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            %error,
+                            "scheduler: failed to recover launch handoff during terminal completion"
+                        );
+                        return;
+                    }
+                };
+                let dispatched = ryeos_scheduler::types::FireRecord {
+                    status: "dispatched".to_string(),
+                    dispatched_at: Some(now.max(fire.reserved_at)),
+                    admitted_capsule_hash: Some(capsule_hash),
+                    ..fire
+                };
+                if let Err(error) =
+                    ryeos_scheduler::projection::persist_fire_snapshot(&app_root, &db, &dispatched)
+                {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        %error,
+                        "scheduler: failed to persist recovered launch handoff"
+                    );
+                    return;
+                }
+                dispatched
+            } else {
+                fire
+            };
+            if fire.status != "dispatched" {
+                return;
+            }
             let updated = ryeos_scheduler::types::FireRecord {
                 status: fire_status.to_string(),
                 outcome: Some(outcome_str.to_string()),
-                fired_at: Some(completed_fired_at),
-                completed_at: Some(now),
+                completed_at: Some(now.max(fire.dispatched_at.unwrap_or(fire.reserved_at))),
                 ..fire
             };
             if let Err(e) =
@@ -6317,6 +6949,7 @@ fn admit_verified_root_execution_inner(
         resolved_history_policy: history,
         resolved_result_policy: launch_policy.result,
         project_binding,
+        candidate_evaluation: None,
         admitted_request_snapshot,
         selected_executor_route: None,
     };
@@ -6378,6 +7011,7 @@ pub fn admit_non_execution_root(
         current_site_id: current_site_id.to_string(),
         origin_site_id: origin_site_id.to_string(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
     let resolved = engine
@@ -6532,6 +7166,53 @@ pub fn preflight_root_execution(
         admitted_request_snapshot,
     )?;
     Ok(PreflightRootExecution { root_admission })
+}
+
+/// Preflight a root while preserving the narrow two-generation authority of
+/// an independent candidate operation. Ordinary callers have no such scope
+/// and retain the existing one-project invariant unchanged. Candidate
+/// operations resolve the executable closure from their immutable base, then
+/// bind the admitted request to the separately verified candidate workspace
+/// before it can be launched.
+pub fn preflight_root_execution_for_provenance(
+    params: ResolveRootExecutionParams<'_>,
+    provenance: &crate::execution_provenance::ExecutionProvenance,
+) -> Result<PreflightRootExecution> {
+    let Some(scope) = provenance.candidate_evaluation_scope().cloned() else {
+        return preflight_root_execution(params);
+    };
+    let ResolveRootExecutionParams {
+        engine: _,
+        plan_context,
+        project_binding: _,
+        node_history_policy,
+        item_ref,
+        ref_bindings,
+        launch_mode,
+        parameters,
+        usage_subject,
+        usage_subject_asserted_by,
+        creates_chain_root,
+    } = params;
+    let resolution_plan_context = scope.resolution_plan_context_for(&plan_context)?;
+    let preflight = preflight_root_execution(ResolveRootExecutionParams {
+        engine: scope.request_engine(),
+        plan_context: resolution_plan_context,
+        project_binding: scope.base_project_binding().clone(),
+        node_history_policy,
+        item_ref,
+        ref_bindings,
+        launch_mode,
+        parameters,
+        usage_subject,
+        usage_subject_asserted_by,
+        creates_chain_root,
+    })?;
+    Ok(PreflightRootExecution {
+        root_admission: preflight
+            .root_admission
+            .for_candidate_evaluation(provenance, scope)?,
+    })
 }
 
 /// Result of dry-run validation (verify + trust + build_plan, no spawn).
@@ -6907,6 +7588,7 @@ mod tests {
             current_site_id: "site:test".to_string(),
             origin_site_id: "site:test".to_string(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: false,
         };
         AdmittedProjectBinding::restore(
@@ -6983,6 +7665,7 @@ mod tests {
             current_site_id: "site:test".to_string(),
             origin_site_id: "site:test".to_string(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: false,
         };
         let binding =
@@ -7027,6 +7710,7 @@ mod tests {
             current_site_id: "site:test".to_string(),
             origin_site_id: "site:test".to_string(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: false,
         };
         let binding =
@@ -7065,6 +7749,7 @@ mod tests {
             current_site_id: "site:test".to_string(),
             origin_site_id: "site:test".to_string(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: false,
         };
 
@@ -7091,6 +7776,7 @@ mod tests {
             json!(SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION)
         );
         assert_eq!(value["project_authority"]["kind"], json!("projectless"));
+        assert!(value["scheduled_fire"].is_null());
         assert_eq!(
             value["executor_route"]["route"],
             json!("managed_runtime_for_kind")
@@ -7111,6 +7797,15 @@ mod tests {
             .unwrap()
             .remove("project_authority");
         assert!(serde_json::from_value::<SealedRootExecutionRequest>(missing_authority).is_err());
+
+        let mut missing_scheduled_fire = value.clone();
+        missing_scheduled_fire
+            .as_object_mut()
+            .unwrap()
+            .remove("scheduled_fire");
+        assert!(
+            serde_json::from_value::<SealedRootExecutionRequest>(missing_scheduled_fire).is_err()
+        );
 
         let mut incomplete_route = value.clone();
         incomplete_route["executor_route"]

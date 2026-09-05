@@ -48,6 +48,7 @@ struct CachedFact {
     payload: Option<Value>,
     first_chain_seq: i64,
     last_chain_seq: i64,
+    first_event_ts: String,
     /// True only after a complete replay, or cache-proven absence followed by
     /// replay of the entire unseen tail, counted this exact key.
     complete: bool,
@@ -116,7 +117,13 @@ impl ReplayIndex {
         self.recent.insert(key, fact);
     }
 
-    fn observe(&mut self, event_type: &str, payload: &Value, chain_seq: i64) -> Result<()> {
+    fn observe(
+        &mut self,
+        event_type: &str,
+        payload: &Value,
+        chain_seq: i64,
+        event_ts: &str,
+    ) -> Result<()> {
         let Some(operation_id) = payload.get("operation_id").and_then(Value::as_str) else {
             return Ok(());
         };
@@ -130,8 +137,13 @@ impl ReplayIndex {
         let cached_payload = (canonical.len() <= CACHED_PAYLOAD_BYTES).then(|| payload.clone());
         if let Some(existing) = self.recent.get_mut(&key) {
             existing.count = existing.count.saturating_add(1);
-            existing.first_chain_seq = existing.first_chain_seq.min(chain_seq);
-            existing.last_chain_seq = existing.last_chain_seq.max(chain_seq);
+            if chain_seq < existing.first_chain_seq {
+                existing.first_chain_seq = chain_seq;
+                existing.first_event_ts = event_ts.to_owned();
+            }
+            if chain_seq > existing.last_chain_seq {
+                existing.last_chain_seq = chain_seq;
+            }
             if existing.payload_digest != payload_digest {
                 existing.payload = None;
             }
@@ -145,6 +157,7 @@ impl ReplayIndex {
                 payload: cached_payload,
                 first_chain_seq: chain_seq,
                 last_chain_seq: chain_seq,
+                first_event_ts: event_ts.to_owned(),
                 complete: false,
             },
         );
@@ -166,6 +179,7 @@ pub struct RootFactLookup {
     pub payload: Option<Value>,
     pub first_chain_seq: Option<i64>,
     pub last_chain_seq: Option<i64>,
+    pub first_event_ts: Option<String>,
 }
 
 fn replay_cache() -> &'static std::sync::Mutex<ReplayCache> {
@@ -215,6 +229,7 @@ fn scan_tail(
     let mut matching_payload = None;
     let mut first_chain_seq = None;
     let mut last_chain_seq = None;
+    let mut first_event_ts = None;
     loop {
         let page = state.state_store.replay_events(
             chain_root_id,
@@ -237,8 +252,14 @@ fn scan_tail(
                 matching_payload = Some(event.payload.clone());
                 first_chain_seq.get_or_insert(event.chain_seq);
                 last_chain_seq = Some(event.chain_seq);
+                first_event_ts.get_or_insert_with(|| event.ts.clone());
             }
-            index.observe(&event.event_type, &event.payload, event.chain_seq)?;
+            index.observe(
+                &event.event_type,
+                &event.payload,
+                event.chain_seq,
+                &event.ts,
+            )?;
         }
         if let Some(last) = page.events.last() {
             after = Some(last.chain_seq);
@@ -255,6 +276,7 @@ fn scan_tail(
         payload: matching_payload,
         first_chain_seq,
         last_chain_seq,
+        first_event_ts,
     })
 }
 
@@ -271,6 +293,7 @@ fn replay_exact(
         payload: None,
         first_chain_seq: None,
         last_chain_seq: None,
+        first_event_ts: None,
     };
     loop {
         let page = state.state_store.replay_events(
@@ -296,6 +319,9 @@ fn replay_exact(
             lookup.payload = Some(event.payload.clone());
             lookup.first_chain_seq.get_or_insert(event.chain_seq);
             lookup.last_chain_seq = Some(event.chain_seq);
+            lookup
+                .first_event_ts
+                .get_or_insert_with(|| event.ts.clone());
         }
         after = page.events.last().map(|event| event.chain_seq);
         if !page.has_more {
@@ -348,6 +374,7 @@ fn lookup_under_lock(
                     payload: exact.payload,
                     first_chain_seq: Some(exact.first_chain_seq),
                     last_chain_seq: Some(exact.last_chain_seq),
+                    first_event_ts: Some(exact.first_event_ts),
                 }
             }
             None if !may_contain_before => tail,
@@ -379,6 +406,10 @@ fn lookup_under_lock(
                 last_chain_seq: lookup
                     .last_chain_seq
                     .expect("present fact has a last chain sequence"),
+                first_event_ts: lookup
+                    .first_event_ts
+                    .clone()
+                    .expect("present fact has a first event timestamp"),
                 complete: true,
             },
         );

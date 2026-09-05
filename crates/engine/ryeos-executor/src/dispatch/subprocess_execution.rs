@@ -538,16 +538,13 @@ fn validate_managed_effective_program(
             "managed static validation engine differs from root admission"
         )));
     }
-    let subject_authority = admission
-        .plan_context()
-        .subject_resolution_authority
-        .clone();
+    let subject_authority = admission.resolution_subject_authority().clone();
     let resolution_project_root = (!matches!(
         subject_authority,
         ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
     ))
     .then(|| {
-        admission.execution_workspace().ok_or_else(|| {
+        admission.resolution_workspace().ok_or_else(|| {
             DispatchError::Internal(anyhow::anyhow!(
                 "managed static validation has no admitted project workspace"
             ))
@@ -1330,7 +1327,7 @@ async fn dispatch_tool_subprocess(
         resolved
             .root_admission
             .as_ref()
-            .and_then(|admission| admission.execution_workspace())
+            .and_then(|admission| admission.resolution_workspace())
             .or(Some(request.project_path)),
         resolved
             .root_admission
@@ -1398,7 +1395,7 @@ async fn dispatch_tool_subprocess(
         let source_project_root = resolved
             .root_admission
             .as_ref()
-            .and_then(|admission| admission.execution_workspace())
+            .and_then(|admission| admission.resolution_workspace())
             .or(Some(request.project_path));
         let source =
             validate_direct_source_closure(state, &engine, &resolved, source_project_root)?;

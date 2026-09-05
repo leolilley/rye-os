@@ -5149,6 +5149,7 @@ mod tests {
                 scopes: vec!["execute".into()],
             }),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: vec!["project.read".into(), "project.write".into()],
             parent_delegation_caps: None,
             executor_ref: Some("native:worker-execution".into()),

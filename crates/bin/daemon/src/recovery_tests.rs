@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use ryeos_app::launch_metadata::{ResumeContext, RuntimeLaunchMetadata};
 use ryeos_app::runtime_db::{
-    NewCredentialProfile, NewDedicatedSession, NewDedicatedSessionCommand, WorkerProcessRecord,
-    WorkerProcessState, WorkspaceBinding, WorkspaceState,
+    DedicatedCandidateDisposition, NewCredentialProfile, NewDedicatedSession,
+    NewDedicatedSessionCommand, WorkerProcessRecord, WorkerProcessState, WorkspaceBinding,
+    WorkspaceState,
 };
 use ryeos_app::state::AppState;
 use ryeos_app::state_store::{
@@ -196,6 +197,7 @@ fn projectless_resume() -> ResumeContext {
         origin_site_id: "site:test".to_string(),
         requested_by: principal(),
         execution_hints: ExecutionHints::default(),
+        scheduled_fire: None,
         effective_caps: Vec::new(),
         parent_delegation_caps: None,
         executor_ref: Some("executor:test/runtime".to_string()),
@@ -1281,6 +1283,7 @@ async fn hosted_startup_replays_root_outboxes_before_detaching_the_old_worker_ep
             admitted_capsule_hash: &capsule_hash,
             workspace_id,
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: profile_id,
             credential_generation,
             credential_lock_owner: worker_id,

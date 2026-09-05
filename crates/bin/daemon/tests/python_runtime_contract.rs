@@ -140,6 +140,7 @@ fn run_tool_with_hints(
         current_site_id: "site:test".into(),
         origin_site_id: "site:test".into(),
         execution_hints: hints,
+        scheduled_fire: None,
         validate_only: false,
     };
 

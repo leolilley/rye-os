@@ -536,6 +536,7 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
                         current_site_id: "site:local".into(),
                         origin_site_id: "site:local".into(),
                         execution_hints: ryeos_engine::contracts::ExecutionHints::default(),
+                        scheduled_fire: None,
                         validate_only: true,
                     };
 
@@ -1058,12 +1059,12 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
                     "reconciled durable launch planning admissions"
                 );
             }
-            let active_reconcile = reconcile::reconcile_active_threads(&app_state).await?;
             ryeos_api::handlers::dedicated_sessions::reconcile_candidate_publications(Arc::new(
                 app_state.clone(),
             ))
             .await
             .context("reconcile hosted candidate publications")?;
+            let active_reconcile = reconcile::reconcile_active_threads(&app_state).await?;
             startup.progress(|snapshot| {
                 snapshot.recovery_threads = Some(active_reconcile.active_thread_ids.len() as u64);
             })?;
@@ -2971,6 +2972,7 @@ async fn run_service_standalone(
         current_site_id: "site:local".into(),
         origin_site_id: "site:local".into(),
         execution_hints: ryeos_engine::contracts::ExecutionHints::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
     let service_canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(service_ref)

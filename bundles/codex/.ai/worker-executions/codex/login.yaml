@@ -17,6 +17,9 @@ config:
   required_terminal_publication: any
   max_lifetime_seconds: 1500
   recover_upstream_session: false
+  mode:
+    kind: session
+  candidate_disposition: owner_decision
 limits:
   duration_seconds: 1800
 requires:

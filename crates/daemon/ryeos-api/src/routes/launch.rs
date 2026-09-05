@@ -349,6 +349,7 @@ fn preflight_dispatch_launch_core(
         current_site_id: request.state.threads.site_id().to_string(),
         origin_site_id: request.origin_site_id.to_string(),
         execution_hints: Default::default(),
+        scheduled_fire: None,
         validate_only: request.validate_only,
     };
     let exec_ctx = ryeos_executor::executor::ExecutionContext {
@@ -364,7 +365,7 @@ fn preflight_dispatch_launch_core(
         request.provenance,
     )
     .map_err(DispatchError::Internal)?;
-    ryeos_executor::dispatch::preflight_root_dispatch(
+    ryeos_executor::dispatch::preflight_root_dispatch_for_provenance(
         request.item_ref.as_str(),
         request.item_ref.kind(),
         request.parameters,
@@ -373,6 +374,7 @@ fn preflight_dispatch_launch_core(
         request.usage_subject_asserted_by,
         &project_binding,
         &exec_ctx,
+        request.provenance,
         request.state,
         request.launch_timings,
     )

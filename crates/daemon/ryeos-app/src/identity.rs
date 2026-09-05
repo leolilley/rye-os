@@ -230,19 +230,7 @@ pub const FORWARDED_OPERATOR_ATTESTATION_SCOPE: &str = "ryeos.attest.request.for
 /// the alphabet deliberately small makes the value byte-stable across TOML,
 /// JSON, signatures, and remote admission claims.
 pub fn validate_canonical_site_id(site_id: &str) -> Result<()> {
-    let Some(name) = site_id.strip_prefix("site:") else {
-        bail!("site id must begin with `site:`");
-    };
-    if name.is_empty() || site_id.len() > 255 {
-        bail!("site id must contain a name and be at most 255 bytes");
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        bail!("site id may contain only ASCII letters, digits, `.`, `_`, and `-` after `site:`");
-    }
-    Ok(())
+    ryeos_engine::principal_contract::validate_canonical_site_id(site_id)
 }
 
 /// Check a caller-signed forwarding-origin assertion against origin verified
@@ -269,13 +257,7 @@ pub fn validate_forwarding_origin_assertion(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthorizedKeyPrincipalClass {
-    LocalClient,
-    RemoteNode,
-    RemoteOperator,
-}
+pub use ryeos_engine::principal_contract::AuthorizedKeyPrincipalClass;
 
 /// Closed create-only publication failure used by online authorization paths.
 /// Callers may expose this as a conflict without parsing an anyhow message;
@@ -284,20 +266,6 @@ pub enum AuthorizedKeyPrincipalClass {
 pub enum AuthorizedKeyCreateError {
     #[error("authorized-key fingerprint already has a grant")]
     AlreadyExists,
-}
-
-impl AuthorizedKeyPrincipalClass {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::LocalClient => "local_client",
-            Self::RemoteNode => "remote_node",
-            Self::RemoteOperator => "remote_operator",
-        }
-    }
-
-    pub const fn is_remote(self) -> bool {
-        matches!(self, Self::RemoteNode | Self::RemoteOperator)
-    }
 }
 
 enum AuthorizedKeySubject<'a> {

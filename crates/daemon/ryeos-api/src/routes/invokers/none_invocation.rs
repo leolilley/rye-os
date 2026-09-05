@@ -34,6 +34,7 @@ impl CompiledRouteInvocation for CompiledNoneVerifier {
             verified: false,
             authorized_key_class: None,
             authenticated_origin_site_id: None,
+            authenticated_grant_authority: None,
             metadata: BTreeMap::new(),
         }))
     }

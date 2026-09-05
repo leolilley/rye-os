@@ -78,14 +78,15 @@ pub async fn spawn_detached_child(
         .threads
         .get_thread(&parent_thread_id)?
         .ok_or_else(|| anyhow::anyhow!("detach: parent thread not found: {parent_thread_id}"))?;
-    let parent_lifecycle_authority = state
+    let parent_resume = state
         .state_store
         .get_launch_metadata(&parent_thread_id)?
         .and_then(|metadata| metadata.resume_context)
-        .map(|resume| resume.lifecycle_authority)
         .ok_or_else(|| {
             anyhow::anyhow!("detach: parent {parent_thread_id} has no sealed lifecycle authority")
         })?;
+    let parent_lifecycle_authority = parent_resume.lifecycle_authority;
+    let scheduled_fire = parent_resume.scheduled_fire.clone();
     if !parent_lifecycle_authority.permits_durable_handoff() {
         anyhow::bail!("detach: request-scoped execution cannot spawn a durable child");
     }
@@ -385,9 +386,10 @@ pub async fn spawn_detached_child(
         current_site_id: parent.current_site_id.clone(),
         origin_site_id: parent.origin_site_id.clone(),
         execution_hints: ryeos_engine::contracts::ExecutionHints::default(),
+        scheduled_fire: scheduled_fire.clone(),
         validate_only: false,
     };
-    let child_preflight = ryeos_app::thread_lifecycle::preflight_root_execution(
+    let child_preflight = ryeos_app::thread_lifecycle::preflight_root_execution_for_provenance(
         ryeos_app::thread_lifecycle::ResolveRootExecutionParams {
             engine: child_engine,
             plan_context: child_plan_context.clone(),
@@ -405,6 +407,7 @@ pub async fn spawn_detached_child(
             usage_subject_asserted_by: None,
             creates_chain_root: true,
         },
+        &child_provenance,
     )
     .context("detach: verified child history-policy preflight")?;
     let child_root_admission = child_preflight.root_admission;
@@ -463,6 +466,7 @@ pub async fn spawn_detached_child(
             origin_site_id: parent.origin_site_id.clone(),
             requested_by: requested_by.clone(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire,
             effective_caps: Vec::new(),
             parent_delegation_caps: Some(
                 cap.effective_caps

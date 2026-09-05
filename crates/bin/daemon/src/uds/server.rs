@@ -294,7 +294,18 @@ pub(crate) async fn dispatch_runtime_method(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("missing thread_id on {method}"))?;
         state.thread_auth.validate(tat, thread_id)?;
-        None
+        let token = params
+            .get("callback_token")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("missing callback_token on {method}"))?;
+        // The handler repeats the stronger operation-specific validation. Keep
+        // the exact callback capability here as well so shared execution-tree
+        // deadline admission cannot be bypassed by the two-proof action path.
+        Some(
+            state
+                .callback_tokens
+                .validate_token_and_thread(token, thread_id)?,
+        )
     } else if matches!(
         method,
         "runtime.poll_input"
@@ -381,6 +392,8 @@ pub(crate) async fn dispatch_runtime_method(
             .assert_launch_owner(&cap.thread_id, owner)?;
     }
 
+    enforce_aggregate_work_deadline(method, state, callback_cap.as_ref())?;
+
     enforce_runtime_callback_admission(method, params, state)?;
 
     // Strip transport-level fields before typed deserialization so
@@ -460,6 +473,12 @@ pub(crate) async fn dispatch_runtime_method(
                 .as_ref()
                 .ok_or_else(|| anyhow!("dedicated-session command requires callback authority"))?;
             dedicated_sessions::command(&clean_params, state, cap).await
+        }
+        "runtime.dedicated_session_command_observation" => {
+            let cap = callback_cap.as_ref().ok_or_else(|| {
+                anyhow!("dedicated-session command observation requires callback authority")
+            })?;
+            dedicated_sessions::command_observation(&clean_params, state, cap)
         }
         "runtime.terminate_dedicated_session" => {
             let cap = callback_cap.as_ref().ok_or_else(|| {
@@ -595,6 +614,73 @@ pub(crate) async fn dispatch_runtime_method(
     }
 }
 
+fn enforce_aggregate_work_deadline(
+    method: &str,
+    state: &AppState,
+    cap: Option<&ryeos_app::callback_token::CallbackCapability>,
+) -> Result<()> {
+    // Gate every callback that can begin/advance child work, provider work, or
+    // durable workload publication. Reads and lifecycle/accounting settlement
+    // remain available after expiry so the daemon can fail and clean up the
+    // already-admitted tree without stranding authority.
+    if !matches!(
+        method,
+        "runtime.dispatch_action"
+            | "runtime.spawn_follow_child"
+            | "runtime.append_event"
+            | "runtime.append_events"
+            | "runtime.bundle_events_append"
+            | "runtime.bundle_events_materialize_attachment"
+            | "runtime.vault_put"
+            | "runtime.author_item"
+            | "runtime.project_snapshot"
+            | "runtime.request_continuation"
+            | "runtime.publish_artifact"
+            | "runtime.publish_state_anchor"
+            | "runtime.publish_project_observation"
+            | "runtime.submit_command"
+            | "runtime.claim_commands"
+            | "runtime.poll_input"
+            | "runtime.provider_attempt_prepare"
+            | "runtime.provider_attempt_mark_issued"
+            | "runtime.provider_attempt_local_stream_start"
+            | "runtime.provider_attempt_local_stream_next"
+    ) {
+        return Ok(());
+    }
+    enforce_aggregate_deadline(state, cap)
+}
+
+fn enforce_aggregate_deadline(
+    state: &AppState,
+    cap: Option<&ryeos_app::callback_token::CallbackCapability>,
+) -> Result<()> {
+    let Some(scope) = cap.and_then(|cap| cap.accounting_scope.as_ref()) else {
+        return Ok(());
+    };
+    let accounting = state
+        .accounting
+        .as_ref()
+        .ok_or_else(|| anyhow!("sealed accounting scope has no live accounting ledger"))?;
+    let budget = accounting
+        .execution_resource_budget_snapshot(&scope.execution_budget_id)?
+        .ok_or_else(|| anyhow!("sealed execution scope has no aggregate budget authority"))?;
+    if budget
+        .deadline_at_ms
+        .is_some_and(|deadline| lillux::time::timestamp_millis() >= deadline)
+    {
+        return Err(ryeos_executor::dispatch_error::DispatchError::LaunchPreparationFailed {
+            code: "budget_exhausted".to_owned(),
+            message: "aggregate execution duration elapsed".to_owned(),
+            classification: "policy".to_owned(),
+            binding: None,
+            details: Box::new(std::collections::BTreeMap::new()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Fence callback mutations once a durable stop (or daemon shutdown) has
 /// closed authoring. Cooperative cancellation retains only the narrow surface
 /// needed to settle already-issued commands and finalize.
@@ -685,6 +771,7 @@ fn is_sensitive_runtime_read_method(method: &str) -> bool {
             | "runtime.provider_attempt_local_stream_next"
             | "runtime.dedicated_session_status"
             | "runtime.wait_dedicated_session"
+            | "runtime.dedicated_session_command_observation"
     )
 }
 
@@ -3012,6 +3099,7 @@ mod tests {
                     scopes: vec![],
                 }),
                 execution_hints: Default::default(),
+                scheduled_fire: None,
                 effective_caps: vec![],
                 parent_delegation_caps: None,
                 executor_ref: Some(sealed.executor_ref().to_string()),
@@ -3142,6 +3230,7 @@ mod tests {
                     scopes: Vec::new(),
                 }),
                 execution_hints: Default::default(),
+                scheduled_fire: None,
                 effective_caps: Vec::new(),
                 parent_delegation_caps: Some(Vec::new()),
                 executor_ref: Some(sealed.executor_ref().to_string()),
@@ -5497,6 +5586,92 @@ mod tests {
                 "wildcard caps must pass UDS cap enforcement; downstream errors are fine: {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dedicated_session_command_observation_requires_exact_root_and_command_cap() {
+        let (_tmp, state) = setup_app_state();
+        for thread_id in ["T-observation", "T-other", "T-no-command-cap"] {
+            create_running_test_thread(&state, thread_id);
+        }
+        let allowed = generate_test_callback(
+            &state,
+            "T-observation",
+            std::path::PathBuf::from("/p"),
+            std::time::Duration::from_secs(300),
+            vec!["ryeos.runtime.dedicated_session.command".to_string()],
+            test_provenance(&state, "/p"),
+            "0".repeat(64),
+        );
+
+        let same_root = dispatch(
+            rpc(
+                "runtime.dedicated_session_command_observation",
+                json!({
+                    "callback_token":allowed.token.clone(),
+                    "thread_id":"T-observation",
+                    "command_sequence":1,
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            rpc_err(&same_root)
+                .message
+                .contains("dedicated session is not admitted"),
+            "the exact authorized root must reach the durable projection lookup: {:?}",
+            same_root.error
+        );
+
+        let other_root = dispatch(
+            rpc(
+                "runtime.dedicated_session_command_observation",
+                json!({
+                    "callback_token":allowed.token,
+                    "thread_id":"T-other",
+                    "command_sequence":1,
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            rpc_err(&other_root)
+                .message
+                .contains("does not match thread_id"),
+            "a callback token must not inspect another root: {:?}",
+            other_root.error
+        );
+
+        let denied = generate_test_callback(
+            &state,
+            "T-no-command-cap",
+            std::path::PathBuf::from("/p"),
+            std::time::Duration::from_secs(300),
+            Vec::new(),
+            test_provenance(&state, "/p"),
+            "0".repeat(64),
+        );
+        let no_cap = dispatch(
+            rpc(
+                "runtime.dedicated_session_command_observation",
+                json!({
+                    "callback_token":denied.token,
+                    "thread_id":"T-no-command-cap",
+                    "command_sequence":1,
+                }),
+            ),
+            &state,
+        )
+        .await;
+        assert!(
+            rpc_err(&no_cap)
+                .message
+                .contains("ryeos.runtime.dedicated_session.command"),
+            "command observation must require admitted command authority: {:?}",
+            no_cap.error
+        );
     }
 
     // ── facets (via runtime.* token-gated) ─────────────────────────

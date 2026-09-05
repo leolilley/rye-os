@@ -30,6 +30,12 @@ launch_contract:
     max_targets_per_dependency: 0
     max_executable_search_entries: 0
     external_content: null
+  evidence_attachments:
+    max_attachments: 0
+    max_total_bytes: 0
+    target: null
+    destination_prefix: null
+    allowed_access: []
   environment_contributions:
     max_contributions: 0
     max_targets_per_contribution: 0

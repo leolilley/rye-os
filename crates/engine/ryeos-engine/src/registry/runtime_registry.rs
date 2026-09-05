@@ -45,6 +45,10 @@ const MAX_LAUNCH_EXECUTION_DEPENDENCIES: usize = 8;
 const MAX_LAUNCH_CONTENT_DEPENDENCIES: usize = 8;
 const MAX_LAUNCH_CONTENT_TARGETS: usize = 8;
 const MAX_LAUNCH_EXECUTABLE_SEARCH_ENTRIES: usize = 32;
+const MAX_LAUNCH_EVIDENCE_ATTACHMENTS: usize = 64;
+const MAX_LAUNCH_EVIDENCE_ATTACHMENT_BYTES: u64 = ryeos_state::objects::MAX_BUNDLE_EVENT_ATTACHMENTS
+    as u64
+    * ryeos_state::objects::MAX_BUNDLE_EVENT_ATTACHMENT_BYTES;
 const MAX_LAUNCH_ENVIRONMENT_CONTRIBUTIONS: usize = 8;
 const MAX_LAUNCH_ENVIRONMENT_TARGETS: usize = 8;
 const MAX_LAUNCH_ENVIRONMENT_VARIABLES: usize = 32;
@@ -172,6 +176,12 @@ pub struct LaunchContractDecl {
     /// Kind/space/trust remain authoritative in `ref_bindings` and are not
     /// repeated here.
     pub content_dependencies: LaunchContentDependencyPolicy,
+    /// Signed admission ceiling for exact bundle-event attachments supplied by
+    /// an invocation and bound into one private persistent-session workspace.
+    /// This is deliberately a sibling of static signed content dependencies:
+    /// the event coordinate is dynamic, while materialization and execution
+    /// identity use the same retained external-realization substrate.
+    pub evidence_attachments: LaunchEvidenceAttachmentPolicy,
     /// Signed mechanical ceiling for path-free environment contributions to
     /// named execution dependencies. Values may reference admitted content
     /// dependencies, but are not themselves content authority.
@@ -220,6 +230,16 @@ pub struct LaunchContentDependencyPolicy {
 pub struct LaunchContentExternalPolicy {
     pub max_declarations: u16,
     pub large_content_max_total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchEvidenceAttachmentPolicy {
+    pub max_attachments: u16,
+    pub max_total_bytes: u64,
+    pub target: Option<String>,
+    pub destination_prefix: Option<String>,
+    pub allowed_access: Vec<ryeos_handler_protocol::EvidenceAttachmentAccessWire>,
 }
 
 impl LaunchContentExternalPolicy {
@@ -1235,6 +1255,74 @@ fn validate_launch_contract(yaml_path: &Path, yaml: &RuntimeYaml) -> Result<(), 
         }
     }
 
+    let evidence_policy = &contract.evidence_attachments;
+    let evidence_disabled = evidence_policy.max_attachments == 0;
+    if usize::from(evidence_policy.max_attachments) > MAX_LAUNCH_EVIDENCE_ATTACHMENTS
+        || evidence_policy.max_total_bytes > MAX_LAUNCH_EVIDENCE_ATTACHMENT_BYTES
+    {
+        return runtime_yaml_error(
+            yaml_path,
+            "launch_contract.evidence_attachments exceeds a daemon aggregate ceiling",
+        );
+    }
+    if evidence_disabled
+        != (evidence_policy.max_total_bytes == 0
+            && evidence_policy.target.is_none()
+            && evidence_policy.destination_prefix.is_none()
+            && evidence_policy.allowed_access.is_empty())
+    {
+        return runtime_yaml_error(
+            yaml_path,
+            "launch_contract.evidence_attachments must be wholly empty exactly when max_attachments is zero",
+        );
+    }
+    if !evidence_disabled {
+        if evidence_policy.max_total_bytes == 0
+            || evidence_policy.allowed_access.as_slice()
+                != [ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly]
+        {
+            return runtime_yaml_error(
+                yaml_path,
+                "enabled launch evidence attachments require a nonzero byte ceiling and exact read_only access",
+            );
+        }
+        let target =
+            evidence_policy
+                .target
+                .as_deref()
+                .ok_or_else(|| EngineError::RuntimeYamlInvalid {
+                    path: yaml_path.to_owned(),
+                    reason: "enabled launch evidence attachments require a target".to_owned(),
+                })?;
+        validate_launch_name(
+            yaml_path,
+            "launch_contract.evidence_attachments.target",
+            target,
+        )?;
+        let prefix = evidence_policy
+            .destination_prefix
+            .as_deref()
+            .ok_or_else(|| EngineError::RuntimeYamlInvalid {
+                path: yaml_path.to_owned(),
+                reason: "enabled launch evidence attachments require a destination_prefix"
+                    .to_owned(),
+            })?;
+        ryeos_state::objects::validate_canonical_project_relative_path(prefix).map_err(
+            |error| EngineError::RuntimeYamlInvalid {
+                path: yaml_path.to_owned(),
+                reason: format!(
+                    "launch_contract.evidence_attachments.destination_prefix is invalid: {error}"
+                ),
+            },
+        )?;
+        if prefix == crate::AI_DIR || prefix.starts_with(&format!("{}/", crate::AI_DIR)) {
+            return runtime_yaml_error(
+                yaml_path,
+                "launch evidence attachments cannot target the .ai control namespace",
+            );
+        }
+    }
+
     let environment_policy = &contract.environment_contributions;
     if usize::from(environment_policy.max_contributions) > MAX_LAUNCH_ENVIRONMENT_CONTRIBUTIONS
         || usize::from(environment_policy.max_targets_per_contribution)
@@ -1275,11 +1363,12 @@ fn validate_launch_contract(yaml_path: &Path, yaml: &RuntimeYaml) -> Result<(), 
             || !contract.runtime_facts.is_empty()
             || contract.execution_dependencies.max_dependencies != 0
             || contract.content_dependencies.max_dependencies != 0
+            || contract.evidence_attachments.max_attachments != 0
             || contract.environment_contributions.max_contributions != 0)
     {
         return runtime_yaml_error(
             yaml_path,
-            "launch_contract.preparation kind `none` requires empty config inputs, secret policy, runtime data, runtime facts, execution dependencies, content dependencies, and environment contributions",
+            "launch_contract.preparation kind `none` requires empty config inputs, secret policy, runtime data, runtime facts, execution dependencies, content dependencies, evidence attachments, and environment contributions",
         );
     }
 
@@ -1475,6 +1564,13 @@ mod tests {
                     max_executable_search_entries: 0,
                     external_content: None,
                 },
+                evidence_attachments: LaunchEvidenceAttachmentPolicy {
+                    max_attachments: 0,
+                    max_total_bytes: 0,
+                    target: None,
+                    destination_prefix: None,
+                    allowed_access: vec![],
+                },
                 environment_contributions: LaunchEnvironmentContributionPolicy {
                     max_contributions: 0,
                     max_targets_per_contribution: 0,
@@ -1524,6 +1620,12 @@ mod tests {
         "    max_targets_per_dependency: 0\n",
         "    max_executable_search_entries: 0\n",
         "    external_content: null\n",
+        "  evidence_attachments:\n",
+        "    max_attachments: 0\n",
+        "    max_total_bytes: 0\n",
+        "    target: null\n",
+        "    destination_prefix: null\n",
+        "    allowed_access: []\n",
         "  environment_contributions:\n",
         "    max_contributions: 0\n",
         "    max_targets_per_contribution: 0\n",
@@ -1698,6 +1800,32 @@ mod tests {
             validate_runtime_yaml(&test_path(), &yaml).is_ok(),
             "the supported runtime ABI should be accepted"
         );
+    }
+
+    #[test]
+    fn evidence_attachment_policy_is_closed_and_avoids_control_paths() {
+        let mut inconsistent = minimal_yaml();
+        inconsistent
+            .launch_contract
+            .evidence_attachments
+            .max_total_bytes = 1;
+        let error = validate_runtime_yaml(&test_path(), &inconsistent)
+            .expect_err("a partially enabled evidence policy must fail");
+        assert!(error.to_string().contains("wholly empty"));
+
+        let mut reserved = minimal_yaml();
+        reserved.launch_contract.evidence_attachments = LaunchEvidenceAttachmentPolicy {
+            max_attachments: 1,
+            max_total_bytes: 1024,
+            target: Some("worker".to_owned()),
+            destination_prefix: Some(".ai/evidence".to_owned()),
+            allowed_access: vec![
+                ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly,
+            ],
+        };
+        let error = validate_runtime_yaml(&test_path(), &reserved)
+            .expect_err("evidence must not overlap the control namespace");
+        assert!(error.to_string().contains(".ai control namespace"));
     }
 
     #[test]

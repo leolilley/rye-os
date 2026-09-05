@@ -121,9 +121,7 @@ fn execution_project_context(
     }
 }
 
-pub(crate) fn project_source_from_execution_policy(
-    policy: &ProjectExecutionPolicy,
-) -> ProjectSource {
+pub fn project_source_from_execution_policy(policy: &ProjectExecutionPolicy) -> ProjectSource {
     match policy {
         ProjectExecutionPolicy::Projectless | ProjectExecutionPolicy::LiveDirect { .. } => {
             ProjectSource::LiveFs
@@ -143,7 +141,7 @@ pub(crate) fn project_source_from_execution_policy(
     }
 }
 
-pub(crate) fn pinned_realization_from_execution_policy(
+pub fn pinned_realization_from_execution_policy(
     policy: &ProjectExecutionPolicy,
 ) -> Option<project_source::PinnedContextRealization> {
     match policy {
@@ -231,7 +229,11 @@ pub(crate) fn create_isolated_no_project_workspace(
     .map_err(|error| anyhow::anyhow!("create isolated no-project workspace: {error}"))
 }
 
-fn resolve_project_authority(
+/// Resolve the portable policy and one already-selected project coordinate
+/// into the same persisted project authority used by ordinary execution.
+/// Callers must separately retain any selected CAS generation until that
+/// authority is durably rooted.
+pub fn resolve_execution_project_authority(
     policy: &ExecutionPolicy,
     project_path: Option<&Path>,
     snapshot_hash: Option<&str>,
@@ -415,13 +417,13 @@ fn resolve_project_authority(
 /// caller's exact policy and resolved project generation. Keeping provenance,
 /// project/environment/child authority, and lifecycle authority in one value
 /// prevents an endpoint from rebuilding any leg with local defaults.
-pub(crate) struct ResolvedExecutionContract {
-    pub(crate) provenance: ryeos_app::execution_provenance::ExecutionProvenance,
-    pub(crate) lifecycle_authority: ryeos_state::objects::ExecutionLifecycleAuthority,
+pub struct ResolvedExecutionContract {
+    pub provenance: ryeos_app::execution_provenance::ExecutionProvenance,
+    pub lifecycle_authority: ryeos_state::objects::ExecutionLifecycleAuthority,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_execution_contract(
+pub fn resolve_execution_contract(
     policy: &ExecutionPolicy,
     project_source: &ProjectSource,
     project_ctx: &project_source::ResolvedProjectContext,
@@ -489,7 +491,7 @@ pub(crate) fn resolve_execution_contract(
     {
         anyhow::bail!("live project authority requires a project root containing .ai");
     }
-    let authority = resolve_project_authority(
+    let authority = resolve_execution_project_authority(
         policy,
         (!no_project_requested).then_some(project_ctx.original_path.as_path()),
         project_ctx.snapshot_hash.as_deref(),
@@ -560,7 +562,7 @@ pub(crate) fn resolve_execution_contract(
 /// Project capture and checkout perform blocking filesystem/CAS work. Keep
 /// that work off the async HTTP worker for every execution endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectRootNormalization {
+pub enum ProjectRootNormalization {
     /// The caller already supplied the canonical root, or the path is a
     /// daemon-owned workspace whose lease is keyed by its exact spelling.
     Preserve,
@@ -568,7 +570,7 @@ pub(crate) enum ProjectRootNormalization {
     CanonicalizeLive,
 }
 
-pub(crate) fn project_root_normalization_from_execution_policy(
+pub fn project_root_normalization_from_execution_policy(
     policy: &ProjectExecutionPolicy,
 ) -> ProjectRootNormalization {
     match policy {
@@ -585,7 +587,7 @@ pub(crate) fn project_root_normalization_from_execution_policy(
     }
 }
 
-pub(crate) struct ResolveProjectContextRequest {
+pub struct ResolveProjectContextRequest {
     pub state: ryeos_app::state::AppState,
     pub source: ProjectSource,
     pub project_path: PathBuf,
@@ -596,7 +598,7 @@ pub(crate) struct ResolveProjectContextRequest {
     pub launch_timings: Option<ryeos_app::launch_stage_timings::LaunchStageTimings>,
 }
 
-pub(crate) async fn resolve_project_context_off_thread(
+pub async fn resolve_project_context_off_thread(
     request: ResolveProjectContextRequest,
 ) -> Result<project_source::ResolvedProjectContext, project_source::ProjectSourceError> {
     let ResolveProjectContextRequest {
@@ -654,7 +656,7 @@ pub(crate) fn map_project_source_error(
     }
 }
 
-fn authorize_terminal_publication(
+pub fn authorize_terminal_publication(
     policy: &ExecutionPolicy,
     original_project_path: &Path,
     acting_principal: &str,
@@ -723,7 +725,7 @@ fn authorize_terminal_publication(
         })
 }
 
-pub(crate) fn preauthorize_execution_policy(
+pub fn preauthorize_execution_policy(
     policy: &ExecutionPolicy,
     caller_scopes: &[String],
     state: &ryeos_app::state::AppState,
@@ -1400,6 +1402,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
                 }
                 hints
             },
+            scheduled_fire: None,
             validate_only: request.validate_only,
         };
 
@@ -1916,13 +1919,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
             effect_authority: None,
         };
 
-        let handler_context = ryeos_app::handler_context::HandlerContext::new_with_authority(
-            principal.id.clone(),
-            principal.scopes.clone(),
-            principal.verified,
-            principal.authorized_key_class,
-            principal.authenticated_origin_site_id.clone(),
-        );
+        let handler_context = principal.handler_context();
         let dispatch_result = ryeos_executor::dispatch::dispatch_with_handler_context(
             item_ref,
             handler_context,
@@ -2311,7 +2308,7 @@ mod tests {
             ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY.to_string(),
         ];
 
-        let authority = resolve_project_authority(
+        let authority = resolve_execution_project_authority(
             &policy,
             Some(project.path()),
             None,
@@ -2355,7 +2352,7 @@ mod tests {
             },
         };
 
-        let authority = resolve_project_authority(
+        let authority = resolve_execution_project_authority(
             &policy,
             Some(project.path()),
             Some(&snapshot_hash),
@@ -2376,7 +2373,7 @@ mod tests {
         );
 
         assert!(
-            resolve_project_authority(
+            resolve_execution_project_authority(
                 &policy,
                 Some(project.path()),
                 Some(&snapshot_hash),
@@ -2391,7 +2388,7 @@ mod tests {
             ..destination
         };
         assert!(
-            resolve_project_authority(
+            resolve_execution_project_authority(
                 &policy,
                 Some(project.path()),
                 Some(&snapshot_hash),

@@ -209,6 +209,9 @@ pub struct ChainRecoveryPins {
     pub seat_leases: u64,
     pub child_links: u64,
     pub scheduler_fires: u64,
+    /// Terminal source/evaluator/qualification/integration chains retained by
+    /// an unresolved frozen candidate disposition.
+    pub candidate_evidence: u64,
 }
 
 impl ChainRecoveryPins {
@@ -226,6 +229,7 @@ impl ChainRecoveryPins {
             && self.seat_leases == 0
             && self.child_links == 0
             && self.scheduler_fires == 0
+            && self.candidate_evidence == 0
     }
 }
 
@@ -1029,14 +1033,14 @@ CREATE TABLE IF NOT EXISTS launch_planning (
     reserved_thread_id TEXT NOT NULL UNIQUE,
     requested_by TEXT NOT NULL,
     daemon_generation_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('planning', 'bound', 'cancelled', 'failed', 'expired')),
+    state TEXT NOT NULL CHECK (state IN ('qualified', 'planning', 'bound', 'cancelled', 'failed', 'expired')),
     bound_thread_id TEXT,
     outcome_code TEXT,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     finished_at_ms INTEGER,
     CHECK (
-        (state = 'planning' AND bound_thread_id IS NULL AND outcome_code IS NULL AND finished_at_ms IS NULL)
+        (state IN ('qualified', 'planning') AND bound_thread_id IS NULL AND outcome_code IS NULL AND finished_at_ms IS NULL)
         OR
         (state = 'bound' AND bound_thread_id IS NOT NULL AND bound_thread_id = reserved_thread_id AND outcome_code IS NOT NULL AND finished_at_ms IS NOT NULL)
         OR
@@ -1081,19 +1085,51 @@ CREATE TABLE IF NOT EXISTS dedicated_session (
     worker_boot_epoch INTEGER,
     workspace_id TEXT NOT NULL,
     candidate_required INTEGER NOT NULL CHECK (candidate_required IN (0, 1)),
+    candidate_disposition TEXT NOT NULL CHECK (candidate_disposition IN ('owner_decision', 'retained_for_review')),
     credential_profile_id TEXT NOT NULL,
     credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
     remote_thread_id TEXT,
     current_turn_id TEXT,
-    state TEXT NOT NULL CHECK (state IN ('admitted', 'binding', 'idle', 'turn_running', 'awaiting_approval', 'recovering', 'outcome_unknown', 'draining', 'freezing', 'frozen', 'verifying', 'publish_ready', 'publishing', 'discarding', 'terminal')),
+    state TEXT NOT NULL CHECK (state IN ('admitted', 'binding', 'idle', 'turn_running', 'awaiting_approval', 'recovering', 'outcome_unknown', 'draining', 'freezing', 'frozen', 'verifying', 'qualifying', 'publish_ready', 'publishing', 'discarding', 'terminal')),
     send_boundary TEXT NOT NULL CHECK (send_boundary IN ('none', 'committed', 'contacted', 'settled', 'outcome_unknown')),
     candidate_snapshot_hash TEXT,
     candidate_validation_hash TEXT,
+    candidate_evaluation_hash TEXT,
+    candidate_evaluation_json TEXT,
+    candidate_qualification_json TEXT,
+    candidate_disposition_root_id TEXT,
+    candidate_disposition_operation_id TEXT,
     publication_result TEXT,
+    completion_worker_boot_epoch INTEGER CHECK (completion_worker_boot_epoch > 0),
+    completion_command_sequence INTEGER CHECK (completion_command_sequence > 0),
+    completion_request_digest TEXT,
+    completion_turn_id TEXT,
+    completion_operation_id TEXT,
+    bounded_outcome_json TEXT,
     disposition_resume_state TEXT,
     terminal_reason TEXT,
     created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL
+    updated_at_ms INTEGER NOT NULL,
+    CHECK (
+        (completion_worker_boot_epoch IS NULL
+            AND completion_command_sequence IS NULL
+            AND completion_request_digest IS NULL
+            AND completion_turn_id IS NULL
+            AND completion_operation_id IS NULL)
+        OR
+        (completion_worker_boot_epoch IS NOT NULL
+            AND worker_boot_epoch IS NOT NULL
+            AND completion_worker_boot_epoch <= worker_boot_epoch
+            AND completion_command_sequence IS NOT NULL
+            AND completion_request_digest IS NOT NULL
+            AND completion_turn_id IS NOT NULL
+            AND completion_operation_id IS NOT NULL)
+    ),
+    CHECK (candidate_disposition = 'owner_decision' OR candidate_required = 1),
+    CHECK (bounded_outcome_json IS NULL OR candidate_disposition = 'retained_for_review'),
+    CHECK ((candidate_evaluation_hash IS NULL) = (candidate_evaluation_json IS NULL)),
+    CHECK ((state = 'qualifying') = (candidate_qualification_json IS NOT NULL)),
+    CHECK ((candidate_disposition_root_id IS NULL) = (candidate_disposition_operation_id IS NULL))
 );
 
 CREATE INDEX IF NOT EXISTS idx_dedicated_session_owner_state
@@ -1281,7 +1317,18 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // and launch-metadata epoch 23. It also makes each handoff credential
 // reservation the durable owner of the exact target project-HEAD fence until
 // authoritative adoption. Predecessor reservations cannot prove that fence.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 21;
+// Epoch 22 stores the original worker boot epoch inside every completion fence,
+// adds the signed candidate-disposition policy, and retains the closed bounded
+// terminal outcome before worker cleanup. A current recovery worker must never
+// be substituted for the epoch that observed a completed turn, and recovery
+// must not reconstruct or redrive a bounded outcome from mutable session state.
+// Epoch 23 retains the exact independently completed evaluator testimony used
+// by owner adoption and HEAD publication. It is a projection on the existing
+// candidate controller, never an append to the terminal worker root.
+// Epoch 24 journals candidate qualification before its append-only adoption
+// fact is contacted. Recovery can therefore settle the exact fact or roll back
+// a proved-uncontacted reservation without discovering roots sideways.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 24;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -2266,6 +2313,12 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                         not_null: true,
                     },
                     sqlite_schema::ColumnSpec {
+                        name: "candidate_disposition",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: true,
+                    },
+                    sqlite_schema::ColumnSpec {
                         name: "credential_profile_id",
                         col_type: "TEXT",
                         pk: false,
@@ -2314,7 +2367,73 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                         not_null: false,
                     },
                     sqlite_schema::ColumnSpec {
+                        name: "candidate_evaluation_hash",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "candidate_evaluation_json",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "candidate_qualification_json",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "candidate_disposition_root_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "candidate_disposition_operation_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
                         name: "publication_result",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "completion_worker_boot_epoch",
+                        col_type: "INTEGER",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "completion_command_sequence",
+                        col_type: "INTEGER",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "completion_request_digest",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "completion_turn_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "completion_operation_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "bounded_outcome_json",
                         col_type: "TEXT",
                         pk: false,
                         not_null: false,
@@ -3477,6 +3596,48 @@ pub struct WorkerProcessRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedicatedCandidateDisposition {
+    OwnerDecision,
+    RetainedForReview,
+}
+
+impl DedicatedCandidateDisposition {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::OwnerDecision => "owner_decision",
+            Self::RetainedForReview => "retained_for_review",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "owner_decision" => Ok(Self::OwnerDecision),
+            "retained_for_review" => Ok(Self::RetainedForReview),
+            _ => bail!("dedicated candidate disposition is not canonical"),
+        }
+    }
+}
+
+impl Serialize for DedicatedCandidateDisposition {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DedicatedCandidateDisposition {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDedicatedSession<'a> {
     pub placement_thread_id: &'a str,
     pub chain_root_id: &'a str,
@@ -3484,6 +3645,7 @@ pub struct NewDedicatedSession<'a> {
     pub admitted_capsule_hash: &'a str,
     pub workspace_id: &'a str,
     pub candidate_required: bool,
+    pub candidate_disposition: DedicatedCandidateDisposition,
     pub credential_profile_id: &'a str,
     pub credential_generation: u64,
     pub credential_lock_owner: &'a str,
@@ -3539,6 +3701,7 @@ pub struct DedicatedSessionRecord {
     pub worker_boot_epoch: Option<u64>,
     pub workspace_id: String,
     pub candidate_required: bool,
+    pub candidate_disposition: DedicatedCandidateDisposition,
     pub credential_profile_id: String,
     pub credential_generation: u64,
     pub remote_thread_id: Option<String>,
@@ -3547,7 +3710,14 @@ pub struct DedicatedSessionRecord {
     pub send_boundary: String,
     pub candidate_snapshot_hash: Option<String>,
     pub candidate_validation_hash: Option<String>,
+    pub candidate_evaluation_hash: Option<String>,
+    pub candidate_evaluation: Option<serde_json::Value>,
+    pub candidate_qualification: Option<serde_json::Value>,
+    pub candidate_disposition_root_id: Option<String>,
+    pub candidate_disposition_operation_id: Option<String>,
     pub publication_result: Option<String>,
+    pub completion_fence: Option<ryeos_runtime::callback::HostedCommandCompletionFence>,
+    pub bounded_outcome: Option<ryeos_runtime::callback::DedicatedSessionBoundedOutcome>,
     pub terminal_reason: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -4250,23 +4420,71 @@ fn read_launch_planning(
 
 fn prune_launch_planning(conn: &Connection, now_ms: i64) -> Result<()> {
     const TERMINAL_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
-    const MAX_TERMINAL_ROWS: i64 = 4_096;
-    conn.execute(
-        "DELETE FROM launch_planning
-          WHERE state IN ('cancelled', 'failed', 'expired')
-            AND finished_at_ms < ?1",
-        params![now_ms.saturating_sub(TERMINAL_RETENTION_MS)],
-    )?;
-    conn.execute(
-        "DELETE FROM launch_planning
-          WHERE launch_id IN (
-              SELECT launch_id FROM launch_planning
-               WHERE state IN ('cancelled', 'failed', 'expired')
-               ORDER BY finished_at_ms DESC, launch_id DESC
-               LIMIT -1 OFFSET ?1
-          )",
-        params![MAX_TERMINAL_ROWS],
-    )?;
+    const MAX_TERMINAL_ROWS: usize = 4_096;
+
+    // A retained candidate may reserve exactly one integration launch before
+    // that launch binds a thread. Its terminal planning row is the durable
+    // proof that a failed pre-birth attempt never contacted execution and may
+    // safely be replaced. Keep that exact proof for the candidate lifetime;
+    // the general 24h/row-count pruning policy still applies to every other
+    // terminal planning record.
+    let mut protected = BTreeSet::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT candidate_evaluation_json, candidate_qualification_json FROM dedicated_session
+              WHERE publication_result IN ('retained','retained_for_review')
+                AND (candidate_evaluation_json IS NOT NULL
+                     OR candidate_qualification_json IS NOT NULL)",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        for row in rows {
+            let (evaluation, pending) = row?;
+            for encoded in evaluation.into_iter().chain(pending.into_iter()) {
+                let value: Value = serde_json::from_str(&encoded)
+                    .context("decode retained candidate integration reservation")?;
+                let evaluation = value.get("candidate_evaluation").unwrap_or(&value);
+                if let Some(launch_id) = evaluation
+                    .pointer("/qualification/reserved_integration_launch_id")
+                    .and_then(Value::as_str)
+                {
+                    protected.insert(launch_id.to_owned());
+                }
+            }
+        }
+    }
+
+    let terminal = {
+        let mut statement = conn.prepare(
+            "SELECT launch_id, finished_at_ms FROM launch_planning
+              WHERE state IN ('cancelled', 'failed', 'expired')
+              ORDER BY finished_at_ms DESC, launch_id DESC",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let cutoff = now_ms.saturating_sub(TERMINAL_RETENTION_MS);
+    let mut retained_unprotected = 0_usize;
+    for (launch_id, finished_at_ms) in terminal {
+        if protected.contains(&launch_id) {
+            continue;
+        }
+        if finished_at_ms < cutoff || retained_unprotected >= MAX_TERMINAL_ROWS {
+            conn.execute(
+                "DELETE FROM launch_planning WHERE launch_id=?1",
+                params![launch_id],
+            )?;
+        } else {
+            retained_unprotected += 1;
+        }
+    }
     Ok(())
 }
 
@@ -4342,6 +4560,36 @@ fn validate_dedicated_session_command_authority(
     Ok(payload_json)
 }
 
+fn require_bounded_route_idle(
+    connection: &rusqlite::Connection,
+    placement_thread_id: &str,
+    worker_boot_epoch: i64,
+    command_kind: &str,
+) -> Result<()> {
+    if command_kind != "route" {
+        return Ok(());
+    }
+    let admitted: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM dedicated_session
+          WHERE placement_thread_id=?1 AND worker_boot_epoch=?2
+            AND (candidate_disposition!='retained_for_review'
+              OR (state='idle' AND current_turn_id IS NULL AND bounded_outcome_json IS NULL
+                AND NOT EXISTS(SELECT 1 FROM dedicated_session_approval
+                    WHERE placement_thread_id=?1
+                      AND state IN ('pending','decision_reserved','delivery_contacting','delivery_unknown'))
+                AND NOT EXISTS(SELECT 1 FROM dedicated_session_observation_batch
+                    WHERE placement_thread_id=?1 AND state!='settled'))))",
+        params![placement_thread_id, worker_boot_epoch],
+        |row| row.get(0),
+    )?;
+    if !admitted {
+        bail!(
+            "bounded route requires an exact approval-free idle worker with no pending observations"
+        );
+    }
+    Ok(())
+}
+
 impl RuntimeDb {
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory runtime db")?;
@@ -4409,6 +4657,11 @@ impl RuntimeDb {
         if session.credential_generation == 0 {
             bail!("dedicated credential generation must be positive");
         }
+        if !session.candidate_required
+            && session.candidate_disposition == DedicatedCandidateDisposition::RetainedForReview
+        {
+            bail!("retained-for-review disposition requires a candidate workspace");
+        }
         if let Some(remote_thread_id) = remote_thread_id {
             validate_bounded_runtime_text("dedicated remote thread id", remote_thread_id, 256)?;
         }
@@ -4463,15 +4716,19 @@ impl RuntimeDb {
             "INSERT INTO dedicated_session (
                 placement_thread_id, chain_root_id, owner_principal, admitted_capsule_hash,
                 worker_instance_id, worker_boot_epoch, workspace_id, candidate_required,
-                credential_profile_id, credential_generation, remote_thread_id,
+                candidate_disposition, credential_profile_id, credential_generation, remote_thread_id,
                 current_turn_id, state, send_boundary, candidate_snapshot_hash,
-                candidate_validation_hash, publication_result, terminal_reason,
+                candidate_validation_hash, publication_result, completion_worker_boot_epoch,
+                completion_command_sequence,
+                completion_request_digest, completion_turn_id, completion_operation_id,
+                bounded_outcome_json, terminal_reason,
                 created_at_ms, updated_at_ms
-             ) SELECT ?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?11, NULL,
-                       'admitted', 'none', NULL, NULL, NULL, NULL, ?10, ?10
+             ) SELECT ?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?12, NULL,
+                       'admitted', 'none', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                       NULL, ?11, ?11
                WHERE EXISTS(SELECT 1 FROM credential_profile
-                 WHERE profile_id=?7 AND owner_principal=?3 AND credential_generation=?8
-                   AND lock_owner=?9 AND state IN ('unauthenticated','enrolling','confirming','active'))",
+                 WHERE profile_id=?8 AND owner_principal=?3 AND credential_generation=?9
+                   AND lock_owner=?10 AND state IN ('unauthenticated','enrolling','confirming','active'))",
             params![
                 session.placement_thread_id,
                 session.chain_root_id,
@@ -4479,6 +4736,7 @@ impl RuntimeDb {
                 session.admitted_capsule_hash,
                 session.workspace_id,
                 i64::from(session.candidate_required),
+                session.candidate_disposition.as_str(),
                 session.credential_profile_id,
                 i64::try_from(session.credential_generation)
                     .context("credential generation exceeds SQLite integer range")?,
@@ -4557,9 +4815,16 @@ impl RuntimeDb {
             .query_row(
                 "SELECT placement_thread_id, chain_root_id, owner_principal, admitted_capsule_hash,
                     worker_instance_id, worker_boot_epoch, workspace_id, candidate_required,
-                    credential_profile_id, credential_generation, remote_thread_id,
+                    candidate_disposition, credential_profile_id, credential_generation, remote_thread_id,
                     current_turn_id, state, send_boundary, candidate_snapshot_hash,
-                    candidate_validation_hash, publication_result, terminal_reason,
+                    candidate_validation_hash, candidate_evaluation_hash,
+                    candidate_evaluation_json, candidate_qualification_json,
+                    candidate_disposition_root_id,
+                    candidate_disposition_operation_id, publication_result,
+                    completion_worker_boot_epoch,
+                    completion_command_sequence,
+                    completion_request_digest, completion_turn_id, completion_operation_id,
+                    bounded_outcome_json, terminal_reason,
                     created_at_ms, updated_at_ms
                FROM dedicated_session WHERE placement_thread_id=?1",
                 [placement_thread_id],
@@ -4574,48 +4839,102 @@ impl RuntimeDb {
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, String>(8)?,
-                        row.get::<_, i64>(9)?,
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
                         row.get::<_, Option<String>>(11)?,
-                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<String>>(12)?,
                         row.get::<_, String>(13)?,
-                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, String>(14)?,
                         row.get::<_, Option<String>>(15)?,
                         row.get::<_, Option<String>>(16)?,
                         row.get::<_, Option<String>>(17)?,
-                        row.get::<_, i64>(18)?,
-                        row.get::<_, i64>(19)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, Option<String>>(20)?,
+                        row.get::<_, Option<String>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, Option<i64>>(23)?,
+                        row.get::<_, Option<i64>>(24)?,
+                        row.get::<_, Option<String>>(25)?,
+                        row.get::<_, Option<String>>(26)?,
+                        row.get::<_, Option<String>>(27)?,
+                        row.get::<_, Option<String>>(28)?,
+                        row.get::<_, Option<String>>(29)?,
+                        row.get::<_, i64>(30)?,
+                        row.get::<_, i64>(31)?,
                     ))
                 },
             )
             .optional()?;
         row.map(|row| {
+            let worker_boot_epoch = row
+                .5
+                .map(u64::try_from)
+                .transpose()
+                .context("negative worker boot epoch")?;
+            let completion_fence = match (&row.23, &row.24, &row.25, &row.26, &row.27) {
+                (None, None, None, None, None) => None,
+                (
+                    Some(completion_worker_boot_epoch),
+                    Some(command_sequence),
+                    Some(request_digest),
+                    Some(turn_id),
+                    Some(operation_id),
+                ) => Some(ryeos_runtime::callback::HostedCommandCompletionFence {
+                    placement_thread_id: row.0.clone(),
+                    admitted_capsule_hash: row.3.clone(),
+                    worker_boot_epoch: u64::try_from(*completion_worker_boot_epoch)
+                        .context("negative completion worker boot epoch")?,
+                    command_sequence: u64::try_from(*command_sequence)
+                        .context("negative completion command sequence")?,
+                    request_digest: request_digest.clone(),
+                    turn_id: turn_id.clone(),
+                    completion_operation_id: operation_id.clone(),
+                }),
+                _ => bail!("persisted dedicated completion fence is partial"),
+            };
             Ok(DedicatedSessionRecord {
                 placement_thread_id: row.0,
                 chain_root_id: row.1,
                 owner_principal: row.2,
                 admitted_capsule_hash: row.3,
                 worker_instance_id: row.4,
-                worker_boot_epoch: row
-                    .5
-                    .map(u64::try_from)
-                    .transpose()
-                    .context("negative worker boot epoch")?,
+                worker_boot_epoch,
                 workspace_id: row.6,
                 candidate_required: row.7 != 0,
-                credential_profile_id: row.8,
-                credential_generation: u64::try_from(row.9)
+                candidate_disposition: DedicatedCandidateDisposition::parse(&row.8)?,
+                credential_profile_id: row.9,
+                credential_generation: u64::try_from(row.10)
                     .context("negative credential generation")?,
-                remote_thread_id: row.10,
-                current_turn_id: row.11,
-                state: row.12,
-                send_boundary: row.13,
-                candidate_snapshot_hash: row.14,
-                candidate_validation_hash: row.15,
-                publication_result: row.16,
-                terminal_reason: row.17,
-                created_at_ms: row.18,
-                updated_at_ms: row.19,
+                remote_thread_id: row.11,
+                current_turn_id: row.12,
+                state: row.13,
+                send_boundary: row.14,
+                candidate_snapshot_hash: row.15,
+                candidate_validation_hash: row.16,
+                candidate_evaluation_hash: row.17,
+                candidate_evaluation: row
+                    .18
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .context("decode dedicated candidate evaluation")?,
+                candidate_qualification: row
+                    .19
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .context("decode dedicated candidate qualification reservation")?,
+                candidate_disposition_root_id: row.20,
+                candidate_disposition_operation_id: row.21,
+                publication_result: row.22,
+                completion_fence,
+                bounded_outcome: row
+                    .28
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()
+                    .context("decode dedicated bounded outcome")?,
+                terminal_reason: row.29,
+                created_at_ms: row.30,
+                updated_at_ms: row.31,
             })
         })
         .transpose()
@@ -4656,6 +4975,60 @@ impl RuntimeDb {
                     .ok_or_else(|| anyhow!("listed dedicated session disappeared"))
             })
             .collect()
+    }
+
+    pub fn retained_candidate_snapshot_roots(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT candidate_snapshot_hash, candidate_evaluation_json,
+                    candidate_qualification_json FROM dedicated_session
+              WHERE candidate_snapshot_hash IS NOT NULL
+                AND (publication_result IN ('retained', 'retained_for_review')
+                     OR candidate_disposition_root_id IS NOT NULL)
+              ORDER BY candidate_snapshot_hash",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut roots = BTreeSet::new();
+        for (source_candidate, evaluation_json, qualification_json) in rows {
+            if !lillux::valid_hash(&source_candidate) {
+                bail!("retained dedicated candidate root is not canonical");
+            }
+            roots.insert(source_candidate);
+            if let Some(evaluation_json) = evaluation_json {
+                let evaluation: Value = serde_json::from_str(&evaluation_json)
+                    .context("decode retained candidate evaluation for GC roots")?;
+                let evaluated_candidate = evaluation
+                    .pointer("/candidate/candidate_snapshot_hash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("retained candidate evaluation has no snapshot root"))?;
+                if !lillux::valid_hash(evaluated_candidate) {
+                    bail!("retained evaluated candidate root is not canonical");
+                }
+                roots.insert(evaluated_candidate.to_owned());
+            }
+            if let Some(qualification_json) = qualification_json {
+                let qualification: Value = serde_json::from_str(&qualification_json)
+                    .context("decode pending candidate qualification for GC roots")?;
+                let pending_candidate = qualification
+                    .pointer("/candidate_evaluation/candidate/candidate_snapshot_hash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!("pending candidate qualification has no snapshot root")
+                    })?;
+                if !lillux::valid_hash(pending_candidate) {
+                    bail!("pending evaluated candidate root is not canonical");
+                }
+                roots.insert(pending_candidate.to_owned());
+            }
+        }
+        Ok(roots.into_iter().collect())
     }
 
     pub fn terminalize_unattached_dedicated_session(
@@ -5912,9 +6285,29 @@ impl RuntimeDb {
             {
                 bail!("command idempotency key belongs to a different contacted worker epoch");
             }
+            if existing.state == "committed" {
+                // An exact pending replay is still a prospective contact,
+                // unlike a settled read. Recheck its bounded idle authority
+                // in this same reservation transaction.
+                require_bounded_route_idle(
+                    &tx,
+                    command.placement_thread_id,
+                    epoch,
+                    command.command_kind,
+                )?;
+            }
             tx.commit()?;
             return Ok(existing);
         }
+        // Keep the approval/outbox read in the transaction that reserves the
+        // command. A concurrent observation cannot change this snapshot and
+        // still let the following write commit successfully.
+        require_bounded_route_idle(
+            &tx,
+            command.placement_thread_id,
+            epoch,
+            command.command_kind,
+        )?;
         let next: i64 = tx.query_row(
             "SELECT COALESCE(MAX(command_sequence), 0) + 1 FROM dedicated_session_command WHERE placement_thread_id=?1",
             [command.placement_thread_id], |row| row.get(0),
@@ -5950,6 +6343,7 @@ impl RuntimeDb {
         let session_changed = tx.execute(
             "UPDATE dedicated_session SET send_boundary='committed', updated_at_ms=?3
               WHERE placement_thread_id=?1 AND worker_boot_epoch=?2
+                AND bounded_outcome_json IS NULL
                 AND state IN ('idle','turn_running','awaiting_approval','recovering')
                 AND send_boundary IN ('none','settled')
                 AND EXISTS(SELECT 1 FROM credential_profile
@@ -5989,6 +6383,109 @@ impl RuntimeDb {
         Ok(record)
     }
 
+    /// Read the bounded pre-contact predicate while the caller owns the
+    /// placement transition gate. Reservation and contact repeat the same
+    /// predicate inside their atomic DB transactions; this preflight keeps a
+    /// known approval or unprojected observation ahead of contacting testimony.
+    pub fn require_bounded_route_contact_admission(
+        &self,
+        placement_thread_id: &str,
+        worker_boot_epoch: u64,
+        command_kind: &str,
+    ) -> Result<()> {
+        require_bounded_route_idle(
+            &self.conn,
+            placement_thread_id,
+            i64::try_from(worker_boot_epoch)?,
+            command_kind,
+        )
+    }
+
+    /// Fence one bounded controller outcome before cleanup can make its live
+    /// worker state disappear. The closed value is intentionally retained on
+    /// the existing session row: it is an outbox projection for canonical
+    /// root testimony, not a second execution or goal registry.
+    pub fn reserve_dedicated_session_bounded_outcome(
+        &self,
+        placement_thread_id: &str,
+        outcome: &ryeos_runtime::callback::DedicatedSessionBoundedOutcome,
+    ) -> Result<()> {
+        validate_bounded_runtime_text(
+            "bounded outcome placement thread id",
+            placement_thread_id,
+            256,
+        )?;
+        use ryeos_runtime::callback::{
+            DedicatedSessionBoundedBudgetDimension as Dimension,
+            DedicatedSessionBoundedOutcomeKind as Kind,
+        };
+        match (outcome.kind, outcome.dimension, outcome.approval.as_ref()) {
+            (
+                Kind::BudgetExhausted,
+                Some(
+                    Dimension::Duration | Dimension::WorkerExecutions | Dimension::ProviderContacts,
+                ),
+                None,
+            ) => {}
+            (Kind::BudgetExhausted, None, _) => {
+                bail!("bounded budget exhaustion requires its exact dimension")
+            }
+            (Kind::ApprovalRequired, None, Some(approval)) => {
+                for (label, value, max) in [
+                    ("approval chain root", approval.chain_root_id.as_str(), 256),
+                    (
+                        "approval placement thread",
+                        approval.placement_thread_id.as_str(),
+                        256,
+                    ),
+                    ("approval turn id", approval.turn_id.as_str(), 256),
+                ] {
+                    validate_bounded_runtime_text(label, value, max)?;
+                }
+                if approval.worker_boot_epoch == 0
+                    || !lillux::valid_hash(&approval.admitted_capsule_hash)
+                    || !lillux::valid_hash(&approval.approval_id)
+                    || !lillux::valid_hash(&approval.request_digest)
+                    || !lillux::valid_hash(&approval.approval_operation_id)
+                {
+                    bail!("bounded approval fence is not canonical");
+                }
+            }
+            (Kind::ApprovalRequired, None, None) => {
+                bail!("bounded approval-required requires its exact approval fence")
+            }
+            (_, Some(_), _) => bail!("only bounded budget exhaustion may carry a dimension"),
+            (_, None, Some(_)) => {
+                bail!("only bounded approval-required may carry an approval fence")
+            }
+            (_, None, None) => {}
+        }
+        let outcome_json = lillux::canonical_json(&serde_json::to_value(outcome)?)?;
+        let now = lillux::time::timestamp_millis() as i64;
+        let changed = self.conn.execute(
+            "UPDATE dedicated_session
+                SET bounded_outcome_json=?2, updated_at_ms=?3
+              WHERE placement_thread_id=?1
+                AND candidate_disposition='retained_for_review'
+                AND bounded_outcome_json IS NULL
+                AND state!='terminal'",
+            params![placement_thread_id, outcome_json, now],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let existing = self
+            .dedicated_session(placement_thread_id)?
+            .ok_or_else(|| anyhow!("bounded outcome session disappeared"))?;
+        if existing.candidate_disposition != DedicatedCandidateDisposition::RetainedForReview {
+            bail!("bounded outcome requires a retained-for-review session");
+        }
+        if existing.bounded_outcome.as_ref() != Some(outcome) {
+            bail!("bounded outcome retry contradicts the durable reservation");
+        }
+        Ok(())
+    }
+
     /// Return an already-settled command for an exact idempotent replay.
     ///
     /// This lookup deliberately does not require the session's current worker
@@ -6025,6 +6522,20 @@ impl RuntimeDb {
         Ok(matches!(existing.state.as_str(), "completed" | "failed").then_some(existing))
     }
 
+    /// Read whether an idempotency coordinate already exists before applying
+    /// admission that governs only new work. The command service remains
+    /// responsible for validating an existing row's complete request digest
+    /// and payload before returning or classifying it.
+    pub fn dedicated_session_command_by_key(
+        &self,
+        placement_thread_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<DedicatedSessionCommandRecord>> {
+        validate_bounded_runtime_text("command placement thread id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text("command idempotency key", idempotency_key, 256)?;
+        read_dedicated_command_by_key(&self.conn, placement_thread_id, idempotency_key)
+    }
+
     /// Read one exact placement-local command coordinate. The operational
     /// row is only a lookup projection; callers must verify it against the
     /// authoritative placement-thread facts before trusting its contents.
@@ -6052,6 +6563,30 @@ impl RuntimeDb {
                     .ok_or_else(|| anyhow!("selected dedicated command disappeared"))
             })
             .transpose()
+    }
+
+    /// Read the complete placement-local command ledger in sequence order.
+    /// These rows are only a durable lookup projection; consumers must verify
+    /// every returned coordinate against its authoritative root facts before
+    /// treating contact or settlement as evidence.
+    pub fn dedicated_session_commands(
+        &self,
+        placement_thread_id: &str,
+    ) -> Result<Vec<DedicatedSessionCommandRecord>> {
+        validate_bounded_runtime_text("command placement thread id", placement_thread_id, 256)?;
+        let mut statement = self.conn.prepare(
+            "SELECT idempotency_key FROM dedicated_session_command
+              WHERE placement_thread_id=?1 ORDER BY command_sequence",
+        )?;
+        let keys = statement
+            .query_map([placement_thread_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        keys.into_iter()
+            .map(|idempotency_key| {
+                read_dedicated_command_by_key(&self.conn, placement_thread_id, &idempotency_key)?
+                    .ok_or_else(|| anyhow!("listed dedicated command disappeared"))
+            })
+            .collect()
     }
 
     /// Prove every workload-contact outbox owned by one placement is settled
@@ -6222,6 +6757,26 @@ impl RuntimeDb {
     ) -> Result<()> {
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
+        let command_kind: String = tx.query_row(
+            "SELECT command_kind FROM dedicated_session_command
+              WHERE placement_thread_id=?1 AND command_sequence=?2
+                AND worker_boot_epoch=?3 AND state='committed'",
+            params![
+                placement_thread_id,
+                i64::try_from(command_sequence)?,
+                i64::try_from(worker_boot_epoch)?
+            ],
+            |row| row.get(0),
+        )?;
+        // This transaction is the send linearization: a bounded route cannot
+        // advance either projection if an approval/outbox arrived after its
+        // earlier reservation. Both updates roll back on any failed gate/CAS.
+        require_bounded_route_idle(
+            &tx,
+            placement_thread_id,
+            i64::try_from(worker_boot_epoch)?,
+            &command_kind,
+        )?;
         let changed = tx.execute(
             "UPDATE dedicated_session_command SET state='dispatched', updated_at_ms=?4
               WHERE placement_thread_id=?1 AND command_sequence=?2 AND worker_boot_epoch=?3 AND state='committed'",
@@ -6243,6 +6798,87 @@ impl RuntimeDb {
             bail!("command contact lost its command/session CAS");
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Settle a committed command as a permanent, authoritative failure while
+    /// it is still provably before the possible-contact boundary. The caller
+    /// must publish the corresponding root-chain testimony first; this method
+    /// only advances the rebuildable SQLite projection.
+    pub fn settle_dedicated_command_uncontacted(
+        &self,
+        placement_thread_id: &str,
+        command_sequence: u64,
+        worker_boot_epoch: u64,
+        result: &serde_json::Value,
+    ) -> Result<()> {
+        let result_json = serde_json::to_string(result)?;
+        validate_bounded_runtime_text("uncontacted command result", &result_json, 256 * 1024)?;
+        let now = lillux::time::timestamp_millis() as i64;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE dedicated_session_command
+                SET state='failed', result_json=?4, updated_at_ms=?5
+              WHERE placement_thread_id=?1 AND command_sequence=?2 AND worker_boot_epoch=?3
+                AND state='committed'",
+            params![
+                placement_thread_id,
+                i64::try_from(command_sequence)?,
+                i64::try_from(worker_boot_epoch)?,
+                result_json,
+                now
+            ],
+        )?;
+        let session_changed = tx.execute(
+            "UPDATE dedicated_session SET send_boundary='settled', updated_at_ms=?3
+              WHERE placement_thread_id=?1 AND worker_boot_epoch=?2
+                AND state IN ('idle','turn_running','awaiting_approval','recovering')
+                AND send_boundary='committed'",
+            params![placement_thread_id, i64::try_from(worker_boot_epoch)?, now],
+        )?;
+        if changed != 1 || session_changed != 1 {
+            bail!("uncontacted command settlement lost its command/session CAS");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Repair the rebuildable command projection when a crash lands after the
+    /// accounting ledger durably denied contact (or after the root fact was
+    /// appended) but before the command row recorded that denial. Worker-epoch
+    /// fencing first classifies the still-`committed` row as exact uncontacted;
+    /// the caller must then prove the retained budget decision and publish its
+    /// root fact before using this narrow compare-and-swap.
+    pub fn repair_fenced_dedicated_command_budget_refusal(
+        &self,
+        placement_thread_id: &str,
+        command_sequence: u64,
+        worker_boot_epoch: u64,
+        result: &serde_json::Value,
+    ) -> Result<()> {
+        let expected_json = serde_json::to_string(&serde_json::json!({
+            "error":"worker epoch ended before contact",
+            "retryable_uncontacted":true,
+        }))?;
+        let result_json = serde_json::to_string(result)?;
+        validate_bounded_runtime_text("budget refusal command result", &result_json, 256 * 1024)?;
+        let changed = self.conn.execute(
+            "UPDATE dedicated_session_command
+                SET result_json=?4, updated_at_ms=?5
+              WHERE placement_thread_id=?1 AND command_sequence=?2 AND worker_boot_epoch=?3
+                AND state='failed' AND result_json=?6",
+            params![
+                placement_thread_id,
+                i64::try_from(command_sequence)?,
+                i64::try_from(worker_boot_epoch)?,
+                result_json,
+                lillux::time::timestamp_millis() as i64,
+                expected_json,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("budget refusal repair lost its exact fenced-command CAS");
+        }
         Ok(())
     }
 
@@ -6369,6 +7005,45 @@ impl RuntimeDb {
         )?;
         if changed != 1 || session_changed != 1 {
             bail!("ambiguous command reconciliation lost its CAS");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Repair the narrow crash boundary where immutable root testimony crossed
+    /// `hosted_command.contacting` but the rebuildable command/session rows
+    /// still say `committed`. The caller must prove that exact root fact before
+    /// invoking this compare-and-swap; without it a committed row remains
+    /// mechanically uncontacted.
+    pub fn mark_committed_dedicated_command_contact_unknown(
+        &self,
+        placement_thread_id: &str,
+        command_sequence: u64,
+        worker_boot_epoch: u64,
+    ) -> Result<()> {
+        let now = lillux::time::timestamp_millis() as i64;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE dedicated_session_command SET state='outcome_unknown', updated_at_ms=?4
+              WHERE placement_thread_id=?1 AND command_sequence=?2 AND worker_boot_epoch=?3
+                AND state='committed'",
+            params![
+                placement_thread_id,
+                i64::try_from(command_sequence)?,
+                i64::try_from(worker_boot_epoch)?,
+                now,
+            ],
+        )?;
+        let session_changed = tx.execute(
+            "UPDATE dedicated_session
+                SET state='outcome_unknown', send_boundary='outcome_unknown', updated_at_ms=?3
+              WHERE placement_thread_id=?1 AND worker_boot_epoch=?2
+                AND state IN ('idle','turn_running','awaiting_approval','recovering')
+                AND send_boundary='committed'",
+            params![placement_thread_id, i64::try_from(worker_boot_epoch)?, now],
+        )?;
+        if changed != 1 || session_changed != 1 {
+            bail!("root-proved contacting command repair lost its committed CAS");
         }
         tx.commit()?;
         Ok(())
@@ -6755,16 +7430,26 @@ impl RuntimeDb {
         let authority_json = serde_json::to_string(approval.requested_authority)?;
         validate_bounded_runtime_text("approval authority", &authority_json, 64 * 1024)?;
         let now = lillux::time::timestamp_millis() as i64;
-        if approval.expires_at_ms <= now {
-            bail!("approval expiry must be in the future");
+        if approval.expires_at_ms < 0 {
+            bail!("approval expiry must be non-negative");
         }
         let tx = self.conn.unchecked_transaction()?;
-        let existing: Option<(String, String, String, i64)> = tx
+        let existing: Option<(String, String, String, i64, String, i64)> = tx
             .query_row(
-                "SELECT request_digest, operation_class, requested_authority_json, worker_boot_epoch
+                "SELECT request_digest, operation_class, requested_authority_json,
+                        worker_boot_epoch, worker_instance_id, expires_at_ms
                    FROM dedicated_session_approval WHERE placement_thread_id=?1 AND approval_id=?2",
                 params![approval.placement_thread_id, approval.approval_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
         if let Some(existing) = existing {
@@ -6772,6 +7457,8 @@ impl RuntimeDb {
                 && existing.1 == approval.operation_class
                 && existing.2 == authority_json
                 && existing.3 == i64::try_from(approval.worker_boot_epoch)?
+                && existing.4 == approval.worker_instance_id
+                && existing.5 == approval.expires_at_ms
             {
                 return Ok(());
             }
@@ -6791,6 +7478,14 @@ impl RuntimeDb {
         if !session_live {
             bail!("approval admission lost its active worker/session CAS");
         }
+        // Projection recovery must not restart the approval clock. The
+        // immutable root event timestamp determines expiry; if replay reaches
+        // this projection after that deadline, retain it as already expired.
+        let (initial_state, resolved_at_ms) = if approval.expires_at_ms <= now {
+            ("expired", Some(now))
+        } else {
+            ("pending", None)
+        };
         tx.execute(
             "INSERT INTO dedicated_session_approval (
                 placement_thread_id, approval_id, worker_instance_id, worker_boot_epoch,
@@ -6798,8 +7493,8 @@ impl RuntimeDb {
                 decision_principal, decision_json, decision_digest, reservation_token,
                 expires_at_ms, created_at_ms, resolved_at_ms,
                 delivery_contacted_at_ms, delivery_settled_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending',
-                       NULL, NULL, NULL, NULL, ?8, ?9, NULL, NULL, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                       NULL, NULL, NULL, NULL, ?9, ?10, ?11, NULL, NULL)",
             params![
                 approval.placement_thread_id,
                 approval.approval_id,
@@ -6808,8 +7503,10 @@ impl RuntimeDb {
                 approval.request_digest,
                 approval.operation_class,
                 authority_json,
+                initial_state,
                 approval.expires_at_ms,
-                now
+                now,
+                resolved_at_ms,
             ],
         )?;
         tx.commit()?;
@@ -6879,6 +7576,74 @@ impl RuntimeDb {
             })
         })
         .collect()
+    }
+
+    pub fn dedicated_session_approval(
+        &self,
+        placement_thread_id: &str,
+        approval_id: &str,
+    ) -> Result<Option<DedicatedSessionApprovalRecord>> {
+        validate_bounded_runtime_text("approval session id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text("approval id", approval_id, 256)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT placement_thread_id, approval_id, worker_instance_id, worker_boot_epoch,
+                        request_digest, operation_class, requested_authority_json, state,
+                        decision_principal, decision_json, decision_digest, reservation_token,
+                        expires_at_ms, created_at_ms, resolved_at_ms,
+                        delivery_contacted_at_ms, delivery_settled_at_ms
+                   FROM dedicated_session_approval
+                  WHERE placement_thread_id=?1 AND approval_id=?2",
+                params![placement_thread_id, approval_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
+                        row.get::<_, Option<i64>>(16)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|row| {
+            Ok(DedicatedSessionApprovalRecord {
+                placement_thread_id: row.0,
+                approval_id: row.1,
+                worker_instance_id: row.2,
+                worker_boot_epoch: u64::try_from(row.3)?,
+                request_digest: row.4,
+                operation_class: row.5,
+                requested_authority: serde_json::from_str(&row.6)?,
+                state: row.7,
+                decision_principal: row.8,
+                decision: row
+                    .9
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+                decision_digest: row.10,
+                reservation_token: row.11,
+                expires_at_ms: row.12,
+                created_at_ms: row.13,
+                resolved_at_ms: row.14,
+                delivery_contacted_at_ms: row.15,
+                delivery_settled_at_ms: row.16,
+            })
+        })
+        .transpose()
     }
 
     pub fn dedicated_approval_has_exact_state(
@@ -7030,58 +7795,147 @@ impl RuntimeDb {
         &self,
         placement_thread_id: &str,
         worker_boot_epoch: u64,
-        expected_route_command_sequence: Option<u64>,
+        completion_fence: &ryeos_runtime::callback::HostedCommandCompletionFence,
     ) -> Result<()> {
+        self.reserve_dedicated_session_completion_inner(
+            placement_thread_id,
+            worker_boot_epoch,
+            completion_fence,
+            None,
+        )
+    }
+
+    pub fn reserve_dedicated_session_bounded_completion(
+        &self,
+        placement_thread_id: &str,
+        worker_boot_epoch: u64,
+        completion_fence: &ryeos_runtime::callback::HostedCommandCompletionFence,
+        outcome: &ryeos_runtime::callback::DedicatedSessionBoundedOutcome,
+    ) -> Result<()> {
+        if outcome.kind != ryeos_runtime::callback::DedicatedSessionBoundedOutcomeKind::Completed
+            || outcome.dimension.is_some()
+            || outcome.approval.is_some()
+        {
+            bail!("bounded completion reservation requires the closed completed outcome");
+        }
+        self.reserve_dedicated_session_completion_inner(
+            placement_thread_id,
+            worker_boot_epoch,
+            completion_fence,
+            Some(outcome),
+        )
+    }
+
+    fn reserve_dedicated_session_completion_inner(
+        &self,
+        placement_thread_id: &str,
+        worker_boot_epoch: u64,
+        completion_fence: &ryeos_runtime::callback::HostedCommandCompletionFence,
+        bounded_outcome: Option<&ryeos_runtime::callback::DedicatedSessionBoundedOutcome>,
+    ) -> Result<()> {
+        validate_bounded_runtime_text("completion placement thread id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text("completion turn id", &completion_fence.turn_id, 256)?;
+        if completion_fence.placement_thread_id != placement_thread_id
+            || completion_fence.worker_boot_epoch == 0
+            || completion_fence.worker_boot_epoch > worker_boot_epoch
+            || completion_fence.command_sequence == 0
+            || !lillux::valid_hash(&completion_fence.admitted_capsule_hash)
+            || !lillux::valid_hash(&completion_fence.request_digest)
+            || !lillux::valid_hash(&completion_fence.completion_operation_id)
+        {
+            bail!("dedicated completion fence is not canonical for this placement");
+        }
         let epoch = i64::try_from(worker_boot_epoch)?;
-        let expected_route_command_sequence = expected_route_command_sequence
-            .map(|sequence| {
-                if sequence == 0 {
-                    bail!("expected completion route-command sequence must be positive");
-                }
-                i64::try_from(sequence)
-                    .context("expected completion route-command sequence overflow")
-            })
+        let completion_epoch = i64::try_from(completion_fence.worker_boot_epoch)?;
+        let command_sequence = i64::try_from(completion_fence.command_sequence)
+            .context("completion command sequence overflow")?;
+        let bounded_outcome_json = bounded_outcome
+            .map(serde_json::to_value)
+            .transpose()?
+            .map(|value| lillux::canonical_json(&value))
             .transpose()?;
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
         let changed = tx.execute(
-            "UPDATE dedicated_session SET state='draining', updated_at_ms=?4
+            "UPDATE dedicated_session
+                SET state='draining', completion_worker_boot_epoch=?4,
+                    completion_command_sequence=?5, completion_request_digest=?6,
+                    completion_turn_id=?7, completion_operation_id=?8,
+                    bounded_outcome_json=?10, updated_at_ms=?9
               WHERE placement_thread_id=?1 AND worker_boot_epoch=?2 AND state='idle'
                 AND current_turn_id IS NULL
-                AND (?3 IS NULL OR ?3=(SELECT MAX(command_sequence)
+                AND admitted_capsule_hash=?3
+                AND completion_worker_boot_epoch IS NULL
+                AND completion_command_sequence IS NULL
+                AND completion_request_digest IS NULL
+                AND completion_turn_id IS NULL
+                AND completion_operation_id IS NULL
+                AND bounded_outcome_json IS NULL
+                AND (?10 IS NULL OR candidate_disposition='retained_for_review')
+                AND ?5=(SELECT MAX(command_sequence)
                     FROM dedicated_session_command
-                    WHERE placement_thread_id=?1 AND command_kind='route'))
+                    WHERE placement_thread_id=?1 AND command_kind='route')
+                AND EXISTS(SELECT 1 FROM dedicated_session_command
+                    WHERE placement_thread_id=?1 AND worker_boot_epoch=?4
+                      AND command_sequence=?5 AND command_kind='route'
+                      AND request_digest=?6 AND state='completed')
                 AND NOT EXISTS(SELECT 1 FROM dedicated_session_command
-                    WHERE placement_thread_id=?1 AND worker_boot_epoch=?2
+                    WHERE placement_thread_id=?1
                       AND state IN ('committed','dispatched','outcome_unknown'))
                 AND NOT EXISTS(SELECT 1 FROM dedicated_session_approval
-                    WHERE placement_thread_id=?1 AND worker_boot_epoch=?2
+                    WHERE placement_thread_id=?1
                       AND state IN ('pending','decision_reserved','delivery_contacting','delivery_unknown'))
                 AND NOT EXISTS(SELECT 1 FROM dedicated_session_observation_batch
-                    WHERE placement_thread_id=?1 AND worker_boot_epoch=?2 AND state!='settled')",
-            params![placement_thread_id, epoch, expected_route_command_sequence, now],
+                    WHERE placement_thread_id=?1 AND state!='settled')",
+            params![
+                placement_thread_id,
+                epoch,
+                completion_fence.admitted_capsule_hash,
+                completion_epoch,
+                command_sequence,
+                completion_fence.request_digest,
+                completion_fence.turn_id,
+                completion_fence.completion_operation_id,
+                now,
+                bounded_outcome_json,
+            ],
         )?;
         if changed == 0 {
             let retry: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM dedicated_session
                   WHERE placement_thread_id=?1 AND worker_boot_epoch=?2 AND state='draining'
-                    AND (?3 IS NULL OR ?3=(SELECT MAX(command_sequence)
+                    AND admitted_capsule_hash=?3
+                    AND completion_worker_boot_epoch=?4
+                    AND completion_command_sequence=?5
+                    AND completion_request_digest=?6
+                    AND completion_turn_id=?7
+                    AND completion_operation_id=?8
+                    AND bounded_outcome_json IS ?9
+                    AND ?5=(SELECT MAX(command_sequence)
                         FROM dedicated_session_command
-                        WHERE placement_thread_id=?1 AND command_kind='route')))",
-                params![placement_thread_id, epoch, expected_route_command_sequence],
+                        WHERE placement_thread_id=?1 AND command_kind='route'))",
+                params![
+                    placement_thread_id,
+                    epoch,
+                    completion_fence.admitted_capsule_hash,
+                    completion_epoch,
+                    command_sequence,
+                    completion_fence.request_digest,
+                    completion_fence.turn_id,
+                    completion_fence.completion_operation_id,
+                    bounded_outcome_json,
+                ],
                 |row| row.get(0),
             )?;
             if !retry {
-                if let Some(expected) = expected_route_command_sequence {
-                    let found: Option<i64> = tx.query_row(
-                        "SELECT MAX(command_sequence) FROM dedicated_session_command
-                          WHERE placement_thread_id=?1 AND command_kind='route'",
-                        params![placement_thread_id],
-                        |row| row.get(0),
-                    )?;
-                    if found != Some(expected) {
-                        bail!("completed termination command frontier has advanced");
-                    }
+                let found: Option<i64> = tx.query_row(
+                    "SELECT MAX(command_sequence) FROM dedicated_session_command
+                      WHERE placement_thread_id=?1 AND command_kind='route'",
+                    params![placement_thread_id],
+                    |row| row.get(0),
+                )?;
+                if found != Some(command_sequence) {
+                    bail!("completed termination command frontier has advanced");
                 }
                 bail!("dedicated completion requires an idle, quiescent worker");
             }
@@ -7938,8 +8792,8 @@ impl RuntimeDb {
             let retry: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM dedicated_session
                   WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3
-                    AND state IN ('recovering','freezing','frozen','verifying','publish_ready',
-                                  'publishing','discarding','terminal'))",
+                    AND state IN ('recovering','freezing','frozen','verifying','qualifying',
+                                  'publish_ready','publishing','discarding','terminal'))",
                 params![placement_thread_id, worker_instance_id, epoch],
                 |row| row.get(0),
             )?;
@@ -7963,16 +8817,25 @@ impl RuntimeDb {
         validate_bounded_runtime_text("dedicated terminal reason", reason, 2048)?;
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
-        let candidate_required: bool = tx.query_row(
-            "SELECT candidate_required != 0 FROM dedicated_session
+        let (candidate_required, has_completion_fence): (bool, bool) = tx.query_row(
+            "SELECT candidate_required != 0,
+                    completion_worker_boot_epoch IS NOT NULL
+                    AND completion_command_sequence IS NOT NULL
+                    AND completion_request_digest IS NOT NULL
+                    AND completion_turn_id IS NOT NULL
+                    AND completion_operation_id IS NOT NULL
+               FROM dedicated_session
               WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3",
             params![
                 placement_thread_id,
                 worker_instance_id,
                 i64::try_from(boot_epoch)?
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if reason == "completed" && !has_completion_fence {
+            bail!("completed dedicated session has no durable completion fence");
+        }
         let terminal_state = if reason == "completed" && candidate_required {
             "freezing"
         } else {
@@ -8078,6 +8941,64 @@ impl RuntimeDb {
         Ok(changed == 1)
     }
 
+    /// Close a bounded worker placement after its immutable candidate has
+    /// been captured. This disposition deliberately retains the candidate in
+    /// CAS without entering validation, publication, or project-HEAD mutation.
+    /// The exact completed-turn fence must already be committed on the
+    /// session, so a crash cannot turn worker exit or mutable idle state into
+    /// successful completion.
+    pub fn settle_dedicated_candidate_retained_for_review(
+        &self,
+        placement_thread_id: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
+        if !lillux::valid_hash(snapshot_hash) {
+            bail!("dedicated candidate snapshot hash is not canonical");
+        }
+        let now = lillux::time::timestamp_millis() as i64;
+        let changed = self.conn.execute(
+            "UPDATE dedicated_session
+                SET state='terminal', publication_result='retained_for_review',
+                    disposition_resume_state=NULL, updated_at_ms=?3
+              WHERE placement_thread_id=?1 AND state='frozen'
+                AND terminal_reason='completed' AND candidate_required=1
+                AND candidate_disposition='retained_for_review'
+                AND candidate_snapshot_hash=?2
+                AND candidate_validation_hash IS NOT NULL
+                AND publication_result='retained'
+                AND completion_worker_boot_epoch IS NOT NULL
+                AND completion_command_sequence IS NOT NULL
+                AND completion_request_digest IS NOT NULL
+                AND completion_turn_id IS NOT NULL
+                AND completion_operation_id IS NOT NULL",
+            params![placement_thread_id, snapshot_hash, now],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let retry: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dedicated_session
+              WHERE placement_thread_id=?1 AND state='terminal'
+                AND terminal_reason='completed' AND candidate_required=1
+                AND candidate_disposition='retained_for_review'
+                AND candidate_snapshot_hash=?2
+                AND candidate_validation_hash IS NOT NULL
+                AND publication_result='retained_for_review'
+                AND completion_worker_boot_epoch IS NOT NULL
+                AND completion_command_sequence IS NOT NULL
+                AND completion_request_digest IS NOT NULL
+                AND completion_turn_id IS NOT NULL
+                AND completion_operation_id IS NOT NULL)",
+            params![placement_thread_id, snapshot_hash],
+            |row| row.get(0),
+        )?;
+        if !retry {
+            bail!("retained-for-review candidate settlement lost its exact state/identity CAS");
+        }
+        Ok(())
+    }
+
     pub fn reserve_dedicated_candidate_validation(
         &self,
         placement_thread_id: &str,
@@ -8088,7 +9009,8 @@ impl RuntimeDb {
             "UPDATE dedicated_session SET state='verifying', disposition_resume_state='frozen', updated_at_ms=?4
               WHERE placement_thread_id=?1 AND state='frozen'
                 AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
-                AND publication_result='retained'",
+                AND publication_result='retained'
+                AND candidate_disposition='owner_decision'",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
@@ -8103,7 +9025,8 @@ impl RuntimeDb {
             "SELECT EXISTS(SELECT 1 FROM dedicated_session
               WHERE placement_thread_id=?1 AND state='verifying'
                 AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
-                AND publication_result='retained')",
+                AND publication_result='retained'
+                AND candidate_disposition='owner_decision')",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
@@ -8133,11 +9056,15 @@ impl RuntimeDb {
         let _evidence_digest = ryeos_state::objects::canonical_value_digest(evidence)?;
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
+        // Closure/base validation is diagnostic evidence only. It may never
+        // authorize publication; only accepted immutable evaluator testimony
+        // advances the controller projection to `publish_ready`.
         let changed = tx.execute(
-            "UPDATE dedicated_session SET state='publish_ready', disposition_resume_state=NULL, updated_at_ms=?4
+            "UPDATE dedicated_session SET state='frozen', disposition_resume_state=NULL, updated_at_ms=?4
               WHERE placement_thread_id=?1 AND state='verifying'
                 AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
-                AND publication_result='retained'",
+                AND publication_result='retained'
+                AND candidate_disposition='owner_decision'",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
@@ -8152,23 +9079,376 @@ impl RuntimeDb {
         Ok(())
     }
 
+    /// Journal one owner-authorized evaluator adoption before contacting its
+    /// append-only qualification root. The incumbent evaluation remains
+    /// authoritative until the rooted fact is observed and settled.
+    pub fn reserve_dedicated_candidate_evaluation(
+        &self,
+        placement_thread_id: &str,
+        candidate_snapshot_hash: &str,
+        candidate_validation_hash: &str,
+        expected_previous_evaluation_hash: Option<&str>,
+        candidate_evaluation_hash: &str,
+        candidate_evaluation: &Value,
+        qualification_root_id: &str,
+        qualification_operation_id: &str,
+        reserved_integration_launch: Option<(&str, &str, &str)>,
+    ) -> Result<()> {
+        validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text(
+            "candidate qualification root id",
+            qualification_root_id,
+            256,
+        )?;
+        for (label, hash) in [
+            ("candidate snapshot", candidate_snapshot_hash),
+            ("candidate validation", candidate_validation_hash),
+            ("candidate evaluation", candidate_evaluation_hash),
+            (
+                "candidate qualification operation",
+                qualification_operation_id,
+            ),
+        ] {
+            if !lillux::valid_hash(hash) {
+                bail!("dedicated {label} hash is not canonical");
+            }
+        }
+        if let Some(hash) = expected_previous_evaluation_hash
+            && !lillux::valid_hash(hash)
+        {
+            bail!("expected previous candidate evaluation hash is not canonical");
+        }
+        if ryeos_state::objects::canonical_value_digest(candidate_evaluation)?
+            != candidate_evaluation_hash
+        {
+            bail!("dedicated candidate evaluation hash does not match its testimony");
+        }
+        let qualification = serde_json::json!({
+            "schema":"ryeos.hosted_candidate_qualification_reservation.v1",
+            "previous_candidate_evaluation_hash":expected_previous_evaluation_hash,
+            "candidate_evaluation_hash":candidate_evaluation_hash,
+            "candidate_evaluation":candidate_evaluation,
+            "qualification_root_id":qualification_root_id,
+            "qualification_operation_id":qualification_operation_id,
+        });
+        let qualification_json = lillux::canonical_json(&qualification)?;
+        let now = lillux::time::timestamp_millis() as i64;
+        let tx = self.conn.unchecked_transaction()?;
+        let incumbent: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT candidate_evaluation_hash, candidate_evaluation_json
+                   FROM dedicated_session WHERE placement_thread_id=?1",
+                params![placement_thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((incumbent_hash, incumbent_json)) = incumbent else {
+            bail!("candidate evaluator adoption references a missing session");
+        };
+        if incumbent_hash.as_deref() != expected_previous_evaluation_hash {
+            bail!("candidate evaluator adoption lost its previous-testimony CAS");
+        }
+        match (incumbent_hash.as_deref(), incumbent_json.as_deref()) {
+            (None, None) => {}
+            (Some(hash), Some(encoded)) => {
+                let testimony: Value = serde_json::from_str(encoded)
+                    .context("decode incumbent candidate evaluation testimony")?;
+                if ryeos_state::objects::canonical_value_digest(&testimony)? != hash {
+                    bail!("incumbent candidate evaluation testimony is corrupt");
+                }
+            }
+            _ => bail!("incumbent candidate evaluation identity is incomplete"),
+        }
+        if let Some((launch_id, reserved_thread_id, requested_by)) = reserved_integration_launch {
+            validate_bounded_runtime_text("candidate integration launch id", launch_id, 64)?;
+            validate_bounded_runtime_text(
+                "candidate integration reserved thread id",
+                reserved_thread_id,
+                256,
+            )?;
+            validate_bounded_runtime_text("candidate integration launch owner", requested_by, 512)?;
+            let incumbent_launch = read_launch_planning(
+                &tx,
+                "SELECT launch_id, reserved_thread_id, requested_by, daemon_generation_id,
+                        state, bound_thread_id, outcome_code
+                   FROM launch_planning WHERE launch_id=?1",
+                launch_id,
+            )?;
+            match incumbent_launch {
+                None => {
+                    let pending_rows: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM launch_planning WHERE state IN ('qualified','planning')",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if pending_rows >= 4_096 {
+                        return Err(LaunchPlanningCapacityExceeded.into());
+                    }
+                    tx.execute(
+                        "INSERT INTO launch_planning (
+                            launch_id, reserved_thread_id, requested_by,
+                            daemon_generation_id, state, created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, 'qualified', ?5, ?5)",
+                        params![
+                            launch_id,
+                            reserved_thread_id,
+                            requested_by,
+                            daemon_generation_id(),
+                            now,
+                        ],
+                    )?;
+                }
+                Some(existing)
+                    if existing.reserved_thread_id == reserved_thread_id
+                        && existing.requested_by == requested_by
+                        && existing.state == "qualified" => {}
+                Some(_) => {
+                    bail!("candidate integration launch coordinate is already reserved")
+                }
+            }
+        }
+        let changed = tx.execute(
+            "UPDATE dedicated_session
+                SET state='qualifying', disposition_resume_state=state,
+                    candidate_qualification_json=?5,
+                    candidate_disposition_root_id=?6,
+                    candidate_disposition_operation_id=?7,
+                    updated_at_ms=?8
+              WHERE placement_thread_id=?1
+                AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
+                AND candidate_evaluation_hash IS ?4
+                AND candidate_qualification_json IS NULL
+                AND candidate_disposition_root_id IS NULL
+                AND candidate_disposition_operation_id IS NULL
+                AND (
+                    (candidate_disposition='owner_decision'
+                     AND state IN ('frozen','publish_ready')
+                     AND publication_result='retained')
+                    OR
+                    (candidate_disposition='retained_for_review'
+                     AND state IN ('terminal','publish_ready') AND terminal_reason='completed'
+                     AND publication_result='retained_for_review'
+                     AND completion_operation_id IS NOT NULL)
+                )",
+            params![
+                placement_thread_id,
+                candidate_snapshot_hash,
+                candidate_validation_hash,
+                expected_previous_evaluation_hash,
+                qualification_json,
+                qualification_root_id,
+                qualification_operation_id,
+                now,
+            ],
+        )?;
+        if changed == 1 {
+            prune_launch_planning(&tx, now)?;
+            tx.commit()?;
+            return Ok(());
+        }
+        let retry: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dedicated_session
+              WHERE placement_thread_id=?1
+                AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
+                AND candidate_evaluation_hash IS ?4
+                AND state='qualifying'
+                AND candidate_qualification_json=?5
+                AND candidate_disposition_root_id=?6
+                AND candidate_disposition_operation_id=?7)",
+            params![
+                placement_thread_id,
+                candidate_snapshot_hash,
+                candidate_validation_hash,
+                expected_previous_evaluation_hash,
+                qualification_json,
+                qualification_root_id,
+                qualification_operation_id,
+            ],
+            |row| row.get(0),
+        )?;
+        if !retry {
+            bail!("candidate evaluator adoption reservation lost its exact candidate/state CAS");
+        }
+        prune_launch_planning(&tx, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commit a reserved evaluator adoption only after its exact append-only
+    /// qualification fact has been verified by the caller.
+    pub fn settle_dedicated_candidate_evaluation(
+        &self,
+        placement_thread_id: &str,
+        candidate_snapshot_hash: &str,
+        candidate_validation_hash: &str,
+        expected_previous_evaluation_hash: Option<&str>,
+        candidate_evaluation_hash: &str,
+        candidate_evaluation: &Value,
+        qualification_root_id: &str,
+        qualification_operation_id: &str,
+    ) -> Result<()> {
+        if ryeos_state::objects::canonical_value_digest(candidate_evaluation)?
+            != candidate_evaluation_hash
+        {
+            bail!("dedicated candidate evaluation hash does not match its testimony");
+        }
+        let qualification = serde_json::json!({
+            "schema":"ryeos.hosted_candidate_qualification_reservation.v1",
+            "previous_candidate_evaluation_hash":expected_previous_evaluation_hash,
+            "candidate_evaluation_hash":candidate_evaluation_hash,
+            "candidate_evaluation":candidate_evaluation,
+            "qualification_root_id":qualification_root_id,
+            "qualification_operation_id":qualification_operation_id,
+        });
+        let qualification_json = lillux::canonical_json(&qualification)?;
+        let evaluation_json = lillux::canonical_json(candidate_evaluation)?;
+        let now = lillux::time::timestamp_millis() as i64;
+        let changed = self.conn.execute(
+            "UPDATE dedicated_session
+                SET candidate_evaluation_hash=?5, candidate_evaluation_json=?6,
+                    candidate_qualification_json=NULL,
+                    candidate_disposition_root_id=NULL,
+                    candidate_disposition_operation_id=NULL,
+                    state='publish_ready', disposition_resume_state=NULL,
+                    updated_at_ms=?10
+              WHERE placement_thread_id=?1
+                AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
+                AND candidate_evaluation_hash IS ?4
+                AND state='qualifying'
+                AND candidate_qualification_json=?7
+                AND candidate_disposition_root_id=?8
+                AND candidate_disposition_operation_id=?9",
+            params![
+                placement_thread_id,
+                candidate_snapshot_hash,
+                candidate_validation_hash,
+                expected_previous_evaluation_hash,
+                candidate_evaluation_hash,
+                evaluation_json,
+                qualification_json,
+                qualification_root_id,
+                qualification_operation_id,
+                now,
+            ],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let retry: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dedicated_session
+              WHERE placement_thread_id=?1
+                AND candidate_snapshot_hash=?2 AND candidate_validation_hash=?3
+                AND candidate_evaluation_hash=?4 AND candidate_evaluation_json=?5
+                AND candidate_qualification_json IS NULL
+                AND state IN ('publish_ready','publishing','terminal'))",
+            params![
+                placement_thread_id,
+                candidate_snapshot_hash,
+                candidate_validation_hash,
+                candidate_evaluation_hash,
+                evaluation_json,
+            ],
+            |row| row.get(0),
+        )?;
+        if !retry {
+            bail!("candidate evaluator adoption lost its exact qualification reservation");
+        }
+        Ok(())
+    }
+
+    /// Roll back an evaluator-adoption journal only when its append-only fact
+    /// was never committed. Any pre-minted integration birth coordinate is
+    /// removed in the same transaction, and only while it still proves that no
+    /// thread was bound or contacted.
+    pub fn rollback_dedicated_candidate_evaluation(
+        &self,
+        placement_thread_id: &str,
+        qualification_root_id: &str,
+        qualification_operation_id: &str,
+        reserved_integration_launch: Option<(&str, &str, &str)>,
+    ) -> Result<()> {
+        validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text(
+            "candidate qualification root id",
+            qualification_root_id,
+            256,
+        )?;
+        if !lillux::valid_hash(qualification_operation_id) {
+            bail!("candidate qualification operation id is not canonical");
+        }
+        let now = lillux::time::timestamp_millis() as i64;
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some((launch_id, reserved_thread_id, requested_by)) = reserved_integration_launch {
+            let deleted = tx.execute(
+                "DELETE FROM launch_planning
+                  WHERE launch_id=?1 AND reserved_thread_id=?2 AND requested_by=?3
+                    AND state='qualified' AND bound_thread_id IS NULL
+                    AND outcome_code IS NULL AND finished_at_ms IS NULL",
+                params![launch_id, reserved_thread_id, requested_by],
+            )?;
+            if deleted != 1 {
+                bail!(
+                    "candidate qualification integration reservation no longer proves no contact"
+                );
+            }
+        }
+        let changed = tx.execute(
+            "UPDATE dedicated_session SET state=disposition_resume_state,
+                    disposition_resume_state=NULL,
+                    candidate_qualification_json=NULL,
+                    candidate_disposition_root_id=NULL,
+                    candidate_disposition_operation_id=NULL,
+                    updated_at_ms=?4
+              WHERE placement_thread_id=?1 AND state='qualifying'
+                AND disposition_resume_state IN ('frozen','publish_ready','terminal')
+                AND candidate_disposition_root_id=?2
+                AND candidate_disposition_operation_id=?3
+                AND publication_result IN ('retained','retained_for_review')",
+            params![
+                placement_thread_id,
+                qualification_root_id,
+                qualification_operation_id,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("candidate qualification rollback lost its exact reservation");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn reserve_dedicated_candidate_discard(
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        disposition_root_id: &str,
+        disposition_operation_id: &str,
     ) -> Result<()> {
         validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text("candidate disposition root id", disposition_root_id, 256)?;
         if !lillux::valid_hash(candidate_snapshot_hash) {
             bail!("discarded candidate hash is not canonical");
         }
+        if !lillux::valid_hash(disposition_operation_id) {
+            bail!("candidate disposition operation id is not canonical");
+        }
         let changed = self.conn.execute(
             "UPDATE dedicated_session
-                SET disposition_resume_state=state, state='discarding', updated_at_ms=?3
+                SET disposition_resume_state=state, state='discarding',
+                    candidate_disposition_root_id=?3,
+                    candidate_disposition_operation_id=?4,
+                    updated_at_ms=?5
               WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
-                AND publication_result='retained' AND state IN ('frozen','publish_ready')",
+                AND candidate_disposition_root_id IS NULL
+                AND candidate_disposition_operation_id IS NULL
+                AND publication_result IN ('retained','retained_for_review')
+                AND state IN ('frozen','publish_ready','terminal')",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
+                disposition_root_id,
+                disposition_operation_id,
                 lillux::time::timestamp_millis() as i64
             ],
         )?;
@@ -8176,8 +9456,16 @@ impl RuntimeDb {
             let retry: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM dedicated_session
                   WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
-                    AND publication_result='retained' AND state='discarding')",
-                params![placement_thread_id, candidate_snapshot_hash],
+                    AND candidate_disposition_root_id=?3
+                    AND candidate_disposition_operation_id=?4
+                    AND publication_result IN ('retained','retained_for_review')
+                    AND state='discarding')",
+                params![
+                    placement_thread_id,
+                    candidate_snapshot_hash,
+                    disposition_root_id,
+                    disposition_operation_id
+                ],
                 |row| row.get(0),
             )?;
             if !retry {
@@ -8187,20 +9475,61 @@ impl RuntimeDb {
         Ok(())
     }
 
+    /// Roll back only an exact discard journal whose owner fact was proved
+    /// absent by complete authoritative root replay.
+    pub fn rollback_dedicated_candidate_discard(
+        &self,
+        placement_thread_id: &str,
+        candidate_snapshot_hash: &str,
+        disposition_root_id: &str,
+        disposition_operation_id: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE dedicated_session
+                SET state=disposition_resume_state, disposition_resume_state=NULL,
+                    candidate_disposition_root_id=NULL,
+                    candidate_disposition_operation_id=NULL, updated_at_ms=?5
+              WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
+                AND candidate_disposition_root_id=?3
+                AND candidate_disposition_operation_id=?4
+                AND state='discarding'
+                AND disposition_resume_state IN ('frozen','publish_ready','terminal')
+                AND publication_result IN ('retained','retained_for_review')",
+            params![
+                placement_thread_id,
+                candidate_snapshot_hash,
+                disposition_root_id,
+                disposition_operation_id,
+                lillux::time::timestamp_millis() as i64,
+            ],
+        )?;
+        if changed != 1 {
+            bail!("candidate discard rollback lost its exact reservation");
+        }
+        Ok(())
+    }
+
     pub fn settle_dedicated_candidate_discard(
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        disposition_root_id: &str,
+        disposition_operation_id: &str,
     ) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE dedicated_session
                 SET state='terminal', publication_result='discarded',
-                    disposition_resume_state=NULL, updated_at_ms=?3
+                    disposition_resume_state=NULL, updated_at_ms=?5
               WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
-                AND publication_result='retained' AND state='discarding'",
+                AND candidate_disposition_root_id=?3
+                AND candidate_disposition_operation_id=?4
+                AND publication_result IN ('retained','retained_for_review')
+                AND state='discarding'",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
+                disposition_root_id,
+                disposition_operation_id,
                 lillux::time::timestamp_millis() as i64
             ],
         )?;
@@ -8214,14 +9543,30 @@ impl RuntimeDb {
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        publication_root_id: &str,
+        publication_operation_id: &str,
     ) -> Result<()> {
+        validate_bounded_runtime_text("candidate publication root id", publication_root_id, 256)?;
+        if !lillux::valid_hash(publication_operation_id) {
+            bail!("candidate publication operation id is not canonical");
+        }
         let changed = self.conn.execute(
-            "UPDATE dedicated_session SET state='publishing', disposition_resume_state='publish_ready', updated_at_ms=?3
+            "UPDATE dedicated_session
+                SET state='publishing', disposition_resume_state='publish_ready',
+                    candidate_disposition_root_id=?3,
+                    candidate_disposition_operation_id=?4,
+                    updated_at_ms=?5
               WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
-                AND publication_result='retained' AND state='publish_ready'",
+                AND candidate_evaluation_hash IS NOT NULL
+                AND candidate_disposition_root_id IS NULL
+                AND candidate_disposition_operation_id IS NULL
+                AND publication_result IN ('retained','retained_for_review')
+                AND state='publish_ready'",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
+                publication_root_id,
+                publication_operation_id,
                 lillux::time::timestamp_millis() as i64
             ],
         )?;
@@ -8229,8 +9574,17 @@ impl RuntimeDb {
             let retry: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM dedicated_session
                   WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
-                    AND publication_result='retained' AND state='publishing')",
-                params![placement_thread_id, candidate_snapshot_hash],
+                    AND candidate_evaluation_hash IS NOT NULL
+                    AND candidate_disposition_root_id=?3
+                    AND candidate_disposition_operation_id=?4
+                    AND publication_result IN ('retained','retained_for_review')
+                    AND state='publishing')",
+                params![
+                    placement_thread_id,
+                    candidate_snapshot_hash,
+                    publication_root_id,
+                    publication_operation_id
+                ],
                 |row| row.get(0),
             )?;
             if !retry {
@@ -8244,22 +9598,33 @@ impl RuntimeDb {
         &self,
         placement_thread_id: &str,
         candidate_snapshot_hash: &str,
+        publication_root_id: &str,
+        publication_operation_id: &str,
         publication_result: &str,
     ) -> Result<()> {
         validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
+        validate_bounded_runtime_text("candidate publication root id", publication_root_id, 256)?;
         if !lillux::valid_hash(candidate_snapshot_hash) {
             bail!("published candidate snapshot hash is not canonical");
         }
+        if !lillux::valid_hash(publication_operation_id) {
+            bail!("candidate publication operation id is not canonical");
+        }
         validate_bounded_runtime_text("dedicated publication result", publication_result, 512)?;
         let changed = self.conn.execute(
-            "UPDATE dedicated_session SET publication_result=?3, state='terminal',
-                    disposition_resume_state=NULL, updated_at_ms=?4
-              WHERE placement_thread_id=?1 AND state='publishing'
-                AND candidate_snapshot_hash=?2
-                AND publication_result='retained'",
+            "UPDATE dedicated_session SET publication_result=?5, state='terminal',
+                    disposition_resume_state=NULL, updated_at_ms=?6
+              WHERE placement_thread_id=?1 AND candidate_snapshot_hash=?2
+                AND candidate_disposition_root_id=?3
+                AND candidate_disposition_operation_id=?4
+                AND candidate_evaluation_hash IS NOT NULL
+                AND state='publishing'
+                AND publication_result IN ('retained','retained_for_review')",
             params![
                 placement_thread_id,
                 candidate_snapshot_hash,
+                publication_root_id,
+                publication_operation_id,
                 publication_result,
                 lillux::time::timestamp_millis() as i64
             ],
@@ -8275,22 +9640,29 @@ impl RuntimeDb {
         placement_thread_id: &str,
         reserved_state: &str,
     ) -> Result<()> {
-        if !matches!(reserved_state, "verifying" | "publishing" | "discarding") {
+        if !matches!(
+            reserved_state,
+            "verifying" | "qualifying" | "publishing" | "discarding"
+        ) {
             bail!("candidate disposition failure state is invalid");
         }
         let fallback = match reserved_state {
             "verifying" => "frozen",
             "publishing" => "publish_ready",
-            "discarding" => "", // retained per-row below
+            "qualifying" | "discarding" => "", // retained per-row below
             _ => unreachable!(),
         };
-        let changed = if reserved_state == "discarding" {
+        let changed = if matches!(reserved_state, "qualifying" | "discarding") {
             self.conn.execute(
                 "UPDATE dedicated_session SET state=disposition_resume_state,
-                    disposition_resume_state=NULL, updated_at_ms=?3
+                    disposition_resume_state=NULL,
+                    candidate_qualification_json=NULL,
+                    candidate_disposition_root_id=NULL,
+                    candidate_disposition_operation_id=NULL,
+                    updated_at_ms=?3
                   WHERE placement_thread_id=?1 AND state=?2
-                    AND disposition_resume_state IN ('frozen','publish_ready')
-                    AND publication_result='retained'",
+                    AND disposition_resume_state IN ('frozen','publish_ready','terminal')
+                    AND publication_result IN ('retained','retained_for_review')",
                 params![
                     placement_thread_id,
                     reserved_state,
@@ -8300,8 +9672,11 @@ impl RuntimeDb {
         } else {
             self.conn.execute(
                 "UPDATE dedicated_session SET state=?3, disposition_resume_state=NULL,
+                    candidate_disposition_root_id=CASE WHEN ?2='publishing' THEN NULL ELSE candidate_disposition_root_id END,
+                    candidate_disposition_operation_id=CASE WHEN ?2='publishing' THEN NULL ELSE candidate_disposition_operation_id END,
                     updated_at_ms=?4
-                  WHERE placement_thread_id=?1 AND state=?2 AND publication_result='retained'",
+                  WHERE placement_thread_id=?1 AND state=?2
+                    AND publication_result IN ('retained','retained_for_review')",
                 params![
                     placement_thread_id,
                     reserved_state,
@@ -8328,9 +9703,13 @@ impl RuntimeDb {
                       WHEN candidate_snapshot_hash IS NULL THEN 'abandoned'
                       ELSE 'discarded'
                     END,
-                    disposition_resume_state=NULL, updated_at_ms=?2
+                    disposition_resume_state=NULL,
+                    candidate_qualification_json=NULL,
+                    candidate_disposition_root_id=NULL,
+                    candidate_disposition_operation_id=NULL,
+                    updated_at_ms=?2
               WHERE placement_thread_id=?1
-                AND state IN ('freezing','frozen','verifying','publish_ready','discarding')
+                AND state IN ('freezing','frozen','verifying','qualifying','publish_ready','discarding')
                 AND EXISTS(SELECT 1 FROM worker_process
                   WHERE worker_instance_id=dedicated_session.worker_instance_id
                     AND placement_thread_id=dedicated_session.placement_thread_id
@@ -8380,7 +9759,7 @@ impl RuntimeDb {
             return Err(LaunchPlanningAlreadyReserved.into());
         }
         let pending_rows: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM launch_planning WHERE state = 'planning'",
+            "SELECT COUNT(*) FROM launch_planning WHERE state IN ('qualified','planning')",
             [],
             |row| row.get(0),
         )?;
@@ -8451,6 +9830,43 @@ impl RuntimeDb {
         Ok(records)
     }
 
+    pub fn activate_qualified_launch_planning(
+        &self,
+        launch_id: &str,
+        reserved_thread_id: &str,
+        requested_by: &str,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE launch_planning
+                SET state='planning', daemon_generation_id=?4, updated_at_ms=?5
+              WHERE launch_id=?1 AND reserved_thread_id=?2 AND requested_by=?3
+                AND state='qualified'",
+            params![
+                launch_id,
+                reserved_thread_id,
+                requested_by,
+                daemon_generation_id(),
+                lillux::time::timestamp_millis() as i64,
+            ],
+        )?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        let active: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM launch_planning
+              WHERE launch_id=?1 AND reserved_thread_id=?2 AND requested_by=?3
+                AND state='planning' AND daemon_generation_id=?4)",
+            params![
+                launch_id,
+                reserved_thread_id,
+                requested_by,
+                daemon_generation_id(),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(active)
+    }
+
     pub fn dedicated_approval_outbox_session_ids(&self) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT DISTINCT placement_thread_id FROM dedicated_session_approval
@@ -8470,7 +9886,7 @@ impl RuntimeDb {
             "UPDATE launch_planning
                 SET state = 'cancelled', outcome_code = 'cancelled_by_requester',
                     updated_at_ms = ?2, finished_at_ms = ?2
-              WHERE launch_id = ?1 AND state = 'planning'",
+              WHERE launch_id = ?1 AND state IN ('qualified','planning')",
             params![launch_id, now],
         )? == 1;
         prune_launch_planning(&tx, now)?;
@@ -10284,6 +11700,117 @@ impl RuntimeDb {
         Ok(pins)
     }
 
+    pub fn candidate_evidence_pin_count(&self, chain_root_id: &str) -> Result<u64> {
+        let mut statement = self.conn.prepare(
+            "SELECT chain_root_id, candidate_evaluation_hash, candidate_evaluation_json,
+                    candidate_qualification_json, candidate_disposition_root_id,
+                    publication_result
+               FROM dedicated_session
+              WHERE publication_result IN ('retained','retained_for_review')
+                 OR candidate_disposition_root_id IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut count = 0_u64;
+        for row in rows {
+            let (
+                source_chain_root_id,
+                evaluation_hash,
+                evaluation_json,
+                qualification_json,
+                disposition_root_id,
+                publication_result,
+            ) = row?;
+            let mut evidence_roots = BTreeSet::new();
+            if publication_result
+                .as_deref()
+                .is_some_and(|result| matches!(result, "retained" | "retained_for_review"))
+            {
+                evidence_roots.insert(source_chain_root_id);
+            }
+            // A terminal session may still precede source-root finalization.
+            // Keep its disposition/evaluator dependencies until retirement
+            // deletes the source session row, but never self-pin that settled
+            // source history and prevent retirement forever.
+            if let Some(root_id) = disposition_root_id {
+                evidence_roots.insert(root_id);
+            }
+            let mut evaluations = Vec::new();
+            match (evaluation_hash, evaluation_json) {
+                (None, None) => {}
+                (Some(hash), Some(encoded)) => {
+                    let evaluation: Value = serde_json::from_str(&encoded)
+                        .context("decode retained candidate evidence roots")?;
+                    evaluations.push((hash, evaluation));
+                }
+                _ => bail!("retained candidate evaluation identity is incomplete"),
+            }
+            if let Some(encoded) = qualification_json {
+                let qualification: Value = serde_json::from_str(&encoded)
+                    .context("decode pending candidate qualification evidence roots")?;
+                let hash = qualification
+                    .get("candidate_evaluation_hash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!("pending candidate qualification has no evaluation hash")
+                    })?
+                    .to_owned();
+                let evaluation = qualification
+                    .get("candidate_evaluation")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("pending candidate qualification has no evaluation"))?;
+                evaluations.push((hash, evaluation));
+            }
+            for (hash, evaluation) in evaluations {
+                if ryeos_state::objects::canonical_value_digest(&evaluation)? != hash {
+                    bail!("retained candidate evaluation testimony is corrupt");
+                }
+                for pointer in [
+                    "/evaluator/chain_root_id",
+                    "/qualification/root_thread_id",
+                    "/integration/operation/chain_root_id",
+                    "/integration/source_evaluation/evaluator/chain_root_id",
+                    "/integration/source_evaluation/qualification/root_thread_id",
+                ] {
+                    if let Some(root_id) = evaluation.pointer(pointer).and_then(Value::as_str) {
+                        evidence_roots.insert(root_id.to_owned());
+                    }
+                }
+                if let Some(launch_id) = evaluation
+                    .pointer("/qualification/reserved_integration_launch_id")
+                    .and_then(Value::as_str)
+                {
+                    let bound_root: Option<String> = self
+                        .conn
+                        .query_row(
+                            "SELECT bound_thread_id FROM launch_planning
+                              WHERE launch_id=?1 AND state='bound'",
+                            params![launch_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(root_id) = bound_root {
+                        evidence_roots.insert(root_id);
+                    }
+                }
+            }
+            if evidence_roots.contains(chain_root_id) {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("candidate evidence pin count overflow"))?;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn chain_has_live_state(&self, chain_root_id: &str) -> Result<bool> {
         let mut statement = self
             .conn
@@ -11574,16 +13101,52 @@ impl RuntimeDb {
             .context("commit retained workspace owner transfer")
     }
 
-    /// Atomically publish the result of a callback freeze into both durable
-    /// recovery authorities. The workspace row is the lifecycle journal; the
-    /// thread launch metadata is the native-resume seed. They must never name
-    /// different generations after a crash.
+    /// Bind a callback/fold-back generation to the owner-fenced workspace
+    /// journal after validating the thread's immutable admitted project
+    /// authority. Launch metadata remains the native-resume seed and is
+    /// verified here; this transaction does not rewrite that authority.
     pub fn bind_frozen_workspace_generation(
         &self,
         workspace_id: &str,
         thread_id: &str,
         launch_owner: &str,
         snapshot_hash: &str,
+    ) -> Result<()> {
+        self.bind_frozen_workspace_generation_inner(
+            workspace_id,
+            thread_id,
+            launch_owner,
+            snapshot_hash,
+            Some(launch_owner),
+        )
+    }
+
+    /// Startup-only counterpart for a freeze journal whose dead-generation
+    /// launch claim was already cleared. The immutable workspace owner remains
+    /// the fence; a current claim or a current-generation owner is refused.
+    pub fn bind_abandoned_frozen_workspace_generation(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        self.bind_frozen_workspace_generation_inner(
+            workspace_id,
+            thread_id,
+            launch_owner,
+            snapshot_hash,
+            None,
+        )
+    }
+
+    fn bind_frozen_workspace_generation_inner(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+        snapshot_hash: &str,
+        expected_claim_owner: Option<&str>,
     ) -> Result<()> {
         validate_sha256("frozen workspace snapshot hash", snapshot_hash)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
@@ -11595,8 +13158,17 @@ impl RuntimeDb {
                 |row| row.get(0),
             )
             .optional()?;
-        if claim_owner.as_deref() != Some(launch_owner) {
-            bail!("stale launch owner cannot bind frozen workspace {workspace_id}");
+        if claim_owner.as_deref() != expected_claim_owner {
+            bail!("launch authority cannot bind frozen workspace {workspace_id}");
+        }
+        if expected_claim_owner.is_none() {
+            let abandoned_owner = serde_json::from_str::<LaunchOwner>(launch_owner)
+                .context("decode abandoned frozen-workspace launch owner")?;
+            if abandoned_owner.thread_id != thread_id
+                || abandoned_owner.daemon_generation_id == daemon_generation_id()
+            {
+                bail!("current or contradictory launch owner cannot use abandoned freeze recovery");
+            }
         }
         let (workspace_thread, workspace_owner, state, base_snapshot, existing_frozen): (
             Option<String>,
@@ -13456,6 +15028,260 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_bounded_idle_contact_session(db: &RuntimeDb) {
+        create_locked_profile(db, "P-bounded-contact", "worker-bounded-contact");
+        db.conn
+            .execute(
+                "UPDATE credential_profile SET state='active' WHERE profile_id='P-bounded-contact'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO worker_process (
+                worker_instance_id, boot_identity_hash, session_capsule_hash,
+                boot_epoch, lifecycle_generation, process_identity,
+                control_channel_identity, state, daemon_generation_id,
+                placement_thread_id, cleanup_state, created_at_ms, updated_at_ms
+             ) VALUES ('worker-bounded-contact', ?1, ?2, 1, 1, ?3,
+                       'fd:bounded-contact', 'live', 'daemon-bounded-contact',
+                       'T-bounded-contact', 'owned', 1, 1)",
+                params![
+                    "b".repeat(64),
+                    "a".repeat(64),
+                    serde_json::to_string(&fake_process_identity(123, 123)).unwrap()
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO dedicated_session (
+                placement_thread_id, chain_root_id, owner_principal, admitted_capsule_hash,
+                worker_instance_id, worker_boot_epoch, workspace_id,
+                candidate_required, candidate_disposition, credential_profile_id,
+                credential_generation, state, send_boundary, created_at_ms, updated_at_ms
+             ) VALUES ('T-bounded-contact', 'T-bounded-contact', 'fp:operator', ?1,
+                       'worker-bounded-contact', 1, 'W-bounded-contact',
+                       1, 'retained_for_review', 'P-bounded-contact',
+                       1, 'idle', 'none', 1, 1)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+    }
+
+    fn insert_bounded_contact_approval(db: &RuntimeDb) {
+        db.observe_dedicated_session_state(
+            "T-bounded-contact",
+            1,
+            "idle",
+            "turn_running",
+            None,
+            Some("turn-approval"),
+        )
+        .unwrap();
+        db.create_dedicated_session_approval(NewDedicatedSessionApproval {
+            placement_thread_id: "T-bounded-contact",
+            approval_id: "approval-contact-race",
+            worker_instance_id: "worker-bounded-contact",
+            worker_boot_epoch: 1,
+            request_digest: &"c".repeat(64),
+            operation_class: "fixture",
+            requested_authority: &serde_json::json!({}),
+            expires_at_ms: lillux::time::timestamp_millis() + 60_000,
+        })
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE dedicated_session SET state='awaiting_approval'
+              WHERE placement_thread_id='T-bounded-contact'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn bounded_contact_command<'a>(
+        payload: &'a Value,
+        digest: &'a str,
+    ) -> NewDedicatedSessionCommand<'a> {
+        NewDedicatedSessionCommand {
+            placement_thread_id: "T-bounded-contact",
+            idempotency_key: "bounded:T-bounded-contact:turn-start:attempt:1",
+            worker_boot_epoch: 1,
+            command_kind: "route",
+            request_digest: digest,
+            payload,
+        }
+    }
+
+    #[test]
+    fn bounded_route_reservation_rechecks_approval_after_stale_idle_read() {
+        let (_tmp, db) = fresh_db();
+        seed_bounded_idle_contact_session(&db);
+        let stale = db.dedicated_session("T-bounded-contact").unwrap().unwrap();
+        assert_eq!(stale.state, "idle");
+        insert_bounded_contact_approval(&db);
+        let payload = serde_json::json!({"route_id":"turn.start","payload":{}});
+        let digest = "d".repeat(64);
+        assert!(
+            db.reserve_dedicated_session_command(bounded_contact_command(&payload, &digest),)
+                .is_err()
+        );
+        assert!(
+            db.dedicated_session_commands("T-bounded-contact")
+                .unwrap()
+                .is_empty()
+        );
+        // Even an idle projection cannot hide an unresolved approval row.
+        db.conn
+            .execute(
+                "UPDATE dedicated_session SET state='idle', current_turn_id=NULL
+              WHERE placement_thread_id='T-bounded-contact'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.reserve_dedicated_session_command(bounded_contact_command(&payload, &digest),)
+                .is_err()
+        );
+        assert_eq!(
+            db.dedicated_session("T-bounded-contact")
+                .unwrap()
+                .unwrap()
+                .send_boundary,
+            "none"
+        );
+    }
+
+    #[test]
+    fn bounded_route_contact_and_committed_replay_reject_later_approval() {
+        let (_tmp, db) = fresh_db();
+        seed_bounded_idle_contact_session(&db);
+        let payload = serde_json::json!({"route_id":"turn.start","payload":{}});
+        let digest = "d".repeat(64);
+        let command = db
+            .reserve_dedicated_session_command(bounded_contact_command(&payload, &digest))
+            .unwrap();
+        insert_bounded_contact_approval(&db);
+        assert!(
+            db.require_bounded_route_contact_admission("T-bounded-contact", 1, "route")
+                .is_err()
+        );
+        assert!(
+            db.reserve_dedicated_session_command(bounded_contact_command(&payload, &digest),)
+                .is_err()
+        );
+        assert!(
+            db.mark_dedicated_command_contacted("T-bounded-contact", command.command_sequence, 1,)
+                .is_err()
+        );
+        assert_eq!(
+            db.dedicated_session_command("T-bounded-contact", command.command_sequence)
+                .unwrap()
+                .unwrap()
+                .state,
+            "committed"
+        );
+        assert_eq!(
+            db.dedicated_session("T-bounded-contact")
+                .unwrap()
+                .unwrap()
+                .send_boundary,
+            "committed"
+        );
+    }
+
+    #[test]
+    fn bounded_route_admission_rejects_unprojected_observation_at_both_boundaries() {
+        let (_tmp, db) = fresh_db();
+        seed_bounded_idle_contact_session(&db);
+        let batch = serde_json::json!({"events":[],"session_observations":[]});
+        let first_digest = "e".repeat(64);
+        db.reserve_dedicated_observation_batch(
+            "T-bounded-contact",
+            1,
+            1,
+            1,
+            None,
+            &first_digest,
+            &batch,
+        )
+        .unwrap();
+        let payload = serde_json::json!({"route_id":"turn.start","payload":{}});
+        let digest = "d".repeat(64);
+        assert_eq!(
+            db.dedicated_session("T-bounded-contact")
+                .unwrap()
+                .unwrap()
+                .state,
+            "idle"
+        );
+        assert!(
+            db.reserve_dedicated_session_command(bounded_contact_command(&payload, &digest),)
+                .is_err()
+        );
+        db.settle_dedicated_observation_batch("T-bounded-contact", 1, 1, &first_digest)
+            .unwrap();
+        let command = db
+            .reserve_dedicated_session_command(bounded_contact_command(&payload, &digest))
+            .unwrap();
+        let second_digest = "f".repeat(64);
+        db.reserve_dedicated_observation_batch(
+            "T-bounded-contact",
+            1,
+            2,
+            2,
+            Some(&first_digest),
+            &second_digest,
+            &batch,
+        )
+        .unwrap();
+        db.mark_dedicated_observation_batch_unknown("T-bounded-contact", 1, 2, &second_digest)
+            .unwrap();
+        assert!(
+            db.require_bounded_route_contact_admission("T-bounded-contact", 1, "route")
+                .is_err()
+        );
+        assert!(
+            db.mark_dedicated_command_contacted("T-bounded-contact", command.command_sequence, 1,)
+                .is_err()
+        );
+        assert_eq!(
+            db.dedicated_session_command("T-bounded-contact", command.command_sequence)
+                .unwrap()
+                .unwrap()
+                .state,
+            "committed"
+        );
+    }
+
+    #[test]
+    fn bounded_route_settled_replay_remains_readable_after_post_contact_approval() {
+        let (_tmp, db) = fresh_db();
+        seed_bounded_idle_contact_session(&db);
+        let payload = serde_json::json!({"route_id":"turn.start","payload":{}});
+        let digest = "d".repeat(64);
+        let command = db
+            .reserve_dedicated_session_command(bounded_contact_command(&payload, &digest))
+            .unwrap();
+        db.mark_dedicated_command_contacted("T-bounded-contact", command.command_sequence, 1)
+            .unwrap();
+        insert_bounded_contact_approval(&db);
+        db.settle_dedicated_command(
+            "T-bounded-contact",
+            command.command_sequence,
+            1,
+            true,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            db.reserve_dedicated_session_command(bounded_contact_command(&payload, &digest),)
+                .unwrap()
+                .state,
+            "completed"
+        );
+    }
+
     #[test]
     fn dedicated_admission_acquires_profile_in_the_session_transaction() {
         let (_tmp, db) = fresh_db();
@@ -13472,6 +15298,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-atomic",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-atomic",
             credential_generation: 1,
             credential_lock_owner: "worker-atomic",
@@ -13550,6 +15377,7 @@ mod tests {
                 admitted_capsule_hash: &"4".repeat(64),
                 workspace_id: "W-handoff-target",
                 candidate_required: true,
+                candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
                 credential_profile_id: "P-handoff-reserved",
                 credential_generation: 1,
                 credential_lock_owner: "worker-target",
@@ -13696,6 +15524,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-admitted",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-admitted",
             credential_generation: 1,
             credential_lock_owner: "worker-admitted",
@@ -13747,6 +15576,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-fenced",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-fenced",
             credential_generation: 1,
             credential_lock_owner: "worker-fenced",
@@ -13804,6 +15634,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-one",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-one",
             credential_generation: 1,
             credential_lock_owner: "worker-one",
@@ -13864,7 +15695,12 @@ mod tests {
         let settled = db.worker_process("worker-one").unwrap().unwrap();
         assert_eq!(settled.state, WorkerProcessState::Dead);
         assert_eq!(settled.cleanup_state, "reaped");
-        db.terminalize_dedicated_session("T-one", "worker-one", 1, "completed")
+        assert!(
+            db.terminalize_dedicated_session("T-one", "worker-one", 1, "completed")
+                .is_err(),
+            "worker exit without a durable completion fence cannot become completed"
+        );
+        db.terminalize_dedicated_session("T-one", "worker-one", 1, "fixture_restart")
             .unwrap();
         let login_terminal = db.dedicated_session("T-one").unwrap().unwrap();
         assert_eq!(login_terminal.state, "terminal");
@@ -13892,6 +15728,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-recover",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-recover",
             credential_generation: 1,
             credential_lock_owner: "worker-recover-1",
@@ -14048,7 +15885,15 @@ mod tests {
             db.reserve_dedicated_session_completion(
                 "T-recover",
                 2,
-                Some(completed_route.command_sequence),
+                &ryeos_runtime::callback::HostedCommandCompletionFence {
+                    placement_thread_id: "T-recover".to_owned(),
+                    admitted_capsule_hash: "a".repeat(64),
+                    worker_boot_epoch: 2,
+                    command_sequence: completed_route.command_sequence,
+                    request_digest: "1".repeat(64),
+                    turn_id: "turn-completed".to_owned(),
+                    completion_operation_id: "3".repeat(64),
+                },
             )
             .is_err(),
             "completed termination must reject a command frontier that moved"
@@ -14264,6 +16109,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-handoff",
             candidate_required: true,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-handoff",
             credential_generation: 1,
             credential_lock_owner: "worker-handoff",
@@ -14333,6 +16179,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-fence",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-fence",
             credential_generation: 1,
             credential_lock_owner: "worker-fence",
@@ -14382,6 +16229,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-abandoned",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-abandoned",
             credential_generation: 1,
             credential_lock_owner: "worker-abandoned",
@@ -14472,6 +16320,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-unproved",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-unproved",
             credential_generation: 1,
             credential_lock_owner: "worker-unproved",
@@ -14561,6 +16410,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-start-unproved",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-start-unproved",
             credential_generation: 1,
             credential_lock_owner: "worker-start-unproved",
@@ -14632,6 +16482,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-ready-fail",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-ready-fail",
             credential_generation: 1,
             credential_lock_owner: "worker-ready-fail",
@@ -14715,12 +16566,13 @@ mod tests {
                 "INSERT INTO dedicated_session(
                     placement_thread_id, chain_root_id, owner_principal, admitted_capsule_hash,
                     worker_instance_id, worker_boot_epoch, workspace_id,
-                    candidate_required, credential_profile_id, credential_generation, remote_thread_id,
+                    candidate_required, candidate_disposition, credential_profile_id,
+                    credential_generation, remote_thread_id,
                     current_turn_id, state, send_boundary, candidate_snapshot_hash,
                     candidate_validation_hash, publication_result, terminal_reason,
                     created_at_ms, updated_at_ms
                  ) VALUES ('T-observe', 'T-observe', 'fp:operator', ?1,
-                           'worker-observe', 3, 'W-observe', 0, 'P-observe', 1,
+                           'worker-observe', 3, 'W-observe', 0, 'owner_decision', 'P-observe', 1,
                            NULL, NULL, 'idle', 'none', NULL, NULL, NULL, NULL, 1, 1)",
                 [&"a".repeat(64)],
             )
@@ -14988,6 +16840,7 @@ mod tests {
             admitted_capsule_hash: &"c".repeat(64),
             workspace_id: "W-ledger",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-one",
             credential_generation: generation,
             credential_lock_owner: "worker-ledger",
@@ -15392,6 +17245,160 @@ mod tests {
     }
 
     #[test]
+    fn discard_journal_survives_restart_and_exact_rollback_preserves_gc_pins() {
+        for (resume_state, disposition, retained) in [
+            ("frozen", "owner_decision", "retained"),
+            ("publish_ready", "owner_decision", "retained"),
+            ("terminal", "retained_for_review", "retained_for_review"),
+        ] {
+            let (tmp, db) = fresh_db();
+            let candidate = "c".repeat(64);
+            let operation = "a".repeat(64);
+            db.conn
+                .execute(
+                    "INSERT INTO dedicated_session (
+                    placement_thread_id, chain_root_id, owner_principal,
+                    admitted_capsule_hash, workspace_id, candidate_required,
+                    candidate_disposition, credential_profile_id, credential_generation,
+                    state, send_boundary, candidate_snapshot_hash,
+                    publication_result, terminal_reason, created_at_ms, updated_at_ms
+                 ) VALUES ('T-discard-source', 'T-discard-source', 'fp:operator', ?1,
+                           'W-discard-source', 1, ?2, 'P-discard-source', 1, ?3,
+                           'settled', ?4, ?5, 'completed', 1, 1)",
+                    params![
+                        "b".repeat(64),
+                        disposition,
+                        resume_state,
+                        candidate,
+                        retained
+                    ],
+                )
+                .unwrap();
+            assert!(
+                db.reserve_dedicated_candidate_discard(
+                    "T-discard-source",
+                    &"d".repeat(64),
+                    "T-discard",
+                    &operation,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                db.dedicated_session("T-discard-source")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                resume_state
+            );
+            db.reserve_dedicated_candidate_discard(
+                "T-discard-source",
+                &candidate,
+                "T-discard",
+                &operation,
+            )
+            .unwrap();
+            drop(db);
+
+            // A crash before the owner fact leaves an exact, discoverable
+            // journal and retains both its candidate and service-root pins.
+            let db = RuntimeDb::open(&tmp.path().join("runtime.db")).unwrap();
+            let pending = db.dedicated_sessions_in_state("discarding").unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].candidate_disposition_root_id.as_deref(),
+                Some("T-discard")
+            );
+            assert_eq!(db.candidate_evidence_pin_count("T-discard").unwrap(), 1);
+            assert!(
+                db.retained_candidate_snapshot_roots()
+                    .unwrap()
+                    .contains(&candidate)
+            );
+            assert!(
+                db.rollback_dedicated_candidate_discard(
+                    "T-discard-source",
+                    &candidate,
+                    "T-other",
+                    &operation,
+                )
+                .is_err()
+            );
+            db.rollback_dedicated_candidate_discard(
+                "T-discard-source",
+                &candidate,
+                "T-discard",
+                &operation,
+            )
+            .unwrap();
+            let rolled_back = db.dedicated_session("T-discard-source").unwrap().unwrap();
+            assert_eq!(rolled_back.state, resume_state);
+            assert!(rolled_back.candidate_disposition_root_id.is_none());
+            assert_eq!(rolled_back.publication_result.as_deref(), Some(retained));
+
+            // A fact-proved commit settles the same reservation instead; it
+            // cannot subsequently take the zero-fact rollback branch.
+            db.reserve_dedicated_candidate_discard(
+                "T-discard-source",
+                &candidate,
+                "T-discard-committed",
+                &operation,
+            )
+            .unwrap();
+            db.settle_dedicated_candidate_discard(
+                "T-discard-source",
+                &candidate,
+                "T-discard-committed",
+                &operation,
+            )
+            .unwrap();
+            assert!(
+                db.rollback_dedicated_candidate_discard(
+                    "T-discard-source",
+                    &candidate,
+                    "T-discard-committed",
+                    &operation,
+                )
+                .is_err()
+            );
+            let settled = db.dedicated_session("T-discard-source").unwrap().unwrap();
+            assert_eq!(settled.state, "terminal");
+            assert_eq!(settled.publication_result.as_deref(), Some("discarded"));
+            assert_eq!(
+                db.candidate_evidence_pin_count("T-discard-source").unwrap(),
+                0
+            );
+            assert_eq!(
+                db.candidate_evidence_pin_count("T-discard-committed")
+                    .unwrap(),
+                1
+            );
+            assert!(
+                db.retained_candidate_snapshot_roots()
+                    .unwrap()
+                    .contains(&candidate)
+            );
+            // Source-history retirement owns deleting this runtime row. Its
+            // dependency pins then disappear without a self-retention cycle.
+            db.conn
+                .execute(
+                    "DELETE FROM dedicated_session WHERE placement_thread_id='T-discard-source'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(
+                db.candidate_evidence_pin_count("T-discard-committed")
+                    .unwrap(),
+                0
+            );
+            assert!(
+                !db.retained_candidate_snapshot_roots()
+                    .unwrap()
+                    .contains(&candidate)
+            );
+        }
+    }
+
+    #[test]
     fn frozen_candidate_requires_exact_verification_before_publish_or_discard() {
         let (_tmp, db) = fresh_db();
         create_locked_profile(&db, "P-candidate", "worker-candidate");
@@ -15412,6 +17419,7 @@ mod tests {
             admitted_capsule_hash: &"a".repeat(64),
             workspace_id: "W-candidate",
             candidate_required: true,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-candidate",
             credential_generation: 1,
             credential_lock_owner: "worker-candidate",
@@ -15436,7 +17444,37 @@ mod tests {
         .unwrap();
         db.complete_worker_binding("worker-candidate", "T-candidate", 1)
             .unwrap();
-        db.reserve_dedicated_session_completion("T-candidate", 1, None)
+        let route_payload = serde_json::json!({"route_id":"turn.start","payload":{}});
+        let route = db
+            .reserve_dedicated_session_command(NewDedicatedSessionCommand {
+                placement_thread_id: "T-candidate",
+                idempotency_key: "turn-start",
+                worker_boot_epoch: 1,
+                command_kind: "route",
+                request_digest: &"d".repeat(64),
+                payload: &route_payload,
+            })
+            .unwrap();
+        db.mark_dedicated_command_contacted("T-candidate", route.command_sequence, 1)
+            .unwrap();
+        db.settle_dedicated_command(
+            "T-candidate",
+            route.command_sequence,
+            1,
+            true,
+            &serde_json::json!({"redacted":true}),
+        )
+        .unwrap();
+        let completion_fence = ryeos_runtime::callback::HostedCommandCompletionFence {
+            placement_thread_id: "T-candidate".to_owned(),
+            admitted_capsule_hash: "a".repeat(64),
+            worker_boot_epoch: 1,
+            command_sequence: route.command_sequence,
+            request_digest: "d".repeat(64),
+            turn_id: "turn-candidate".to_owned(),
+            completion_operation_id: "e".repeat(64),
+        };
+        db.reserve_dedicated_session_completion("T-candidate", 1, &completion_fence)
             .unwrap();
         db.settle_worker_process("worker-candidate", "T-candidate", 1, "reaped", "completed")
             .unwrap();
@@ -15456,10 +17494,16 @@ mod tests {
         );
         let frozen = db.dedicated_session("T-candidate").unwrap().unwrap();
         assert_eq!(frozen.state, "frozen");
+        assert_eq!(frozen.completion_fence.as_ref(), Some(&completion_fence));
         let plan = frozen.candidate_validation_hash.unwrap();
         assert!(
-            db.reserve_dedicated_candidate_publication("T-candidate", &candidate)
-                .is_err()
+            db.reserve_dedicated_candidate_publication(
+                "T-candidate",
+                &candidate,
+                "T-publication",
+                &"b".repeat(64),
+            )
+            .is_err()
         );
         assert!(
             db.reserve_dedicated_candidate_validation("T-candidate", &candidate, &"d".repeat(64))
@@ -15484,13 +17528,68 @@ mod tests {
         .unwrap();
         assert_eq!(
             db.dedicated_session("T-candidate").unwrap().unwrap().state,
+            "frozen",
+            "closure/base validation alone must not grant publication authority"
+        );
+        assert!(
+            db.reserve_dedicated_candidate_publication(
+                "T-candidate",
+                &candidate,
+                "T-publication",
+                &"b".repeat(64),
+            )
+            .is_err()
+        );
+        let evaluation = serde_json::json!({
+            "schema":"ryeos.hosted_candidate_evaluation.v1",
+            "candidate":{"candidate_snapshot_hash":candidate},
+            "result":{"accepted":true},
+        });
+        let evaluation_hash = ryeos_state::objects::canonical_value_digest(&evaluation).unwrap();
+        let qualification_operation = "a".repeat(64);
+        db.reserve_dedicated_candidate_evaluation(
+            "T-candidate",
+            &candidate,
+            &plan,
+            None,
+            &evaluation_hash,
+            &evaluation,
+            "T-qualification",
+            &qualification_operation,
+            None,
+        )
+        .unwrap();
+        db.settle_dedicated_candidate_evaluation(
+            "T-candidate",
+            &candidate,
+            &plan,
+            None,
+            &evaluation_hash,
+            &evaluation,
+            "T-qualification",
+            &qualification_operation,
+        )
+        .unwrap();
+        assert_eq!(
+            db.dedicated_session("T-candidate").unwrap().unwrap().state,
             "publish_ready"
         );
-        db.reserve_dedicated_candidate_publication("T-candidate", &candidate)
-            .unwrap();
+        db.reserve_dedicated_candidate_publication(
+            "T-candidate",
+            &candidate,
+            "T-publication",
+            &"b".repeat(64),
+        )
+        .unwrap();
         let unknown_result = format!("publication_unknown:{candidate}");
-        db.settle_dedicated_candidate_publication("T-candidate", &candidate, &unknown_result)
-            .unwrap();
+        db.settle_dedicated_candidate_publication(
+            "T-candidate",
+            &candidate,
+            "T-publication",
+            &"b".repeat(64),
+            &unknown_result,
+        )
+        .unwrap();
         let unknown = db.dedicated_session("T-candidate").unwrap().unwrap();
         assert_eq!(unknown.state, "terminal");
         assert_eq!(
@@ -15498,26 +17597,333 @@ mod tests {
             Some(unknown_result.as_str())
         );
         assert!(
-            db.reserve_dedicated_candidate_publication("T-candidate", &candidate)
-                .is_err()
+            db.reserve_dedicated_candidate_publication(
+                "T-candidate",
+                &candidate,
+                "T-publication",
+                &"b".repeat(64),
+            )
+            .is_err()
         );
 
         // Reuse the fully constructed candidate to retain independent discard
         // settlement coverage in this state-machine test.
         db.conn
             .execute(
-                "UPDATE dedicated_session SET state='publish_ready', publication_result='retained'
+                "UPDATE dedicated_session SET state='publish_ready', publication_result='retained',
+                    candidate_disposition_root_id=NULL, candidate_disposition_operation_id=NULL
                   WHERE placement_thread_id='T-candidate'",
                 [],
             )
             .unwrap();
-        db.reserve_dedicated_candidate_discard("T-candidate", &candidate)
-            .unwrap();
-        db.settle_dedicated_candidate_discard("T-candidate", &candidate)
-            .unwrap();
+        db.reserve_dedicated_candidate_discard(
+            "T-candidate",
+            &candidate,
+            "T-discard",
+            &"d".repeat(64),
+        )
+        .unwrap();
+        db.settle_dedicated_candidate_discard(
+            "T-candidate",
+            &candidate,
+            "T-discard",
+            &"d".repeat(64),
+        )
+        .unwrap();
         let discarded = db.dedicated_session("T-candidate").unwrap().unwrap();
         assert_eq!(discarded.state, "terminal");
         assert_eq!(discarded.publication_result.as_deref(), Some("discarded"));
+    }
+
+    #[test]
+    fn retained_for_review_is_completion_fenced_and_requires_owner_evaluator_adoption() {
+        let (_tmp, db) = fresh_db();
+        create_locked_profile(&db, "P-retained", "worker-retained");
+        db.conn
+            .execute(
+                "INSERT INTO execution_workspace (
+                    workspace_id, thread_id, launch_owner, backend_id,
+                    base_snapshot, root_path, state, created_at_ms, updated_at_ms
+                 ) VALUES ('W-retained', 'T-retained', 'owner', 'trusted-daemon',
+                           'a', '/tmp/retained', 'ready', 1, 1)",
+                [],
+            )
+            .unwrap();
+        db.admit_dedicated_session(NewDedicatedSession {
+            placement_thread_id: "T-retained",
+            chain_root_id: "T-retained",
+            owner_principal: "fp:operator",
+            admitted_capsule_hash: &"a".repeat(64),
+            workspace_id: "W-retained",
+            candidate_required: true,
+            candidate_disposition: DedicatedCandidateDisposition::RetainedForReview,
+            credential_profile_id: "P-retained",
+            credential_generation: 1,
+            credential_lock_owner: "worker-retained",
+        })
+        .unwrap();
+        let now = lillux::time::timestamp_millis() as i64;
+        db.attach_worker_process(&WorkerProcessRecord {
+            worker_instance_id: "worker-retained".to_owned(),
+            boot_identity_hash: "b".repeat(64),
+            session_capsule_hash: "a".repeat(64),
+            boot_epoch: 1,
+            lifecycle_generation: 1,
+            process_identity: fake_process_identity(126, 126),
+            control_channel_identity: "fd:12".to_owned(),
+            state: WorkerProcessState::Attached,
+            daemon_generation_id: "daemon-one".to_owned(),
+            placement_thread_id: "T-retained".to_owned(),
+            cleanup_state: "owned".to_owned(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+        .unwrap();
+        db.complete_worker_binding("worker-retained", "T-retained", 1)
+            .unwrap();
+        let payload = serde_json::json!({"route_id":"turn.start","payload":{}});
+        let route = db
+            .reserve_dedicated_session_command(NewDedicatedSessionCommand {
+                placement_thread_id: "T-retained",
+                idempotency_key: "turn-start",
+                worker_boot_epoch: 1,
+                command_kind: "route",
+                request_digest: &"d".repeat(64),
+                payload: &payload,
+            })
+            .unwrap();
+        db.mark_dedicated_command_contacted("T-retained", route.command_sequence, 1)
+            .unwrap();
+        db.settle_dedicated_command(
+            "T-retained",
+            route.command_sequence,
+            1,
+            true,
+            &serde_json::json!({"redacted":true}),
+        )
+        .unwrap();
+        let fence = ryeos_runtime::callback::HostedCommandCompletionFence {
+            placement_thread_id: "T-retained".to_owned(),
+            admitted_capsule_hash: "a".repeat(64),
+            worker_boot_epoch: 1,
+            command_sequence: route.command_sequence,
+            request_digest: "d".repeat(64),
+            turn_id: "turn-retained".to_owned(),
+            completion_operation_id: "e".repeat(64),
+        };
+        // A daemon restart may reattach the upstream session under a later
+        // worker epoch after the original turn has already completed. The
+        // retained completion fence must continue to name the epoch that
+        // observed that turn, while retirement remains fenced to the current
+        // live worker.
+        db.conn
+            .execute(
+                "UPDATE worker_process SET state='dead', cleanup_state='reaped'
+                  WHERE worker_instance_id='worker-retained' AND boot_epoch=1",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO worker_process (
+                    worker_instance_id, boot_identity_hash, session_capsule_hash,
+                    boot_epoch, lifecycle_generation, process_identity,
+                    control_channel_identity, state, daemon_generation_id,
+                    placement_thread_id, cleanup_state, created_at_ms, updated_at_ms
+                 ) VALUES ('worker-retained-2', ?1, ?2, 2, 1, ?3,
+                           'fd:13', 'live', 'daemon-two', 'T-retained', 'owned', 3, 3)",
+                params![
+                    "c".repeat(64),
+                    "a".repeat(64),
+                    fake_process_identity(127, 127)
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE dedicated_session
+                    SET worker_instance_id='worker-retained-2', worker_boot_epoch=2,
+                        state='idle', current_turn_id=NULL
+                  WHERE placement_thread_id='T-retained'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE credential_profile SET lock_owner='worker-retained-2'
+                  WHERE profile_id='P-retained'",
+                [],
+            )
+            .unwrap();
+
+        db.reserve_dedicated_session_completion("T-retained", 2, &fence)
+            .unwrap();
+        let mut conflicting = fence.clone();
+        conflicting.turn_id = "turn-other".to_owned();
+        assert!(
+            db.reserve_dedicated_session_completion("T-retained", 2, &conflicting)
+                .is_err(),
+            "a draining retry cannot replace its durable completion coordinate"
+        );
+        db.settle_worker_process("worker-retained-2", "T-retained", 2, "reaped", "completed")
+            .unwrap();
+        db.terminalize_dedicated_session("T-retained", "worker-retained-2", 2, "completed")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE execution_workspace SET state='closed' WHERE workspace_id='W-retained'",
+                [],
+            )
+            .unwrap();
+        let candidate = "c".repeat(64);
+        assert!(
+            db.bind_dedicated_session_candidate("T-retained", &candidate)
+                .unwrap()
+        );
+        assert!(
+            db.reserve_dedicated_candidate_validation(
+                "T-retained",
+                &candidate,
+                &db.dedicated_session("T-retained")
+                    .unwrap()
+                    .unwrap()
+                    .candidate_validation_hash
+                    .unwrap(),
+            )
+            .is_err(),
+            "retained-for-review policy cannot race into owner publication"
+        );
+        db.settle_dedicated_candidate_retained_for_review("T-retained", &candidate)
+            .unwrap();
+        db.settle_dedicated_candidate_retained_for_review("T-retained", &candidate)
+            .unwrap();
+        let terminal = db.dedicated_session("T-retained").unwrap().unwrap();
+        assert_eq!(terminal.state, "terminal");
+        assert_eq!(
+            terminal.publication_result.as_deref(),
+            Some("retained_for_review")
+        );
+        assert_eq!(terminal.completion_fence.as_ref(), Some(&fence));
+        assert_eq!(terminal.worker_boot_epoch, Some(2));
+        assert_eq!(
+            terminal
+                .completion_fence
+                .as_ref()
+                .map(|fence| fence.worker_boot_epoch),
+            Some(1),
+            "historical completion identity must not be rebuilt from the recovery worker",
+        );
+        assert_eq!(
+            db.retained_candidate_snapshot_roots().unwrap(),
+            vec![candidate.clone()]
+        );
+        assert!(
+            db.reserve_dedicated_candidate_publication(
+                "T-retained",
+                &candidate,
+                "T-publication",
+                &"b".repeat(64),
+            )
+            .is_err(),
+            "retained-for-review cannot enter publication without evaluator testimony"
+        );
+        let validation = terminal.candidate_validation_hash.as_deref().unwrap();
+        let evaluation = serde_json::json!({
+            "schema":"ryeos.hosted_candidate_evaluation.v1",
+            "candidate":{"candidate_snapshot_hash":candidate},
+            "result":{"accepted":true},
+        });
+        let evaluation_hash = ryeos_state::objects::canonical_value_digest(&evaluation).unwrap();
+        let qualification_operation = "a".repeat(64);
+        db.reserve_dedicated_candidate_evaluation(
+            "T-retained",
+            &candidate,
+            validation,
+            None,
+            &evaluation_hash,
+            &evaluation,
+            "T-qualification",
+            &qualification_operation,
+            None,
+        )
+        .unwrap();
+        db.settle_dedicated_candidate_evaluation(
+            "T-retained",
+            &candidate,
+            validation,
+            None,
+            &evaluation_hash,
+            &evaluation,
+            "T-qualification",
+            &qualification_operation,
+        )
+        .unwrap();
+        let adopted = db.dedicated_session("T-retained").unwrap().unwrap();
+        assert_eq!(adopted.state, "publish_ready");
+        assert_eq!(
+            adopted.candidate_disposition,
+            DedicatedCandidateDisposition::RetainedForReview,
+            "owner adoption must not rewrite bounded-worker disposition authority"
+        );
+        assert_eq!(
+            adopted.candidate_evaluation_hash.as_deref(),
+            Some(evaluation_hash.as_str())
+        );
+        let final_evaluation = serde_json::json!({
+            "schema":"ryeos.hosted_candidate_evaluation.v1",
+            "candidate":{"candidate_snapshot_hash":"d".repeat(64)},
+            "integration":{"source_evaluation_hash":evaluation_hash},
+            "result":{"accepted":true},
+        });
+        let final_evaluation_hash =
+            ryeos_state::objects::canonical_value_digest(&final_evaluation).unwrap();
+        assert!(
+            db.reserve_dedicated_candidate_evaluation(
+                "T-retained",
+                &candidate,
+                validation,
+                Some(&"f".repeat(64)),
+                &final_evaluation_hash,
+                &final_evaluation,
+                "T-final-qualification",
+                &"b".repeat(64),
+                None,
+            )
+            .is_err(),
+            "a final evaluation cannot replace different retained testimony"
+        );
+        db.reserve_dedicated_candidate_evaluation(
+            "T-retained",
+            &candidate,
+            validation,
+            Some(&evaluation_hash),
+            &final_evaluation_hash,
+            &final_evaluation,
+            "T-final-qualification",
+            &"b".repeat(64),
+            None,
+        )
+        .unwrap();
+        db.settle_dedicated_candidate_evaluation(
+            "T-retained",
+            &candidate,
+            validation,
+            Some(&evaluation_hash),
+            &final_evaluation_hash,
+            &final_evaluation,
+            "T-final-qualification",
+            &"b".repeat(64),
+        )
+        .unwrap();
+        assert_eq!(
+            db.dedicated_session("T-retained")
+                .unwrap()
+                .unwrap()
+                .candidate_evaluation_hash
+                .as_deref(),
+            Some(final_evaluation_hash.as_str()),
+            "final D evaluation must replace C testimony only by exact prior-testimony CAS"
+        );
     }
 
     #[test]

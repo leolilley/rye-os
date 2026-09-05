@@ -2,8 +2,8 @@ mod test_state;
 
 use ryeos_app::process::{ExecutionProcessIdentity, PROCESS_IDENTITY_SCHEMA_VERSION};
 use ryeos_app::runtime_db::{
-    NewCredentialProfile, NewDedicatedSession, WorkerProcessRecord, WorkerProcessState,
-    WorkspaceBinding, WorkspaceState,
+    DedicatedCandidateDisposition, NewCredentialProfile, NewDedicatedSession, WorkerProcessRecord,
+    WorkerProcessState, WorkspaceBinding, WorkspaceState,
 };
 use ryeos_app::state_store::{
     FinalizeThreadRecord, NewDedicatedSessionCommand, NewEventRecord, NewThreadRecord,
@@ -323,6 +323,7 @@ fn seed_completed_turn_fixture(
             admitted_capsule_hash: &capsule_hash,
             workspace_id: &workspace_id,
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: &profile_id,
             credential_generation: 1,
             credential_lock_owner: &worker_instance_id,
@@ -492,6 +493,10 @@ async fn completed_termination_requires_the_exact_immutable_turn_fence_and_front
     let (_tmp, state) = test_state::build_test_state();
     let root = "T-completed-fence";
     let fixture = seed_completed_turn_fixture(&state, root);
+
+    ryeos_app::dedicated_session_service::terminate_session(&state, root, "completed", None)
+        .await
+        .expect_err("mutable idle state cannot replace an exact completed-turn fence");
 
     let mut mutations = Vec::new();
     let mut changed = fixture.fence.clone();
@@ -789,6 +794,7 @@ async fn terminal_root_replays_only_exact_authoritatively_settled_command() {
             admitted_capsule_hash: &capsule_hash,
             workspace_id: "W-terminal-hosted-replay",
             candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
             credential_profile_id: "P-terminal-hosted-replay",
             credential_generation: 1,
             credential_lock_owner: "worker-terminal-hosted-replay",

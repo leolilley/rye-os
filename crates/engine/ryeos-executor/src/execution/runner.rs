@@ -121,7 +121,12 @@ pub struct ExecutionParams {
 struct ExecutionGuard {
     state: AppState,
     thread_id: Option<String>,
+    /// Owned project workspace used for journal/foldback authority.
     temp_dir: Option<Arc<TempDirGuard>>,
+    /// Optional disposable process-input workspace. This is deliberately
+    /// separate from `temp_dir`: candidate integration executes from a private
+    /// copy while daemon authoring and terminal capture retain the owned COW.
+    process_input_dir: Option<Arc<TempDirGuard>>,
     thread_finalized: bool,
     callback_token: Option<String>,
     thread_auth_token: Option<String>,
@@ -185,6 +190,7 @@ impl ExecutionGuard {
             state,
             thread_id: None,
             temp_dir: None,
+            process_input_dir: None,
             thread_finalized: false,
             callback_token: None,
             thread_auth_token: None,
@@ -205,6 +211,16 @@ impl ExecutionGuard {
     /// when the last Arc holder drops.
     fn track_temp_dir(&mut self, guard: Arc<TempDirGuard>) {
         self.temp_dir = Some(guard);
+    }
+
+    fn track_process_input_dir(&mut self, guard: Arc<TempDirGuard>) {
+        self.process_input_dir = Some(guard);
+    }
+
+    fn process_workspace_lifeline(&self) -> Option<Arc<TempDirGuard>> {
+        self.process_input_dir
+            .clone()
+            .or_else(|| self.temp_dir.clone())
     }
 
     /// Track a callback token for revocation on cleanup.
@@ -379,6 +395,7 @@ impl ExecutionGuard {
         self.revoke_thread_auth_token();
         // Drop the Arc<TempDirGuard>. If this is the last holder,
         // the directory is removed by the TempDirGuard Drop impl.
+        self.process_input_dir = None;
         self.temp_dir = None;
     }
 
@@ -393,6 +410,7 @@ impl ExecutionGuard {
         ExecutionGuardParts {
             state: self.state.clone(),
             temp_dir: self.temp_dir.take(),
+            process_input_dir: self.process_input_dir.take(),
             callback_token: self.callback_token.take(),
             thread_auth_token: self.thread_auth_token.take(),
         }
@@ -408,10 +426,12 @@ impl Drop for ExecutionGuard {
         self.revoke_callback_token();
         self.revoke_thread_auth_token();
         if self.thread_finalized {
+            self.process_input_dir = None;
             self.temp_dir = None;
             return;
         }
         let Some(thread_id) = self.thread_id.clone() else {
+            self.process_input_dir = None;
             self.temp_dir = None;
             return;
         };
@@ -430,6 +450,7 @@ impl Drop for ExecutionGuard {
                 "execution guard drop could not fully stop and settle owned execution tree"
             ),
         }
+        self.process_input_dir = None;
         self.temp_dir = None;
     }
 }
@@ -639,6 +660,7 @@ fn stop_owner_dropped_thread(state: &AppState, thread_id: &str) -> Result<OwnerD
 struct ExecutionGuardParts {
     state: AppState,
     temp_dir: Option<Arc<TempDirGuard>>,
+    process_input_dir: Option<Arc<TempDirGuard>>,
     callback_token: Option<String>,
     thread_auth_token: Option<String>,
 }
@@ -1111,6 +1133,64 @@ fn read_pre_tree_for_snapshot(state: &AppState, snap_hash: &str) -> Result<(Stri
     Ok((snapshot.project_tree_hash, snapshot.effective_policy_hash))
 }
 
+fn record_candidate_integration_process_completion(
+    state: &AppState,
+    thread_id: &str,
+    authority: Option<&ryeos_app::thread_lifecycle::CandidateEvaluationAuthority>,
+    completion: &ExecutionCompletion,
+) -> Result<Option<ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact>> {
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+    if !matches!(
+        &authority.purpose,
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+    ) {
+        return Ok(None);
+    }
+    if completion.status != ryeos_engine::contracts::ThreadTerminalStatus::Completed {
+        return Ok(None);
+    }
+    if completion.outcome_code.as_deref().is_some_and(|code| code != "success")
+        || completion.error.is_some()
+        || !completion.artifacts.is_empty()
+        || completion.final_cost.is_some()
+        || completion.continuation_request.is_some()
+    {
+        bail!(
+            "successful candidate integration returned a non-canonical terminal contract"
+        );
+    }
+    let thread = state
+        .state_store
+        .get_thread(thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("candidate integration thread disappeared"))?;
+    if thread.thread_id != thread_id || thread.chain_root_id != thread_id {
+        bail!("candidate integration completion is not attached to its sealed root");
+    }
+    let capsule_hash = thread
+        .admitted_launch_capsule_hash
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("candidate integration root has no admitted capsule"))?;
+    let process_completion_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(completion)?,
+    )?;
+    let fact = ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact::new(
+        authority,
+        thread_id,
+        capsule_hash,
+        process_completion_digest,
+    )?;
+    ryeos_app::authoritative_root_fact::append_once(
+        state,
+        thread_id,
+        ryeos_app::thread_lifecycle::CANDIDATE_INTEGRATION_PROCESS_COMPLETED_EVENT,
+        &fact.operation_id,
+        serde_json::to_value(&fact)?,
+    )?;
+    Ok(Some(fact))
+}
+
 struct PostExecutionFoldbackParams<'a> {
     pub state: &'a AppState,
     pub thread_id: &'a str,
@@ -1139,6 +1219,12 @@ fn post_execution_foldback(
         execution_dir,
         completion: _completion,
     } = params;
+    if matches!(
+        terminal_publication,
+        ryeos_state::objects::PinnedTerminalPublication::Discard
+    ) {
+        anyhow::bail!("discarded COW execution cannot publish a fold-back generation");
+    }
     let authority = super::pinned_state_authority(state)
         .context("pin state authority for authoritative fold-back")?;
     // Need a working dir for fold-back. If neither an exec checkout
@@ -1172,7 +1258,7 @@ fn post_execution_foldback(
         .context("acquire pinned CAS mutation guard for authoritative fold-back")?;
 
     // Acquire write barrier for CAS mutations (fold-back + head advance).
-    let _permit = state
+    let permit = state
         .write_barrier
         .acquire_with_timeout(ryeos_app::write_barrier::ONLINE_WRITE_PERMIT_TIMEOUT)
         .map_err(|error| anyhow::anyhow!("acquire CAS write permit for fold-back: {error}"))?;
@@ -1253,9 +1339,19 @@ fn post_execution_foldback(
     } else {
         base_snapshot_hash.to_string()
     };
+    // The shared CAS guard and staged-root publication retain the completed
+    // closure. Release the online mutation permit before StateStore acquires
+    // its own permit for the owner-fenced workspace journal transaction.
+    drop(permit);
     state
         .state_store
         .assert_launch_owner(thread_id, launch_owner)?;
+    state.state_store.bind_frozen_execution_workspace(
+        workspace_id,
+        thread_id,
+        launch_owner,
+        &snapshot_hash,
+    )?;
     Ok(crate::execution::PendingProjectResult {
         snapshot_hash,
         publication: Some(publication),
@@ -2263,13 +2359,18 @@ enum ProcessInputRootSelection {
     Existing,
     SparsePrivate,
     PinnedReadOnlyPrivate,
+    CandidateIntegrationPrivate,
 }
 
 fn select_process_input_root(
     project: ProcessProjectClass,
     has_bindings: bool,
     isolation_enforced: bool,
+    candidate_integration: bool,
 ) -> ProcessInputRootSelection {
+    if candidate_integration {
+        return ProcessInputRootSelection::CandidateIntegrationPrivate;
+    }
     match (project, has_bindings, isolation_enforced) {
         (ProcessProjectClass::Live, true, _) => ProcessInputRootSelection::SparsePrivate,
         (ProcessProjectClass::PinnedReadOnly, _, false) => {
@@ -2301,28 +2402,37 @@ mod process_input_selection_tests {
     #[test]
     fn exact_input_root_selection_matrix_is_closed() {
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::Live, false, false),
+            select_process_input_root(ProcessProjectClass::Live, false, false, false),
             ProcessInputRootSelection::Existing
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::Live, true, false),
+            select_process_input_root(ProcessProjectClass::Live, true, false, false),
             ProcessInputRootSelection::SparsePrivate
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::Live, true, true),
+            select_process_input_root(ProcessProjectClass::Live, true, true, false),
             ProcessInputRootSelection::SparsePrivate
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedReadOnly, false, false),
+            select_process_input_root(
+                ProcessProjectClass::PinnedReadOnly,
+                false,
+                false,
+                false,
+            ),
             ProcessInputRootSelection::PinnedReadOnlyPrivate
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedReadOnly, true, true),
+            select_process_input_root(ProcessProjectClass::PinnedReadOnly, true, true, false),
             ProcessInputRootSelection::Existing
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedCow, true, false),
+            select_process_input_root(ProcessProjectClass::PinnedCow, true, false, false),
             ProcessInputRootSelection::Existing
+        );
+        assert_eq!(
+            select_process_input_root(ProcessProjectClass::PinnedCow, true, true, true),
+            ProcessInputRootSelection::CandidateIntegrationPrivate
         );
     }
 
@@ -2371,14 +2481,29 @@ pub(crate) fn prepare_process_inputs(
     super::source_closure::validate_external_mount_separation(state, retained_resolution)?;
     let has_bindings = retained_resolution_has_filesystem_bindings(retained_resolution)?;
     let project_class = process_project_class(provenance);
-    let root_selection =
-        select_process_input_root(project_class, has_bindings, state.isolation.is_enforced());
+    let candidate_integration = provenance.candidate_evaluation_scope().is_some_and(|scope| {
+        matches!(
+            &scope.authority().purpose,
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+        )
+    });
+    let root_selection = select_process_input_root(
+        project_class,
+        has_bindings,
+        state.isolation.is_enforced(),
+        candidate_integration,
+    );
     let live_private_root = root_selection == ProcessInputRootSelection::SparsePrivate;
     let pinned_read_only_private_root =
         root_selection == ProcessInputRootSelection::PinnedReadOnlyPrivate;
+    let candidate_integration_private_root =
+        root_selection == ProcessInputRootSelection::CandidateIntegrationPrivate;
 
     let (path, lifeline, isolation_project_authority, isolation_live_access_authority) =
-        if live_private_root || pinned_read_only_private_root {
+        if live_private_root
+            || pinned_read_only_private_root
+            || candidate_integration_private_root
+        {
             let (path, lifeline) = ryeos_app::temp_dir_guard::create_admitted_input_workspace(
                 &state.config.runtime_root().cache(),
                 thread_id,
@@ -2404,10 +2529,12 @@ pub(crate) fn prepare_process_inputs(
         has_bindings,
         state.isolation.is_enforced(),
     );
-    let budget = (private_copy || pinned_read_only_private_root)
+    let budget = (private_copy
+        || pinned_read_only_private_root
+        || candidate_integration_private_root)
         .then(super::external_content::private_materialization_budget)
         .transpose()?;
-    if pinned_read_only_private_root {
+    if pinned_read_only_private_root || candidate_integration_private_root {
         let snapshot_hash = match provenance.project_authority() {
             ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
                 snapshot_hash,
@@ -2553,6 +2680,7 @@ fn admitted_root_launch_metadata(
         origin_site_id: params.resolved.origin_site_id.clone(),
         requested_by: params.resolved.plan_context.requested_by.clone(),
         execution_hints: params.resolved.plan_context.execution_hints.clone(),
+        scheduled_fire: params.resolved.plan_context.scheduled_fire.clone(),
         effective_caps: params.effective_caps.clone(),
         parent_delegation_caps: None,
         executor_ref: Some(params.resolved.executor_ref.clone()),
@@ -2670,7 +2798,7 @@ pub(crate) fn finalize_direct_effective_program(
     let mut resolution = admission.resolution_output().clone();
     let roots = engine.resolution_roots(
         admission
-            .execution_workspace()
+            .resolution_workspace()
             .map(std::path::Path::to_path_buf),
     );
     // A declaring kind captures here exactly as the managed path does, and a
@@ -3209,7 +3337,7 @@ pub async fn run_and_wait(
     )?;
     effective_path = process_path;
     if let Some(lifeline) = process_input_lifeline {
-        guard.track_temp_dir(lifeline);
+        guard.track_process_input_dir(lifeline);
     }
     if let Some(parent_thread_id) = params.parent_thread_id.as_deref() {
         let inherited_stop = match state.state_store.record_child_link(
@@ -3285,7 +3413,12 @@ pub async fn run_and_wait(
     // Resolve the terminator's signed protocol and materialize exactly its env
     // contract. Callback authority exists only when that descriptor asks for
     // it; the guard owns any credentials that were actually minted.
-    let child_provenance = params.provenance.clone_for_borrowed_child();
+    // This token authenticates callbacks made by the terminal root process
+    // itself. Keep its exact root provenance (including an admitted candidate
+    // integration authoring root). Callback-dispatched descendants derive a
+    // borrowed projection in `runtime_dispatch`, so they cannot inherit root
+    // publication authority.
+    let callback_provenance = params.provenance.clone();
     // Callback-state project path: the deliberate `state_root` override when
     // requested, otherwise the effective project path. Protocol `project_path`
     // injections remain anchored at `effective_path`; only callback authority
@@ -3322,7 +3455,7 @@ pub async fn run_and_wait(
         params.handler_context.as_ref(),
         &params.resolved.current_site_id,
         &params.resolved.origin_site_id,
-        child_provenance,
+        callback_provenance,
         &params.resolved.item_ref,
         params.resolved.root_raw_content_digest.clone(),
         effective_bundle_id_for_request(&params.resolved),
@@ -3384,7 +3517,7 @@ pub async fn run_and_wait(
         .unwrap_or_default();
     let mut wait_external_mounts = wait_external_mounts;
     wait_external_mounts.append(&mut wait_source_mounts);
-    let spawn_workspace_lifeline = guard.temp_dir.clone();
+    let spawn_workspace_lifeline = guard.process_workspace_lifeline();
     let wait_node_trusted_keys_dir = state.config.runtime_root().trusted_keys_dir();
     let spawn_handle = task::spawn_blocking(move || {
         let _spawn_workspace_lifeline = spawn_workspace_lifeline;
@@ -3624,9 +3757,9 @@ pub async fn run_and_wait(
     );
 
     // Wait
-    let wait_workspace_lifeline = guard.temp_dir.clone();
+    let wait_workspace_lifeline = guard.process_workspace_lifeline();
     let waited_identity = spawned.process_identity.clone();
-    let completion = match task::spawn_blocking(move || {
+    let mut completion = match task::spawn_blocking(move || {
         // A cancelled HTTP future must not drop an ephemeral cwd while the
         // blocking wait and its child process are still alive.
         let _wait_workspace_lifeline = wait_workspace_lifeline;
@@ -3657,13 +3790,6 @@ pub async fn run_and_wait(
         }
     };
 
-    if !state.state_store.process_attachment_admission_is_open() {
-        let _ = state.state_store.reset_resume_attempts(&running.thread_id);
-        release_tree_publication(tree_publication, "waiting shutdown without CAS publication");
-        guard.cleanup();
-        anyhow::bail!("execution interrupted by daemon shutdown; row preserved for recovery");
-    }
-
     // Lift the `--debug-raw` block out of the completion metadata before
     // finalization consumes the completion. `None` on the normal path.
     let debug_block = completion
@@ -3672,9 +3798,33 @@ pub async fn run_and_wait(
         .and_then(|m| m.get("debug"))
         .cloned();
 
+    let candidate_integration_completion = record_candidate_integration_process_completion(
+        &state,
+        &running.thread_id,
+        params
+            .provenance
+            .candidate_evaluation_scope()
+            .map(|scope| scope.authority()),
+        &completion,
+    )?;
+
+    if !state.state_store.process_attachment_admission_is_open() {
+        let _ = state.state_store.reset_resume_attempts(&running.thread_id);
+        release_tree_publication(tree_publication, "waiting shutdown without CAS publication");
+        guard.cleanup();
+        anyhow::bail!("execution interrupted by daemon shutdown; row preserved for recovery");
+    }
+
     let callback_sealed_result = state
         .state_store
         .authoritative_result_project_snapshot(&running.thread_id)?;
+    if candidate_integration_completion.is_some() && callback_sealed_result.is_some() {
+        guard.fail_thread("candidate_integration_result_authority_conflict");
+        guard.cleanup();
+        anyhow::bail!(
+            "candidate integration cannot bypass its retained workspace freeze with a callback result"
+        );
+    }
     let mut pending_project_result = None;
     let result_project_snapshot_hash = if let Some(snapshot) = callback_sealed_result.as_ref() {
         if !wait_requires_foldback {
@@ -3683,7 +3833,7 @@ pub async fn run_and_wait(
             anyhow::bail!("read-only project authority cannot publish a project result generation");
         }
         wait_records_terminal_generation.then(|| snapshot.clone())
-    } else if !wait_requires_foldback {
+    } else if !wait_requires_foldback || !wait_records_terminal_generation {
         None
     } else {
         transition_owned_workspace(
@@ -3745,6 +3895,14 @@ pub async fn run_and_wait(
             }
         }
     };
+    if let Some(fact) = candidate_integration_completion.as_ref() {
+        let result_snapshot_hash = result_project_snapshot_hash.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "successful candidate integration produced no frozen result generation"
+            )
+        })?;
+        completion = fact.canonical_completion(result_snapshot_hash)?;
+    }
     // A non-resumable live-tree execution has no durable snapshot root. Keep
     // its staged project tree protected through execution, then release it here.
     // Native-resume pinning transferred the same permit into
@@ -3790,7 +3948,12 @@ pub async fn run_and_wait(
             }
             if !matches!(
                 session.state.as_str(),
-                "frozen" | "verifying" | "publish_ready" | "publishing" | "discarding"
+                "frozen"
+                    | "verifying"
+                    | "qualifying"
+                    | "publish_ready"
+                    | "publishing"
+                    | "discarding"
             ) {
                 anyhow::bail!(
                     "session-bound candidate entered invalid disposition state {}",
@@ -3951,6 +4114,10 @@ pub async fn run_detached(
     } = prepare_cas_context(&state, &params.provenance, &thread_id, &mut guard)?;
     verify_fresh_root_admission(&params).context("revalidate exact admitted detached root")?;
     let bg_project_authority = params.provenance.project_authority().clone();
+    let bg_candidate_operation_authority = params
+        .provenance
+        .candidate_evaluation_scope()
+        .map(|scope| scope.authority().clone());
     let admission_isolation_live_access_authority =
         params.provenance.isolation_live_access_authority()?;
     let engine = params.provenance.request_engine().clone();
@@ -4041,7 +4208,7 @@ pub async fn run_detached(
     )?;
     effective_path = process_path;
     if let Some(lifeline) = process_input_lifeline {
-        guard.track_temp_dir(lifeline);
+        guard.track_process_input_dir(lifeline);
     }
     if let Some(parent_thread_id) = params.parent_thread_id.as_deref() {
         let inherited_stop = match state.state_store.record_child_link(
@@ -4110,7 +4277,9 @@ pub async fn run_detached(
     // Build the exact signed protocol env. Any minted credentials transfer to
     // the background task's revocation guards; callback-free protocols mint
     // none and do not receive isolation access to the daemon socket.
-    let child_provenance = params.provenance.clone_for_borrowed_child();
+    // The detached terminal process is still this execution root. Descendant
+    // callback launches are narrowed at their dispatch boundary.
+    let callback_provenance = params.provenance.clone();
     // Same runtime-state root selection as `run_and_wait` (see comment there).
     let runtime_state_root = params
         .provenance
@@ -4148,7 +4317,7 @@ pub async fn run_detached(
         params.handler_context.as_ref(),
         &params.resolved.current_site_id,
         &params.resolved.origin_site_id,
-        child_provenance,
+        callback_provenance,
         &params.resolved.item_ref,
         params.resolved.root_raw_content_digest.clone(),
         effective_bundle_id_for_request(&params.resolved),
@@ -4169,6 +4338,7 @@ pub async fn run_detached(
     let parts = guard.into_detached_parts();
     let bg_state = parts.state;
     let bg_temp_dir = parts.temp_dir;
+    let bg_process_input_dir = parts.process_input_dir;
     let bg_cb_token = parts.callback_token;
     let bg_tat_token = parts.thread_auth_token;
     let bg_thread_id = created.thread_id.clone();
@@ -4213,11 +4383,13 @@ pub async fn run_detached(
         bg_tree_publication,
         bg_project_path,
         bg_project_authority,
+        bg_candidate_operation_authority,
         bg_state_root,
         bg_isolation_project_authority,
         bg_isolation_live_access_authority,
         isolation_daemon_socket_path,
         bg_temp_dir,
+        bg_process_input_dir,
         bg_skip_resume_snapshot_pin,
         bg_terminal_publication,
         bg_bound_external,
@@ -4303,7 +4475,9 @@ impl DetachedDispatchKind {
         bg_resume_snapshot_hash, bg_tree_publication,
         bg_project_path, bg_state_root,
         bg_project_authority,
+        bg_candidate_operation_authority,
         bg_isolation_project_authority, bg_isolation_daemon_socket_path, bg_temp_dir,
+        bg_process_input_dir,
         bg_skip_resume_snapshot_pin, bg_terminal_publication, bg_external_realizations,
         bg_source_closure,
         bg_runtime_state_dir,
@@ -4333,6 +4507,9 @@ async fn dispatch_detached_bg_task(
     mut bg_tree_publication: Option<super::PendingCasPublication>,
     bg_project_path: Option<PathBuf>,
     bg_project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+    bg_candidate_operation_authority: Option<
+        ryeos_app::thread_lifecycle::CandidateEvaluationAuthority,
+    >,
     bg_state_root: Option<PathBuf>,
     bg_isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
     bg_isolation_live_access_authority: Option<
@@ -4340,6 +4517,7 @@ async fn dispatch_detached_bg_task(
     >,
     bg_isolation_daemon_socket_path: Option<PathBuf>,
     mut bg_temp_dir: Option<Arc<TempDirGuard>>,
+    bg_process_input_dir: Option<Arc<TempDirGuard>>,
     bg_skip_resume_snapshot_pin: bool,
     bg_terminal_publication: Option<ryeos_state::objects::PinnedTerminalPublication>,
     bg_external_realizations: Option<super::external_content::BoundExternalRealizations>,
@@ -4443,7 +4621,9 @@ async fn dispatch_detached_bg_task(
     let state_root_for_spawn = bg_state_root;
     let isolation_for_spawn = bg_state.isolation.clone();
     let isolation_daemon_socket_path_for_spawn = bg_isolation_daemon_socket_path;
-    let spawn_workspace_lifeline = bg_temp_dir.clone();
+    let spawn_workspace_lifeline = bg_process_input_dir
+        .clone()
+        .or_else(|| bg_temp_dir.clone());
 
     match super::process_attachment::finalize_requested_stop_if_present(&bg_state, &bg_thread_id) {
         Ok(true) => {
@@ -4823,7 +5003,9 @@ async fn dispatch_detached_bg_task(
         }
     };
 
-    let wait_workspace_lifeline = bg_temp_dir.clone();
+    let wait_workspace_lifeline = bg_process_input_dir
+        .clone()
+        .or_else(|| bg_temp_dir.clone());
     let waited_identity = spawned.process_identity.clone();
     let wait_result = task::spawn_blocking(move || {
         let _wait_workspace_lifeline = wait_workspace_lifeline;
@@ -4831,24 +5013,49 @@ async fn dispatch_detached_bg_task(
     })
     .await;
     clear_finished_process(&bg_state, &bg_thread_id, &waited_identity, &launch_owner);
-    if !bg_state.state_store.process_attachment_admission_is_open() {
-        let _ = bg_state.state_store.reset_resume_attempts(&bg_thread_id);
-        release_tree_publication(
-            bg_tree_publication,
-            "detached shutdown without CAS publication",
-        );
-        drop(bg_temp_dir);
-        tracing::info!(
-            phase = log_phase,
-            thread_id = %bg_thread_id,
-            "preserving execution row after shutdown-owned interruption"
-        );
-        return;
-    }
     // Extract the execution dir path while the Arc is still alive.
     let bg_exec_dir_path = bg_temp_dir.as_ref().and_then(|g| g.path());
     match wait_result {
-        Ok(completion) => {
+        Ok(mut completion) => {
+            let candidate_integration_completion =
+                match record_candidate_integration_process_completion(
+                    &bg_state,
+                    &bg_thread_id,
+                    bg_candidate_operation_authority.as_ref(),
+                    &completion,
+                ) {
+                    Ok(fact) => fact,
+                    Err(error) => {
+                        tracing::error!(
+                            phase = log_phase,
+                            thread_id = %bg_thread_id,
+                            %error,
+                            "candidate integration completion could not be journaled"
+                        );
+                        let _ = fail_thread_static_owned(
+                            &bg_state,
+                            &bg_thread_id,
+                            "candidate_integration_completion_invalid",
+                            &launch_owner,
+                        );
+                        drop(bg_temp_dir.take());
+                        return;
+                    }
+                };
+            if !bg_state.state_store.process_attachment_admission_is_open() {
+                let _ = bg_state.state_store.reset_resume_attempts(&bg_thread_id);
+                release_tree_publication(
+                    bg_tree_publication,
+                    "detached shutdown without CAS publication",
+                );
+                drop(bg_temp_dir);
+                tracing::info!(
+                    phase = log_phase,
+                    thread_id = %bg_thread_id,
+                    "preserving execution row after shutdown-owned interruption"
+                );
+                return;
+            }
             let callback_sealed_result = match bg_state
                 .state_store
                 .authoritative_result_project_snapshot(&bg_thread_id)
@@ -4859,6 +5066,21 @@ async fn dispatch_detached_bg_task(
                     return;
                 }
             };
+            if candidate_integration_completion.is_some() && callback_sealed_result.is_some() {
+                tracing::error!(
+                    phase = log_phase,
+                    thread_id = %bg_thread_id,
+                    "candidate integration attempted to bypass retained-workspace freeze"
+                );
+                let _ = fail_thread_static_owned(
+                    &bg_state,
+                    &bg_thread_id,
+                    "candidate_integration_result_authority_conflict",
+                    &launch_owner,
+                );
+                drop(bg_temp_dir.take());
+                return;
+            }
             if callback_sealed_result.is_none()
                 && bg_requires_foldback
                 && let Err(error) = transition_owned_workspace(
@@ -4904,7 +5126,7 @@ async fn dispatch_detached_bg_task(
                     return;
                 }
                 bg_records_terminal_generation.then(|| snapshot.clone())
-            } else if !bg_requires_foldback {
+            } else if !bg_requires_foldback || !bg_records_terminal_generation {
                 None
             } else {
                 match (
@@ -4972,7 +5194,6 @@ async fn dispatch_detached_bg_task(
                                     thread_id = %bg_thread_id,
                                     error = %cleanup_error,
                                     "fold-back failure cleanup did not settle"
-                                );
                             }
                             drop(bg_temp_dir.take());
                             return;
@@ -4995,6 +5216,42 @@ async fn dispatch_detached_bg_task(
                     }
                 }
             };
+            if let Some(fact) = candidate_integration_completion.as_ref() {
+                let Some(result_snapshot_hash) = result_project_snapshot_hash.as_deref() else {
+                    tracing::error!(
+                        phase = log_phase,
+                        thread_id = %bg_thread_id,
+                        "successful candidate integration produced no frozen result generation"
+                    );
+                    let _ = fail_thread_static_owned(
+                        &bg_state,
+                        &bg_thread_id,
+                        "candidate_integration_result_missing",
+                        &launch_owner,
+                    );
+                    drop(bg_temp_dir.take());
+                    return;
+                };
+                completion = match fact.canonical_completion(result_snapshot_hash) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        tracing::error!(
+                            phase = log_phase,
+                            thread_id = %bg_thread_id,
+                            %error,
+                            "candidate integration terminal result canonicalization failed"
+                        );
+                        let _ = fail_thread_static_owned(
+                            &bg_state,
+                            &bg_thread_id,
+                            "candidate_integration_result_invalid",
+                            &launch_owner,
+                        );
+                        drop(bg_temp_dir.take());
+                        return;
+                    }
+                };
+            }
             let mut dedicated_disposition = false;
             if let (Some(snapshot_hash), Ok(Some(session))) = (
                 result_project_snapshot_hash.as_deref(),
@@ -5031,6 +5288,7 @@ async fn dispatch_detached_bg_task(
                             session.state.as_str(),
                             "frozen"
                                 | "verifying"
+                                | "qualifying"
                                 | "publish_ready"
                                 | "publishing"
                                 | "discarding"
@@ -5570,12 +5828,8 @@ pub fn retained_workspace_provenance_for_native_resume(
         .map(serde_json::from_str::<ryeos_app::process::ExecutionProcessIdentity>)
         .transpose()
         .context("decode retained execution-workspace process identity")?;
-    if matches!(
-        workspace.state,
-        WorkspaceState::Ready | WorkspaceState::Freezing
-    ) && recorded_process_identity.is_some()
-    {
-        anyhow::bail!("ready/frozen retained execution workspace still has a process attachment");
+    if workspace.state == WorkspaceState::Ready && recorded_process_identity.is_some() {
+        anyhow::bail!("ready retained execution workspace still has a process attachment");
     }
     if workspace.state == WorkspaceState::Freezing && workspace.frozen_snapshot_hash.is_none() {
         anyhow::bail!("frozen retained execution workspace has no candidate generation");
@@ -5685,9 +5939,18 @@ pub fn execution_params_from_sealed_root_request(
     provenance_override: Option<ExecutionProvenance>,
 ) -> Result<ExecutionParams> {
     sealed.validate_current_operator_authority(state)?;
-    let provenance = match provenance_override {
-        Some(provenance) => provenance,
-        None => execution_provenance_from_resume_context(state, resume)?.0,
+    let provenance = match sealed.candidate_evaluation_authority() {
+        Some(authority) => candidate_evaluation_provenance_from_resume_context(
+            state,
+            resume,
+            authority,
+            provenance_override,
+        )?
+        .0,
+        None => match provenance_override {
+            Some(provenance) => provenance,
+            None => execution_provenance_from_resume_context(state, resume)?.0,
+        },
     };
     if sealed.project_authority() != &resume.project_authority
         || sealed.project_authority() != provenance.project_authority()
@@ -5724,6 +5987,7 @@ pub fn execution_params_from_sealed_root_request(
         || resolved.plan_context.requested_by != operational_resume.requested_by
         || resolved.plan_context.project_context != operational_resume.project_context
         || resolved.plan_context.execution_hints != operational_resume.execution_hints
+        || resolved.plan_context.scheduled_fire != operational_resume.scheduled_fire
         || operational_resume.executor_ref.as_deref() != Some(sealed.executor_ref())
         || operational_resume.runtime_ref.as_deref() != Some(sealed.runtime_ref())
     {
@@ -5750,6 +6014,231 @@ pub fn execution_params_from_sealed_root_request(
         effect_authority: None,
         finalized_direct: None,
     })
+}
+
+/// Reconstruct both immutable legs of a candidate operation after restart.
+/// The executable closure is restored from `base_snapshot_hash`; the runtime
+/// sees only the separately materialized candidate generation. Neither leg is
+/// rebuilt from the live project or current HEAD.
+pub(crate) fn candidate_evaluation_provenance_from_resume_context(
+    state: &AppState,
+    resume: &ResumeContext,
+    authority: &ryeos_app::thread_lifecycle::CandidateEvaluationAuthority,
+    retained_candidate_provenance: Option<ExecutionProvenance>,
+) -> Result<(ExecutionProvenance, ProjectContext)> {
+    use ryeos_state::objects::{
+        ChildProjectAuthorityPolicy, EnvironmentAuthority, ExecutionProjectAuthority,
+        PinnedProjectRealization, PinnedTerminalPublication,
+    };
+
+    authority.validate()?;
+    let (
+        stable_project_identity,
+        original_project_path,
+        candidate_base,
+        candidate_snapshot,
+        candidate_realization,
+        candidate_environment,
+        candidate_capabilities,
+    ) = match &resume.project_authority {
+        ExecutionProjectAuthority::PinnedGeneration {
+            stable_project_identity,
+            display_path: Some(display_path),
+            base_snapshot_hash,
+            snapshot_hash,
+            realization,
+            environment,
+            capability_ceiling,
+            ..
+        } => (
+            stable_project_identity.clone(),
+            display_path.clone(),
+            base_snapshot_hash,
+            snapshot_hash,
+            realization,
+            environment,
+            capability_ceiling.clone(),
+        ),
+        _ => anyhow::bail!(
+            "candidate operation recovery requires a pinned candidate with stable display identity"
+        ),
+    };
+    let owner = resume.principal_identifier();
+    let candidate_mode_ok = match &authority.purpose {
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+            candidate_base == &authority.candidate_snapshot_hash
+                && matches!(
+                    candidate_realization,
+                    PinnedProjectRealization::ReadOnly
+                        | PinnedProjectRealization::Cow {
+                            terminal_publication: PinnedTerminalPublication::Discard,
+                        }
+                )
+                && !candidate_capabilities.iter().any(|capability| {
+                    capability == ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+                })
+        }
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. } => {
+            candidate_base == &authority.base_snapshot_hash
+                && matches!(
+                    candidate_realization,
+                    PinnedProjectRealization::Cow {
+                        terminal_publication:
+                            PinnedTerminalPublication::RetainCurrentHead {
+                                expected_hash,
+                                ..
+                            },
+                    } if expected_hash == &authority.base_snapshot_hash
+                )
+                && !candidate_capabilities.iter().any(|capability| {
+                    capability == ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+                })
+        }
+    };
+    if owner != authority.owner_principal
+        || candidate_snapshot != &authority.candidate_snapshot_hash
+        || !candidate_mode_ok
+        || candidate_environment != &EnvironmentAuthority::None
+    {
+        anyhow::bail!("candidate operation resume authority contradicts its sealed coordinate");
+    }
+
+    let base_checkout_id = format!(
+        "candidate-evaluator-base-{}-{:08x}",
+        lillux::time::timestamp_millis(),
+        rand::random::<u32>()
+    );
+    let base = super::project_source::resolve_pinned_snapshot_context(
+        state,
+        &authority.base_snapshot_hash,
+        original_project_path.clone(),
+        &base_checkout_id,
+        super::project_source::PinnedContextRealization::ReadOnly,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let base_lifeline = base.temp_dir.clone().ok_or_else(|| {
+        anyhow::anyhow!("candidate operation base materialization has no workspace lifeline")
+    })?;
+    let base_materialization = base.pinned_materialization.clone().ok_or_else(|| {
+        anyhow::anyhow!("candidate operation base materialization has no CAS proof")
+    })?;
+    let base_authority = ExecutionProjectAuthority::pinned(
+        stable_project_identity,
+        Some(original_project_path.clone()),
+        authority.base_snapshot_hash.clone(),
+        PinnedProjectRealization::ReadOnly,
+        EnvironmentAuthority::None,
+        candidate_capabilities,
+    )?
+    .with_child_policy(ChildProjectAuthorityPolicy::Inherit)?;
+    let base_provenance = ExecutionProvenance::root_pushed_head(
+        original_project_path.clone(),
+        base.request_engine.clone(),
+        base_lifeline,
+        base_materialization,
+        base_authority,
+    )?;
+    let base_plan_context = ryeos_engine::contracts::PlanContext {
+        requested_by: resume.requested_by.clone(),
+        project_context: ProjectContext::LocalPath {
+            path: base.effective_path.clone(),
+        },
+        subject_resolution_authority: base_provenance.subject_resolution_authority(),
+        current_site_id: resume.current_site_id.clone(),
+        origin_site_id: resume.origin_site_id.clone(),
+        execution_hints: resume.execution_hints.clone(),
+        scheduled_fire: resume.scheduled_fire.clone(),
+        validate_only: false,
+    };
+    let base_binding = ryeos_app::thread_lifecycle::AdmittedProjectBinding::from_provenance(
+        &base.request_engine,
+        &base_plan_context,
+        &base_provenance,
+    )?;
+    let scope = Arc::new(
+        ryeos_app::thread_lifecycle::CandidateEvaluationExecutionScope::admit(
+            authority.clone(),
+            base_plan_context,
+            base_binding,
+        )?,
+    );
+
+    if let Some(retained) = retained_candidate_provenance {
+        // Native COW recovery has already re-opened and journal-validated the
+        // exact retained candidate workspace. Preserve that path,
+        // materialization and authority, but replace its temporary C-derived
+        // resolution engine with the independently verified immutable-B
+        // engine before attaching the dual-authority scope. Re-materializing C
+        // here would overwrite integration output already present in the
+        // retained workspace.
+        if retained.is_borrowed_child()
+            || retained.project_authority() != &resume.project_authority
+            || retained.original_project_path() != original_project_path.as_path()
+        {
+            anyhow::bail!(
+                "retained candidate workspace contradicts its sealed resume authority"
+            );
+        }
+        let candidate_lifeline = retained.workspace_lifeline().ok_or_else(|| {
+            anyhow::anyhow!("retained candidate workspace has no ownership lifeline")
+        })?;
+        let candidate_materialization = retained
+            .pinned_materialization()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("retained candidate workspace has no materialization proof")
+            })?;
+        let effective_path = retained.effective_path().to_path_buf();
+        let provenance = ExecutionProvenance::root_pushed_head(
+            original_project_path,
+            base.request_engine,
+            candidate_lifeline,
+            candidate_materialization,
+            resume.project_authority.clone(),
+        )?
+        .with_candidate_evaluation_scope(scope)?;
+        return Ok((
+            provenance,
+            ProjectContext::LocalPath {
+                path: effective_path,
+            },
+        ));
+    }
+
+    let candidate_checkout_id = format!(
+        "candidate-evaluator-workspace-{}-{:08x}",
+        lillux::time::timestamp_millis(),
+        rand::random::<u32>()
+    );
+    let candidate = super::project_source::resolve_pinned_snapshot_context(
+        state,
+        &authority.candidate_snapshot_hash,
+        original_project_path.clone(),
+        &candidate_checkout_id,
+        super::project_source::pinned_context_realization(&resume.project_authority)?,
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let candidate_lifeline = candidate.temp_dir.clone().ok_or_else(|| {
+        anyhow::anyhow!("candidate operation materialization has no workspace lifeline")
+    })?;
+    let candidate_materialization = candidate.pinned_materialization.ok_or_else(|| {
+        anyhow::anyhow!("candidate operation materialization has no CAS proof")
+    })?;
+    let effective_path = candidate.effective_path.clone();
+    let provenance = ExecutionProvenance::root_pushed_head(
+        original_project_path,
+        base.request_engine,
+        candidate_lifeline,
+        candidate_materialization,
+        resume.project_authority.clone(),
+    )?
+    .with_candidate_evaluation_scope(scope)?;
+    Ok((
+        provenance,
+        ProjectContext::LocalPath {
+            path: effective_path,
+        },
+    ))
 }
 
 /// Re-spawn an existing thread under its original `thread_id` after a
@@ -5911,7 +6400,9 @@ async fn run_existing_recovered_thread(
     // Rebuild the signed protocol environment for the recovered subprocess.
     // Credentials are fresh when declared and absent for callback-free tools;
     // originals, if any, were revoked with the prior background owner.
-    let child_provenance = params.provenance.clone_for_borrowed_child();
+    // Recovery remints the same root-scoped callback authority sealed at the
+    // original launch. It must not pre-project the root into a borrowed child.
+    let callback_provenance = params.provenance.clone();
     let engine = params.provenance.request_engine().clone();
     let admitted_capsule = state
         .state_store
@@ -5963,7 +6454,7 @@ async fn run_existing_recovered_thread(
     })?;
     effective_path = process_path;
     if let Some(lifeline) = process_input_lifeline {
-        guard.track_temp_dir(lifeline);
+        guard.track_process_input_dir(lifeline);
     }
     if matches!(
         &params.resolved.plan_context.project_context,
@@ -6123,7 +6614,7 @@ async fn run_existing_recovered_thread(
         params.handler_context.as_ref(),
         &params.resolved.current_site_id,
         &params.resolved.origin_site_id,
-        child_provenance,
+        callback_provenance,
         &params.resolved.item_ref,
         params.resolved.root_raw_content_digest.clone(),
         effective_bundle_id_for_request(&params.resolved),
@@ -6144,9 +6635,14 @@ async fn run_existing_recovered_thread(
     // runtime capabilities remain a separate launch fact and never rewrite
     // project authority after admission.
     let bg_project_authority = params.provenance.project_authority().clone();
+    let bg_candidate_operation_authority = params
+        .provenance
+        .candidate_evaluation_scope()
+        .map(|scope| scope.authority().clone());
     let parts = guard.into_detached_parts();
     let bg_state = parts.state;
     let bg_temp_dir = parts.temp_dir;
+    let bg_process_input_dir = parts.process_input_dir;
     let bg_cb_token = parts.callback_token;
     let bg_tat_token = parts.thread_auth_token;
     let bg_thread_id = thread_id.clone();
@@ -6190,11 +6686,13 @@ async fn run_existing_recovered_thread(
         bg_tree_publication,
         bg_project_path,
         bg_project_authority,
+        bg_candidate_operation_authority,
         bg_state_root,
         bg_isolation_project_authority,
         bg_isolation_live_access_authority,
         isolation_daemon_socket_path,
         bg_temp_dir,
+        bg_process_input_dir,
         bg_skip_resume_snapshot_pin,
         bg_terminal_publication,
         bg_external_realizations,
@@ -6394,6 +6892,7 @@ mod tests {
                 scopes: vec!["execute".into()],
             }),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: Vec::new(),
             parent_delegation_caps: None,
             executor_ref: None,

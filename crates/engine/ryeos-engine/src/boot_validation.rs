@@ -50,10 +50,11 @@ use ryeos_handler_protocol::{
     ConfigMergeModeWire, ExternalEffectAuthorityDeclWire, FinancialAuthorityDeclWire,
     HandlerRequest, HandlerResponse, ItemSpaceWire, LaunchConfigInputDeclWire,
     LaunchContentDependencyPolicyWire, LaunchContentExternalPolicyWire,
-    LaunchEnvironmentContributionPolicyWire, LaunchExecutionDependencyPolicyWire,
-    LaunchSecretPolicyDeclWire, RefBindingDeclWire, RuntimeFactDeclWire, RuntimeFactKindWire,
-    TrustClassWire, ValidateComposerConfigRequest, ValidateLaunchPreparerConfigRequest,
-    ValidateLaunchPreparerConfigResponse, ValidateParserConfigRequest,
+    LaunchEnvironmentContributionPolicyWire, LaunchEvidenceAttachmentPolicyWire,
+    LaunchExecutionDependencyPolicyWire, LaunchSecretPolicyDeclWire, RefBindingDeclWire,
+    RuntimeFactDeclWire, RuntimeFactKindWire, TrustClassWire, ValidateComposerConfigRequest,
+    ValidateLaunchPreparerConfigRequest, ValidateLaunchPreparerConfigResponse,
+    ValidateParserConfigRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -749,6 +750,13 @@ fn launch_preparer_validation_request(
                     large_content_max_total_bytes: external.large_content_max_total_bytes,
                 },
             ),
+        },
+        evidence_attachments: LaunchEvidenceAttachmentPolicyWire {
+            max_attachments: contract.evidence_attachments.max_attachments,
+            max_total_bytes: contract.evidence_attachments.max_total_bytes,
+            target: contract.evidence_attachments.target.clone(),
+            destination_prefix: contract.evidence_attachments.destination_prefix.clone(),
+            allowed_access: contract.evidence_attachments.allowed_access.clone(),
         },
         environment_contributions: LaunchEnvironmentContributionPolicyWire {
             max_contributions: contract.environment_contributions.max_contributions,

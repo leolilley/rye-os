@@ -30,8 +30,8 @@ use ryeos_state::objects::{
 };
 
 use super::launch_preparation::{
-    PreparedContentDependency, PreparedExecutionDependency, PreparedRuntimeLaunch,
-    RefBindingLaunchRecord,
+    PreparedContentDependency, PreparedEvidenceAttachment, PreparedExecutionDependency,
+    PreparedRuntimeLaunch, RefBindingLaunchRecord,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +85,42 @@ pub(crate) struct PreparedDependencyValidationPreview {
 pub(crate) struct PersistentSessionExactProgram {
     pub(crate) effective_definition_digest: String,
     pub(crate) resolution_output: ryeos_engine::resolution::RetainedResolutionOutput,
+    pub(crate) evidence_attachments: Vec<PreparedEvidenceAttachment>,
+}
+
+fn validate_exact_evidence_attachments(exact: &PersistentSessionExactProgram) -> Result<()> {
+    let mut previous: Option<&str> = None;
+    for binding in &exact.evidence_attachments {
+        binding.validate()?;
+        if previous.is_some_and(|value| value >= binding.binding_id.as_str()) {
+            bail!("persistent-session evidence attachments are not canonically ordered");
+        }
+        previous = Some(&binding.binding_id);
+    }
+    Ok(())
+}
+
+fn evidence_realizations(
+    bindings: &[PreparedEvidenceAttachment],
+) -> Result<ryeos_engine::external_realization::RealizedExternalContentSet> {
+    let entries = bindings
+        .iter()
+        .map(|binding| {
+            binding.validate()?;
+            Ok(
+                ryeos_engine::external_realization::RealizedExternalContent {
+                    id: format!("ev-{}", binding.binding_id),
+                    kind: ryeos_state::objects::ExternalContentKind::File,
+                    mode: ryeos_state::objects::ExternalContentMode::Pinned,
+                    manifest_hash: binding.manifest_hash.clone(),
+                    entry_count: 1,
+                    total_bytes: binding.size_bytes,
+                    mount: binding.destination_path.clone(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ryeos_engine::external_realization::RealizedExternalContentSet::new(entries)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +166,294 @@ pub(crate) struct AdmittedSessionPublications {
 }
 
 impl AdmittedSessionPublications {
+    pub(crate) fn include_evidence_publication(
+        &mut self,
+        publication: Option<ryeos_state::PendingCasPublication>,
+    ) {
+        self.publications.extend(publication);
+    }
+}
+
+/// Resolve invocation-supplied bundle-event attachments into exact retained
+/// launch bindings. Authorization and identity verification happen here,
+/// before any persistent worker can be admitted or spawned. The returned CAS
+/// publication keeps newly synthesized file manifests and their already-local
+/// event/blob inputs rooted until the outer launch capsule is committed.
+pub(crate) fn prepare_or_verify_evidence_attachments(
+    state: &AppState,
+    policy: &ryeos_engine::runtime_registry::LaunchEvidenceAttachmentPolicy,
+    principal: &EffectivePrincipal,
+    parameters: &Value,
+    prepared: &mut PreparedRuntimeLaunch,
+    recovered: bool,
+) -> Result<Option<ryeos_state::PendingCasPublication>> {
+    let requests = parameters
+        .as_object()
+        .and_then(|object| object.get("evidence_attachments"))
+        .map(|value| {
+            serde_json::from_value::<Vec<ryeos_handler_protocol::EvidenceAttachmentRequestWire>>(
+                value.clone(),
+            )
+            .context("decode evidence_attachments")
+        })
+        .transpose()?
+        .unwrap_or_default();
+    validate_evidence_request_shape(policy, &requests, prepared)?;
+
+    let scopes = super::launch_preparation::principal_scopes(principal);
+    let authorizer = ryeos_runtime::authorizer::Authorizer::new();
+    let authority = state.state_store.pinned_state_authority()?;
+    let guard = authority.acquire_shared_guard()?;
+    authority.ensure_guard(&guard)?;
+
+    let mut observed = Vec::with_capacity(requests.len());
+    let mut total_bytes = 0u64;
+    for request in &requests {
+        let required = ryeos_bundle::runtime_authority::bundle_event_cap(
+            &ryeos_bundle::manifest::BundleEventOperation::Scan,
+            &request.bundle_id,
+            &request.event_kind,
+        );
+        authorizer
+            .authorize(
+                &scopes,
+                &ryeos_runtime::authorizer::AuthorizationPolicy::require(&required),
+            )
+            .with_context(|| {
+                format!(
+                    "evidence attachment `{}` is not authorized for exact bundle-event scan `{required}`",
+                    request.binding_id
+                )
+            })?;
+        let (record, attachment, bytes) = state.state_store.read_bundle_event_attachment(
+            &request.event_hash,
+            &request.bundle_id,
+            &request.event_kind,
+            &request.attachment_name,
+        )?;
+        record.event.validate()?;
+        if record.event_hash != request.event_hash
+            || ryeos_state::objects::hash_bundle_event(&record.event)? != request.event_hash
+            || record.event.chain_id != request.chain_id
+            || attachment.blob_hash != request.blob_hash
+            || lillux::sha256_hex(&bytes) != request.blob_hash
+        {
+            bail!(
+                "evidence attachment `{}` differs from its exact event, chain, or blob coordinate",
+                request.binding_id
+            );
+        }
+        total_bytes = total_bytes
+            .checked_add(attachment.size_bytes)
+            .ok_or_else(|| anyhow!("evidence attachment byte total overflow"))?;
+        if total_bytes > policy.max_total_bytes {
+            bail!("evidence attachments exceed the signed aggregate byte ceiling");
+        }
+        let manifest = evidence_file_manifest(&attachment);
+        manifest.validate()?;
+        let manifest_value = serde_json::to_value(&manifest)?;
+        let manifest_hash = lillux::sha256_hex(lillux::canonical_json(&manifest_value)?.as_bytes());
+        observed.push((request, attachment, manifest, manifest_hash));
+    }
+
+    if recovered {
+        let mut expected = observed
+            .into_iter()
+            .map(|(request, attachment, _, manifest_hash)| {
+                prepared_evidence_attachment(policy, request, &attachment, manifest_hash)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        expected.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
+        if expected != prepared.evidence_attachments {
+            bail!("recovered evidence attachments contradict the admitted launch binding");
+        }
+        let cas = authority.cas_store()?;
+        for binding in &prepared.evidence_attachments {
+            binding.validate()?;
+            let value = cas
+                .get_object(&binding.manifest_hash)?
+                .ok_or_else(|| anyhow!("admitted evidence attachment manifest is missing"))?;
+            let manifest = ryeos_state::objects::ExternalContentManifestObject::from_value(&value)?;
+            if manifest != evidence_file_manifest_from_binding(binding) {
+                bail!("admitted evidence attachment manifest changed");
+            }
+        }
+        return Ok(None);
+    }
+    if !prepared.evidence_attachments.is_empty() {
+        bail!("fresh launch already carries prepared evidence attachments");
+    }
+    if observed.is_empty() {
+        return Ok(None);
+    }
+
+    let staged = authority
+        .require_recovery()?
+        .begin_staged_cas_roots_admitted(&guard, "evidence-attachments")?;
+    let mut publication = ryeos_state::PendingCasPublication::new(authority, staged);
+    let authority = publication.authority().try_clone()?;
+    let guard = authority.acquire_shared_guard()?;
+    authority.ensure_guard(&guard)?;
+    let _permit = state
+        .write_barrier
+        .acquire_with_timeout(ryeos_app::write_barrier::ONLINE_WRITE_PERMIT_TIMEOUT)
+        .map_err(|error| anyhow!("cannot acquire evidence-attachment CAS write permit: {error}"))?;
+    let cas = authority.cas_store()?;
+    let mut bindings = Vec::with_capacity(observed.len());
+    for (request, attachment, manifest, expected_manifest_hash) in observed {
+        let stored = publication.staged_roots_mut().store_object_admitted(
+            &guard,
+            &cas,
+            &serde_json::to_value(&manifest)?,
+        )?;
+        if stored != expected_manifest_hash {
+            bail!("evidence attachment manifest hash changed during admission");
+        }
+        publication
+            .staged_roots_mut()
+            .protect_object_hash_admitted(&guard, &request.event_hash)?;
+        publication
+            .staged_roots_mut()
+            .protect_blob_hash_admitted(&guard, &request.blob_hash)?;
+        bindings.push(prepared_evidence_attachment(
+            policy,
+            request,
+            &attachment,
+            stored,
+        )?);
+    }
+    bindings.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
+    prepared.evidence_attachments = bindings;
+    Ok(Some(publication))
+}
+
+fn validate_evidence_request_shape(
+    policy: &ryeos_engine::runtime_registry::LaunchEvidenceAttachmentPolicy,
+    requests: &[ryeos_handler_protocol::EvidenceAttachmentRequestWire],
+    prepared: &PreparedRuntimeLaunch,
+) -> Result<()> {
+    if requests.len() > usize::from(policy.max_attachments) {
+        bail!("evidence attachments exceed the signed count ceiling");
+    }
+    if requests.is_empty() {
+        return Ok(());
+    }
+    let target = policy
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("runtime does not admit evidence attachments"))?;
+    if !prepared.execution_dependencies.contains_key(target) {
+        bail!("evidence attachment target is not a prepared execution dependency");
+    }
+    let prefix = policy
+        .destination_prefix
+        .as_deref()
+        .ok_or_else(|| anyhow!("runtime has no evidence destination authority"))?;
+    if policy.allowed_access.as_slice()
+        != [ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly]
+    {
+        bail!("runtime does not admit read-only evidence attachments");
+    }
+    let mut ids = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    for request in requests {
+        if request.binding_id.is_empty()
+            || request.binding_id.len() > 61
+            || !request.binding_id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+            || !ids.insert(request.binding_id.as_str())
+        {
+            bail!("evidence attachment binding_id is invalid or duplicated");
+        }
+        for (label, value) in [
+            ("bundle_id", request.bundle_id.as_str()),
+            ("event_kind", request.event_kind.as_str()),
+            ("chain_id", request.chain_id.as_str()),
+            ("attachment_name", request.attachment_name.as_str()),
+        ] {
+            ryeos_state::objects::validate_bundle_identifier(label, value)?;
+        }
+        if !lillux::valid_hash(&request.event_hash) || !lillux::valid_hash(&request.blob_hash) {
+            bail!("evidence attachment carries a non-canonical hash");
+        }
+        validate_evidence_destination(prefix, &request.destination_path)?;
+        if !destinations.insert(request.destination_path.as_str()) {
+            bail!("evidence attachment destination is duplicated");
+        }
+        if request.access != ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly {
+            bail!("evidence attachments currently require read_only access");
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence_destination(prefix: &str, destination: &str) -> Result<()> {
+    ryeos_state::objects::validate_canonical_project_relative_path(destination)?;
+    if !destination.starts_with(&format!("{prefix}/")) {
+        bail!("evidence attachment destination must be contained by `{prefix}`");
+    }
+    Ok(())
+}
+
+fn evidence_file_manifest(
+    attachment: &ryeos_state::objects::BundleEventAttachment,
+) -> ryeos_state::objects::ExternalContentManifestObject {
+    ryeos_state::objects::ExternalContentManifestObject {
+        schema: ryeos_state::objects::EXTERNAL_CONTENT_TREE_SCHEMA.to_owned(),
+        kind: ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
+        entries: vec![ryeos_state::objects::ExternalContentManifestEntry {
+            path: ryeos_state::objects::FILE_REALIZATION_ENTRY_PATH.to_owned(),
+            kind: ryeos_state::objects::ExternalContentManifestEntryKind::File,
+            mode: Some(0o644),
+            blob_hash: Some(attachment.blob_hash.clone()),
+            size: Some(attachment.size_bytes),
+            target: None,
+        }],
+        entry_count: 1,
+        total_bytes: attachment.size_bytes,
+    }
+}
+
+fn evidence_file_manifest_from_binding(
+    binding: &PreparedEvidenceAttachment,
+) -> ryeos_state::objects::ExternalContentManifestObject {
+    evidence_file_manifest(&ryeos_state::objects::BundleEventAttachment {
+        name: binding.attachment_name.clone(),
+        blob_hash: binding.blob_hash.clone(),
+        size_bytes: binding.size_bytes,
+        media_type: binding.media_type.clone(),
+    })
+}
+
+fn prepared_evidence_attachment(
+    policy: &ryeos_engine::runtime_registry::LaunchEvidenceAttachmentPolicy,
+    request: &ryeos_handler_protocol::EvidenceAttachmentRequestWire,
+    attachment: &ryeos_state::objects::BundleEventAttachment,
+    manifest_hash: String,
+) -> Result<PreparedEvidenceAttachment> {
+    let mut binding = PreparedEvidenceAttachment {
+        binding_id: request.binding_id.clone(),
+        bundle_id: request.bundle_id.clone(),
+        event_kind: request.event_kind.clone(),
+        chain_id: request.chain_id.clone(),
+        event_hash: request.event_hash.clone(),
+        attachment_name: request.attachment_name.clone(),
+        blob_hash: request.blob_hash.clone(),
+        size_bytes: attachment.size_bytes,
+        media_type: attachment.media_type.clone(),
+        target: policy.target.clone().expect("validated evidence target"),
+        destination_path: request.destination_path.clone(),
+        access: request.access,
+        manifest_hash,
+        binding_digest: String::new(),
+    };
+    binding.binding_digest = binding.reproduce_binding_digest()?;
+    binding.validate()?;
+    Ok(binding)
+}
+
+impl AdmittedSessionPublications {
     pub(crate) fn publish(self) -> Result<()> {
         for publication in self.publications {
             publication.publish()?;
@@ -162,6 +486,7 @@ pub(crate) fn reset_for_cross_site_admission(
             current_site_id: "cross-site-admission".to_owned(),
             origin_site_id: "cross-site-admission".to_owned(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: true,
         };
         let target_resolved = engine.resolve(&plan_context, &canonical)?;
@@ -283,6 +608,14 @@ pub(crate) fn admit_or_verify_prepared_sessions(
         &prepared.environment_contributions,
         &realizations_by_dependency,
     )?;
+    let mut evidence_by_target: BTreeMap<String, Vec<PreparedEvidenceAttachment>> = BTreeMap::new();
+    for binding in &prepared.evidence_attachments {
+        binding.validate()?;
+        evidence_by_target
+            .entry(binding.target.clone())
+            .or_default()
+            .push(binding.clone());
+    }
     let (dependencies, admitted_sessions) = (
         &mut prepared.execution_dependencies,
         &mut prepared.admitted_sessions,
@@ -295,11 +628,15 @@ pub(crate) fn admit_or_verify_prepared_sessions(
         let target_environment = environment_by_target
             .get(name)
             .unwrap_or(&empty_environment);
+        let target_evidence = evidence_by_target
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if recovered {
-            if !target_environment.is_empty() && !admitted_sessions.contains_key(name) {
-                bail!(
-                    "environment contribution target `{name}` has no admitted persistent-session capsule"
-                );
+            if (!target_environment.is_empty() || !target_evidence.is_empty())
+                && !admitted_sessions.contains_key(name)
+            {
+                bail!("worker-input target `{name}` has no admitted persistent-session capsule");
             }
             let Some(hash) = admitted_sessions.get(name) else {
                 continue;
@@ -312,14 +649,14 @@ pub(crate) fn admit_or_verify_prepared_sessions(
                 hash,
                 search_by_target.get(name).map(Vec::as_slice).unwrap_or(&[]),
                 target_environment,
+                target_evidence,
             )
             .with_context(|| format!("verify recovered session dependency `{name}`"))?;
         } else {
             let session = session_contract(engine, dependency)?;
-            if !target_environment.is_empty() && session.is_none() {
-                bail!(
-                    "environment contribution target `{name}` is not a persistent-session dependency"
-                );
+            if (!target_environment.is_empty() || !target_evidence.is_empty()) && session.is_none()
+            {
+                bail!("worker-input target `{name}` is not a persistent-session dependency");
             }
             let Some((declaration, protocol)) = session else {
                 continue;
@@ -337,6 +674,7 @@ pub(crate) fn admit_or_verify_prepared_sessions(
                 content_by_target.get(name),
                 search_by_target.get(name).map(Vec::as_slice).unwrap_or(&[]),
                 target_environment,
+                target_evidence,
             )
             .inspect_err(|error| {
                 tracing::warn!(
@@ -611,6 +949,16 @@ fn admit_or_verify_content_dependencies(
             );
         }
         realizations_by_dependency.insert(name.clone(), realized);
+    }
+    for binding in &prepared.evidence_attachments {
+        entries_by_target
+            .entry(binding.target.clone())
+            .or_default()
+            .extend(
+                evidence_realizations(std::slice::from_ref(binding))?
+                    .iter()
+                    .cloned(),
+            );
     }
     let (content_by_target, search_by_target) =
         validate_content_target_aggregation(entries_by_target, search_by_target)?;
@@ -1090,6 +1438,7 @@ fn admit_session_capsule(
     inherited_content: Option<&ryeos_engine::external_realization::RealizedExternalContentSet>,
     executable_search: &[ExecutableSearchPathEntry],
     environment: &BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue>,
+    evidence_attachments: &[PreparedEvidenceAttachment],
 ) -> Result<(String, Vec<ryeos_state::PendingCasPublication>)> {
     let roots = engine.resolution_roots(None);
     let mut resolution = dependency.resolution.clone();
@@ -1144,6 +1493,7 @@ fn admit_session_capsule(
         resolution_output: ryeos_engine::resolution::RetainedResolutionOutput::capture(
             finalized.resolution(),
         ),
+        evidence_attachments: evidence_attachments.to_vec(),
     };
     let exact_program_value = serde_json::to_value(&exact_program)?;
     let exact_program_hash = canonical_hash(&exact_program_value)?;
@@ -1298,6 +1648,7 @@ fn verify_session_capsule(
     capsule_hash: &str,
     executable_search: &[ExecutableSearchPathEntry],
     environment: &BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue>,
+    evidence_attachments: &[PreparedEvidenceAttachment],
 ) -> Result<AdmittedPersistentSessionCapsule> {
     let capsule = load_capsule(state, capsule_hash)?;
     let exact: PersistentSessionExactProgram =
@@ -1316,6 +1667,10 @@ fn verify_session_capsule(
     if &capsule.process_environment != environment {
         bail!("persistent-session capsule contradicts its process-environment contribution");
     }
+    if exact.evidence_attachments != evidence_attachments {
+        bail!("persistent-session capsule contradicts its evidence attachments");
+    }
+    validate_exact_evidence_attachments(&exact)?;
     let observed_digest = exact.resolution_output.effective_definition_digest()?;
     if observed_digest.as_str() != exact.effective_definition_digest {
         bail!("persistent-session exact effective-definition digest changed");
@@ -1344,6 +1699,7 @@ pub fn inspect_capsule(
     validate_capsule_current_trust(&state.engine, &capsule)?;
     let exact: PersistentSessionExactProgram =
         serde_json::from_value(capsule.exact_program.clone())?;
+    validate_exact_evidence_attachments(&exact)?;
     let current_digest = exact.resolution_output.effective_definition_digest()?;
     if current_digest.as_str() != exact.effective_definition_digest {
         bail!("persistent-session exact program digest does not reproduce");
@@ -1389,6 +1745,7 @@ where
     }
     let exact: PersistentSessionExactProgram =
         serde_json::from_value(capsule.exact_program.clone())?;
+    validate_exact_evidence_attachments(&exact)?;
     let current_digest = exact.resolution_output.effective_definition_digest()?;
     if current_digest.as_str() != exact.effective_definition_digest {
         bail!("persistent-session exact program digest does not reproduce");
@@ -1582,13 +1939,48 @@ fn spawn_capsule_process_held(
                 .expect("disabled isolation has a private copy budget"),
         )?
     };
-    let (mounts, external_env, leases) = match bound {
+    let (mounts, external_env, mut leases) = match bound {
         Some(bound) => {
             let (mounts, env, leases) = bound.into_spawn_parts();
             (mounts, Some(env), leases)
         }
         None => (Vec::new(), None, Vec::new()),
     };
+    if realization_workspace != workspace && !exact.evidence_attachments.is_empty() {
+        // The runtime view keeps executable dependencies out of the retained
+        // candidate. Evidence also has an admitted project-relative address
+        // consumed by the workload itself, whose cwd is `workspace`. Bind the
+        // same immutable inputs there before attachment; fold-back derives
+        // their operational exclusions from the root capsule on live/recovery
+        // paths. The existing runtime-view bindings and environment stay exact.
+        let evidence = evidence_realizations(&exact.evidence_attachments)?;
+        let admitted = realization_set(&resolution)?;
+        for entry in evidence.iter() {
+            if !admitted.iter().any(|candidate| candidate == entry) {
+                bail!("workspace evidence differs from the admitted session realization");
+            }
+        }
+        let mut evidence_resolution = resolution.clone();
+        evidence_resolution.composed.derived.insert(
+            ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY.to_owned(),
+            evidence.to_value()?,
+        );
+        let bound_evidence =
+            super::external_content::bind_external_realizations_in_private_workspace_with_budget(
+                state,
+                &evidence_resolution,
+                workspace,
+                private_budget
+                    .as_ref()
+                    .expect("private evidence uses the admitted copy budget"),
+            )?
+            .ok_or_else(|| anyhow!("admitted workspace evidence was not bound"))?;
+        let (evidence_mounts, _, evidence_leases) = bound_evidence.into_spawn_parts();
+        if !evidence_mounts.is_empty() {
+            bail!("private workspace evidence unexpectedly required isolation mounts");
+        }
+        leases.extend(evidence_leases);
+    }
     let source = if state.isolation.is_enforced() {
         super::source_closure::bind_source(state, &resolution, &workspace)?
     } else {
@@ -1737,6 +2129,7 @@ pub fn start_exclusive_capsule(
     validate_capsule_current_trust(&state.engine, &capsule)?;
     let exact: PersistentSessionExactProgram =
         serde_json::from_value(capsule.exact_program.clone())?;
+    validate_exact_evidence_attachments(&exact)?;
     let protocol_ref = capsule_protocol_identity(&capsule)?.0;
     let session_protocol = installed_session_protocol(state, protocol_ref)?;
     use ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority;
@@ -2041,6 +2434,7 @@ fn direct_request(
             current_site_id: site.clone(),
             origin_site_id: site,
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: false,
         },
         root_admission: None,
@@ -2107,6 +2501,14 @@ fn canonical_hash(value: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_destination_is_strictly_below_its_signed_prefix() {
+        validate_evidence_destination("evidence", "evidence/reports/result.json").unwrap();
+        assert!(validate_evidence_destination("evidence", "evidence").is_err());
+        assert!(validate_evidence_destination("evidence", "other/result.json").is_err());
+        assert!(validate_evidence_destination("evidence", "evidence/../secret").is_err());
+    }
 
     #[test]
     fn absent_content_binding_keeps_its_typed_launch_classification() {
@@ -2287,6 +2689,7 @@ mod tests {
             resolution_output: ryeos_engine::resolution::RetainedResolutionOutput::capture(
                 &resolution,
             ),
+            evidence_attachments: Vec::new(),
         }
     }
 

@@ -16,12 +16,12 @@ inference. The executable, its same-version code-mode host, its packaged
 model-command runtime resources, and App Server schemas are pinned by
 activation and source closure.
 
-The signed session item carries a finite RyeOS `spend_usd` execution allowance
-so the accounting ledger can conserve one exact allowance across placement
-handoff. The worker-execution runtime has no provider financial authority and
-Codex does not expose ChatGPT-subscription charges to this contract. The
-allowance is therefore placement authority only: it is not observed usage, a
-billing limit, or evidence of subscription spend.
+The signed Codex worker profiles do not claim a finite RyeOS `spend_usd`
+allowance. The worker-execution runtime has no provider financial authority,
+and Codex does not expose authoritative ChatGPT-subscription charges to this
+contract. Unattended execution can still use the shared whole-tree duration,
+logical-worker, and bounded hosted-turn contact ceilings; none of those is
+presented as subscription billing evidence.
 
 This is installed operator knowledge shipped by the Codex bundle. It documents
 how to activate and accept that optional integration; it is not a RyeOS
@@ -261,6 +261,31 @@ being mistaken for the turn the caller intended to complete. A daemon-owned
 reattach may advance the worker boot epoch after restart, but it does not
 replace the owner-route frontier proved by that fence; placement and admitted
 capsule must still match exactly.
+
+`worker_execution:codex/bounded-turn` packages that same generic protocol for
+one followed, unattended turn. Its signed routes and retry ceiling are fixed by
+the profile; invocation input supplies the credential profile, the two typed
+route payloads, and any separately admitted read-only evidence attachments.
+Only a root-proved uncontacted command can move to the next attempt. Successful
+completion freezes the private CoW result and terminalizes it as
+`retained_for_review`, so a graph follow receives a reviewable candidate and
+the exact command/turn/fence evidence without polling session status. This is
+additional to `codex/session`, which remains the interactive owner-directed
+session surface.
+
+The daemon applies the same bounded admission checks to runtime callbacks and
+owner commands: each route payload must match the sealed goal, attempts must
+stay within the signed ceiling, and retries require exact uncontacted
+predecessor testimony. New contact requires an approval-free idle session with
+no unresolved observation projection. Approval ingestion and the durable
+contact commit share a short transition gate; approvals accepted after that
+commit are post-contact events, not permission to start another turn.
+
+The creation-anchored worker lifetime and any aggregate execution deadline
+survive restart and also bound queued worker writes. A pending command or an
+already-reserved contact allowance cannot extend either deadline. Exact settled
+replay remains readable after expiry; a possible-contact boundary without a
+proven result remains unknown and is never resent.
 
 ## Mechanical policy boundary
 

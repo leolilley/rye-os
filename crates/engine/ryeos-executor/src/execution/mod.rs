@@ -630,6 +630,24 @@ fn admitted_operational_shadow_paths(
     {
         paths.push(source_mount);
     }
+    let capsule = state
+        .state_store
+        .admitted_launch_capsule(thread_id)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("operational input exclusions lost their admitted capsule")
+        })?;
+    if let ryeos_state::objects::AdmittedExecutionClosure::ManagedRuntime {
+        prepared_runtime_launch,
+        ..
+    } = capsule.execution_closure
+    {
+        let prepared: launch_preparation::PreparedRuntimeLaunch =
+            serde_json::from_value(prepared_runtime_launch)?;
+        for binding in prepared.evidence_attachments {
+            binding.validate()?;
+            paths.push(binding.destination_path);
+        }
+    }
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -730,13 +748,23 @@ pub(crate) fn fold_back_outputs(
     } else {
         let project = lillux::PinnedDirectory::open(&layout.project)?
             .ok_or_else(|| anyhow::anyhow!("daemon-private workspace project disappeared"))?;
-        let captured = ingest::ingest_project_tree_with_operational_exclusions(
+        let mut captured = ingest::ingest_project_tree_with_operational_exclusions(
             authority,
             cas_mutation_guard,
             &project,
             policy,
             operational_shadow_paths,
         )?;
+        // Copy-bound inputs shadow project files just as read-only mounts do.
+        // Omitting their process-visible bytes must preserve any original
+        // project bytes underneath, rather than turning an input overlay into
+        // an authored deletion during native fold-back.
+        ingest::restore_operational_shadow_files(
+            &mut captured,
+            pre_tree,
+            operational_shadow_paths,
+        )?;
+        ryeos_state::project_sync::validate_project_tree_paths(&captured, policy)?;
         (captured != *pre_tree).then_some(captured)
     };
     let Some(new_tree) = new_tree else {
@@ -1177,6 +1205,25 @@ pub fn recover_interrupted_workspace_freeze(
     state: &ryeos_app::state::AppState,
     record: &ryeos_app::runtime_db::WorkspaceRecord,
 ) -> Result<String> {
+    recover_interrupted_workspace_freeze_inner(state, record, false)
+}
+
+/// Startup recovery for the same journal after the prior daemon's launch
+/// claim has already been cleared. The StateStore retains a distinct,
+/// dead-generation-only bind fence; ordinary live freeze completion continues
+/// to require the active launch claim.
+pub fn recover_abandoned_interrupted_workspace_freeze(
+    state: &ryeos_app::state::AppState,
+    record: &ryeos_app::runtime_db::WorkspaceRecord,
+) -> Result<String> {
+    recover_interrupted_workspace_freeze_inner(state, record, true)
+}
+
+fn recover_interrupted_workspace_freeze_inner(
+    state: &ryeos_app::state::AppState,
+    record: &ryeos_app::runtime_db::WorkspaceRecord,
+    abandoned_owner: bool,
+) -> Result<String> {
     if record.state != WorkspaceState::Freezing {
         anyhow::bail!("only a freezing workspace can recover a callback generation");
     }
@@ -1228,12 +1275,23 @@ pub fn recover_interrupted_workspace_freeze(
         None => record.base_snapshot.clone(),
     };
     drop(permit);
-    state.state_store.bind_frozen_execution_workspace(
-        &record.workspace_id,
-        thread_id,
-        launch_owner,
-        &snapshot_hash,
-    )?;
+    if abandoned_owner {
+        state
+            .state_store
+            .bind_abandoned_frozen_execution_workspace(
+                &record.workspace_id,
+                thread_id,
+                launch_owner,
+                &snapshot_hash,
+            )?;
+    } else {
+        state.state_store.bind_frozen_execution_workspace(
+            &record.workspace_id,
+            thread_id,
+            launch_owner,
+            &snapshot_hash,
+        )?;
+    }
     publication.publish()?;
     Ok(snapshot_hash)
 }

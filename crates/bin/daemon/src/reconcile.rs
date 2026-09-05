@@ -2094,6 +2094,15 @@ pub async fn reconcile_dedicated_worker_startup(state: &AppState) -> Result<()> 
     ryeos_api::handlers::dedicated_sessions::reconcile_approval_outboxes(Arc::new(state.clone()))
         .await
         .context("reconcile hosted approvals before worker detachment")?;
+    let preserved_approval_outcomes =
+        ryeos_app::dedicated_session_service::reserve_restart_pending_approval_outcomes(state)
+            .context("reserve exact bounded approval outcomes before worker detachment")?;
+    if preserved_approval_outcomes != 0 {
+        tracing::warn!(
+            preserved_approval_outcomes,
+            "preserved exact bounded approval-required outcomes across daemon restart"
+        );
+    }
     let repaired_target_attachments = ryeos_api::handlers::worker_placements::reconcile_observed_target_handoff_attachments_before_detachment(state)
         .await
         .context("reconcile target handoff attachments before worker detachment")?;
@@ -2104,6 +2113,14 @@ pub async fn reconcile_dedicated_worker_startup(state: &AppState) -> Result<()> 
         );
     }
     reconcile_dedicated_workers(state)?;
+    // The first pass must run while the old epoch is still attached so root
+    // observation testimony can be projected before detachment. Fencing then
+    // classifies the one remaining pre-contact state (`committed`) as exact
+    // retryable-uncontacted. Complete that derived command testimony now,
+    // before any recovered session can issue another command; otherwise the
+    // failed row has no authoritative root fact until a second daemon restart.
+    ryeos_app::dedicated_session_service::reconcile_command_outboxes(state)
+        .context("reconcile hosted commands classified by worker detachment")?;
     let (sessions_recovered, locks_released) = state
         .state_store
         .reconcile_unattached_credential_profile_locks()
@@ -2611,9 +2628,24 @@ fn reconcile_execution_workspaces(
                     );
                     continue;
                 }
-                match ryeos_executor::execution::recover_interrupted_workspace_freeze(
-                    state, &workspace,
-                ) {
+                let recovered = if mode == ActiveReconcileMode::Startup
+                    && workspace_claim.is_none()
+                {
+                    // Startup deliberately clears dead-generation launch
+                    // claims before driving any replacement launch. A
+                    // freezing journal remains fenced by its exact immutable
+                    // old owner, so finish that already-contacted operation
+                    // through the distinct abandoned-owner bind instead of
+                    // weakening the ordinary live claim check.
+                    ryeos_executor::execution::recover_abandoned_interrupted_workspace_freeze(
+                        state, &workspace,
+                    )
+                } else {
+                    ryeos_executor::execution::recover_interrupted_workspace_freeze(
+                        state, &workspace,
+                    )
+                };
+                match recovered {
                     Ok(snapshot_hash) => {
                         if !quiesced_members.is_empty() {
                             ryeos_app::process::terminate_exact_processes(
@@ -3360,6 +3392,7 @@ mod tests {
             origin_site_id: "site:a".into(),
             requested_by: principal(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: Vec::new(),
             parent_delegation_caps: None,
             executor_ref: None,

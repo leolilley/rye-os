@@ -442,6 +442,32 @@ pub struct LaunchContentDependencyRequestWire {
     pub executable_search: Vec<ExecutableSearchPathEntryWire>,
 }
 
+/// One exact bundle-event attachment requested as an immutable worker input.
+///
+/// This is an authored request coordinate only. The launch admission layer
+/// verifies the event, attachment, capability, and destination before sealing
+/// a prepared binding; runtimes must never treat this value as filesystem or
+/// CAS authority on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceAttachmentRequestWire {
+    pub binding_id: String,
+    pub bundle_id: String,
+    pub event_kind: String,
+    pub chain_id: String,
+    pub event_hash: String,
+    pub attachment_name: String,
+    pub blob_hash: String,
+    pub destination_path: String,
+    pub access: EvidenceAttachmentAccessWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAttachmentAccessWire {
+    ReadOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchEnvironmentContributionRequestWire {
@@ -589,6 +615,10 @@ pub struct ValidateLaunchPreparerConfigRequest {
     /// the preparer. Kind/space/trust remain owned by `ref_bindings` and are
     /// deliberately not repeated here.
     pub content_dependencies: LaunchContentDependencyPolicyWire,
+    /// Signed ceiling for invocation-supplied bundle-event attachments. The
+    /// handler only acknowledges this policy; generic launch admission reads
+    /// and verifies the authored requests.
+    pub evidence_attachments: LaunchEvidenceAttachmentPolicyWire,
     /// Signed ceiling for path-free environment contributions selected by the
     /// preparer. The executor remains authoritative for resolving and applying
     /// the selected values to their named execution dependencies.
@@ -617,6 +647,16 @@ pub struct LaunchContentDependencyPolicyWire {
     pub max_targets_per_dependency: u16,
     pub max_executable_search_entries: u16,
     pub external_content: Option<LaunchContentExternalPolicyWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchEvidenceAttachmentPolicyWire {
+    pub max_attachments: u16,
+    pub max_total_bytes: u64,
+    pub target: Option<String>,
+    pub destination_prefix: Option<String>,
+    pub allowed_access: Vec<EvidenceAttachmentAccessWire>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -956,5 +996,26 @@ mod tests {
                 .unwrap()
                 .contains("validate_composer_ok")
         );
+    }
+
+    #[test]
+    fn evidence_attachment_request_is_a_closed_exact_coordinate() {
+        let value = serde_json::json!({
+            "binding_id": "campaign-input",
+            "bundle_id": "observations",
+            "event_kind": "report",
+            "chain_id": "candidate-7",
+            "event_hash": "a".repeat(64),
+            "attachment_name": "report-json",
+            "blob_hash": "b".repeat(64),
+            "destination_path": "evidence/report.json",
+            "access": "read_only",
+        });
+        let decoded: EvidenceAttachmentRequestWire = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.access, EvidenceAttachmentAccessWire::ReadOnly);
+
+        let mut widened = value;
+        widened["replace"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EvidenceAttachmentRequestWire>(widened).is_err());
     }
 }

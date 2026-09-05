@@ -941,6 +941,7 @@ mod tests {
                 },
             ),
             execution_hints: ryeos_engine::contracts::ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: Vec::new(),
             parent_delegation_caps: None,
             executor_ref: Some("executor:test/directive".to_string()),

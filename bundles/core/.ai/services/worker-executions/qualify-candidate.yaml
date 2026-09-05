@@ -1,0 +1,7 @@
+category: worker-executions
+name: qualify-candidate
+kind: service
+endpoint: worker-executions.qualify-candidate
+required_caps: ["ryeos.execute.service.worker-executions/qualify-candidate"]
+schema: {chain_root_id: string, candidate_snapshot_hash: string, candidate_validation_hash: string, evaluator_chain_root_id: string, evaluator_terminal_thread_id: string, evaluator_capsule_hash: string, evaluator_item_ref: string, evaluator_definition_digest: string, evaluator_parameters_digest: string, integration: object?, integration_launch_id: string?}
+description: Adopt exact successful immutable evaluator testimony for one retained candidate and reserve its sole integration coordinate when required.

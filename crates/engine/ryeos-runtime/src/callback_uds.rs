@@ -117,6 +117,18 @@ impl UdsRuntimeClient {
         }
         Ok((params, inline))
     }
+
+    fn serialize_completed_dedicated_session_termination(
+        request: DedicatedSessionCompletedTerminateRequest,
+    ) -> Result<Value, CallbackError> {
+        let mut params = serde_json::to_value(request).map_err(|error| {
+            CallbackError::Transport(anyhow::anyhow!(
+                "serialize completed dedicated-session terminate request: {error}"
+            ))
+        })?;
+        params["reason"] = json!("completed");
+        Ok(params)
+    }
 }
 
 #[async_trait]
@@ -249,6 +261,22 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
             .map_err(Self::map_rpc_error)
     }
 
+    async fn dedicated_session_command_observation(
+        &self,
+        request: DedicatedSessionCommandObservationRequest,
+    ) -> Result<Value, CallbackError> {
+        let mut params = serde_json::to_value(request).map_err(|error| {
+            CallbackError::Transport(anyhow::anyhow!(
+                "serialize dedicated-session command observation request: {error}"
+            ))
+        })?;
+        self.inject_callback_token(&mut params);
+        self.rpc
+            .request("runtime.dedicated_session_command_observation", params)
+            .await
+            .map_err(Self::map_rpc_error)
+    }
+
     async fn terminate_dedicated_session(
         &self,
         request: DedicatedSessionTerminateRequest,
@@ -258,6 +286,18 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
                 "serialize dedicated-session terminate request: {error}"
             ))
         })?;
+        self.inject_callback_token(&mut params);
+        self.rpc
+            .request("runtime.terminate_dedicated_session", params)
+            .await
+            .map_err(Self::map_rpc_error)
+    }
+
+    async fn terminate_completed_dedicated_session(
+        &self,
+        request: DedicatedSessionCompletedTerminateRequest,
+    ) -> Result<Value, CallbackError> {
+        let mut params = Self::serialize_completed_dedicated_session_termination(request)?;
         self.inject_callback_token(&mut params);
         self.rpc
             .request("runtime.terminate_dedicated_session", params)
@@ -770,6 +810,30 @@ mod tests {
         client.inject_callback_token(&mut params);
         assert!(params.get("callback_token").is_none());
         assert!(params.get("thread_auth_token").is_none());
+    }
+
+    #[test]
+    fn completed_dedicated_session_termination_has_one_fenced_wire_shape() {
+        let fence = HostedCommandCompletionFence {
+            placement_thread_id: "T-worker".to_string(),
+            admitted_capsule_hash: "a".repeat(64),
+            worker_boot_epoch: 4,
+            command_sequence: 2,
+            request_digest: "b".repeat(64),
+            turn_id: "turn-9".to_string(),
+            completion_operation_id: "c".repeat(64),
+        };
+        let params = UdsRuntimeClient::serialize_completed_dedicated_session_termination(
+            DedicatedSessionCompletedTerminateRequest {
+                thread_id: "T-worker".to_string(),
+                completion: fence.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(params["thread_id"], "T-worker");
+        assert_eq!(params["reason"], "completed");
+        assert_eq!(params["completion"], serde_json::to_value(fence).unwrap());
     }
 
     #[test]

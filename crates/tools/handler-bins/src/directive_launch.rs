@@ -588,6 +588,14 @@ fn validate_contract(request: &ValidateLaunchPreparerConfigRequest) -> Result<()
     {
         return Err("content_dependencies must be disabled".into());
     }
+    if request.evidence_attachments.max_attachments != 0
+        || request.evidence_attachments.max_total_bytes != 0
+        || request.evidence_attachments.target.is_some()
+        || request.evidence_attachments.destination_prefix.is_some()
+        || !request.evidence_attachments.allowed_access.is_empty()
+    {
+        return Err("evidence_attachments must be disabled".into());
+    }
     if request.environment_contributions.max_contributions != 0
         || request
             .environment_contributions

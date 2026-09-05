@@ -14,14 +14,20 @@ use super::{
 // v19 requires the generic, target-bound environment-contribution projection
 // in every prepared managed-runtime launch. Predecessor capsules cannot be
 // interpreted as current portable launch authority.
-pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 19;
+// v20 seals the daemon-authored scheduled-fire coordinate as invocation
+// authority while keeping it outside executable-program identity. v21 seals
+// independently-evaluated-candidate purpose and dual generation authority as
+// executable-program identity.
+pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 21;
 pub const ADMITTED_DIRECT_COMMAND_ROOT: &str = "/ryeos/admitted-direct-command";
 
 const SEALED_ROOT_INVOCATION_FIELDS: &[&str] = &[
     "captured_history_policy",
+    "candidate_evaluation",
     "current_site_id",
     "effective_definition_digest",
     "execution_hints",
+    "scheduled_fire",
     "executor_ref",
     "executor_route",
     "handler_context",
@@ -67,6 +73,7 @@ const INVOCATION_ONLY_FIELDS: &[&str] = &[
     "project_binding_subject_authority",
     "project_context",
     "requested_by",
+    "scheduled_fire",
     "resolution_subject_authority",
     "resolved_history_policy",
     "target_site_id",
@@ -1851,10 +1858,12 @@ mod tests {
             "project_binding_subject_authority": {"kind":"projectless"},
             "resolution_subject_authority": {"kind":"projectless"},
             "execution_hints": {},
+            "scheduled_fire": null,
             "validate_only": false,
             "resolved_history_policy": {"retention":"durable"},
             "resolved_result_policy": {"retention":"full"},
             "captured_history_policy": {"retention":"durable"},
+            "candidate_evaluation": null,
         });
         let exact_program = project_sealed_root_exact_program(&sealed_invocation).unwrap();
         let exact_program_hash =
@@ -2024,6 +2033,15 @@ mod tests {
         relocated["validate_only"] = serde_json::json!(true);
         relocated["resolved_history_policy"] = serde_json::json!({"retention":"short"});
         relocated["captured_history_policy"] = serde_json::json!({"retention":"short"});
+        relocated["scheduled_fire"] = serde_json::json!({
+            "schema_version": 1,
+            "schedule_id": "nightly.solve",
+            "fire_id": "nightly.solve@1700000000000",
+            "scheduled_at_ms": 1700000000000_i64,
+            "first_dispatch_at_ms": 1700000000100_i64,
+            "trigger_reason": "normal",
+            "schedule_spec_hash": "a".repeat(64),
+        });
 
         assert_eq!(
             project_sealed_root_exact_program(&relocated).unwrap(),

@@ -127,8 +127,11 @@ where
 /// verified transport principal during recovery or callback dispatch.
 /// v12 carries flat exact node-history policy provenance instead of the
 /// predecessor tagged config wrapper. v13 binds remotely adopted execution
-/// to the exact target-node operator grant generation.
-pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 13;
+/// to the exact target-node operator grant generation. v14 seals the optional
+/// daemon-authored scheduled-fire coordinate. v15 seals the narrow
+/// independently-evaluated-candidate purpose and its exact base/candidate
+/// authority.
+pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -550,7 +553,11 @@ pub struct SealedRootExecutionRequest {
     project_authority: ryeos_state::objects::ExecutionProjectAuthority,
     project_binding_subject_authority: ryeos_engine::contracts::SubjectResolutionAuthority,
     resolution_subject_authority: ryeos_engine::contracts::SubjectResolutionAuthority,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    candidate_evaluation: Option<CandidateEvaluationAuthority>,
     execution_hints: HashMap<String, Value>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    scheduled_fire: Option<ryeos_engine::contracts::ScheduledFireContext>,
     validate_only: bool,
     resolved_history_policy: ResolvedThreadHistoryPolicy,
     resolved_result_policy: ryeos_engine::history_policy::ResolvedThreadResultPolicy,
@@ -568,6 +575,11 @@ impl SealedRootExecutionRequest {
         capsule.validate()?;
         let sealed: Self = serde_json::from_value(capsule.sealed_invocation.clone())
             .context("decode admitted capsule sealed invocation")?;
+        if let Some(authority) = sealed.candidate_evaluation.as_ref() {
+            authority
+                .validate()
+                .context("validate sealed candidate-evaluation authority")?;
+        }
         sealed.validate_executor_route_against_capsule(capsule)?;
         if sealed.admitted_program_value()? != capsule.exact_program
             || sealed.admitted_program_hash()? != capsule.exact_program_hash
@@ -750,7 +762,11 @@ impl SealedRootExecutionRequest {
                 .subject_resolution_authority()
                 .clone(),
             resolution_subject_authority: admission.resolution_closure.subject_authority().clone(),
+            candidate_evaluation: admission
+                .candidate_evaluation_scope()
+                .map(|scope| scope.authority().clone()),
             execution_hints: admission.plan_context.execution_hints.values.clone(),
+            scheduled_fire: admission.plan_context.scheduled_fire.clone(),
             validate_only: admission.plan_context.validate_only,
             resolved_history_policy: admission.resolved_history_policy.clone(),
             resolved_result_policy: admission.resolved_result_policy.clone(),
@@ -833,6 +849,14 @@ impl SealedRootExecutionRequest {
         &self.effective_definition_digest
     }
 
+    /// Digest of the exact invocation parameters sealed into this admitted
+    /// root. Candidate qualification uses this projection to bind an
+    /// owner-selected evaluator invocation without exposing its possibly
+    /// sensitive parameter values through a second API surface.
+    pub fn admitted_parameters_digest(&self) -> Result<String> {
+        ryeos_state::objects::canonical_value_digest(&self.parameters)
+    }
+
     /// Verify and expose the immutable effective resolution for sanitized
     /// definition projection. This never re-resolves current content.
     pub fn admitted_effective_resolution(
@@ -852,6 +876,27 @@ impl SealedRootExecutionRequest {
 
     pub fn project_context(&self) -> &ProjectContext {
         &self.project_context
+    }
+
+    /// Execution-filesystem subject authority sealed at fresh admission.
+    /// This remains distinct from [`Self::resolution_subject_authority`] for
+    /// explicitly admitted evaluator/augmentation roots.
+    pub fn project_binding_subject_authority(
+        &self,
+    ) -> &ryeos_engine::contracts::SubjectResolutionAuthority {
+        &self.project_binding_subject_authority
+    }
+
+    /// Immutable authority under which the executable definition and its
+    /// complete resolution closure were admitted.
+    pub fn resolution_subject_authority(
+        &self,
+    ) -> &ryeos_engine::contracts::SubjectResolutionAuthority {
+        &self.resolution_subject_authority
+    }
+
+    pub fn candidate_evaluation_authority(&self) -> Option<&CandidateEvaluationAuthority> {
+        self.candidate_evaluation.as_ref()
     }
 
     /// Stable portable program closure shared by continuation segments and
@@ -926,6 +971,8 @@ impl SealedRootExecutionRequest {
             Some("runtime_ref")
         } else if self.execution_hints != resume.execution_hints.values {
             Some("execution_hints")
+        } else if self.scheduled_fire != resume.scheduled_fire {
+            Some("scheduled_fire")
         } else {
             None
         }
@@ -975,6 +1022,7 @@ impl SealedRootExecutionRequest {
             || resume.executor_ref.as_deref() != Some(self.executor_ref())
             || resume.runtime_ref.as_deref() != Some(self.runtime_ref())
             || self.execution_hints != resume.execution_hints.values
+            || self.scheduled_fire != resume.scheduled_fire
         {
             bail!(
                 "continuation invocation does not match admitted program identity for {}",
@@ -993,6 +1041,7 @@ impl SealedRootExecutionRequest {
             &resume.project_authority,
         )?;
         successor.execution_hints = resume.execution_hints.values.clone();
+        successor.scheduled_fire = resume.scheduled_fire.clone();
         successor.validate_handler_context()?;
         successor
             .validate_invocation_against_resume(resume)
@@ -1214,7 +1263,9 @@ impl SealedRootExecutionRequest {
                 ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
             resolution_subject_authority:
                 ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+            candidate_evaluation: None,
             execution_hints: HashMap::new(),
+            scheduled_fire: None,
             validate_only: false,
             resolved_history_policy,
             resolved_result_policy,
@@ -1262,6 +1313,11 @@ impl SealedRootExecutionRequest {
         if self.validate_only {
             bail!("persisted root execution request cannot be validate-only");
         }
+        if self.candidate_evaluation.is_some() {
+            bail!(
+                "candidate evaluator restoration requires independently reconstructed base and candidate authority"
+            );
+        }
         self.validate_handler_context()
             .context("validate sealed root handler authority")?;
         let requested_by = self.planning_principal.restore()?;
@@ -1276,6 +1332,11 @@ impl SealedRootExecutionRequest {
         self.project_authority
             .validate()
             .context("validate sealed root project authority")?;
+        if let Some(scheduled_fire) = &self.scheduled_fire {
+            scheduled_fire
+                .validate()
+                .context("validate sealed scheduled fire context")?;
+        }
         validate_launch_mode(&self.launch_mode)?;
         if self.runtime_ref.trim().is_empty() || self.runtime_ref.trim() != self.runtime_ref {
             bail!("sealed root execution runtime ref must be non-empty and trimmed");
@@ -1302,6 +1363,7 @@ impl SealedRootExecutionRequest {
             execution_hints: ExecutionHints {
                 values: self.execution_hints.clone(),
             },
+            scheduled_fire: self.scheduled_fire.clone(),
             validate_only: false,
         };
         let project_binding = AdmittedProjectBinding::restore(
@@ -1339,6 +1401,7 @@ impl SealedRootExecutionRequest {
             resolved_result_policy: self.resolved_result_policy.clone(),
             captured_history_policy: self.captured_history_policy.clone(),
             project_binding,
+            candidate_evaluation: None,
             admitted_request_snapshot: None,
             selected_executor_route: None,
         };
@@ -1397,6 +1460,52 @@ impl SealedRootExecutionRequest {
         capsule_root: &Path,
         provenance: &crate::execution_provenance::ExecutionProvenance,
     ) -> Result<ResolvedExecutionRequest> {
+        if let Some(expected) = self.candidate_evaluation.as_ref() {
+            let scope = provenance.candidate_evaluation_scope().ok_or_else(|| {
+                anyhow!("candidate evaluator recovery has no dual-generation execution scope")
+            })?;
+            if scope.authority() != expected {
+                bail!("candidate evaluator recovery scope differs from sealed authority");
+            }
+            if !Arc::ptr_eq(engine, scope.request_engine())
+                || !Arc::ptr_eq(engine, provenance.request_engine())
+                || &self.project_authority != provenance.project_authority()
+            {
+                bail!("candidate evaluator recovery engine or candidate authority changed");
+            }
+
+            // Restore the sealed evaluator program under the independently
+            // reconstructed immutable base. This private clone is only a
+            // restoration aid; the persisted request remains unchanged and
+            // retains the candidate authority in its exact program identity.
+            let mut base_request = self.clone();
+            base_request.candidate_evaluation = None;
+            base_request.project_context = scope.base_plan_context().project_context.clone();
+            base_request.project_authority =
+                scope.base_project_binding().exact_authority().clone();
+            base_request.project_binding_subject_authority = scope
+                .base_project_binding()
+                .subject_resolution_authority()
+                .clone();
+            let mut request = base_request.restore(engine, capsule_root)?;
+            let mut candidate_plan = request.plan_context.clone();
+            candidate_plan.project_context = ProjectContext::LocalPath {
+                path: provenance.effective_path().to_path_buf(),
+            };
+            candidate_plan.subject_resolution_authority =
+                provenance.subject_resolution_authority();
+            let base_admission = request
+                .root_admission
+                .take()
+                .ok_or_else(|| anyhow!("restored candidate evaluator has no base admission"))?;
+            let candidate_admission =
+                base_admission.for_candidate_evaluation(provenance, scope.clone())?;
+            request.plan_context = candidate_plan;
+            request.root_admission = Some(candidate_admission.clone());
+            candidate_admission.ensure_matches_request(&request)?;
+            candidate_admission.ensure_matches_provenance(provenance)?;
+            return Ok(request);
+        }
         if !Arc::ptr_eq(engine, provenance.request_engine()) {
             bail!("reconstructed provenance engine differs from sealed request engine");
         }
@@ -1490,6 +1599,9 @@ impl SealedRootExecutionRequest {
     ) -> Result<(crate::launch_metadata::ResumeContext, Self)> {
         capsule.validate_durable_handoff_eligibility()?;
         let source = Self::decode_from_admitted_capsule(capsule)?;
+        if source.candidate_evaluation.is_some() {
+            bail!("candidate evaluator execution is local to its exact retained candidate");
+        }
         let requested_by = source.planning_principal.restore()?;
         let owner = match &requested_by {
             EffectivePrincipal::Local(principal) => principal.fingerprint.as_str(),
@@ -1551,6 +1663,7 @@ impl SealedRootExecutionRequest {
             execution_hints: ExecutionHints {
                 values: source.execution_hints.clone(),
             },
+            scheduled_fire: source.scheduled_fire.clone(),
             effective_caps: capsule.effective_caps.clone(),
             parent_delegation_caps: capsule.parent_delegation_caps.clone(),
             executor_ref: Some(capsule.executor_ref.clone()),
@@ -1927,6 +2040,7 @@ mod authority_tests {
                 scopes: Vec::new(),
             }),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: Vec::new(),
             parent_delegation_caps: None,
             executor_ref: Some("native:storage-fixture".to_string()),
@@ -1987,6 +2101,39 @@ mod authority_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot replace the admitted execution principal")
+        );
+    }
+
+    #[test]
+    fn machine_continuation_preserves_exact_scheduled_fire() {
+        let scheduled_fire = ryeos_engine::contracts::ScheduledFireContext::new(
+            "nightly.solve".to_owned(),
+            "nightly.solve@1700000000000".to_owned(),
+            1_700_000_000_000,
+            1_700_000_000_100,
+            "normal".to_owned(),
+            "a".repeat(64),
+        )
+        .unwrap();
+        let mut fixture = SealedRootExecutionRequest::storage_test_fixture();
+        fixture.scheduled_fire = Some(scheduled_fire.clone());
+        let mut resume = continuation_resume(
+            "/unused",
+            ryeos_state::objects::ExecutionProjectAuthority::PROJECTLESS,
+        );
+        resume.project_context = ProjectContext::None;
+        resume.scheduled_fire = Some(scheduled_fire);
+        fixture
+            .for_continuation_invocation(&resume)
+            .expect("the exact scheduled coordinate survives continuation");
+
+        resume.scheduled_fire = None;
+        assert!(
+            fixture
+                .for_continuation_invocation(&resume)
+                .unwrap_err()
+                .to_string()
+                .contains("program identity")
         );
     }
 

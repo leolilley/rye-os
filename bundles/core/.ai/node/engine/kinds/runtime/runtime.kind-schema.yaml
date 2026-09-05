@@ -71,6 +71,7 @@ composed_value_contract:
           runtime_facts: { type: single, prim: mapping }
           execution_dependencies: { type: single, prim: mapping }
           content_dependencies: { type: single, prim: mapping }
+          evidence_attachments: { type: single, prim: mapping }
           environment_contributions: { type: single, prim: mapping }
           financial_authority: { type: single, prim: mapping }
           external_effect_authority: { type: single, prim: mapping }

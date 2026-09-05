@@ -621,6 +621,10 @@ pub struct DedicatedSessionStartRequest {
     pub workspace_env: String,
     pub require_pinned_cow: bool,
     pub required_terminal_publication: String,
+    /// Signed root policy for the captured candidate. Interactive sessions
+    /// wait for an owner decision; bounded turns become terminal only after
+    /// retaining the frozen candidate for later independent review.
+    pub candidate_disposition: String,
     /// Whether this execution may recover a retained upstream session after a
     /// worker restart. The daemon verifies this against the signed protocol
     /// profile before launching the worker.
@@ -639,11 +643,101 @@ pub struct DedicatedSessionCommandRequest {
     pub payload: Value,
 }
 
+/// Exact durable coordinate for observing one command issued to a dedicated
+/// session. The daemon derives every other identity dimension from retained
+/// session and command authority.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedSessionCommandObservationRequest {
+    pub thread_id: String,
+    pub command_sequence: u64,
+}
+
+/// Immutable proof that one command-started turn reached its authoritative
+/// terminal observation. A completed dedicated-session termination must carry
+/// this entire fence; mutable session status is not completion authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedCommandCompletionFence {
+    pub placement_thread_id: String,
+    pub admitted_capsule_hash: String,
+    pub worker_boot_epoch: u64,
+    pub command_sequence: u64,
+    pub request_digest: String,
+    pub turn_id: String,
+    pub completion_operation_id: String,
+}
+
+/// Closed terminal classification for the generic bounded-session controller.
+/// This is orthogonal to the session lifecycle's completed/cancelled reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedicatedSessionBoundedOutcomeKind {
+    Completed,
+    BudgetExhausted,
+    ApprovalRequired,
+    RetryableUncontactedExhausted,
+    OutcomeUnknown,
+    WorkerFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedicatedSessionBoundedBudgetDimension {
+    Duration,
+    WorkerExecutions,
+    ProviderContacts,
+}
+
+/// Window reserved before the execution-tree hard deadline so a bounded
+/// session can durably record budget exhaustion and retire its worker before
+/// the executor enforces the absolute process deadline. Both the controller
+/// and daemon validation use this exact protocol constant.
+pub const DEDICATED_SESSION_AGGREGATE_TERMINALIZATION_RESERVE_MS: i64 = 1_000;
+
+/// Exact durable authority for one unresolved approval requested by the
+/// worker's current turn. The daemon projects this only after matching the
+/// approval ledger row to its immutable root-chain fact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedApprovalFence {
+    pub chain_root_id: String,
+    pub placement_thread_id: String,
+    pub admitted_capsule_hash: String,
+    pub worker_boot_epoch: u64,
+    pub turn_id: String,
+    pub approval_id: String,
+    pub request_digest: String,
+    pub approval_operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedSessionBoundedOutcome {
+    pub kind: DedicatedSessionBoundedOutcomeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<DedicatedSessionBoundedBudgetDimension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<HostedApprovalFence>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DedicatedSessionTerminateRequest {
     pub thread_id: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_outcome: Option<DedicatedSessionBoundedOutcome>,
+}
+
+/// Completion-fenced terminal request. This is separate from the existing
+/// cancellation request so callers cannot accidentally label an unfenced stop
+/// as successful completion.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedSessionCompletedTerminateRequest {
+    pub thread_id: String,
+    pub completion: HostedCommandCompletionFence,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -725,9 +819,33 @@ pub trait RuntimeCallbackAPI: Send + Sync {
         })
     }
 
+    async fn dedicated_session_command_observation(
+        &self,
+        request: DedicatedSessionCommandObservationRequest,
+    ) -> Result<Value, CallbackError> {
+        let _ = request;
+        Err(CallbackError::ActionFailed {
+            code: "unsupported".to_string(),
+            message: "dedicated sessions are only supported by the daemon UDS client".to_string(),
+            retryable: false,
+        })
+    }
+
     async fn terminate_dedicated_session(
         &self,
         request: DedicatedSessionTerminateRequest,
+    ) -> Result<Value, CallbackError> {
+        let _ = request;
+        Err(CallbackError::ActionFailed {
+            code: "unsupported".to_string(),
+            message: "dedicated sessions are only supported by the daemon UDS client".to_string(),
+            retryable: false,
+        })
+    }
+
+    async fn terminate_completed_dedicated_session(
+        &self,
+        request: DedicatedSessionCompletedTerminateRequest,
     ) -> Result<Value, CallbackError> {
         let _ = request;
         Err(CallbackError::ActionFailed {

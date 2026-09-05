@@ -167,6 +167,9 @@ pub struct PlanContext {
     pub current_site_id: String,
     pub origin_site_id: String,
     pub execution_hints: ExecutionHints,
+    /// Immutable daemon-authored scheduler coordinate. This is never accepted
+    /// from item parameters and is sealed across continuation/recovery.
+    pub scheduled_fire: Option<crate::scheduled_fire_context::ScheduledFireContext>,
     /// When true, the daemon should not call `execute_plan` after
     /// `build_plan` succeeds. The engine does not enforce this — it is
     /// safe structurally because `PlanContext` does not carry thread IDs.

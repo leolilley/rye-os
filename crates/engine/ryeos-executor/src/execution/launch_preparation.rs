@@ -78,6 +78,10 @@ pub struct PreparedRuntimeLaunch {
     /// kind-owned; generic launch code applies only the signed mechanical
     /// policy and never interprets workload configuration fields.
     pub content_dependencies: BTreeMap<String, PreparedContentDependency>,
+    /// Invocation-selected bundle-event attachments after authorization and
+    /// exact event/blob verification. These are dynamic siblings of static
+    /// content dependencies and are sealed into the outer launch capsule.
+    pub evidence_attachments: Vec<PreparedEvidenceAttachment>,
     /// Path-free, target-bound environment declarations selected by the
     /// preparer. They remain separate from content authority; content-backed
     /// values explicitly reference a prepared content dependency.
@@ -99,6 +103,90 @@ pub struct PreparedRuntimeLaunch {
     /// Its family is opaque to generic launch code, which validates, seals,
     /// and transports the mechanical contract without interpreting it.
     pub external_effect_authority: Option<ryeos_effect_contract::AdmittedExternalEffectAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedEvidenceAttachment {
+    pub binding_id: String,
+    pub bundle_id: String,
+    pub event_kind: String,
+    pub chain_id: String,
+    pub event_hash: String,
+    pub attachment_name: String,
+    pub blob_hash: String,
+    pub size_bytes: u64,
+    pub media_type: Option<String>,
+    pub target: String,
+    pub destination_path: String,
+    pub access: ryeos_handler_protocol::EvidenceAttachmentAccessWire,
+    pub manifest_hash: String,
+    pub binding_digest: String,
+}
+
+impl PreparedEvidenceAttachment {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !valid_ref_binding_name(&self.binding_id) {
+            anyhow::bail!("prepared evidence attachment binding_id is not canonical");
+        }
+        for (label, value) in [
+            ("bundle_id", self.bundle_id.as_str()),
+            ("event_kind", self.event_kind.as_str()),
+            ("chain_id", self.chain_id.as_str()),
+            ("attachment_name", self.attachment_name.as_str()),
+        ] {
+            ryeos_state::objects::validate_bundle_identifier(label, value)?;
+        }
+        for (label, value) in [
+            ("event_hash", self.event_hash.as_str()),
+            ("blob_hash", self.blob_hash.as_str()),
+            ("manifest_hash", self.manifest_hash.as_str()),
+            ("binding_digest", self.binding_digest.as_str()),
+        ] {
+            if !lillux::valid_hash(value) {
+                anyhow::bail!("prepared evidence attachment {label} is not a canonical hash");
+            }
+        }
+        if self.size_bytes > ryeos_state::objects::MAX_BUNDLE_EVENT_ATTACHMENT_BYTES {
+            anyhow::bail!("prepared evidence attachment exceeds the bundle-event file bound");
+        }
+        ryeos_state::objects::validate_canonical_project_relative_path(&self.destination_path)?;
+        if self.target.is_empty()
+            || !self.target.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+        {
+            anyhow::bail!("prepared evidence attachment target is not canonical");
+        }
+        if self.access != ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly {
+            anyhow::bail!("prepared evidence attachment is not read-only");
+        }
+        if self.binding_digest != self.reproduce_binding_digest()? {
+            anyhow::bail!("prepared evidence attachment binding digest changed");
+        }
+        Ok(())
+    }
+
+    pub fn reproduce_binding_digest(&self) -> anyhow::Result<String> {
+        let value = serde_json::json!({
+            "schema": "ryeos.evidence_attachment_binding.v1",
+            "binding_id": self.binding_id,
+            "bundle_id": self.bundle_id,
+            "event_kind": self.event_kind,
+            "chain_id": self.chain_id,
+            "event_hash": self.event_hash,
+            "attachment_name": self.attachment_name,
+            "blob_hash": self.blob_hash,
+            "size_bytes": self.size_bytes,
+            "media_type": self.media_type,
+            "target": self.target,
+            "destination_path": self.destination_path,
+            "access": self.access,
+            "manifest_hash": self.manifest_hash,
+        });
+        let canonical = lillux::canonical_json(&value)?;
+        Ok(lillux::sha256_hex(canonical.as_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1669,6 +1757,7 @@ fn finish_runtime_launch_preparation_parts(
         binding_records: inputs.binding_records.clone(),
         execution_dependencies,
         content_dependencies,
+        evidence_attachments: Vec::new(),
         environment_contributions,
         admitted_sessions: BTreeMap::new(),
         config_contributors,
@@ -1883,6 +1972,7 @@ fn resolve_execution_dependencies(
             current_site_id: "launch-preparation".to_owned(),
             origin_site_id: "launch-preparation".to_owned(),
             execution_hints: Default::default(),
+            scheduled_fire: None,
             validate_only: true,
         };
         let resolved_subject = engine.resolve(&plan_context, &canonical).map_err(|error| {
@@ -2770,7 +2860,7 @@ fn json_depth(value: &Value) -> usize {
     }
 }
 
-fn principal_scopes(principal: &EffectivePrincipal) -> Vec<String> {
+pub(crate) fn principal_scopes(principal: &EffectivePrincipal) -> Vec<String> {
     match principal {
         EffectivePrincipal::Local(principal) => principal.scopes.clone(),
         EffectivePrincipal::Delegated(principal) => principal.delegated_scopes.clone(),

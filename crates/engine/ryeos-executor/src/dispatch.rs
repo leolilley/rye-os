@@ -4199,7 +4199,7 @@ async fn dispatch_inner(
         let admitted_hop_authority = request.root_admission.as_ref().and_then(|admission| {
             admission.admitted_request_snapshot().and_then(|snapshot| {
                 admission
-                    .execution_workspace()
+                    .resolution_workspace()
                     .map(|root| (root, snapshot.as_ref()))
             })
         });
@@ -4406,7 +4406,7 @@ fn can_reuse_root_dispatch_evidence(
 ) -> bool {
     use ryeos_engine::contracts::SubjectResolutionAuthority;
 
-    match &admission.plan_context().subject_resolution_authority {
+    match admission.resolution_subject_authority() {
         SubjectResolutionAuthority::Projectless
         | SubjectResolutionAuthority::PinnedGeneration { .. } => true,
         SubjectResolutionAuthority::CowWorkspace { .. } => {
@@ -4440,7 +4440,7 @@ pub fn launch_contract_applicability_from_admission(
         .admitted_request_snapshot()
         .and_then(|snapshot| {
             root_admission
-                .execution_workspace()
+                .resolution_workspace()
                 .map(|root| (root, snapshot.as_ref()))
         });
     launch_contract_applicability_with_evidence(
@@ -4610,12 +4610,8 @@ pub async fn prepare_admitted_launch_contract(
     };
     let protocol =
         require_callback_runtime_protocol(&ctx.engine, runtime, "threadless admission")?.clone();
-    let subject_authority = root_admission
-        .plan_context()
-        .subject_resolution_authority
-        .clone();
-    let resolution_project_root =
-        resolution_project_root(&subject_authority, provenance.effective_path());
+    let subject_authority = root_admission.resolution_subject_authority().clone();
+    let resolution_project_root = root_admission.resolution_workspace();
     let roots = ctx
         .engine
         .resolution_roots(resolution_project_root.map(Path::to_path_buf));
@@ -4885,6 +4881,15 @@ impl RootDispatchClass {
             self,
             Self::TerminalSubprocess | Self::ManagedSubprocess | Self::MethodDispatch
         )
+    }
+
+    /// Whether dispatch produces the admitted launch capsule required to bind
+    /// a recovered execution to its exact program and project authorities.
+    ///
+    /// Method dispatch can persist a pre-minted root, but it does not cross the
+    /// launch-envelope boundary and therefore cannot carry capsule authority.
+    pub fn produces_admitted_launch_capsule(self) -> bool {
+        matches!(self, Self::TerminalSubprocess | Self::ManagedSubprocess)
     }
 }
 
@@ -5979,6 +5984,72 @@ pub fn preflight_root_dispatch(
     }
 }
 
+/// Admit an independently trusted evaluator without creating a general
+/// dual-project execution mode. The evaluator closure is resolved from the
+/// exact immutable base binding retained in the candidate-evaluation scope;
+/// only after that admission succeeds is execution rebound to the separately
+/// verified frozen-candidate workspace.
+#[allow(clippy::too_many_arguments)]
+pub fn preflight_root_dispatch_for_provenance(
+    item_ref: &str,
+    original_root_kind: &str,
+    params: &Value,
+    ref_bindings: &BTreeMap<String, String>,
+    usage_subject: Option<&ryeos_state::UsageSubject>,
+    usage_subject_asserted_by: Option<&str>,
+    project_binding: &ryeos_app::thread_lifecycle::AdmittedProjectBinding,
+    ctx: &ExecutionContext,
+    provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
+    state: &AppState,
+    launch_timings: Option<&ryeos_app::launch_stage_timings::LaunchStageTimings>,
+) -> Result<RootDispatchPreflight, DispatchError> {
+    let Some(scope) = provenance.candidate_evaluation_scope() else {
+        return preflight_root_dispatch(
+            item_ref,
+            original_root_kind,
+            params,
+            ref_bindings,
+            usage_subject,
+            usage_subject_asserted_by,
+            project_binding,
+            ctx,
+            state,
+            launch_timings,
+        );
+    };
+    let resolution_ctx = ExecutionContext {
+        principal_fingerprint: ctx.principal_fingerprint.clone(),
+        caller_scopes: ctx.caller_scopes.clone(),
+        engine: scope.request_engine().clone(),
+        plan_ctx: scope
+            .resolution_plan_context_for(&ctx.plan_ctx)
+            .map_err(DispatchError::Internal)?,
+        requested_call: ctx.requested_call.clone(),
+    };
+    let mut admitted = preflight_root_dispatch(
+        item_ref,
+        original_root_kind,
+        params,
+        ref_bindings,
+        usage_subject,
+        usage_subject_asserted_by,
+        scope.base_project_binding(),
+        &resolution_ctx,
+        state,
+        launch_timings,
+    )?;
+    let root = admitted.root_admission.take().ok_or_else(|| {
+        DispatchError::Internal(anyhow::anyhow!(
+            "candidate evaluator dispatch did not produce a root admission"
+        ))
+    })?;
+    admitted.root_admission = Some(
+        root.for_candidate_evaluation(provenance, scope.clone())
+            .map_err(DispatchError::Internal)?,
+    );
+    Ok(admitted)
+}
+
 /// Resolve an executor chain under the executable subject's exact resolution
 /// authority, which is independent from the workspace admitted for execution.
 ///
@@ -6393,6 +6464,7 @@ metadata:
             current_site_id: "site:test".into(),
             origin_site_id: "site:test".into(),
             execution_hints: Default::default(),
+            scheduled_fire: None,
             validate_only: false,
         }
     }
@@ -6449,6 +6521,7 @@ metadata:
                 current_site_id: "site:test".into(),
                 origin_site_id: "site:test".into(),
                 execution_hints: Default::default(),
+                scheduled_fire: None,
                 validate_only: false,
             },
             requested_call: None,
@@ -7740,6 +7813,7 @@ requires:
             current_site_id: "site:test".into(),
             origin_site_id: "site:test".into(),
             execution_hints: Default::default(),
+            scheduled_fire: None,
             validate_only: false,
         };
         let ctx = ExecutionContext {

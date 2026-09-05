@@ -5,7 +5,7 @@ name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.6.0"
+version: "1.7.0"
 ```
 
 # Worker-Hosted Execution
@@ -465,6 +465,32 @@ tail. Its Bloom filter proves absence only; an evicted or possible hit falls
 back to complete root replay. It never consults a mutable projection as
 testimony, and restart merely pays the one-time replay cost again.
 
+`limits.aggregate` is the shared execution-tree budget, not another worker
+controller. Its current closed dimensions are one durable absolute duration
+deadline, total logical worker executions, and bounded hosted-turn contacts.
+They follow the daemon-minted accounting scope through descendants. Worker
+recovery reuses its placement claim; an exact command replay reuses its command
+claim; only root-proved uncontacted attempts release a contact. Possible or
+unknown contact remains consumed. Finite hosted-contact limits are rejected
+for interactive sessions because their open command stream has no equivalent
+pre-contact meter.
+
+This operational frontier is currently node-bound. A signed remote launch may
+admit the whole beat directly on its target node, but cross-site migration of
+an already-running worker is refused when its aggregate budget is finite or
+consumed. The existing handoff transfer conserves financial allowance; it does
+not yet partition distributed operational counters, and the target must never
+restart them from its local account birth.
+
+Other limits retain their narrower truthful authority. Token and USD limits
+are enforceable only where a runtime/provider supplies those authoritative
+observations; a subscription-backed hosted worker supplies neither and must not
+claim them. Event, attachment, process, and per-command byte/cardinality caps
+remain per admitted execution or worker. Combined with the aggregate logical
+worker ceiling they provide a mechanically bounded whole-tree maximum, without
+duplicating those ledgers as aggregate counters. Domain work units such as
+simulator steps remain the responsibility of the signed workload contract.
+
 ## Lifecycle and evidence
 
 Process lifecycle is separate from session projection, command contact, the
@@ -532,6 +558,80 @@ existing root-operation lock RyeOS revalidates the exact capsule, command,
 request, turn, completion fact, and that turn's originating worker epoch. A
 recovered worker may have a new boot epoch, but termination is refused when the
 placement's owner-route command frontier has advanced.
+
+Approval-required is equally fact-bound. Status and wait expose an exact
+pending-approval fence only when the current placement, capsule, worker epoch,
+turn, approval ID, request digest, unresolved approval row, and immutable
+`hosted_session.approval_requested` root fact all agree. A bounded controller
+may terminate as `approval_required` only with that fence. Terminal validation
+rechecks the same fact both before worker shutdown and after cleanup has changed
+the unresolved row to its stale-epoch state. A transient
+`awaiting_approval` label, an expired request, or a request with a reserved or
+possibly delivered decision cannot authorize that outcome.
+
+A signed worker-execution profile may select `bounded_turn` instead of the
+ordinary owner-directed `session` mode. That controller issues only its two
+profile-fixed session-start and turn-start routes, observes the exact turn
+command coordinate, and requests completed termination only with its durable
+completion fence. Each step uses a typed, deterministic attempt key. Only an
+exact daemon-verified `failed_uncontacted` settlement may advance to the next
+bounded attempt; a contacted or outcome-unknown command is never redriven.
+Fresh execution therefore normally uses command sequences one and two, while
+restart recovery reports the actual sequences and boot epochs rather than
+assuming that reattachment did not advance the ledger. Approval requests,
+budget expiry, and ambiguous recovery fail closed.
+
+These restrictions are daemon admission rules for both owner commands and
+runtime callbacks, not only controller conventions. A new route must match the
+sealed goal and signed attempt ceiling. Reservation and contact both require
+an approval-free idle boundary with no unresolved observation projection;
+observation ingestion serializes with the contact commit. Absolute worker and
+aggregate deadlines also bound queued writes. Exact settled replay remains
+readable after expiry without contacting the worker.
+
+The bounded profile requires a pinned private CoW workspace, retain-result
+capture, and `retained_for_review` candidate disposition. Its compact
+terminal session projection is rebuilt from the command/root facts, workspace,
+completion fence, and admitted launch capsule. It exposes every bounded attempt
+coordinate, exact contact classification, base and candidate identities, and
+the original completion boot epoch. Spend is reported as unavailable/null when
+the launch has no authoritative financial ledger; subscription-backed or
+external account metadata is never fabricated as RyeOS cost. Existing session
+profiles remain owner-directed and retain their live-filesystem/projectless
+operation where admitted.
+
+## Candidate evaluation and integration
+
+Canonical closure and admitted-base ancestry are necessary diagnostics, but
+they never make a candidate publish-ready. Publication authority begins only
+with an accepted result from an independent evaluator whose complete signed
+definition closure was resolved from the exact immutable base generation. The
+evaluator executes against the exact frozen candidate in a read-only or
+CoW-discard view. Its separate root capsule seals both generations, the source
+candidate/root/owner, parameters, external-content authority, and execution
+limits; its terminal chain retains the exact result and contact evidence.
+
+A bounded `retained_for_review` worker cannot publish its own candidate. After
+the first accepted evaluation of candidate C, an owner may launch one separate
+integration root. RyeOS resolves the signed authoring wrapper from base B and
+runs it inside a private retained CoW view of C. `runtime.author_item` keeps the
+signing key in the daemon and writes only that capsule-sealed workspace, under
+the wrapper's signed item-authoring namespace. It does not write the live
+project tree or advance HEAD. The completed integration root captures result
+generation D and proves D descends C.
+
+D must then pass a fresh independent evaluator run, again resolved from B.
+Only the resulting C-evaluation, integration-root, and D-evaluation testimony
+together authorize the serialized project transition. `publish` re-verifies
+those immutable coordinates and advances the principal-scoped project HEAD by
+one compare-and-swap from B to D. A stale HEAD fails closed. The terminal worker
+root remains immutable evidence throughout; evaluator and integration work use
+their own roots and ordinary restart-recoverable launch capsules.
+
+This candidate lane is additive. Ordinary admitted `live_direct` execution and
+daemon-mediated live-project item authoring remain available under their
+existing explicit write authority; RyeOS never silently treats a live-tree
+write as a CAS generation or HEAD publication.
 
 Approval consent covers one exact action inside the admitted ceiling. It never
 expands authority. The outbox reserves the decision, writes its root
@@ -630,24 +730,37 @@ boundary later consumed by publication. Capture-live pinning remains a valid
 private execution source, but its newly captured parentless snapshot is not an
 existing `HEAD` and therefore is not the publication source for this workflow.
 Workspace IDs and candidate rows are projections. Completion never publishes.
+Exact event attachments are available at their admitted `evidence/...` paths
+relative to the worker workspace, including when node isolation is disabled.
+These are execution inputs: native fold-back excludes their process-visible
+bytes and preserves any original project files underneath the input paths.
+They cannot silently become authored candidate content. An enforced isolation
+backend supplies read-only mounts; disabled isolation supplies exact private
+copies on the trusted node and does not claim kernel-enforced immutability.
 After the worker and managed controller have stopped, RyeOS freezes the exact
 workspace generation, closes the private workspace, appends
-`hosted_candidate.captured` to the still-live root, and only then exposes the
+`hosted_candidate.captured` to the worker root, and only then exposes the
 candidate projection. One root-operation lease covers close, fact, and bind.
 That fact binds the candidate, admitted base/capsule, workspace, and credential
-generation. The already-closed snapshot remains available in CAS for
-validation and publication; validation, publish/discard, and only then root
-terminalization follow on the same chain.
+generation. The bounded worker root can then terminalize as
+`retained_for_review`; it remains immutable evidence. Owner-authorized
+validation, evaluation, qualification, integration, publish, and discard use
+separate recorded service or execution roots that name the source root exactly.
 `validate-candidate-closure-and-base` proves canonical closure and admitted-base
-ancestry only; project tests remain ordinary executions.
+ancestry only; project tests remain ordinary evaluator executions and only
+accepted immutable evaluator testimony can make a candidate publish-ready.
 
 Publication additionally requires `ryeos.write.project.live`, the exact
 principal key/project hash and expected base retained in root authority at
-admission, owner authorization, and HEAD CAS. An owner-authorized root
-reservation precedes HEAD contact; startup recovery requires that reservation
-and appends a separately linked filesystem-verified result. After possible
-contact, `HEAD == base` proves no publication and is the only retryable state;
-`HEAD == candidate` proves success. A missing or different HEAD is
+admission, owner authorization, and HEAD CAS. An owner-authorized publication
+root appends the exact reservation before HEAD contact. Startup recovery
+re-verifies that reservation. An exact rooted terminal result preserves the
+classification made at contact even after later HEAD movement. If recovery
+finds only the reservation, it keeps that same publication root appendable,
+classifies the signed authoritative HEAD and history, and appends the recovered
+terminal result before settling the controller projection: `HEAD == base`
+proves no publication and is the only retryable state; `HEAD == candidate`
+proves success. A missing or different HEAD is
 irreducibly ambiguous, receives authoritative `publication_unknown` testimony,
 and terminalizes without retry. Root
 terminalization waits while
@@ -656,8 +769,10 @@ fences every hosted root-chain mutation; terminalization closes admission and
 waits on its condition variable rather than polling SQLite. Pinned CoW worker
 executions admit a retained-result authority (including the exact explicit
 current-HEAD destination where applicable); projectless executions admit
-exactly `any`. Discard/automatic-advance launch authority is not accepted by
-this release.
+exactly `any`. Candidate evaluators use read-only or CoW-discard authority.
+The one candidate-integration root uses retain-current-HEAD only to preserve D
+for independent evaluation; it never advances HEAD itself. Only the later
+owner-authorized publication root may perform the exact B-to-D HEAD CAS.
 
 For a runtime that declares native resume, a proved-dead launch owner does not
 discard an unpublished CoW workspace. Startup retains the exact workspace

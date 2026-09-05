@@ -118,6 +118,26 @@ fn is_operationally_excluded(path: &str, exclusions: &[String]) -> bool {
     })
 }
 
+pub(super) fn restore_operational_shadow_files(
+    captured: &mut ProjectTree,
+    base: &ProjectTree,
+    exclusions: &[String],
+) -> Result<()> {
+    captured
+        .files
+        .retain(|path, _| !is_operationally_excluded(path, exclusions));
+    captured.files.extend(
+        base.files
+            .iter()
+            .filter(|(path, _)| is_operationally_excluded(path, exclusions))
+            .map(|(path, hash)| (path.clone(), hash.clone())),
+    );
+    // The process can replace an input's ancestor with a regular file. The
+    // restored base and captured edits must still form one valid tree before
+    // any candidate snapshot can commit it.
+    captured.validate()
+}
+
 fn canonical_relative_path(relative: &Path) -> Result<String> {
     let value = relative
         .to_str()
@@ -158,7 +178,58 @@ pub fn materialize_project_file(
 
 #[cfg(test)]
 mod tests {
-    use super::is_operationally_excluded;
+    use super::{is_operationally_excluded, restore_operational_shadow_files};
+
+    #[test]
+    fn private_input_shadows_preserve_base_files_and_do_not_publish_evidence() {
+        use ryeos_state::objects::ProjectTree;
+        let base = ProjectTree {
+            files: [
+                ("evidence/existing.json".to_owned(), "a".repeat(64)),
+                ("src/solver.py".to_owned(), "b".repeat(64)),
+            ]
+            .into(),
+        };
+        let mut captured = ProjectTree {
+            files: [
+                ("evidence/existing.json".to_owned(), "c".repeat(64)),
+                ("evidence/new.json".to_owned(), "d".repeat(64)),
+                ("src/solver.py".to_owned(), "e".repeat(64)),
+                ("evidence-adjacent.json".to_owned(), "f".repeat(64)),
+            ]
+            .into(),
+        };
+        let exclusions = vec![
+            "evidence/existing.json".to_owned(),
+            "evidence/new.json".to_owned(),
+        ];
+        restore_operational_shadow_files(&mut captured, &base, &exclusions).unwrap();
+        assert_eq!(
+            captured.files.get("evidence/existing.json"),
+            base.files.get("evidence/existing.json")
+        );
+        assert!(!captured.files.contains_key("evidence/new.json"));
+        assert_eq!(captured.files["src/solver.py"], "e".repeat(64));
+        assert_eq!(captured.files["evidence-adjacent.json"], "f".repeat(64));
+    }
+
+    #[test]
+    fn private_input_shadow_rejects_a_captured_regular_file_ancestor() {
+        use ryeos_state::objects::ProjectTree;
+        let base = ProjectTree {
+            files: [("evidence/input.json".to_owned(), "a".repeat(64))].into(),
+        };
+        let mut captured = ProjectTree {
+            files: [("evidence".to_owned(), "b".repeat(64))].into(),
+        };
+        let error = restore_operational_shadow_files(
+            &mut captured,
+            &base,
+            &["evidence/input.json".to_owned()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("nested below regular file"));
+    }
 
     #[test]
     fn operational_shadow_roots_match_only_segment_bounded_descendants() {

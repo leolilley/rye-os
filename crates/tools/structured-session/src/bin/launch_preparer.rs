@@ -22,6 +22,12 @@ enum WorkerSelection {
     Environment(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerExecutionMode {
+    Session,
+    BoundedTurn,
+}
+
 #[derive(Debug)]
 struct ValidatedWorkerEnvironment {
     worker_ref: String,
@@ -267,6 +273,12 @@ fn validate(request: ValidateLaunchPreparerConfigRequest) -> ValidateLaunchPrepa
                 external.max_declarations == 8
                     && external.large_content_max_total_bytes == Some(4_294_967_296)
             })
+        && request.evidence_attachments.max_attachments == 16
+        && request.evidence_attachments.max_total_bytes == 536_870_912
+        && request.evidence_attachments.target.as_deref() == Some(DEPENDENCY_NAME)
+        && request.evidence_attachments.destination_prefix.as_deref() == Some("evidence")
+        && request.evidence_attachments.allowed_access
+            == [ryeos_handler_protocol::EvidenceAttachmentAccessWire::ReadOnly]
         && request.environment_contributions.max_contributions == 1
         && request
             .environment_contributions
@@ -318,6 +330,8 @@ fn validate_execution_config(
         "required_terminal_publication",
         "max_lifetime_seconds",
         "recover_upstream_session",
+        "mode",
+        "candidate_disposition",
     ];
     if object.len() != KEYS.len() || object.keys().any(|key| !KEYS.contains(&key.as_str())) {
         return Err(wire_error(
@@ -384,6 +398,31 @@ fn validate_execution_config(
             "worker_execution_policy_invalid",
             "worker execution config is outside the admitted policy vocabulary",
         ));
+    }
+    let mode = validate_execution_mode(object.get("mode"))?;
+    let candidate_disposition = object
+        .get("candidate_disposition")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match (&mode, candidate_disposition) {
+        (WorkerExecutionMode::Session, "owner_decision") => {}
+        (WorkerExecutionMode::BoundedTurn, "retained_for_review")
+            if require_pinned_cow == Some(true)
+                && required_terminal_publication == Some("retain_result")
+                && object
+                    .get("recover_upstream_session")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && object
+                    .get("required_credential_state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("active") => {}
+        _ => {
+            return Err(wire_error(
+                "worker_execution_policy_invalid",
+                "bounded turns require an active credential, recoverable retained pinned CoW candidate; session mode remains owner-decision",
+            ));
+        }
     }
     if !matches!(
         (require_pinned_cow, required_terminal_publication),
@@ -461,6 +500,76 @@ fn validate_execution_config(
         })?;
     }
     Ok(selection)
+}
+
+fn validate_execution_mode(
+    value: Option<&serde_json::Value>,
+) -> Result<WorkerExecutionMode, LaunchPrepareError> {
+    let object = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            wire_error(
+                "worker_execution_mode_invalid",
+                "worker execution mode must be a closed object",
+            )
+        })?;
+    match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some("session") if object.len() == 1 => Ok(WorkerExecutionMode::Session),
+        Some("bounded_turn")
+            if object.len() == 4
+                && object.contains_key("session_start_route")
+                && object.contains_key("turn_start_route")
+                && object
+                    .get("max_uncontacted_attempts")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|attempts| (1..=8).contains(&attempts)) =>
+        {
+            let session_start_route = validate_route_id(
+                object.get("session_start_route"),
+                "bounded session-start route",
+            )?;
+            let turn_start_route =
+                validate_route_id(object.get("turn_start_route"), "bounded turn-start route")?;
+            if session_start_route == turn_start_route {
+                return Err(wire_error(
+                    "worker_execution_mode_invalid",
+                    "bounded session-start and turn-start routes must be distinct",
+                ));
+            }
+            Ok(WorkerExecutionMode::BoundedTurn)
+        }
+        _ => Err(wire_error(
+            "worker_execution_mode_invalid",
+            "worker execution mode is not an admitted session or bounded-turn contract",
+        )),
+    }
+}
+
+fn validate_route_id(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> Result<String, LaunchPrepareError> {
+    let value = value
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or_else(|| {
+            wire_error(
+                "worker_execution_mode_invalid",
+                &format!("{label} is not a bounded route identifier"),
+            )
+        })?;
+    if !value.split('.').all(|segment| {
+        !segment.is_empty()
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+    }) {
+        return Err(wire_error(
+            "worker_execution_mode_invalid",
+            &format!("{label} is not canonical"),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_worker_ref(worker_ref: &str) -> Result<String, LaunchPrepareError> {
@@ -750,7 +859,9 @@ mod tests {
             "require_pinned_cow": true,
             "required_terminal_publication": "retain_result",
             "max_lifetime_seconds": 86_400,
-            "recover_upstream_session": true
+            "recover_upstream_session": true,
+            "mode": {"kind":"session"},
+            "candidate_disposition":"owner_decision"
         })
     }
 
@@ -999,6 +1110,57 @@ mod tests {
                 "worker_execution_policy_invalid"
             );
         }
+    }
+
+    #[test]
+    fn bounded_turn_is_closed_and_requires_retained_candidate_policy() {
+        let mut config = valid_config();
+        config["mode"] = serde_json::json!({
+            "kind":"bounded_turn",
+            "session_start_route":"session.start",
+            "turn_start_route":"turn.start",
+            "max_uncontacted_attempts":3
+        });
+        config["candidate_disposition"] = serde_json::json!("retained_for_review");
+        assert_eq!(
+            validate_execution_config(&config).unwrap(),
+            WorkerSelection::Direct("worker:fixture/hosted".to_owned())
+        );
+
+        for (field, value) in [
+            ("candidate_disposition", serde_json::json!("owner_decision")),
+            ("recover_upstream_session", serde_json::json!(false)),
+            ("required_credential_state", serde_json::json!("any")),
+        ] {
+            let mut invalid = config.clone();
+            invalid[field] = value;
+            assert_eq!(
+                validate_execution_config(&invalid).unwrap_err().code,
+                "worker_execution_policy_invalid"
+            );
+        }
+
+        let mut caller_selected_route = config;
+        caller_selected_route["mode"]["extra_route"] = serde_json::json!("turn.steer");
+        assert_eq!(
+            validate_execution_config(&caller_selected_route)
+                .unwrap_err()
+                .code,
+            "worker_execution_mode_invalid"
+        );
+
+        let mut unbounded_attempts = caller_selected_route;
+        unbounded_attempts["mode"]
+            .as_object_mut()
+            .unwrap()
+            .remove("extra_route");
+        unbounded_attempts["mode"]["max_uncontacted_attempts"] = serde_json::json!(9);
+        assert_eq!(
+            validate_execution_config(&unbounded_attempts)
+                .unwrap_err()
+                .code,
+            "worker_execution_mode_invalid"
+        );
     }
 }
 

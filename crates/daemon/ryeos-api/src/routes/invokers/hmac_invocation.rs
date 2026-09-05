@@ -479,6 +479,7 @@ impl CompiledRouteInvocation for CompiledHmacVerifier {
             verified: true,
             authorized_key_class: None,
             authenticated_origin_site_id: None,
+            authenticated_grant_authority: None,
             metadata,
         }))
     }

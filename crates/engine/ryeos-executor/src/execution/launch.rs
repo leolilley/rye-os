@@ -3846,12 +3846,13 @@ async fn prepare_managed_launch_authority(
     transferred_continuation_capsule: Option<&ryeos_state::objects::AdmittedLaunchCapsule>,
 ) -> Result<PreparedManagedLaunchAuthority, BuildAndLaunchError> {
     let engine = params.provenance.request_engine();
-    let subject_resolution_authority = params.provenance.subject_resolution_authority();
-    let resolution_project_root = (!matches!(
-        subject_resolution_authority,
-        ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
-    ))
-    .then_some(params.project_path);
+    let root_admission = params.resolved.root_admission.as_ref().ok_or_else(|| {
+        BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "managed launch is missing exact admitted resolution authority"
+        ))
+    })?;
+    let subject_resolution_authority = root_admission.resolution_subject_authority().clone();
+    let resolution_project_root = root_admission.resolution_workspace();
     let engine_roots = engine.resolution_roots(resolution_project_root.map(Path::to_path_buf));
     let bundle_roots: Vec<PathBuf> = engine_roots
         .authoritative_bundle_roots()
@@ -3961,11 +3962,6 @@ async fn prepare_managed_launch_authority(
     } else {
         None
     };
-    let root_admission = params.resolved.root_admission.as_ref().ok_or_else(|| {
-        BuildAndLaunchError::Internal(anyhow::anyhow!(
-            "managed launch is missing exact admitted resolution authority"
-        ))
-    })?;
     let recovery_trust_store = admitted_capsule
         .is_some()
         .then(|| root_admission.current_policy_trust_store())
@@ -4489,6 +4485,15 @@ async fn prepare_managed_launch_authority(
         &prepared_launch,
     )
     .map_err(BuildAndLaunchError::Internal)?;
+    let evidence_publication = super::persistent_session::prepare_or_verify_evidence_attachments(
+        params.state,
+        &selected_runtime.yaml.launch_contract.evidence_attachments,
+        &params.resolved.plan_context.requested_by,
+        params.parameters,
+        &mut prepared_launch,
+        admitted_capsule.is_some(),
+    )
+    .map_err(BuildAndLaunchError::Internal)?;
     // A cross-site continuation inherits the source's portable outer program,
     // but persistent-session capsules bind node-local realization and must be
     // admitted again on the target. The transferred source capsule remains
@@ -4503,7 +4508,7 @@ async fn prepare_managed_launch_authority(
         )
         .map_err(BuildAndLaunchError::Internal)?;
     }
-    let pending_session_publications =
+    let mut pending_session_publications =
         super::persistent_session::admit_or_verify_prepared_sessions(
             params.state,
             engine,
@@ -4515,6 +4520,7 @@ async fn prepare_managed_launch_authority(
                 .map(BuildAndLaunchError::from)
                 .unwrap_or_else(|| BuildAndLaunchError::Internal(error))
         })?;
+    pending_session_publications.include_evidence_publication(evidence_publication);
     let effective_caps = if let Some(capsule) = admitted_capsule.as_ref() {
         // Capability authority is part of the admitted execution closure.
         // Recovery must not reopen the composed item or its runtime-authority
@@ -4969,6 +4975,7 @@ async fn prepare_managed_launch_authority(
                 origin_site_id: params.resolved.origin_site_id.clone(),
                 requested_by: params.resolved.plan_context.requested_by.clone(),
                 execution_hints: params.resolved.plan_context.execution_hints.clone(),
+                scheduled_fire: params.resolved.plan_context.scheduled_fire.clone(),
                 effective_caps: effective_caps.clone(),
                 parent_delegation_caps: metadata_template
                     .and_then(|template| template.resume_context.as_ref())
@@ -5641,12 +5648,12 @@ async fn run_claimed_thread_row_inner(
         }
     }
 
-    let subject_resolution_authority = provenance.subject_resolution_authority();
-    let resolution_project_root = (!matches!(
-        subject_resolution_authority,
-        ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
-    ))
-    .then_some(project_path);
+    let root_admission = resolved
+        .root_admission
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("managed launch has no exact root admission"))?;
+    let subject_resolution_authority = root_admission.resolution_subject_authority().clone();
+    let resolution_project_root = root_admission.resolution_workspace();
     let engine_roots = engine.resolution_roots(resolution_project_root.map(Path::to_path_buf));
     let effective_request_snapshot = match resolved
         .root_admission
@@ -5822,6 +5829,9 @@ async fn run_claimed_thread_row_inner(
         turns = hard_limits.turns,
         turns_source = %turns_source,
         turns_cap = ?limits_config.caps.turns,
+        aggregate_duration_seconds = hard_limits.aggregate.duration_seconds,
+        aggregate_worker_executions = hard_limits.aggregate.worker_executions,
+        aggregate_provider_contacts = hard_limits.aggregate.provider_contacts,
         runtime_limits = %serde_json::to_string(&hard_limits.runtime)
             .unwrap_or_else(|_| "{}".to_string()),
         runtime_limit_caps = %serde_json::to_string(&limits_config.caps.runtime)
@@ -6000,6 +6010,14 @@ async fn run_claimed_thread_row_inner(
             )));
         }
     }
+    if !hard_limits.aggregate.is_unlimited()
+        && (accounting_scope.is_none() || state.accounting.is_none())
+    {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "aggregate execution limits require the accounting ledger and a sealed accounting \
+             scope; refusing to launch"
+        )));
+    }
 
     // 6a¾. Journaled account birth and the launch accounting gate. Only a
     // freshly minted scope may create accounts; a recovered or continued
@@ -6007,6 +6025,7 @@ async fn run_claimed_thread_row_inner(
     // on a missing account — allowance is never re-minted from limits).
     // The gate must be open before the runtime can spawn; reserve/issue
     // callbacks require it and terminal fencing closes it atomically.
+    let mut aggregate_deadline_at_ms = None;
     if let (Some(scope), Some(accounting)) = (accounting_scope.as_ref(), state.accounting.as_ref())
     {
         let account_limit = (!hard_limits.spend_usd.is_zero()).then_some(hard_limits.spend_usd);
@@ -6054,6 +6073,28 @@ async fn run_claimed_thread_row_inner(
                     ))
                 })?;
         }
+        let aggregate_budget = accounting
+            .ensure_execution_resource_budget(&scope.execution_budget_id, &hard_limits.aggregate)
+            .map_err(|error| {
+                BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "aggregate execution budget admission failed: {error:#}"
+                ))
+            })?;
+        if aggregate_budget
+            .deadline_at_ms
+            .is_some_and(|deadline| lillux::time::timestamp_millis() >= deadline)
+        {
+            return Err(BuildAndLaunchError::from(
+                DispatchError::LaunchPreparationFailed {
+                    code: "budget_exhausted".to_owned(),
+                    message: "aggregate execution duration is exhausted".to_owned(),
+                    classification: "policy".to_owned(),
+                    binding: None,
+                    details: Box::new(BTreeMap::new()),
+                },
+            ));
+        }
+        aggregate_deadline_at_ms = aggregate_budget.deadline_at_ms;
         accounting
             .activate_account(
                 &scope.execution_budget_id,
@@ -6264,6 +6305,7 @@ async fn run_claimed_thread_row_inner(
             parent_capabilities: None,
             depth: current_depth,
             suppress_stimulus,
+            scheduled_fire: params.resolved.plan_context.scheduled_fire.clone(),
         },
         EnvelopePolicy {
             effective_caps: effective_caps.clone(),
@@ -6485,6 +6527,7 @@ async fn run_claimed_thread_row_inner(
             owns_workspace,
             envelope: &envelope,
             timeout_secs: duration,
+            aggregate_deadline_at_ms,
             callback: &callback_owned,
             thread_id: &thread_id_owned,
             launch_owner: &launch_owner_owned,
@@ -6555,6 +6598,10 @@ async fn run_claimed_thread_row_inner(
                 let _ = state.state_store.reset_resume_attempts(&thread_id);
                 return Err(BuildAndLaunchError::Internal(err));
             }
+            let terminal_code = err
+                .downcast_ref::<DispatchError>()
+                .map(DispatchError::code)
+                .unwrap_or("pre_runtime_failure");
             // Pre-runtime failure (launch preparation, secret resolution, materialization,
             // builder): record the real cause into `error` — the ONLY field the
             // terminal `thread_failed` braid event persists — not `result`,
@@ -6565,10 +6612,10 @@ async fn run_claimed_thread_row_inner(
                 &ThreadFinalizeParams {
                     thread_id: thread_id.clone(),
                     status: "failed".to_string(),
-                    outcome_code: Some("pre_runtime_failure".to_string()),
+                    outcome_code: Some(terminal_code.to_string()),
                     result: None,
                     error: Some(json!({
-                        "code": "pre_runtime_failure",
+                        "code": terminal_code,
                         "message": format!("{err:#}"),
                     })),
                     metadata: None,
@@ -6731,8 +6778,8 @@ async fn run_claimed_thread_row_inner(
         };
         // A retained worker-hosted candidate is a pre-terminal disposition
         // saga. Its worker and managed controller have stopped, but the RyeOS
-        // root remains running so validation and the owner's publish/discard
-        // decision can be testified on that same authoritative chain.
+        // root remains running until its admitted retained-for-review policy
+        // or the owner's publish/discard decision settles durably.
         if let Some(candidate_snapshot_hash) = result_project_snapshot_hash.as_deref()
             && let Some(session) = state.state_store.dedicated_session(&thread_id)?
             && session.state == "freezing"
@@ -6783,9 +6830,20 @@ async fn run_claimed_thread_row_inner(
                     "managed hosted candidate lost its exact freezing-state CAS"
                 )));
             }
+            if session.candidate_disposition
+                == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+            {
+                state
+                    .state_store
+                    .settle_dedicated_candidate_retained_for_review(
+                        &thread_id,
+                        candidate_snapshot_hash,
+                    )
+                    .map_err(BuildAndLaunchError::Internal)?;
+            }
             ryeos_app::dedicated_session_service::notify_projection_change(&thread_id);
             drop(candidate_root_operation);
-            let terminal_session = loop {
+            let _terminal_session = loop {
                 let session = state
                     .state_store
                     .dedicated_session(&thread_id)?
@@ -6799,7 +6857,12 @@ async fn run_claimed_thread_row_inner(
                 }
                 if !matches!(
                     session.state.as_str(),
-                    "frozen" | "verifying" | "publish_ready" | "publishing" | "discarding"
+                    "frozen"
+                        | "verifying"
+                        | "qualifying"
+                        | "publish_ready"
+                        | "publishing"
+                        | "discarding"
                 ) {
                     return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
                         "managed hosted candidate entered invalid disposition state {}",
@@ -6831,7 +6894,23 @@ async fn run_claimed_thread_row_inner(
             };
             runtime_result = ryeos_runtime::envelope::dedicated_session_terminal_result(
                 thread_id.clone(),
-                serde_json::to_value(terminal_session)?,
+                ryeos_app::dedicated_session_service::canonical_terminal_session_projection(
+                    state, &thread_id,
+                )
+                .map_err(BuildAndLaunchError::Internal)?,
+            );
+        }
+        if let Some(session) = state.state_store.dedicated_session(&thread_id)?
+            && session.state == "terminal"
+            && session.candidate_disposition
+                == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+        {
+            runtime_result = ryeos_runtime::envelope::dedicated_session_terminal_result(
+                thread_id.clone(),
+                ryeos_app::dedicated_session_service::canonical_terminal_session_projection(
+                    state, &thread_id,
+                )
+                .map_err(BuildAndLaunchError::Internal)?,
             );
         }
         let fallback = fallback_finalization(&thread_id, &runtime_result, terminal_status);
@@ -7388,6 +7467,7 @@ async fn prepare_follow_child_launch_inner(
         || admitted_request.plan_context.requested_by != operational_resume.requested_by
         || admitted_request.plan_context.project_context != operational_resume.project_context
         || admitted_request.plan_context.execution_hints != operational_resume.execution_hints
+        || admitted_request.plan_context.scheduled_fire != operational_resume.scheduled_fire
         || operational_resume.executor_ref.as_deref()
             != Some(admitted_request.executor_ref.as_str())
         || operational_resume.runtime_ref.as_deref() != Some(admitted_runtime_ref.as_str())
@@ -8527,6 +8607,15 @@ async fn finalize_recovered_hosted_candidate_disposition(
             )));
         }
     }
+    if candidate_session.candidate_disposition
+        == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+    {
+        state
+            .state_store
+            .settle_dedicated_candidate_retained_for_review(thread_id, candidate_snapshot_hash)
+            .map_err(BuildAndLaunchError::Internal)?;
+        ryeos_app::dedicated_session_service::notify_projection_change(thread_id);
+    }
     let terminal_session = loop {
         let session = state
             .state_store
@@ -8546,7 +8635,7 @@ async fn finalize_recovered_hosted_candidate_disposition(
         }
         if !matches!(
             session.state.as_str(),
-            "frozen" | "verifying" | "publish_ready" | "publishing" | "discarding"
+            "frozen" | "verifying" | "qualifying" | "publish_ready" | "publishing" | "discarding"
         ) {
             return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
                 "recovered hosted candidate entered invalid disposition state {}",
@@ -8576,20 +8665,29 @@ async fn finalize_recovered_hosted_candidate_disposition(
             }
         }
     };
-    let published_result = format!("published:{candidate_snapshot_hash}");
-    let has_owner_disposition = matches!(
+    let has_nonpublication_disposition = matches!(
         terminal_session.publication_result.as_deref(),
-        Some("discarded")
-    ) || terminal_session.publication_result.as_deref()
-        == Some(published_result.as_str());
-    if terminal_session.terminal_reason.as_deref() != Some("completed") || !has_owner_disposition {
+        Some("discarded" | "retained_for_review")
+    );
+    if terminal_session.terminal_reason.as_deref() != Some("completed") {
         return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
-            "recovered hosted candidate has no completed owner disposition"
+            "recovered hosted candidate has no completed terminal disposition"
         )));
+    }
+    if !has_nonpublication_disposition {
+        ryeos_app::dedicated_session_service::verify_terminal_candidate_publication(
+            state,
+            &terminal_session,
+            candidate_snapshot_hash,
+        )
+        .map_err(BuildAndLaunchError::Internal)?;
     }
     let runtime_result = ryeos_runtime::envelope::dedicated_session_terminal_result(
         thread_id.to_owned(),
-        serde_json::to_value(terminal_session)?,
+        ryeos_app::dedicated_session_service::canonical_terminal_session_projection(
+            state, thread_id,
+        )
+        .map_err(BuildAndLaunchError::Internal)?,
     );
     let terminal_status = runtime_terminal_status(runtime_result.status);
     let fallback = fallback_finalization(thread_id, &runtime_result, terminal_status);
@@ -8621,6 +8719,204 @@ async fn finalize_recovered_hosted_candidate_disposition(
     })
 }
 
+fn load_candidate_integration_completion_fact(
+    state: &AppState,
+    thread: &ryeos_app::state_store::ThreadDetail,
+    resume: &ryeos_app::launch_metadata::ResumeContext,
+    sealed: &ryeos_app::thread_lifecycle::SealedRootExecutionRequest,
+    authority: &ryeos_app::thread_lifecycle::CandidateEvaluationAuthority,
+) -> Result<
+    Option<ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact>,
+    BuildAndLaunchError,
+> {
+    if !matches!(
+        &authority.purpose,
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+    ) {
+        return Ok(None);
+    }
+    if thread.thread_id != thread.chain_root_id {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "candidate integration recovery is not attached to its own root"
+        )));
+    }
+    let capsule_hash = thread
+        .admitted_launch_capsule_hash
+        .as_deref()
+        .ok_or_else(|| {
+            BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "candidate integration recovery has no admitted capsule"
+            ))
+        })?;
+    let capsule = state
+        .state_store
+        .admitted_launch_capsule(&thread.thread_id)?
+        .ok_or_else(|| {
+            BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "candidate integration admitted capsule disappeared"
+            ))
+        })?;
+    if capsule.content_hash()? != capsule_hash
+        || capsule.sealed_invocation != serde_json::to_value(sealed)?
+        || capsule.project_authority != resume.project_authority
+        || sealed.candidate_evaluation_authority() != Some(authority)
+    {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "candidate integration capsule contradicts its recovery authority"
+        )));
+    }
+    let operation_id =
+        ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact::operation_id(
+            authority,
+            &thread.thread_id,
+            capsule_hash,
+        )?;
+    let lookup = ryeos_app::authoritative_root_fact::lookup(
+        state,
+        &thread.thread_id,
+        ryeos_app::thread_lifecycle::CANDIDATE_INTEGRATION_PROCESS_COMPLETED_EVENT,
+        &operation_id,
+    )?;
+    if lookup.count > 1 {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "candidate integration completion fact is duplicated"
+        )));
+    }
+    let Some(payload) = lookup.payload else {
+        return if lookup.count == 0 {
+            Ok(None)
+        } else {
+            Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "candidate integration completion fact payload is unavailable"
+            )))
+        };
+    };
+    let fact: ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact =
+        serde_json::from_value(payload).map_err(|error| {
+            BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "decode candidate integration completion fact: {error}"
+            ))
+        })?;
+    fact.validate_for(authority, &thread.thread_id, capsule_hash)?;
+    Ok(Some(fact))
+}
+
+fn verify_recovered_candidate_integration_generation(
+    state: &AppState,
+    source_candidate_snapshot_hash: &str,
+    result_candidate_snapshot_hash: &str,
+) -> Result<(), BuildAndLaunchError> {
+    let authority = super::pinned_state_authority(state)?;
+    let guard = authority.acquire_shared_guard()?;
+    authority.ensure_guard(&guard)?;
+    let cas = authority.cas_store()?;
+    let source = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
+        &cas,
+        source_candidate_snapshot_hash,
+    )?;
+    let result = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
+        &cas,
+        result_candidate_snapshot_hash,
+    )?;
+    if source.snapshot().effective_policy_hash != result.snapshot().effective_policy_hash {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "candidate integration changed the admitted snapshot policy"
+        )));
+    }
+    if result_candidate_snapshot_hash != source_candidate_snapshot_hash
+        && !result
+            .snapshot()
+            .parent_hashes
+            .iter()
+            .any(|parent| parent == source_candidate_snapshot_hash)
+    {
+        return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "candidate integration result is not a direct descendant of its sealed source"
+        )));
+    }
+    Ok(())
+}
+
+fn finalize_recovered_candidate_integration(
+    state: &AppState,
+    thread_id: &str,
+    launch_owner: &str,
+    resume: &ryeos_app::launch_metadata::ResumeContext,
+    authority: &ryeos_app::thread_lifecycle::CandidateEvaluationAuthority,
+    fact: &ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact,
+    provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
+) -> Result<NativeLaunchResult, BuildAndLaunchError> {
+    let result_snapshot_hash = super::prepare_stopped_managed_runtime_terminal_project_result(
+        state,
+        provenance,
+        thread_id,
+        launch_owner,
+    )?
+    .ok_or_else(|| {
+        BuildAndLaunchError::Internal(anyhow::anyhow!(
+            "completed candidate integration produced no retained generation"
+        ))
+    })?;
+    verify_recovered_candidate_integration_generation(
+        state,
+        &authority.candidate_snapshot_hash,
+        &result_snapshot_hash,
+    )?;
+    let completion = fact.canonical_completion(&result_snapshot_hash)?;
+    let mut terminalization = ryeos_app::hosted_operation::begin_hosted_root_terminalization(
+        &state.state_store,
+        thread_id,
+    )?;
+    let finalized = state.threads.finalize_from_completion_owned(
+        thread_id,
+        launch_owner,
+        &completion,
+        Some(&result_snapshot_hash),
+    )?;
+    terminalization.commit();
+
+    let terminal_publication =
+        resume
+            .project_authority
+            .terminal_publication()
+            .ok_or_else(|| {
+                BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "candidate integration recovery has no terminal publication authority"
+                ))
+            })?;
+    let workspace_lifeline = provenance.workspace_lifeline();
+    if let Err(error) = super::runner::close_managed_runtime_workspace(
+        state,
+        workspace_lifeline.as_ref(),
+        thread_id,
+        terminal_publication,
+        Some(&result_snapshot_hash),
+    ) {
+        if let Some(workspace) = workspace_lifeline.as_ref() {
+            workspace.disarm();
+        }
+        tracing::error!(
+            thread_id,
+            %error,
+            "recovered candidate integration finalized but its workspace cleanup remains pending"
+        );
+    }
+    kick_launch_window_for_terminal(state, &finalized.chain_root_id);
+    kick_follow_resume_if_ready(state, &finalized.chain_root_id);
+    Ok(NativeLaunchResult {
+        thread: serde_json::to_value(&finalized)?,
+        result_project_snapshot_hash: Some(result_snapshot_hash),
+        result: json!({
+            "success":true,
+            "status":"completed",
+            "result":completion.result,
+            "outputs":Value::Null,
+            "cost":Value::Null,
+            "warnings":[],
+        }),
+    })
+}
+
 async fn launch_claimed_native_resume(
     state: &AppState,
     thread: ryeos_app::state_store::ThreadDetail,
@@ -8641,13 +8937,97 @@ async fn launch_claimed_native_resume(
             anyhow::anyhow!("native resume: {thread_id} has no sealed admitted request")
         })?;
 
+    if let Some(authority) = sealed.candidate_evaluation_authority()
+        && matches!(
+            &authority.purpose,
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+        )
+    {
+        let fact =
+            load_candidate_integration_completion_fact(state, &thread, &resume, sealed, authority)?;
+        let workspace = state
+            .state_store
+            .execution_workspace_for_thread(&thread_id)?
+            .ok_or_else(|| {
+                BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "candidate integration recovery workspace disappeared"
+                ))
+            })?;
+        if workspace.thread_id.as_deref() != Some(thread_id.as_str())
+            || workspace.base_snapshot != authority.candidate_snapshot_hash
+        {
+            return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "candidate integration workspace contradicts its sealed source generation"
+            )));
+        }
+        match (workspace.state, fact.as_ref()) {
+            (ryeos_app::runtime_db::WorkspaceState::Ready, None) => {}
+            (ryeos_app::runtime_db::WorkspaceState::Active, None) => {
+                return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "candidate integration stopped after process contact without durable successful completion"
+                )));
+            }
+            (ryeos_app::runtime_db::WorkspaceState::Freezing, None) => {
+                return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "candidate integration entered its freeze journal without durable successful completion"
+                )));
+            }
+            (
+                ryeos_app::runtime_db::WorkspaceState::Ready
+                | ryeos_app::runtime_db::WorkspaceState::Active
+                | ryeos_app::runtime_db::WorkspaceState::Freezing,
+                Some(fact),
+            ) => {
+                let provenance =
+                    crate::execution::runner::retained_workspace_provenance_for_native_resume(
+                        state,
+                        &thread_id,
+                        launch_owner,
+                        &resume,
+                    )?
+                    .ok_or_else(|| {
+                        BuildAndLaunchError::Internal(anyhow::anyhow!(
+                            "completed candidate integration lost its retained workspace authority"
+                        ))
+                    })?;
+                let (provenance, _) =
+                    crate::execution::runner::candidate_evaluation_provenance_from_resume_context(
+                        state,
+                        &resume,
+                        authority,
+                        Some(provenance),
+                    )?;
+                return finalize_recovered_candidate_integration(
+                    state,
+                    &thread_id,
+                    launch_owner,
+                    &resume,
+                    authority,
+                    fact,
+                    &provenance,
+                );
+            }
+            (state, _) => {
+                return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "candidate integration cannot recover from workspace state {state}"
+                )));
+            }
+        }
+    }
+
     let recovered_candidate_workspace_id = state
         .state_store
         .dedicated_session(&thread_id)?
         .filter(|session| {
             matches!(
                 session.state.as_str(),
-                "frozen" | "verifying" | "publish_ready" | "publishing" | "discarding" | "terminal"
+                "frozen"
+                    | "verifying"
+                    | "qualifying"
+                    | "publish_ready"
+                    | "publishing"
+                    | "discarding"
+                    | "terminal"
             ) && session.candidate_snapshot_hash.is_some()
         })
         .map(|session| session.workspace_id);
@@ -11592,6 +11972,7 @@ mod tests {
             spawns: 2,
             depth: 3,
             duration_seconds: 45,
+            aggregate: Default::default(),
             runtime: BTreeMap::from([
                 ("actions".to_string(), 4),
                 ("payload_bytes".to_string(), 8_192),
@@ -11615,6 +11996,7 @@ mod tests {
             spawns: 10,
             depth: 8,
             duration_seconds: 300,
+            aggregate: Default::default(),
             runtime: BTreeMap::from([
                 ("actions".to_string(), 12),
                 ("payload_bytes".to_string(), 65_536),

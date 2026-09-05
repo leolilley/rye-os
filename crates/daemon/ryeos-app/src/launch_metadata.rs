@@ -76,7 +76,7 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // remote adoption to the exact target-node operator grant generation.
 // Predecessor authority remains opaque history rather than being interpreted
 // as current launch authority.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 23;
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 24;
 
 /// Per-thread daemon-owned state directory.
 ///
@@ -460,6 +460,11 @@ pub struct ResumeContext {
     /// `ExecutionHints` from the original `PlanContext`. Carried
     /// verbatim so executor-specific flags survive resume.
     pub execution_hints: ExecutionHints,
+    /// Immutable daemon-authored scheduler coordinate. Required as an
+    /// explicit nullable field so persisted resume authority cannot silently
+    /// lose whether this chain belongs to a scheduled fire.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub scheduled_fire: Option<ryeos_engine::contracts::ScheduledFireContext>,
     /// Composed CHILD `effective_caps` captured at original spawn time. The
     /// reconciler re-mints a callback token for the resumed subprocess and
     /// the daemon enforces caps on every callback dispatch — this set is
@@ -561,6 +566,11 @@ impl ResumeContext {
     pub fn authoritative_project_identity(
         &self,
     ) -> anyhow::Result<(Option<PathBuf>, Option<String>)> {
+        if let Some(scheduled_fire) = &self.scheduled_fire {
+            scheduled_fire
+                .validate()
+                .context("validate resumed scheduled fire context")?;
+        }
         self.project_authority.validate()?;
         self.lifecycle_authority.validate()?;
         if let Some(identity) = &self.stable_project_identity {
@@ -1515,6 +1525,7 @@ mod tests {
             origin_site_id: "site:test".to_string(),
             requested_by: local_principal(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             effective_caps: Vec::new(),
             parent_delegation_caps: None,
             executor_ref: Some("native:test".to_string()),
@@ -1909,6 +1920,17 @@ mod tests {
             origin_site_id: "site:a".to_string(),
             requested_by: local_principal(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: Some(
+                ryeos_engine::contracts::ScheduledFireContext::new(
+                    "nightly.solve".to_owned(),
+                    "nightly.solve@1700000000000".to_owned(),
+                    1_700_000_000_000,
+                    1_700_000_000_100,
+                    "normal".to_owned(),
+                    "a".repeat(64),
+                )
+                .unwrap(),
+            ),
             effective_caps: vec!["ryeos.execute.tool.test".to_string()],
             parent_delegation_caps: None,
             executor_ref: Some("native:test-runtime".to_string()),
@@ -1921,10 +1943,23 @@ mod tests {
             serde_json::to_value(&m).unwrap(),
             serde_json::to_value(&back).unwrap()
         );
+        let mut missing_scheduled_fire = serde_json::to_value(&m).unwrap();
+        missing_scheduled_fire["resume_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scheduled_fire");
+        assert!(serde_json::from_value::<RuntimeLaunchMetadata>(missing_scheduled_fire).is_err());
         let back_ctx = back.resume_context.expect("resume_context");
         assert_eq!(back_ctx.kind, "tool_run");
         assert_eq!(back_ctx.item_ref, "ns/foo");
         assert_eq!(back_ctx.original_snapshot_hash.as_deref(), Some("abc123"));
+        assert_eq!(
+            back_ctx
+                .scheduled_fire
+                .as_ref()
+                .map(|fire| fire.fire_id.as_str()),
+            Some("nightly.solve@1700000000000")
+        );
         assert_eq!(
             back_ctx.original_pushed_head_ref,
             Some(OriginalPushedHeadRef {

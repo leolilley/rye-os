@@ -38,6 +38,12 @@ launch_contract:
     external_content:
       max_declarations: 8
       large_content_max_total_bytes: 4294967296
+  evidence_attachments:
+    max_attachments: 16
+    max_total_bytes: 536870912
+    target: session_worker
+    destination_prefix: evidence
+    allowed_access: [read_only]
   environment_contributions:
     max_contributions: 1
     max_targets_per_contribution: 1

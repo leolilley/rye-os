@@ -247,6 +247,7 @@ fn prepare_item_ref(
         current_site_id: state.threads.site_id().to_string(),
         origin_site_id: state.threads.site_id().to_string(),
         execution_hints: Default::default(),
+        scheduled_fire: None,
         validate_only: false,
     };
 

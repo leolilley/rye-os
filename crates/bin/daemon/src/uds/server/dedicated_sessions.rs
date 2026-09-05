@@ -7,13 +7,21 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use ryeos_app::callback_token::CallbackCapability;
+use ryeos_app::accounting_db::{
+    ExecutionResourceBudgetSnapshot, ExecutionResourceClaimOutcome, ExecutionResourceDimension,
+};
 use ryeos_app::runtime_db::{
-    NewDedicatedSession, WorkspaceBinding, WorkspaceRecord, WorkspaceState,
+    DedicatedCandidateDisposition, NewDedicatedSession, WorkspaceBinding, WorkspaceRecord,
+    WorkspaceState,
 };
 use ryeos_app::state::AppState;
 use ryeos_executor::execution::persistent_session::ExclusivePersistentSessionIdentity;
 use ryeos_runtime::authorizer::AuthorizationPolicy;
-use ryeos_runtime::callback::{DedicatedSessionCommandRequest, DedicatedSessionStartRequest};
+use ryeos_runtime::callback::{
+    DedicatedSessionBoundedBudgetDimension, DedicatedSessionBoundedOutcome,
+    DedicatedSessionCommandObservationRequest, DedicatedSessionCommandRequest,
+    DedicatedSessionStartRequest, HostedCommandCompletionFence,
+};
 
 const START_CAPABILITY: &str = "ryeos.runtime.dedicated_session.start";
 const COMMAND_CAPABILITY: &str = "ryeos.runtime.dedicated_session.command";
@@ -150,11 +158,114 @@ fn require_terminate_authority(state: &AppState, cap: &CallbackCapability) -> Re
         .map_err(|error| anyhow!(error.to_string()))
 }
 
+fn require_callback_root(operation: &str, requested: &str, callback_root: &str) -> Result<()> {
+    if requested != callback_root {
+        bail!("dedicated-session {operation} is restricted to the callback root");
+    }
+    Ok(())
+}
+
+fn execution_resource_budget(
+    state: &AppState,
+    cap: &CallbackCapability,
+) -> Result<Option<ExecutionResourceBudgetSnapshot>> {
+    let Some(scope) = cap.accounting_scope.as_ref() else {
+        return Ok(None);
+    };
+    let accounting = state
+        .accounting
+        .as_ref()
+        .ok_or_else(|| anyhow!("sealed accounting scope has no live accounting ledger"))?;
+    let budget = accounting
+        .execution_resource_budget_snapshot(&scope.execution_budget_id)?
+        .ok_or_else(|| anyhow!("sealed execution scope has no aggregate budget authority"))?;
+    Ok(Some(budget))
+}
+
+fn attach_execution_resource_budget(
+    value: impl serde::Serialize,
+    budget: Option<&ExecutionResourceBudgetSnapshot>,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(value)?;
+    if let Some(budget) = budget {
+        value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("dedicated-session projection is not an object"))?
+            .insert("execution_budget".to_owned(), serde_json::to_value(budget)?);
+    }
+    Ok(value)
+}
+
+fn attach_exact_pending_approval(
+    state: &AppState,
+    session: impl serde::Serialize,
+    placement_thread_id: &str,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(session)?;
+    if value
+        .get("candidate_disposition")
+        .and_then(Value::as_str)
+        != Some("retained_for_review")
+    {
+        return Ok(value);
+    }
+    if let Some(approval) =
+        ryeos_app::dedicated_session_service::exact_pending_approval(state, placement_thread_id)?
+    {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("dedicated-session projection is not an object"))?;
+        let exact = object.get("placement_thread_id").and_then(Value::as_str)
+            == Some(approval.placement_thread_id.as_str())
+            && object.get("chain_root_id").and_then(Value::as_str)
+                == Some(approval.chain_root_id.as_str())
+            && object.get("admitted_capsule_hash").and_then(Value::as_str)
+                == Some(approval.admitted_capsule_hash.as_str())
+            && object.get("worker_boot_epoch").and_then(Value::as_u64)
+                == Some(approval.worker_boot_epoch)
+            && object.get("current_turn_id").and_then(Value::as_str)
+                == Some(approval.turn_id.as_str());
+        if !exact {
+            bail!("pending approval changed across its session projection read");
+        }
+        object.insert("pending_approval".to_owned(), serde_json::to_value(approval)?);
+    }
+    Ok(value)
+}
+
+fn attach_session_start_authority(
+    state: &AppState,
+    session: impl serde::Serialize,
+    budget: Option<&ExecutionResourceBudgetSnapshot>,
+    placement_thread_id: &str,
+) -> Result<Value> {
+    let projection = attach_execution_resource_budget(session, budget)?;
+    attach_exact_pending_approval(state, projection, placement_thread_id)
+}
+
+fn bounded_budget_outcome(reason: &str) -> Result<DedicatedSessionBoundedOutcome> {
+    let dimension = match reason {
+        "aggregate_worker_executions_exhausted" => {
+            DedicatedSessionBoundedBudgetDimension::WorkerExecutions
+        }
+        "aggregate_provider_contacts_exhausted" => {
+            DedicatedSessionBoundedBudgetDimension::ProviderContacts
+        }
+        "aggregate_duration_exhausted" => DedicatedSessionBoundedBudgetDimension::Duration,
+        _ => bail!("aggregate worker refusal has an unknown budget reason"),
+    };
+    Ok(DedicatedSessionBoundedOutcome {
+        kind: ryeos_runtime::callback::DedicatedSessionBoundedOutcomeKind::BudgetExhausted,
+        dimension: Some(dimension),
+        approval: None,
+    })
+}
+
 fn admitted_session_capsule(
     state: &AppState,
     thread_id: &str,
     dependency_ref: &str,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let launch = state
         .state_store
         .admitted_launch_capsule(thread_id)?
@@ -169,6 +280,19 @@ fn admitted_session_capsule(
     let prepared: ryeos_executor::execution::launch_preparation::PreparedRuntimeLaunch =
         serde_json::from_value(prepared_runtime_launch)
             .context("decode retained runtime launch authority")?;
+    let mode = prepared
+        .runtime_data
+        .get("worker_execution")
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("worker execution has no admitted mode"))?;
+    let bounded_turn = match mode {
+        "session" => false,
+        "bounded_turn" => true,
+        _ => bail!("worker execution has an unknown admitted mode"),
+    };
     let mut matches = prepared
         .execution_dependencies
         .iter()
@@ -180,11 +304,12 @@ fn admitted_session_capsule(
     if matches.next().is_some() {
         bail!("requested dependency ref is ambiguous in the admitted launch");
     }
-    prepared
+    let capsule_hash = prepared
         .admitted_sessions
         .get(name)
         .cloned()
-        .ok_or_else(|| anyhow!("admitted dependency has no retained session capsule"))
+        .ok_or_else(|| anyhow!("admitted dependency has no retained session capsule"))?;
+    Ok((capsule_hash, bounded_turn))
 }
 
 fn require_structured_session_route_effect_contract(
@@ -409,7 +534,7 @@ pub(super) fn status(params: &Value, state: &AppState, cap: &CallbackCapability)
         .state_store
         .dedicated_session(&params.thread_id)?
         .ok_or_else(|| anyhow!("dedicated session is not admitted"))?;
-    Ok(serde_json::to_value(session)?)
+    attach_exact_pending_approval(state, session, &params.thread_id)
 }
 
 pub(super) async fn wait(
@@ -432,7 +557,7 @@ pub(super) async fn wait(
         std::time::Duration::from_millis(request.timeout_ms),
     )
     .await?;
-    Ok(serde_json::to_value(session)?)
+    attach_exact_pending_approval(state, session, &request.thread_id)
 }
 
 pub(super) async fn command(
@@ -454,6 +579,16 @@ pub(super) async fn command(
         "route" if session.state != "recovering" => {}
         _ => bail!("dedicated-session command kind contradicts its lifecycle state"),
     }
+    // The absolute beat deadline governs only a new worker contact. An exact
+    // idempotent coordinate must remain observable/replayable after expiry so
+    // recovery can settle or classify work that was already admitted.
+    if state
+        .state_store
+        .dedicated_session_command_by_key(&request.thread_id, &request.idempotency_key)?
+        .is_none()
+    {
+        super::enforce_aggregate_deadline(state, Some(cap))?;
+    }
     ryeos_app::dedicated_session_service::execute_command(
         state,
         &request.thread_id,
@@ -464,22 +599,71 @@ pub(super) async fn command(
     .await
 }
 
+pub(super) fn command_observation(
+    params: &Value,
+    state: &AppState,
+    cap: &CallbackCapability,
+) -> Result<Value> {
+    require_command_authority(state, cap)?;
+    let request: DedicatedSessionCommandObservationRequest =
+        serde_json::from_value(params.clone())?;
+    require_callback_root("command observation", &request.thread_id, &cap.thread_id)?;
+    if request.command_sequence == 0 {
+        bail!("dedicated-session command observation sequence must be positive");
+    }
+    ryeos_app::dedicated_session_service::command_observation(
+        state,
+        &request.thread_id,
+        request.command_sequence,
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DedicatedSessionTerminateParams {
+    thread_id: String,
+    reason: String,
+    #[serde(default)]
+    completion: Option<HostedCommandCompletionFence>,
+    #[serde(default)]
+    bounded_outcome: Option<DedicatedSessionBoundedOutcome>,
+}
+
+fn validate_runtime_termination(request: &DedicatedSessionTerminateParams) -> Result<()> {
+    match (
+        request.reason.as_str(),
+        request.completion.is_some(),
+        request.bounded_outcome.is_some(),
+    ) {
+        ("completed", true, false) | ("cancelled", false, _) => Ok(()),
+        ("completed", false, _) => {
+            bail!("completed dedicated-session termination requires an exact completion fence")
+        }
+        ("completed", true, true) => {
+            bail!("completed bounded outcome is derived from its completion fence")
+        }
+        ("cancelled", true, _) => {
+            bail!("cancelled dedicated-session termination cannot carry a completion fence")
+        }
+        _ => bail!("dedicated-session termination reason is not supported"),
+    }
+}
+
 pub(super) async fn terminate(
     params: &Value,
     state: &AppState,
     cap: &CallbackCapability,
 ) -> Result<Value> {
     require_terminate_authority(state, cap)?;
-    let request: ryeos_runtime::callback::DedicatedSessionTerminateRequest =
-        serde_json::from_value(params.clone())?;
-    if request.thread_id != cap.thread_id {
-        bail!("dedicated-session termination is restricted to the callback root");
-    }
-    ryeos_app::dedicated_session_service::terminate_session(
+    let request: DedicatedSessionTerminateParams = serde_json::from_value(params.clone())?;
+    require_callback_root("termination", &request.thread_id, &cap.thread_id)?;
+    validate_runtime_termination(&request)?;
+    ryeos_app::dedicated_session_service::terminate_session_with_bounded_outcome(
         state,
         &request.thread_id,
         &request.reason,
-        None,
+        request.completion.as_ref(),
+        request.bounded_outcome.as_ref(),
     )
     .await
 }
@@ -564,13 +748,47 @@ pub(super) async fn start(
     } else if request.required_terminal_publication != "any" {
         bail!("projectless worker execution requires any terminal publication");
     }
+    let candidate_disposition = match request.candidate_disposition.as_str() {
+        "owner_decision" => DedicatedCandidateDisposition::OwnerDecision,
+        "retained_for_review" if request.require_pinned_cow => {
+            DedicatedCandidateDisposition::RetainedForReview
+        }
+        _ => bail!("dedicated-session candidate disposition contradicts its project policy"),
+    };
+    let mut aggregate_budget = execution_resource_budget(state, cap)?;
+    let (capsule_hash, bounded_turn) =
+        admitted_session_capsule(state, &request.thread_id, &request.dependency_ref)?;
+    if bounded_turn
+        != (candidate_disposition == DedicatedCandidateDisposition::RetainedForReview)
+    {
+        bail!("dedicated-session candidate disposition contradicts its admitted worker mode");
+    }
+    if aggregate_budget
+        .as_ref()
+        .is_some_and(|budget| budget.max_provider_contacts.is_some())
+        && !bounded_turn
+    {
+        bail!(
+            "finite aggregate provider_contacts requires an admitted bounded-turn worker; \
+             interactive session commands have no mechanically provable provider-contact \
+             boundary"
+        );
+    }
     let recovering =
         if let Some(existing) = state.state_store.dedicated_session(&request.thread_id)? {
             if existing.credential_profile_id != request.credential_profile_id {
                 bail!("dedicated-session retry changed credential profile identity");
             }
-            if existing.state != "recovering" {
-                return Ok(serde_json::to_value(existing)?);
+            if existing.candidate_disposition != candidate_disposition {
+                bail!("dedicated-session retry changed candidate disposition");
+            }
+            if existing.bounded_outcome.is_some() || existing.state != "recovering" {
+                return attach_session_start_authority(
+                    state,
+                    existing,
+                    aggregate_budget.as_ref(),
+                    &request.thread_id,
+                );
             }
             true
         } else {
@@ -606,6 +824,50 @@ pub(super) async fn start(
     }
     if profile.owner_principal != owner {
         bail!("credential profile is not owned by the session principal");
+    }
+    require_structured_session_route_effect_contract(
+        state,
+        &capsule_hash,
+        &request.route_set,
+        &request.allowed_effect_classes,
+        request.recover_upstream_session,
+    )?;
+    if !recovering {
+        if let (Some(scope), Some(accounting)) =
+            (cap.accounting_scope.as_ref(), state.accounting.as_ref())
+        {
+            let request_digest = ryeos_state::objects::canonical_value_digest(&json!({
+                "schema":1,
+                "kind":"dedicated_worker_execution",
+                "request":&request,
+                "admitted_session_capsule_hash":&capsule_hash,
+                "credential_generation":profile.credential_generation,
+            }))?;
+            match accounting.claim_execution_resource(
+                &scope.execution_budget_id,
+                ExecutionResourceDimension::WorkerExecution,
+                &request.thread_id,
+                &request_digest,
+                lillux::time::timestamp_millis(),
+            )? {
+                ExecutionResourceClaimOutcome::Admitted { .. } => {}
+                ExecutionResourceClaimOutcome::ReleasedUncontacted { .. } => {
+                    bail!("worker-execution claim cannot be in a released state")
+                }
+                ExecutionResourceClaimOutcome::Denied { reason, .. } => {
+                    aggregate_budget = execution_resource_budget(state, cap)?;
+                    let refused = json!({
+                        "state":"budget_exhausted",
+                        "budget_reason":reason,
+                        "bounded_outcome":bounded_budget_outcome(&reason)?,
+                    });
+                    return attach_execution_resource_budget(
+                        refused,
+                        aggregate_budget.as_ref(),
+                    );
+                }
+            }
+        }
     }
     ryeos_app::private_artifact_home::require_within_default_limit(
         &state.config.runtime_state_dir(),
@@ -653,15 +915,6 @@ pub(super) async fn start(
     if !workspace_path.is_absolute() {
         bail!("dedicated-session workspace path is not absolute");
     }
-    let capsule_hash =
-        admitted_session_capsule(state, &request.thread_id, &request.dependency_ref)?;
-    require_structured_session_route_effect_contract(
-        state,
-        &capsule_hash,
-        &request.route_set,
-        &request.allowed_effect_classes,
-        request.recover_upstream_session,
-    )?;
     let worker_instance_id = ryeos_app::thread_lifecycle::new_thread_id();
     let credential_generation = profile.credential_generation;
     if recovering {
@@ -773,6 +1026,7 @@ pub(super) async fn start(
                     admitted_capsule_hash: &capsule_hash,
                     workspace_id: &workspace.workspace_id,
                     candidate_required: request.require_pinned_cow,
+                    candidate_disposition: candidate_disposition.clone(),
                     credential_profile_id: &request.credential_profile_id,
                     credential_generation,
                     credential_lock_owner: &worker_instance_id,
@@ -792,6 +1046,7 @@ pub(super) async fn start(
                     admitted_capsule_hash: &capsule_hash,
                     workspace_id: &workspace.workspace_id,
                     candidate_required: request.require_pinned_cow,
+                    candidate_disposition: candidate_disposition.clone(),
                     credential_profile_id: &request.credential_profile_id,
                     credential_generation,
                     credential_lock_owner: &worker_instance_id,
@@ -809,6 +1064,7 @@ pub(super) async fn start(
                 admitted_capsule_hash: &capsule_hash,
                 workspace_id: &workspace.workspace_id,
                 candidate_required: request.require_pinned_cow,
+                candidate_disposition,
                 credential_profile_id: &request.credential_profile_id,
                 credential_generation,
                 credential_lock_owner: &worker_instance_id,
@@ -926,12 +1182,21 @@ pub(super) async fn start(
         .state_store
         .dedicated_session(&request.thread_id)?
         .ok_or_else(|| anyhow!("started dedicated session disappeared"))?;
-    Ok(serde_json::to_value(session)?)
+    aggregate_budget = execution_resource_budget(state, cap)?;
+    attach_session_start_authority(
+        state,
+        session,
+        aggregate_budget.as_ref(),
+        &request.thread_id,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_worker_failure_reason, validate_structured_session_route_effect_contract};
+    use super::{
+        DedicatedSessionTerminateParams, bounded_worker_failure_reason, require_callback_root,
+        validate_runtime_termination, validate_structured_session_route_effect_contract,
+    };
 
     fn structured_contract() -> serde_json::Value {
         serde_json::json!({
@@ -958,6 +1223,58 @@ mod tests {
         assert_eq!(reason.trim(), reason);
         assert!(!reason.chars().any(char::is_control));
         assert!(reason.starts_with("worker failed: first line "));
+    }
+
+    #[test]
+    fn completion_fenced_termination_wire_is_exact_and_closed() {
+        let wire = serde_json::json!({
+            "thread_id":"T-worker",
+            "reason":"completed",
+            "completion":{
+                "placement_thread_id":"T-worker",
+                "admitted_capsule_hash":"a".repeat(64),
+                "worker_boot_epoch":3,
+                "command_sequence":2,
+                "request_digest":"b".repeat(64),
+                "turn_id":"turn-7",
+                "completion_operation_id":"c".repeat(64),
+            }
+        });
+        let parsed: DedicatedSessionTerminateParams = serde_json::from_value(wire.clone()).unwrap();
+        validate_runtime_termination(&parsed).unwrap();
+        let completion = parsed.completion.expect("completion fence");
+        assert_eq!(completion.placement_thread_id, "T-worker");
+        assert_eq!(completion.command_sequence, 2);
+
+        let mut unknown = wire;
+        unknown["completion"]["latest_turn"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<DedicatedSessionTerminateParams>(unknown).is_err());
+
+        let cancelled: DedicatedSessionTerminateParams = serde_json::from_value(
+            serde_json::json!({"thread_id":"T-worker", "reason":"cancelled"}),
+        )
+        .unwrap();
+        validate_runtime_termination(&cancelled).unwrap();
+        assert!(cancelled.completion.is_none());
+
+        let unfenced_completed: DedicatedSessionTerminateParams = serde_json::from_value(
+            serde_json::json!({"thread_id":"T-worker", "reason":"completed"}),
+        )
+        .unwrap();
+        assert!(validate_runtime_termination(&unfenced_completed).is_err());
+    }
+
+    #[test]
+    fn exact_command_observation_and_termination_reject_other_callback_roots() {
+        for operation in ["command observation", "termination"] {
+            require_callback_root(operation, "T-worker", "T-worker").unwrap();
+            let error = require_callback_root(operation, "T-other", "T-worker").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("restricted to the callback root")
+            );
+        }
     }
 
     #[test]

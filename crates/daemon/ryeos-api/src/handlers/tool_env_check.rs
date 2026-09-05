@@ -115,6 +115,7 @@ pub async fn handle(
         current_site_id: site_id.clone(),
         origin_site_id: ctx.execution_origin(&site_id),
         execution_hints: Default::default(),
+        scheduled_fire: None,
         validate_only: true,
     };
 

@@ -116,6 +116,7 @@ pub async fn handle(
         current_site_id: site_id.clone(),
         origin_site_id,
         execution_hints: Default::default(),
+        scheduled_fire: None,
         validate_only,
     };
     let exec_ctx = ryeos_executor::executor::ExecutionContext {

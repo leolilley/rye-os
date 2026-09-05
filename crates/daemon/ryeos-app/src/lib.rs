@@ -64,6 +64,7 @@ pub mod runtime_db;
 pub mod runtime_item_author_service;
 pub mod runtime_project_snapshot_service;
 pub mod runtime_vault_service;
+pub mod scheduled_execution_authority;
 pub mod service_registry;
 pub mod source_closure_admission;
 pub mod standalone_audit;

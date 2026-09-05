@@ -1108,7 +1108,15 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
     );
     plan_env.insert("RYEOS_ITEM_KIND".to_owned(), resolved.kind.clone());
     plan_env.insert("RYEOS_ITEM_REF".to_owned(), canonical_ref.clone());
-    if let Some(ref root) = resolved.materialized_project_root {
+    let execution_project_root = match &ctx.project_context {
+        crate::contracts::ProjectContext::LocalPath { path } => Some(path),
+        crate::contracts::ProjectContext::None
+        | crate::contracts::ProjectContext::SnapshotHash { .. }
+        | crate::contracts::ProjectContext::ProjectRef { .. } => {
+            resolved.materialized_project_root.as_ref()
+        }
+    };
+    if let Some(root) = execution_project_root {
         plan_env.insert(
             "RYEOS_PROJECT_ROOT".to_owned(),
             root.to_string_lossy().to_string(),
@@ -1118,6 +1126,11 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
     plan_env.insert(
         "RYEOS_ORIGIN_SITE_ID".to_owned(),
         ctx.origin_site_id.clone(),
+    );
+    plan_env.insert(
+        "RYEOS_EXECUTION_CONTEXT".to_owned(),
+        crate::scheduled_fire_context::execution_context_value(ctx.scheduled_fire.as_ref())
+            .to_string(),
     );
 
     // Step 4: Compile intermediates into SubprocessSpec via the
@@ -1581,6 +1594,7 @@ metadata:
             current_site_id: "site:test".into(),
             origin_site_id: "site:test".into(),
             execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
             validate_only: false,
         }
     }
@@ -1666,7 +1680,18 @@ config:
             Some(project_dir.clone()),
         );
 
-        let ctx = test_plan_context(Some(project_dir.clone()));
+        let mut ctx = test_plan_context(Some(project_dir.clone()));
+        ctx.scheduled_fire = Some(
+            crate::contracts::ScheduledFireContext::new(
+                "campaign.nightly".to_owned(),
+                "campaign.nightly@1700000000000".to_owned(),
+                1_700_000_000_000,
+                1_700_000_000_123,
+                "normal".to_owned(),
+                "a".repeat(64),
+            )
+            .unwrap(),
+        );
         let roots = ResolutionRoots::from_flat(Some(project_dir.join(AI_DIR)), vec![]);
 
         let plan = build_plan(BuildPlanInput {
@@ -1693,6 +1718,23 @@ config:
             plan.executor_chain
                 .iter()
                 .any(|id| id.contains("subprocess"))
+        );
+        let PlanNode::DispatchSubprocess { spec, .. } = &plan.nodes[0] else {
+            panic!("tool plan entrypoint must be a subprocess");
+        };
+        let execution_context: serde_json::Value = serde_json::from_str(
+            spec.env
+                .get("RYEOS_EXECUTION_CONTEXT")
+                .expect("engine plan execution context"),
+        )
+        .unwrap();
+        assert_eq!(
+            execution_context["schedule"]["fire_id"],
+            "campaign.nightly@1700000000000"
+        );
+        assert_eq!(
+            spec.env_sources.get("RYEOS_EXECUTION_CONTEXT"),
+            Some(&crate::contracts::RuntimeEnvSource::EnginePlan)
         );
     }
 

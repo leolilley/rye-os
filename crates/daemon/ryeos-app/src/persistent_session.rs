@@ -315,10 +315,7 @@ impl SessionProcess {
         {
             bail!("persistent-session reader failed: {reason}");
         }
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut writer = lock_writer_before_deadline(&self.writer, deadline)?;
         write_frame(&mut writer, wire, frame, deadline)
     }
 
@@ -1022,7 +1019,24 @@ impl PersistentSessionPool {
         session_id: &str,
         request_body: Value,
         cancelled: C,
+        on_delta: D,
+    ) -> Result<Value>
+    where
+        C: Fn() -> bool,
+        D: FnMut(Value) -> Result<()>,
+    {
+        self.execute_exclusive_with_deadline(session_id, request_body, cancelled, on_delta, None)
+    }
+
+    /// Apply an already-admitted absolute deadline to the ordinary request
+    /// I/O deadline, including time waiting for the shared writer.
+    pub fn execute_exclusive_with_deadline<C, D>(
+        &self,
+        session_id: &str,
+        request_body: Value,
+        cancelled: C,
         mut on_delta: D,
+        absolute_deadline: Option<Instant>,
     ) -> Result<Value>
     where
         C: Fn() -> bool,
@@ -1044,7 +1058,7 @@ impl PersistentSessionPool {
             (Arc::clone(&entry.process), entry.contract.clone())
         };
         let deadline =
-            Instant::now() + Duration::from_millis(contract.lifecycle.request_timeout_ms);
+            exclusive_request_deadline(contract.lifecycle.request_timeout_ms, absolute_deadline);
         let result = execute_on_process(
             &process,
             &contract.wire,
@@ -1092,6 +1106,15 @@ impl PersistentSessionPool {
         session_id: &str,
         control_body: Value,
     ) -> Result<Value> {
+        self.execute_exclusive_control_with_deadline(session_id, control_body, None)
+    }
+
+    pub fn execute_exclusive_control_with_deadline(
+        &self,
+        session_id: &str,
+        control_body: Value,
+        absolute_deadline: Option<Instant>,
+    ) -> Result<Value> {
         self.ensure_admission_open()?;
         validate_exclusive_session_id(session_id)?;
         let (process, contract) = {
@@ -1108,7 +1131,7 @@ impl PersistentSessionPool {
             (Arc::clone(&entry.process), entry.contract.clone())
         };
         let deadline =
-            Instant::now() + Duration::from_millis(contract.lifecycle.request_timeout_ms);
+            exclusive_request_deadline(contract.lifecycle.request_timeout_ms, absolute_deadline);
         let result = execute_on_process(
             &process,
             &contract.wire,
@@ -2740,6 +2763,30 @@ fn require_frame_identity(
     Ok(())
 }
 
+fn exclusive_request_deadline(
+    request_timeout_ms: u64,
+    absolute_deadline: Option<Instant>,
+) -> Instant {
+    let signed_deadline = Instant::now() + Duration::from_millis(request_timeout_ms);
+    absolute_deadline.map_or(signed_deadline, |absolute| signed_deadline.min(absolute))
+}
+
+fn lock_writer_before_deadline(
+    writer: &Mutex<UnixStream>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'_, UnixStream>> {
+    loop {
+        if Instant::now() >= deadline {
+            bail!("persistent-session frame deadline expired while waiting for its writer");
+        }
+        match writer.try_lock() {
+            Ok(writer) => return Ok(writer),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => sleep_until_io_retry(deadline),
+        }
+    }
+}
+
 fn write_frame(
     stream: &mut UnixStream,
     wire: &PersistentSessionWireContract,
@@ -2749,6 +2796,12 @@ fn write_frame(
     let encoded = encode_frame(wire, frame)?;
     let mut written = 0;
     while written < encoded.len() {
+        // The writer lock or a previous partial write may consume the entire
+        // remaining budget. Never initiate another write syscall after expiry,
+        // even if the descriptor is immediately writable at that point.
+        if Instant::now() >= deadline {
+            bail!("persistent-session frame write exceeded its deadline");
+        }
         // Use the descriptor operation directly. This protocol is admitted as
         // an inherited byte-stream FD; it does not require socket-specific
         // send authority, which may be deliberately absent in a sandbox.
@@ -3110,6 +3163,58 @@ fn spawn_idle_reaper(inner: Weak<PoolInner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_contact_deadline_caps_existing_signed_io_deadline() {
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert_eq!(exclusive_request_deadline(60_000, Some(expired)), expired);
+        let distant = Instant::now() + Duration::from_secs(60);
+        assert!(exclusive_request_deadline(100, Some(distant)) < distant);
+        let before = Instant::now();
+        let interactive = exclusive_request_deadline(100, None);
+        let after = Instant::now();
+        assert!(interactive >= before + Duration::from_millis(100));
+        assert!(interactive <= after + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn expired_contact_deadline_prevents_request_and_control_frame_writes() {
+        let wire = test_wire();
+        for kind in [
+            PersistentSessionFrameKind::Request,
+            PersistentSessionFrameKind::Control,
+        ] {
+            let (mut writer, mut peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let frame = PersistentSessionFrame {
+                protocol: wire.wire_protocol.clone(),
+                version: wire.wire_version,
+                kind,
+                request_id: Some("expired-request".into()),
+                body: Some(serde_json::json!({"kind":"fixture"})),
+            };
+            assert!(write_frame(&mut writer, &wire, &frame, Instant::now()).is_err());
+            let error = peer.read(&mut [0_u8; 1]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn writer_contention_cannot_outlive_the_contact_deadline() {
+        let (writer, _peer) = UnixStream::pair().unwrap();
+        let writer = Mutex::new(writer);
+        let held = writer.lock().unwrap();
+        // A same-thread holder makes an unconditional lock deadlock. The
+        // bounded acquisition must return without needing that lock released.
+        assert!(
+            lock_writer_before_deadline(&writer, Instant::now() + Duration::from_millis(1),)
+                .is_err()
+        );
+        drop(held);
+        assert!(
+            lock_writer_before_deadline(&writer, Instant::now() + Duration::from_secs(1),).is_ok()
+        );
+    }
 
     #[test]
     fn bounded_stream_error_retains_the_terminal_exception() {

@@ -931,7 +931,8 @@ pub async fn execute_service_verified(
                     &task_scopes,
                     &task_current_site_id,
                     &task_origin_site_id,
-                )?;
+                )?
+                .with_recorded_service_root_id(task_invocation_id.clone())?;
                 let handler = task_state
                     .services
                     .get(&task_endpoint)

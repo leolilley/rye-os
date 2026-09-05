@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use anyhow::Context as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -508,6 +509,13 @@ impl Walker {
                 .get("hard_limits")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            params
+                .get("scheduled_fire")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("decode scheduled fire execution context")?,
         );
         let execution_context = exec_ctx.as_context_value();
 

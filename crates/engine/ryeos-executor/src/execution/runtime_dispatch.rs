@@ -134,6 +134,11 @@ fn callback_execution_context(
     if current_site_id != state.threads.site_id() {
         anyhow::bail!("callback caller current site differs from the serving node");
     }
+    let scheduled_fire = state
+        .state_store
+        .get_launch_metadata(&params.thread_id)?
+        .and_then(|metadata| metadata.resume_context)
+        .and_then(|resume| resume.scheduled_fire);
     let plan_ctx = PlanContext {
         requested_by: EffectivePrincipal::Local(ryeos_engine::contracts::Principal {
             fingerprint: thread_auth.acting_principal.clone(),
@@ -144,6 +149,7 @@ fn callback_execution_context(
         current_site_id: current_site_id.to_string(),
         origin_site_id: origin_site_id.to_string(),
         execution_hints: Default::default(),
+        scheduled_fire,
         validate_only: false,
     };
     let handler_context = thread_auth.narrowed_handler_context(
@@ -193,7 +199,7 @@ fn prepare_callback_dispatch(
         &context.plan_ctx,
         child_provenance,
     )?;
-    let preflight = crate::dispatch::preflight_root_dispatch(
+    let preflight = crate::dispatch::preflight_root_dispatch_for_provenance(
         &params.action.item_id,
         root.kind.as_str(),
         &params.action.params,
@@ -202,6 +208,7 @@ fn prepare_callback_dispatch(
         None,
         &project_binding,
         &context,
+        child_provenance,
         state,
         None,
     )

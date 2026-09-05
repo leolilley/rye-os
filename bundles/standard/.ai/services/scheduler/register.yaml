@@ -16,5 +16,7 @@ schema:
   overlap_policy: string
   lateness_grace_secs: integer
   enabled: boolean
+  capabilities: array
   project_root: string?
+  execution_policy: object
 description: "Create or update a schedule spec"

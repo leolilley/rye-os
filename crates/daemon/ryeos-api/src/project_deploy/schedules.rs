@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use ryeos_app::node_document;
 use ryeos_scheduler::types::ScheduleSpecRecord;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ProjectDeployContext;
@@ -69,7 +69,7 @@ struct ScheduleDeclarationFile {
     schedules: Vec<ScheduleDeclaration>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScheduleDeclaration {
     schedule_id: String,
@@ -82,9 +82,11 @@ struct ScheduleDeclaration {
     overlap_policy: String,
     lateness_grace_secs: i64,
     enabled: bool,
+    capabilities: Vec<String>,
     #[serde(default)]
     project_root: Option<String>,
     params: Value,
+    execution_policy: ryeos_engine::execution_contract::ExecutionPolicy,
 }
 
 #[cfg(test)]
@@ -158,7 +160,7 @@ pub fn plan(ctx: &ProjectDeployContext<'_>) -> Result<ScheduleDeployPlan> {
                 require_project_reconcile_schedule_owner(
                     ctx.caller,
                     schedule_id,
-                    &existing.requester_fingerprint,
+                    existing.execution.principal_id(),
                 )?;
                 actions.push(ScheduleAction::Update {
                     desired: desired_schedule.clone(),
@@ -193,7 +195,7 @@ pub fn plan(ctx: &ProjectDeployContext<'_>) -> Result<ScheduleDeployPlan> {
         require_project_reconcile_schedule_owner(
             ctx.caller,
             schedule_id,
-            &existing.requester_fingerprint,
+            existing.execution.principal_id(),
         )?;
         actions.push(ScheduleAction::DeleteMissing {
             schedule_id: schedule_id.clone(),
@@ -294,8 +296,6 @@ pub fn prepare_commit(
                         desired,
                         ctx,
                         lillux::time::timestamp_millis(),
-                        &ctx.caller.fingerprint,
-                        &ctx.caller.scopes,
                     )?;
                     tx.touch(desired.declaration.schedule_id.clone());
                     report.created += 1;
@@ -306,14 +306,7 @@ pub fn prepare_commit(
                     adopt_manual: _,
                 } => {
                     tx.backup(ctx, &desired.declaration.schedule_id)?;
-                    write_reconciled_schedule(
-                        &tx.directory,
-                        desired,
-                        ctx,
-                        existing.registered_at,
-                        &existing.requester_fingerprint,
-                        &existing.capabilities,
-                    )?;
+                    write_reconciled_schedule(&tx.directory, desired, ctx, existing.registered_at)?;
                     tx.touch(desired.declaration.schedule_id.clone());
                     report.updated += 1;
                 }
@@ -444,7 +437,7 @@ fn revalidate_action(
                 })?;
             if current.spec_hash != existing.spec_hash
                 || current.registered_at != existing.registered_at
-                || current.requester_fingerprint != existing.requester_fingerprint
+                || current.execution.principal_id() != existing.execution.principal_id()
             {
                 anyhow::bail!(
                     "schedule_id '{}' changed during project deploy; retry project sync",
@@ -494,7 +487,7 @@ fn revalidate_action(
                     require_project_reconcile_schedule_owner(
                         ctx.caller,
                         schedule_id,
-                        &current.requester_fingerprint,
+                        current.execution.principal_id(),
                     )?;
                 }
                 None => {
@@ -521,7 +514,7 @@ fn revalidate_action(
                 })?;
             if current.spec_hash != existing.spec_hash
                 || current.registered_at != existing.registered_at
-                || current.requester_fingerprint != existing.requester_fingerprint
+                || current.execution.principal_id() != existing.execution.principal_id()
             {
                 anyhow::bail!(
                     "schedule_id '{}' changed during project deploy; refusing delete",
@@ -570,7 +563,7 @@ fn revalidate_action(
             require_project_reconcile_schedule_owner(
                 ctx.caller,
                 schedule_id,
-                &current.requester_fingerprint,
+                current.execution.principal_id(),
             )?;
         }
     }
@@ -750,6 +743,36 @@ fn validate_schedule_declaration(
             schedule.schedule_id
         );
     }
+    if schedule.capabilities.is_empty()
+        || schedule
+            .capabilities
+            .iter()
+            .any(|capability| capability.trim().is_empty())
+        || schedule
+            .capabilities
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        anyhow::bail!(
+            "capabilities must be non-empty, sorted, and unique for schedule '{}'",
+            schedule.schedule_id
+        );
+    }
+    schedule.execution_policy.validate().with_context(|| {
+        format!(
+            "invalid execution_policy for schedule '{}'",
+            schedule.schedule_id
+        )
+    })?;
+    if matches!(
+        &schedule.execution_policy.project,
+        ryeos_engine::execution_contract::ProjectExecutionPolicy::Projectless
+    ) {
+        anyhow::bail!(
+            "project-managed schedule '{}' must use a project-backed execution policy; register projectless work directly with the scheduler service",
+            schedule.schedule_id
+        );
+    }
     if let Some(ref project_root) = schedule.project_root {
         let declared = Path::new(project_root);
         if !declared.is_absolute() {
@@ -902,10 +925,8 @@ fn write_reconciled_schedule(
     desired: &DesiredSchedule,
     ctx: &ProjectDeployContext<'_>,
     registered_at: i64,
-    requester_fingerprint: &str,
-    capabilities: &[String],
 ) -> Result<()> {
-    if requester_fingerprint.is_empty() || capabilities.is_empty() {
+    if ctx.caller.fingerprint.is_empty() || desired.declaration.capabilities.is_empty() {
         anyhow::bail!(
             "project schedule '{}' cannot be reconciled without execution requester and capabilities",
             desired.declaration.schedule_id
@@ -914,8 +935,36 @@ fn write_reconciled_schedule(
 
     let schedule = &desired.declaration;
     let canonical_project_path = project_path_identity(ctx.project_path)?.to_owned();
+    let capabilities = desired.declaration.capabilities.clone();
+    let authorizer = ryeos_runtime::authorizer::Authorizer::new();
+    for capability in &capabilities {
+        authorizer
+            .authorize(
+                &ctx.caller.scopes,
+                &ryeos_runtime::authorizer::AuthorizationPolicy::require(capability),
+            )
+            .map_err(|_| anyhow!(
+                "project schedule '{}' capability {:?} is not covered by the authenticated deployment grant",
+                schedule.schedule_id,
+                capability,
+            ))?;
+    }
+    let registration_request_hash =
+        ryeos_state::objects::canonical_value_digest(&serde_json::json!({
+            "operation": "project_schedule_registration",
+            "project_key": ctx.project_key,
+            "project_snapshot_hash": ctx.snapshot_hash,
+            "source_path": desired.source_path,
+            "source_body_hash": desired.source_body_hash,
+            "schedule": schedule,
+        }))?;
+    let authority = crate::handlers::scheduler_register::authenticated_schedule_authority(
+        ctx.caller,
+        ctx.state,
+        registration_request_hash,
+    )?;
     let body = serde_json::json!({
-        "spec_version": 1,
+        "spec_version": 2,
         "schedule_id": schedule.schedule_id,
         "item_ref": schedule.item_ref,
         "ref_bindings": schedule.ref_bindings,
@@ -930,8 +979,9 @@ fn write_reconciled_schedule(
         "params": schedule.params,
         "project_root": canonical_project_path,
         "execution": {
-            "requester_fingerprint": requester_fingerprint,
+            "authority": authority,
             "capabilities": capabilities,
+            "policy": schedule.execution_policy,
         },
         "managed_by": {
             "type": MANAGED_BY_TYPE,

@@ -1,0 +1,7 @@
+category: worker-executions
+name: start-candidate-evaluation
+kind: service
+endpoint: worker-executions.start-candidate-evaluation
+required_caps: ["ryeos.execute.service.worker-executions/start-candidate-evaluation"]
+schema: {chain_root_id: string, candidate_snapshot_hash: string, candidate_validation_hash: string, evaluator_item_ref: string, evaluator_parameters: object?, evaluator_ref_bindings: object?, integration: object?, launch_id: string}
+description: Launch an evaluator resolved from the exact immutable base against one exact retained candidate view without publication authority.

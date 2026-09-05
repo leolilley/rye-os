@@ -5,8 +5,9 @@ tokens:
 description: >-
   Create or update a schedule spec. The input object must explicitly provide
   schedule_id, item_ref, ref_bindings, schedule_type, expression, params, timezone,
-  misfire_policy, overlap_policy, lateness_grace_secs, and enabled;
-  project_root is optional.
+  misfire_policy, overlap_policy, lateness_grace_secs, enabled, capabilities, and
+  execution_policy;
+  execution_policy is required and project_root is optional only for projectless execution.
 arguments:
 - name: params
   kind: json

@@ -14,6 +14,7 @@ use crate::canonical_ref::CanonicalRef;
 
 mod execution_plan;
 mod runtime_decorations;
+pub use crate::scheduled_fire_context::ScheduledFireContext;
 pub use execution_plan::{
     EngineContext, ExecutionPlan, MaterializationRequirement, PlanArgument,
     PlanBundleExecutorIdentity, PlanCapabilities, PlanContext, PlanNode, PlanNodeId,

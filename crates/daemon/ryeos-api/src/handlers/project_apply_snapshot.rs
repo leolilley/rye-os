@@ -1296,6 +1296,25 @@ schedules:
     overlap_policy: skip
     lateness_grace_secs: 60
     enabled: true
+    capabilities:
+      - ryeos.execute.graph.snap-track/discover_feed_scrape
+    execution_policy:
+      schema_version: 2
+      ownership: daemon_owned
+      recovery: restart_recoverable
+      response: accepted
+      target:
+        kind: here
+      environment:
+        kind: project_overlay
+        include_operator_vault: false
+        name_policy:
+          kind: declared_required
+      project:
+        kind: live_direct
+        access: read_write
+        child_policy:
+          kind: inherit
     project_root: {}
     params:
       country: US
@@ -1336,6 +1355,25 @@ schedules:
     overlap_policy: skip
     lateness_grace_secs: 60
     enabled: true
+    capabilities:
+      - ryeos.execute.graph.snap-track/discover_feed_scrape
+    execution_policy:
+      schema_version: 2
+      ownership: daemon_owned
+      recovery: restart_recoverable
+      response: accepted
+      target:
+        kind: here
+      environment:
+        kind: project_overlay
+        include_operator_vault: false
+        name_policy:
+          kind: declared_required
+      project:
+        kind: live_direct
+        access: read_write
+        child_policy:
+          kind: inherit
     params: {}
 "#,
             )
@@ -1405,6 +1443,25 @@ schedules:
     overlap_policy: skip
     lateness_grace_secs: 60
     enabled: true
+    capabilities:
+      - ryeos.execute.graph.snap-track/discover_feed_scrape
+    execution_policy:
+      schema_version: 2
+      ownership: daemon_owned
+      recovery: restart_recoverable
+      response: accepted
+      target:
+        kind: here
+      environment:
+        kind: project_overlay
+        include_operator_vault: false
+        name_policy:
+          kind: declared_required
+      project:
+        kind: live_direct
+        access: read_write
+        child_policy:
+          kind: inherit
     params: {{}}
     project_root: {}
 "#,
@@ -1419,5 +1476,53 @@ schedules:
         )
         .expect_err("foreign project root must fail preflight");
         assert!(format!("{err:#}").contains("cannot target another project"));
+    }
+
+    #[test]
+    fn preflight_schedule_declarations_rejects_projectless_execution() {
+        let project = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let schedules = staging.path().join(".ai/config/schedules");
+        std::fs::create_dir_all(&schedules).unwrap();
+        std::fs::write(
+            schedules.join("projectless.yaml"),
+            r#"category: schedules
+version: 1.0.0
+schema_version: 1.0.0
+schedules:
+  - schedule_id: projectless-from-project
+    item_ref: service:operator/task
+    ref_bindings: {}
+    schedule_type: cron
+    expression: "0 */15 * * * *"
+    timezone: UTC
+    misfire_policy: skip
+    overlap_policy: skip
+    lateness_grace_secs: 60
+    enabled: true
+    capabilities:
+      - ryeos.execute.service.operator/task
+    execution_policy:
+      schema_version: 2
+      ownership: daemon_owned
+      recovery: restart_recoverable
+      response: accepted
+      target:
+        kind: here
+      environment:
+        kind: none
+      project:
+        kind: projectless
+    params: {}
+"#,
+        )
+        .unwrap();
+
+        let err = crate::project_deploy::schedules::validate_declarations_for_test(
+            staging.path(),
+            project.path(),
+        )
+        .expect_err("project-managed schedules must retain project authority");
+        assert!(format!("{err:#}").contains("must use a project-backed execution policy"));
     }
 }

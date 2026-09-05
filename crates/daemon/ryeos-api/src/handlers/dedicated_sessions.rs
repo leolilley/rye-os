@@ -1,6 +1,6 @@
 //! Meaning-blind owner-authorized access to one attached exclusive session.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 use crate::handler_context::HandlerContext;
 use crate::handler_error::HandlerError;
 use crate::registry::ServiceDescriptor;
+use ryeos_app::dedicated_session_service::{
+    CandidatePublicationAuthority, candidate_publication_operation_id,
+    candidate_publication_reservation_payload, candidate_publication_result_payload,
+    verify_candidate_publication_reservation, verify_candidate_publication_result,
+};
 use ryeos_app::persistent_session::ExclusiveRetirementOutcome;
 use ryeos_app::state::AppState;
 use ryeos_app::worker_handoff::WORKER_SESSION_HANDOFF_PEER_CALL_TIMEOUT;
@@ -49,6 +54,29 @@ fn approval_delivery_lock(placement_thread_id: &str) -> Arc<tokio::sync::Mutex<(
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     locks.insert(placement_thread_id.to_owned(), Arc::downgrade(&lock));
     lock
+}
+
+struct CandidateEvaluationLaunchGuard {
+    state: AppState,
+    reserved_thread_id: String,
+    armed: bool,
+}
+
+impl Drop for CandidateEvaluationLaunchGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self
+                .state
+                .state_store
+                .settle_launch_planning_admission_exit(&self.reserved_thread_id)
+        {
+            tracing::error!(
+                thread_id = %self.reserved_thread_id,
+                error = %error,
+                "failed to settle candidate-evaluator launch admission"
+            );
+        }
+    }
 }
 
 fn exact_reaped_source_worker_authority(
@@ -128,68 +156,6 @@ fn find_authoritative_approval_delivery_settlement(
         .map(str::to_owned)
         .map(Some)
         .ok_or_else(|| internal("approval settlement fact has no valid delivery digest"))
-}
-
-fn has_authoritative_candidate_publication_reservation(
-    state: &AppState,
-    session: &ryeos_app::state_store::DedicatedSessionRecord,
-    operation_id: &str,
-    candidate: &str,
-    expected_previous_hash: &str,
-    validation: &str,
-    principal_key: &str,
-    project_hash: &str,
-) -> Result<bool, HandlerError> {
-    let fact = ryeos_app::authoritative_root_fact::lookup(
-        state,
-        &session.placement_thread_id,
-        "hosted_candidate.publication_reserved",
-        operation_id,
-    )
-    .map_err(internal)?;
-    if fact.count > 1 {
-        return Err(internal(
-            "candidate publication reservation is duplicated in the root chain",
-        ));
-    }
-    let Some(payload) = fact.payload else {
-        return if fact.count == 0 {
-            Ok(false)
-        } else {
-            Err(internal(
-                "candidate publication testimony exceeds the bounded replay cache payload",
-            ))
-        };
-    };
-    let exact = payload.get("schema").and_then(Value::as_u64) == Some(1)
-        && payload.get("operation_id").and_then(Value::as_str) == Some(operation_id)
-        && payload.get("origin").and_then(Value::as_str) == Some("owner_authorized")
-        && payload.get("owner_principal").and_then(Value::as_str)
-            == Some(session.owner_principal.as_str())
-        && payload.get("chain_root_id").and_then(Value::as_str)
-            == Some(session.chain_root_id.as_str())
-        && payload.get("placement_thread_id").and_then(Value::as_str)
-            == Some(session.placement_thread_id.as_str())
-        && payload
-            .get("candidate_snapshot_hash")
-            .and_then(Value::as_str)
-            == Some(candidate)
-        && payload
-            .get("expected_previous_hash")
-            .and_then(Value::as_str)
-            == Some(expected_previous_hash)
-        && payload
-            .get("candidate_validation_hash")
-            .and_then(Value::as_str)
-            == Some(validation)
-        && payload.get("principal_key").and_then(Value::as_str) == Some(principal_key)
-        && payload.get("project_hash").and_then(Value::as_str) == Some(project_hash);
-    if !exact {
-        return Err(internal(
-            "candidate publication reservation operation is contradictory",
-        ));
-    }
-    Ok(true)
 }
 
 fn owned_session(
@@ -5825,12 +5791,29 @@ fn classify_candidate_publication_recovery(
 }
 
 /// Reconcile the only irreversible candidate-publication crash boundary. The
-/// project HEAD is read back under retained project authority before the root
-/// fact/projection is settled. After an authorized possible contact, only the
+/// project HEAD is read back under retained project authority before the
+/// controller projection is settled. After an authorized possible contact, only the
 /// admitted base proves that this operation did not publish. The candidate
 /// proves success; a missing or different HEAD is irreducibly ambiguous and is
 /// terminalized as unknown rather than reopening an unsafe retry.
 pub async fn reconcile_candidate_publications(state: Arc<AppState>) -> anyhow::Result<()> {
+    // Qualification journals the exact evaluator adoption before contacting
+    // its separate recorded-service root. Startup either observes that exact
+    // append-only fact and settles it, or rolls back a complete-replay-proven
+    // absence; it never discovers a replacement root through global scans.
+    for session in state
+        .state_store
+        .dedicated_sessions_in_state("qualifying")?
+    {
+        let _operation_guard = disposition_operation_lock(&session.placement_thread_id)
+            .lock_owned()
+            .await;
+        reconcile_candidate_qualification(&state, &session)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        ryeos_app::dedicated_session_service::notify_projection_change(
+            &session.placement_thread_id,
+        );
+    }
     for session in state
         .state_store
         .dedicated_sessions_in_state("publishing")?
@@ -5838,150 +5821,207 @@ pub async fn reconcile_candidate_publications(state: Arc<AppState>) -> anyhow::R
         let _operation_guard = disposition_operation_lock(&session.placement_thread_id)
             .lock_owned()
             .await;
-        let _root_operation = ryeos_app::hosted_operation::begin_hosted_root_operation(
-            &state.state_store,
-            &session.placement_thread_id,
-        )?;
-        let candidate = session
-            .candidate_snapshot_hash
+        let authority = candidate_publication_authority(&state, &session)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let source_candidate = authority.source_candidate_snapshot_hash.as_str();
+        let candidate = authority.candidate_snapshot_hash.as_str();
+        let base_snapshot_hash = authority.base_snapshot_hash.as_str();
+        let principal_key = authority.principal_key.as_str();
+        let project_hash = authority.project_hash.as_str();
+        let publication_root_id = session
+            .candidate_disposition_root_id
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("publishing session has no candidate"))?;
-        let validation = session
-            .candidate_validation_hash
+            .ok_or_else(|| anyhow::anyhow!("publishing session has no publication root"))?;
+        let publication_operation_id = session
+            .candidate_disposition_operation_id
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("publishing session has no validation identity"))?;
-        let thread = state
-            .state_store
-            .get_thread(&session.placement_thread_id)?
-            .ok_or_else(|| anyhow::anyhow!("publishing root thread disappeared"))?;
-        let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
-            base_snapshot_hash,
-            realization,
-            ..
-        } = thread
-            .project_authority
-            .ok_or_else(|| anyhow::anyhow!("publishing root has no project authority"))?
-        else {
-            anyhow::bail!("publishing root project authority is not pinned");
-        };
-        let ryeos_state::objects::PinnedProjectRealization::Cow {
-            terminal_publication:
-                ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
-                    principal_key,
-                    project_hash,
-                    expected_hash,
-                },
-        } = realization
-        else {
-            anyhow::bail!("publishing root lacks an admitted explicit project HEAD destination");
-        };
-        if expected_hash != base_snapshot_hash {
-            anyhow::bail!("publishing root HEAD fence differs from its admitted base");
-        }
-        let operation_id = ryeos_state::objects::canonical_value_digest(&json!({
-            "schema":"ryeos.hosted_candidate_publication_operation.v1",
-            "chain_root_id":session.chain_root_id,
-            "placement_thread_id":session.placement_thread_id,
-            "candidate_snapshot_hash":candidate,
-            "expected_previous_hash":base_snapshot_hash,
-            "candidate_validation_hash":validation,
-            "principal_key":principal_key,
-            "project_hash":project_hash,
-        }))?;
-        let authorized = has_authoritative_candidate_publication_reservation(
+            .ok_or_else(|| anyhow::anyhow!("publishing session has no publication operation"))?;
+        verify_candidate_publication_reservation(
             &state,
             &session,
-            &operation_id,
-            candidate,
-            &base_snapshot_hash,
-            validation,
-            &principal_key,
-            &project_hash,
+            &authority,
+            publication_root_id,
+            publication_operation_id,
         )
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let current = state
+        let published_fact = verify_candidate_publication_result(
+            &state,
+            &session,
+            &authority,
+            publication_root_id,
+            publication_operation_id,
+            "hosted_candidate.published",
+            "published",
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let not_applied_fact = verify_candidate_publication_result(
+            &state,
+            &session,
+            &authority,
+            publication_root_id,
+            publication_operation_id,
+            "hosted_candidate.publication_not_applied",
+            "not_applied",
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let unknown_fact = verify_candidate_publication_result(
+            &state,
+            &session,
+            &authority,
+            publication_root_id,
+            publication_operation_id,
+            "hosted_candidate.publication_unknown",
+            "unknown",
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if usize::from(published_fact) + usize::from(not_applied_fact) + usize::from(unknown_fact)
+            > 1
+        {
+            anyhow::bail!("candidate publication root contains contradictory terminal facts");
+        }
+        let pinned = state
             .state_store
-            .with_state_db(|db| db.read_project_head(&principal_key, &project_hash))?;
-        if !authorized {
-            if current.as_deref() == Some(base_snapshot_hash.as_str()) {
-                state.state_store.fail_dedicated_candidate_disposition(
-                    &session.placement_thread_id,
-                    "publishing",
-                )?;
-                continue;
-            }
-            anyhow::bail!(
-                "publishing session {} contacted project HEAD without authoritative owner reservation",
-                session.placement_thread_id
-            );
-        }
-        match classify_candidate_publication_recovery(
-            current.as_deref(),
-            &base_snapshot_hash,
+            .with_state_db(|db| db.pinned_authority())?;
+        let _cas_guard = pinned.acquire_shared_guard()?;
+        let cas = pinned.cas_store()?;
+        if !super::project_apply_snapshot::snapshot_history_contains(
+            &cas,
             candidate,
-        ) {
-            CandidatePublicationRecovery::Published => {
-                append_root_fact_once(
-                    &state,
+            base_snapshot_hash,
+        )? {
+            anyhow::bail!("publishing candidate no longer proves descent from its admitted base");
+        }
+        // A rooted terminal result records the classification made at the
+        // irreversible contact boundary. It remains authoritative even if a
+        // later independent publication advances HEAD again. Only an
+        // interrupted operation with no result fact is classified from the
+        // signed current HEAD and its admitted history.
+        if published_fact {
+            state.state_store.settle_dedicated_candidate_publication(
+                &session.placement_thread_id,
+                source_candidate,
+                publication_root_id,
+                publication_operation_id,
+                &format!("published:{candidate}"),
+            )?;
+        } else if not_applied_fact {
+            state
+                .state_store
+                .fail_dedicated_candidate_disposition(&session.placement_thread_id, "publishing")?;
+        } else if unknown_fact {
+            state.state_store.settle_dedicated_candidate_publication(
+                &session.placement_thread_id,
+                source_candidate,
+                publication_root_id,
+                publication_operation_id,
+                &format!("publication_unknown:{candidate}"),
+            )?;
+        } else {
+            // The reservation proves that HEAD may already have been
+            // contacted. Keep the exact publication root appendable while we
+            // classify that boundary, then make the recovered classification
+            // durable before changing the mutable session projection. A
+            // terminal root without a result fact cannot safely be inferred
+            // from whatever HEAD happens to contain later.
+            let _publication_operation =
+                ryeos_app::hosted_operation::begin_hosted_root_operation_if_appendable(
+                    &state.state_store,
+                    publication_root_id,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "candidate publication root is terminal without a rooted result"
+                    )
+                })?;
+            let current = state
+                .state_store
+                .with_state_db(|db| db.read_project_head(&principal_key, &project_hash))?;
+            let recovery = classify_candidate_publication_recovery(
+                current.as_deref(),
+                base_snapshot_hash,
+                candidate,
+            );
+            let (event_type, outcome) = match recovery {
+                CandidatePublicationRecovery::Published => {
+                    ("hosted_candidate.published", "published")
+                }
+                CandidatePublicationRecovery::NotPublished => {
+                    ("hosted_candidate.publication_not_applied", "not_applied")
+                }
+                CandidatePublicationRecovery::Unknown => {
+                    ("hosted_candidate.publication_unknown", "unknown")
+                }
+            };
+            ryeos_app::authoritative_root_fact::append_once(
+                &state,
+                publication_root_id,
+                event_type,
+                publication_operation_id,
+                candidate_publication_result_payload(
                     &session,
-                    "hosted_candidate.published",
-                    &operation_id,
-                    json!({
-                        "schema":1,
-                        "origin":"filesystem_verified",
-                        "owner_principal":session.owner_principal,
-                        "chain_root_id":session.chain_root_id,
-                        "placement_thread_id":session.placement_thread_id,
-                        "candidate_snapshot_hash":candidate,
-                        "expected_previous_hash":base_snapshot_hash,
-                        "candidate_validation_hash":validation,
-                        "principal_key":principal_key,
-                        "project_hash":project_hash,
-                        "reservation_operation_id":operation_id,
-                        "recovered_after_head_contact":true,
-                    }),
-                )?;
-                state.state_store.settle_dedicated_candidate_publication(
-                    &session.placement_thread_id,
-                    candidate,
-                    &format!("published:{candidate}"),
-                )?;
+                    &authority,
+                    publication_root_id,
+                    publication_operation_id,
+                    outcome,
+                    true,
+                ),
+            )?;
+            if !verify_candidate_publication_result(
+                &state,
+                &session,
+                &authority,
+                publication_root_id,
+                publication_operation_id,
+                event_type,
+                outcome,
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            {
+                anyhow::bail!("candidate publication recovery result was not rooted");
             }
-            CandidatePublicationRecovery::NotPublished => {
-                state.state_store.fail_dedicated_candidate_disposition(
-                    &session.placement_thread_id,
-                    "publishing",
-                )?;
-            }
-            CandidatePublicationRecovery::Unknown => {
-                append_root_fact_once(
-                    &state,
-                    &session,
-                    "hosted_candidate.publication_unknown",
-                    &operation_id,
-                    json!({
-                        "schema":1,
-                        "origin":"filesystem_verified",
-                        "owner_principal":session.owner_principal,
-                        "chain_root_id":session.chain_root_id,
-                        "placement_thread_id":session.placement_thread_id,
-                        "candidate_snapshot_hash":candidate,
-                        "expected_previous_hash":base_snapshot_hash,
-                        "candidate_validation_hash":validation,
-                        "principal_key":principal_key,
-                        "project_hash":project_hash,
-                        "observed_head":current,
-                        "reservation_operation_id":operation_id,
-                        "recovered_after_head_contact":true,
-                    }),
-                )?;
-                state.state_store.settle_dedicated_candidate_publication(
-                    &session.placement_thread_id,
-                    candidate,
-                    &format!("publication_unknown:{candidate}"),
-                )?;
+            match recovery {
+                CandidatePublicationRecovery::Published => {
+                    state.state_store.settle_dedicated_candidate_publication(
+                        &session.placement_thread_id,
+                        source_candidate,
+                        publication_root_id,
+                        publication_operation_id,
+                        &format!("published:{candidate}"),
+                    )?;
+                }
+                CandidatePublicationRecovery::NotPublished => {
+                    state.state_store.fail_dedicated_candidate_disposition(
+                        &session.placement_thread_id,
+                        "publishing",
+                    )?;
+                }
+                CandidatePublicationRecovery::Unknown => {
+                    state.state_store.settle_dedicated_candidate_publication(
+                        &session.placement_thread_id,
+                        source_candidate,
+                        publication_root_id,
+                        publication_operation_id,
+                        &format!("publication_unknown:{candidate}"),
+                    )?;
+                }
             }
         }
+        ryeos_app::dedicated_session_service::notify_projection_change(
+            &session.placement_thread_id,
+        );
+    }
+    // Discard has no external side effect. Its append-only owner fact is the
+    // commit boundary, so an interrupted projection settlement is completed
+    // deterministically on startup instead of leaving `discarding` stranded.
+    for session in state
+        .state_store
+        .dedicated_sessions_in_state("discarding")?
+    {
+        let _operation_guard = disposition_operation_lock(&session.placement_thread_id)
+            .lock_owned()
+            .await;
+        reconcile_candidate_discard(&state, &session)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         ryeos_app::dedicated_session_service::notify_projection_change(
             &session.placement_thread_id,
         );
@@ -6418,6 +6458,2159 @@ pub struct ValidateCandidateRequest {
     candidate_validation_hash: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartCandidateEvaluationRequest {
+    chain_root_id: String,
+    candidate_snapshot_hash: String,
+    candidate_validation_hash: String,
+    evaluator_item_ref: String,
+    #[serde(default)]
+    evaluator_parameters: Value,
+    #[serde(default)]
+    evaluator_ref_bindings: BTreeMap<String, String>,
+    /// Required when the evaluated generation was produced by a separate
+    /// candidate-integration operation. Direct worker candidates omit it.
+    #[serde(default)]
+    integration: Option<CandidateIntegrationCoordinate>,
+    launch_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateIntegrationCoordinate {
+    chain_root_id: String,
+    terminal_thread_id: String,
+    capsule_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartCandidateIntegrationRequest {
+    chain_root_id: String,
+    candidate_snapshot_hash: String,
+    candidate_validation_hash: String,
+    accepted_evaluation_hash: String,
+    authoring_wrapper_item_ref: String,
+    #[serde(default)]
+    authoring_parameters: Value,
+    #[serde(default)]
+    authoring_ref_bindings: BTreeMap<String, String>,
+    launch_id: String,
+}
+
+struct CandidateOperationLaunchRequest {
+    chain_root_id: String,
+    candidate_snapshot_hash: String,
+    candidate_validation_hash: String,
+    item_ref: String,
+    parameters: Value,
+    ref_bindings: BTreeMap<String, String>,
+    launch_id: String,
+    pre_reserved_thread_id: Option<String>,
+    purpose: ryeos_app::thread_lifecycle::CandidateOperationPurpose,
+    integration: Option<CandidateIntegrationCoordinate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualifyCandidateRequest {
+    chain_root_id: String,
+    candidate_snapshot_hash: String,
+    candidate_validation_hash: String,
+    evaluator_chain_root_id: String,
+    evaluator_terminal_thread_id: String,
+    evaluator_capsule_hash: String,
+    evaluator_item_ref: String,
+    evaluator_definition_digest: String,
+    evaluator_parameters_digest: String,
+    #[serde(default)]
+    integration: Option<CandidateIntegrationCoordinate>,
+    /// One pre-minted launch coordinate reserved by accepted source-candidate
+    /// testimony for its sole integration attempt. Final integrated-candidate
+    /// qualification omits it.
+    #[serde(default)]
+    integration_launch_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateEvaluationResult {
+    schema_version: u32,
+    candidate_snapshot_hash: String,
+    base_snapshot_hash: String,
+    accepted: bool,
+    evidence: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateQualificationReservation {
+    schema: String,
+    previous_candidate_evaluation_hash: Option<String>,
+    candidate_evaluation_hash: String,
+    candidate_evaluation: Value,
+    qualification_root_id: String,
+    qualification_operation_id: String,
+}
+
+fn authorize_candidate_operation_refs(
+    item_ref: &str,
+    ref_bindings: &BTreeMap<String, String>,
+    ctx: &HandlerContext,
+    state: &AppState,
+) -> Result<(), HandlerError> {
+    let mut refs = Vec::with_capacity(ref_bindings.len() + 1);
+    refs.push(item_ref);
+    refs.extend(ref_bindings.values().map(String::as_str));
+    for item_ref in refs {
+        let canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(item_ref)
+            .map_err(|error| HandlerError::BadRequest(format!("invalid evaluator ref: {error}")))?;
+        let capability = ryeos_runtime::authorizer::canonical_cap(
+            &canonical.kind,
+            &canonical.bare_id,
+            "execute",
+        );
+        state
+            .authorizer
+            .authorize(
+                &ctx.scopes,
+                &ryeos_runtime::authorizer::AuthorizationPolicy::require(&capability),
+            )
+            .map_err(|_| {
+                HandlerError::Forbidden(format!(
+                    "candidate operation requires capability `{capability}`"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn candidate_evaluation_source_ready(
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_snapshot_hash: &str,
+    candidate_validation_hash: &str,
+) -> bool {
+    let owner_candidate = matches!(session.state.as_str(), "frozen" | "publish_ready")
+        && session.publication_result.as_deref() == Some("retained");
+    let bounded_candidate = matches!(session.state.as_str(), "terminal" | "publish_ready")
+        && session.candidate_disposition
+            == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+        && session.publication_result.as_deref() == Some("retained_for_review")
+        && session.terminal_reason.as_deref() == Some("completed")
+        && session.completion_fence.is_some();
+    (owner_candidate || bounded_candidate)
+        && session.candidate_snapshot_hash.as_deref() == Some(candidate_snapshot_hash)
+        && session.candidate_validation_hash.as_deref() == Some(candidate_validation_hash)
+}
+
+async fn start_candidate_evaluation(
+    req: StartCandidateEvaluationRequest,
+    ctx: HandlerContext,
+    state: Arc<AppState>,
+) -> Result<Value, HandlerError> {
+    start_candidate_operation(
+        CandidateOperationLaunchRequest {
+            chain_root_id: req.chain_root_id,
+            candidate_snapshot_hash: req.candidate_snapshot_hash,
+            candidate_validation_hash: req.candidate_validation_hash,
+            item_ref: req.evaluator_item_ref,
+            parameters: req.evaluator_parameters,
+            ref_bindings: req.evaluator_ref_bindings,
+            launch_id: req.launch_id,
+            pre_reserved_thread_id: None,
+            purpose: ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate,
+            integration: req.integration,
+        },
+        ctx,
+        state,
+    )
+    .await
+}
+
+async fn start_candidate_integration(
+    req: StartCandidateIntegrationRequest,
+    ctx: HandlerContext,
+    state: Arc<AppState>,
+) -> Result<Value, HandlerError> {
+    let initial = owned_session(&state, &ctx, &req.chain_root_id)?;
+    let placement_thread_id = initial.placement_thread_id.clone();
+    let operation_lock = disposition_operation_lock(&placement_thread_id);
+    let _operation_guard = operation_lock.lock_owned().await;
+    let session = owned_session(&state, &ctx, &req.chain_root_id)?;
+    if session.placement_thread_id != placement_thread_id {
+        return Err(HandlerError::BadRequest(
+            "hosted execution placement changed while candidate integration was reserved".into(),
+        ));
+    }
+    let evaluation = session.candidate_evaluation.as_ref().ok_or_else(|| {
+        HandlerError::BadRequest(
+            "candidate integration requires accepted independent evaluator testimony".into(),
+        )
+    })?;
+    if session.state != "publish_ready"
+        || session.candidate_evaluation_hash.as_deref()
+            != Some(req.accepted_evaluation_hash.as_str())
+        || ryeos_state::objects::canonical_value_digest(evaluation).map_err(internal)?
+            != req.accepted_evaluation_hash
+        || evaluation
+            .pointer("/candidate/candidate_snapshot_hash")
+            .and_then(Value::as_str)
+            != Some(req.candidate_snapshot_hash.as_str())
+        || evaluation
+            .pointer("/result/accepted")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration identity differs from its accepted evaluator testimony".into(),
+        ));
+    }
+    verify_candidate_evaluation_testimony(
+        &state,
+        &session,
+        &req.accepted_evaluation_hash,
+        evaluation,
+    )?;
+    if evaluation
+        .pointer("/qualification/reserved_integration_launch_id")
+        .and_then(Value::as_str)
+        != Some(req.launch_id.as_str())
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration launch differs from its one reserved coordinate".into(),
+        ));
+    }
+    let reserved_thread_id = evaluation
+        .pointer("/qualification/reserved_integration_thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HandlerError::BadRequest(
+                "candidate integration qualification has no pre-minted thread coordinate".into(),
+            )
+        })?
+        .to_owned();
+    start_candidate_operation(
+        CandidateOperationLaunchRequest {
+            chain_root_id: req.chain_root_id,
+            candidate_snapshot_hash: req.candidate_snapshot_hash,
+            candidate_validation_hash: req.candidate_validation_hash,
+            item_ref: req.authoring_wrapper_item_ref,
+            parameters: req.authoring_parameters,
+            ref_bindings: req.authoring_ref_bindings,
+            launch_id: req.launch_id,
+            pre_reserved_thread_id: Some(reserved_thread_id),
+            purpose: ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate {
+                accepted_evaluation_hash: req.accepted_evaluation_hash,
+            },
+            integration: None,
+        },
+        ctx,
+        state,
+    )
+    .await
+}
+
+async fn start_candidate_operation(
+    req: CandidateOperationLaunchRequest,
+    ctx: HandlerContext,
+    state: Arc<AppState>,
+) -> Result<Value, HandlerError> {
+    ctx.require_verified()?;
+    authorize_candidate_operation_refs(&req.item_ref, &req.ref_bindings, &ctx, &state)?;
+    let session = owned_session(&state, &ctx, &req.chain_root_id)?;
+    let verified_source = match &req.purpose {
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+            verified_candidate_source(
+                &state,
+                &session,
+                &req.candidate_snapshot_hash,
+                &req.candidate_validation_hash,
+                req.integration.as_ref(),
+            )?
+        }
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate {
+            accepted_evaluation_hash,
+        } => {
+            if req.integration.is_some()
+                || !candidate_evaluation_source_ready(
+                    &session,
+                    &req.candidate_snapshot_hash,
+                    &req.candidate_validation_hash,
+                )
+                || session.candidate_evaluation_hash.as_deref()
+                    != Some(accepted_evaluation_hash.as_str())
+            {
+                return Err(HandlerError::BadRequest(
+                    "candidate integration requires the exact directly retained accepted candidate"
+                        .into(),
+                ));
+            }
+            let (base_snapshot_hash, closure_evidence) = frozen_candidate_closure_evidence(
+                &state,
+                &session,
+                &req.candidate_snapshot_hash,
+                &req.candidate_validation_hash,
+            )?;
+            VerifiedCandidateSource {
+                base_snapshot_hash,
+                closure_evidence,
+                integration_evidence: None,
+                integration_operation_hash: None,
+            }
+        }
+    };
+    let base_snapshot_hash = verified_source.base_snapshot_hash.clone();
+    let evaluation_authority = ryeos_app::thread_lifecycle::CandidateEvaluationAuthority {
+        schema_version: ryeos_app::thread_lifecycle::CandidateEvaluationAuthority::SCHEMA_VERSION,
+        source_chain_root_id: session.chain_root_id.clone(),
+        source_placement_thread_id: session.placement_thread_id.clone(),
+        owner_principal: session.owner_principal.clone(),
+        base_snapshot_hash: base_snapshot_hash.clone(),
+        candidate_snapshot_hash: req.candidate_snapshot_hash.clone(),
+        candidate_validation_hash: req.candidate_validation_hash.clone(),
+        integration_operation_hash: verified_source.integration_operation_hash.clone(),
+        integration_launch_id: matches!(
+            &req.purpose,
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+        )
+        .then(|| req.launch_id.clone()),
+        purpose: req.purpose.clone(),
+    };
+    let (source, _, _) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("dedicated candidate source disappeared"))?;
+    let (stable_project_identity, original_project_path, source_base_snapshot_hash) = match &source
+        .project_authority
+    {
+        ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+            stable_project_identity,
+            display_path: Some(display_path),
+            base_snapshot_hash,
+            ..
+        } => (
+            stable_project_identity.clone(),
+            display_path.clone(),
+            base_snapshot_hash.clone(),
+        ),
+        _ => {
+            return Err(HandlerError::BadRequest(
+                "candidate evaluator requires a pinned source with stable project identity".into(),
+            ));
+        }
+    };
+    if source.current_site_id != state.threads.site_id()
+        || source_base_snapshot_hash != base_snapshot_hash
+        || source.requested_by.as_deref() != Some(session.owner_principal.as_str())
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate evaluator source authority is not local and exact".into(),
+        ));
+    }
+
+    let integration_head_destination = if matches!(
+        &req.purpose,
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+    ) {
+        let project_path = original_project_path
+            .to_str()
+            .ok_or_else(|| internal("candidate project path is not UTF-8"))?;
+        let principal_key = ryeos_state::refs::principal_storage_key(&session.owner_principal)
+            .map_err(internal)?
+            .to_owned();
+        let project_hash = ryeos_state::refs::deployed_project_key(project_path);
+        let current = state
+            .state_store
+            .with_state_db(|db| db.read_project_head(&principal_key, &project_hash))
+            .map_err(internal)?;
+        if current.as_deref() != Some(base_snapshot_hash.as_str()) {
+            return Err(HandlerError::BadRequest(format!(
+                "candidate integration base is stale: expected HEAD {}, current HEAD is {:?}",
+                base_snapshot_hash, current
+            )));
+        }
+        Some((principal_key, project_hash))
+    } else {
+        None
+    };
+
+    let reserved_thread_id = if let Some(reserved_thread_id) = &req.pre_reserved_thread_id {
+        let planning = state
+            .state_store
+            .launch_planning_record_for_owner(&req.launch_id, &session.owner_principal)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                HandlerError::BadRequest(
+                    "candidate integration lost its qualified launch reservation".into(),
+                )
+            })?;
+        if planning.reserved_thread_id != *reserved_thread_id {
+            return Err(HandlerError::BadRequest(
+                "candidate integration launch reservation changed its pre-minted thread".into(),
+            ));
+        }
+        match planning.state.as_str() {
+            "qualified" => {
+                state
+                    .state_store
+                    .activate_qualified_launch_planning(
+                        &req.launch_id,
+                        reserved_thread_id,
+                        &session.owner_principal,
+                    )
+                    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+                reserved_thread_id.clone()
+            }
+            "planning" => reserved_thread_id.clone(),
+            "bound" if planning.bound_thread_id.as_deref() == Some(reserved_thread_id.as_str()) => {
+                let capsule = state
+                    .state_store
+                    .admitted_launch_capsule(reserved_thread_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        internal("bound candidate integration has no admitted capsule")
+                    })?;
+                let sealed = ryeos_app::thread_lifecycle::SealedRootExecutionRequest::decode_from_admitted_capsule(&capsule)
+                    .map_err(internal)?;
+                if sealed.candidate_evaluation_authority() != Some(&evaluation_authority) {
+                    return Err(internal(
+                        "bound candidate integration capsule contradicts its qualified operation",
+                    ));
+                }
+                return Ok(json!({
+                    "launch_id":req.launch_id,
+                    "thread_id":reserved_thread_id,
+                    "chain_root_id":reserved_thread_id,
+                    "candidate_operation":evaluation_authority,
+                    "idempotent":true,
+                }));
+            }
+            _ => {
+                return Err(HandlerError::BadRequest(
+                    "candidate integration launch reservation is no longer startable".into(),
+                ));
+            }
+        }
+    } else {
+        let reserved_thread_id = ryeos_app::thread_lifecycle::new_thread_id();
+        state
+            .state_store
+            .reserve_launch_planning_with_id(
+                &req.launch_id,
+                &reserved_thread_id,
+                &session.owner_principal,
+            )
+            .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+        reserved_thread_id
+    };
+    let mut launch_guard = CandidateEvaluationLaunchGuard {
+        state: (*state).clone(),
+        reserved_thread_id: reserved_thread_id.clone(),
+        armed: true,
+    };
+
+    let base_checkout_id = format!("candidate-operation-base-{reserved_thread_id}");
+    let candidate_checkout_id = format!("candidate-operation-view-{reserved_thread_id}");
+    let base = crate::routes::response_modes::execute_mode::resolve_project_context_off_thread(
+        crate::routes::response_modes::execute_mode::ResolveProjectContextRequest {
+            state: (*state).clone(),
+            source: ryeos_executor::execution::project_source::ProjectSource::Snapshot {
+                hash: base_snapshot_hash.clone(),
+            },
+            project_path: original_project_path.clone(),
+            principal_id: session.owner_principal.clone(),
+            checkout_id: base_checkout_id,
+            pinned_realization: Some(
+                ryeos_executor::execution::project_source::PinnedContextRealization::ReadOnly,
+            ),
+            normalization:
+                crate::routes::response_modes::execute_mode::ProjectRootNormalization::Preserve,
+            launch_timings: None,
+        },
+    )
+    .await
+    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+    let candidate =
+        crate::routes::response_modes::execute_mode::resolve_project_context_off_thread(
+            crate::routes::response_modes::execute_mode::ResolveProjectContextRequest {
+                state: (*state).clone(),
+                source: ryeos_executor::execution::project_source::ProjectSource::Snapshot {
+                    hash: req.candidate_snapshot_hash.clone(),
+                },
+                project_path: original_project_path.clone(),
+                principal_id: session.owner_principal.clone(),
+                checkout_id: candidate_checkout_id,
+                pinned_realization: Some(match &req.purpose {
+                    ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+                        ryeos_executor::execution::project_source::PinnedContextRealization::ReadOnly
+                    }
+                    ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. } => {
+                        ryeos_executor::execution::project_source::PinnedContextRealization::Cow
+                    }
+                }),
+                normalization: crate::routes::response_modes::execute_mode::ProjectRootNormalization::Preserve,
+                launch_timings: None,
+            },
+        )
+        .await
+        .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+
+    let mut effective_caps = ctx.scopes.clone();
+    // Candidate operations never receive ambient live-filesystem publication
+    // authority. Integration authoring is separately capsule-scoped to the
+    // private COW workspace by runtime.author_item.
+    effective_caps.retain(|capability| {
+        capability != ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+    });
+    effective_caps.sort();
+    effective_caps.dedup();
+    let base_authority = ryeos_state::objects::ExecutionProjectAuthority::pinned(
+        stable_project_identity.clone(),
+        Some(original_project_path.clone()),
+        base_snapshot_hash.clone(),
+        ryeos_state::objects::PinnedProjectRealization::ReadOnly,
+        ryeos_state::objects::EnvironmentAuthority::None,
+        effective_caps.clone(),
+    )
+    .and_then(|authority| {
+        authority.with_child_policy(ryeos_state::objects::ChildProjectAuthorityPolicy::Inherit)
+    })
+    .map_err(internal)?;
+    let base_lifeline = base
+        .temp_dir
+        .clone()
+        .ok_or_else(|| internal("candidate evaluator base lost its materialization lease"))?;
+    let base_materialization = base
+        .pinned_materialization
+        .clone()
+        .ok_or_else(|| internal("candidate evaluator base has no materialization proof"))?;
+    let base_provenance = ryeos_app::execution_provenance::ExecutionProvenance::root_pushed_head(
+        original_project_path.clone(),
+        base.request_engine.clone(),
+        base_lifeline,
+        base_materialization,
+        base_authority,
+    )
+    .map_err(internal)?;
+    let current_site_id = state.threads.site_id().to_string();
+    let origin_site_id = source.origin_site_id.clone();
+    let requested_by =
+        ryeos_engine::contracts::EffectivePrincipal::Local(ryeos_engine::contracts::Principal {
+            fingerprint: session.owner_principal.clone(),
+            scopes: effective_caps.clone(),
+        });
+    let base_plan_context = ryeos_engine::contracts::PlanContext {
+        requested_by: requested_by.clone(),
+        project_context: ryeos_engine::contracts::ProjectContext::LocalPath {
+            path: base.effective_path.clone(),
+        },
+        subject_resolution_authority: base_provenance.subject_resolution_authority(),
+        current_site_id: current_site_id.clone(),
+        origin_site_id: origin_site_id.clone(),
+        execution_hints: Default::default(),
+        scheduled_fire: None,
+        validate_only: false,
+    };
+    let base_binding = ryeos_app::thread_lifecycle::AdmittedProjectBinding::from_provenance(
+        &base.request_engine,
+        &base_plan_context,
+        &base_provenance,
+    )
+    .map_err(internal)?;
+    let evaluation_scope = Arc::new(
+        ryeos_app::thread_lifecycle::CandidateEvaluationExecutionScope::admit(
+            evaluation_authority.clone(),
+            base_plan_context,
+            base_binding,
+        )
+        .map_err(internal)?,
+    );
+    let candidate_realization = match &req.purpose {
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+            ryeos_state::objects::PinnedProjectRealization::ReadOnly
+        }
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. } => {
+            let (principal_key, project_hash) = integration_head_destination
+                .as_ref()
+                .ok_or_else(|| internal("candidate integration lost its HEAD destination"))?;
+            ryeos_state::objects::PinnedProjectRealization::Cow {
+                terminal_publication:
+                    ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
+                        principal_key: principal_key.clone(),
+                        project_hash: project_hash.clone(),
+                        expected_hash: base_snapshot_hash.clone(),
+                    },
+            }
+        }
+    };
+    let mut candidate_authority = ryeos_state::objects::ExecutionProjectAuthority::pinned(
+        stable_project_identity,
+        Some(original_project_path.clone()),
+        match &req.purpose {
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+                req.candidate_snapshot_hash.clone()
+            }
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. } => {
+                base_snapshot_hash.clone()
+            }
+        },
+        candidate_realization,
+        ryeos_state::objects::EnvironmentAuthority::None,
+        effective_caps.clone(),
+    )
+    .and_then(|authority| {
+        authority.with_child_policy(ryeos_state::objects::ChildProjectAuthorityPolicy::Inherit)
+    })
+    .map_err(internal)?;
+    if matches!(
+        &req.purpose,
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+    ) {
+        candidate_authority = candidate_authority
+            .transition_operational_generation(
+                ryeos_state::objects::OperationalProjectAuthorityTransition::AdvancePinnedCowContinuation {
+                    result_snapshot_hash: &req.candidate_snapshot_hash,
+                },
+            )
+            .map_err(internal)?;
+    }
+    let candidate_lifeline = candidate
+        .temp_dir
+        .clone()
+        .ok_or_else(|| internal("candidate evaluator view lost its materialization lease"))?;
+    let candidate_materialization = candidate
+        .pinned_materialization
+        .clone()
+        .ok_or_else(|| internal("candidate evaluator view has no materialization proof"))?;
+    let candidate_provenance =
+        ryeos_app::execution_provenance::ExecutionProvenance::root_pushed_head(
+            original_project_path,
+            base.request_engine.clone(),
+            candidate_lifeline,
+            candidate_materialization,
+            candidate_authority,
+        )
+        .and_then(|provenance| provenance.with_candidate_evaluation_scope(evaluation_scope))
+        .map_err(internal)?;
+    let parsed_item_ref = crate::routes::parsed_ref::ParsedItemRef::parse(&req.item_ref)
+        .map_err(HandlerError::BadRequest)?;
+    let preflight = crate::routes::launch::preflight_dispatch_launch_off_thread(
+        crate::routes::launch::OwnedDispatchPreflight {
+            state: (*state).clone(),
+            item_ref: parsed_item_ref.clone(),
+            project_path: candidate.effective_path.clone(),
+            request_engine: base.request_engine.clone(),
+            provenance: candidate_provenance.clone(),
+            parameters: req.parameters.clone(),
+            ref_bindings: req.ref_bindings.clone(),
+            principal_id: session.owner_principal.clone(),
+            principal_scopes: effective_caps.clone(),
+            origin_site_id: origin_site_id.clone(),
+            call: None,
+            launch_mode: "detached".into(),
+            validate_only: false,
+            usage_subject: None,
+            usage_subject_asserted_by: None,
+            launch_timings: None,
+        },
+    )
+    .await
+    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+    let class_allowed = match &req.purpose {
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+            preflight.class.produces_admitted_launch_capsule()
+        }
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. } => {
+            preflight.class == ryeos_executor::dispatch::RootDispatchClass::TerminalSubprocess
+        }
+    };
+    if !class_allowed {
+        return Err(HandlerError::BadRequest(
+            "candidate operation does not resolve to its required capsule-producing root class"
+                .into(),
+        ));
+    }
+    let root_admission = preflight
+        .root_admission
+        .ok_or_else(|| internal("candidate evaluator preflight returned no root admission"))?;
+    let handler_context = ctx
+        .narrowed_for_execution(effective_caps.clone(), &current_site_id, &origin_site_id)
+        .map_err(internal)?;
+    let lifecycle_authority = ryeos_state::objects::ExecutionLifecycleAuthority {
+        ownership: ryeos_state::objects::ExecutionOwnershipAuthority::DaemonOwned,
+        recovery: ryeos_state::objects::ExecutionRecoveryAuthority::RestartRecoverable,
+    };
+    let mut options = crate::routes::launch::DispatchLaunchOptions::admitted(
+        root_admission,
+        preflight.root_dispatch_evidence,
+        &candidate.effective_path,
+        req.ref_bindings.clone(),
+        lifecycle_authority,
+        Some(handler_context),
+    )
+    .map_err(internal)?;
+    options.launch_mode = "detached".into();
+    let (mut task, ready) = crate::routes::launch::spawn_dispatch_launch_with_handoff(
+        &state,
+        parsed_item_ref,
+        req.parameters,
+        session.owner_principal.clone(),
+        effective_caps,
+        reserved_thread_id.clone(),
+        candidate_provenance,
+        options,
+    );
+    launch_guard.armed = false;
+    let thread_id = tokio::select! {
+        readiness = ready => match readiness {
+            Ok(Ok(thread_id)) => thread_id,
+            Ok(Err(failure)) => return Err(HandlerError::Structured {
+                code: failure.code,
+                status: failure.status,
+                body: failure.body,
+            }),
+            Err(_) => match task.await {
+                Ok(Err(error)) => return Err(HandlerError::BadRequest(error.to_string())),
+                Ok(Ok(())) => return Err(internal("candidate evaluator completed without launch handoff")),
+                Err(error) => return Err(internal(error)),
+            },
+        },
+        result = &mut task => match result {
+            Ok(Err(error)) => return Err(HandlerError::BadRequest(error.to_string())),
+            Ok(Ok(())) => return Err(internal("candidate evaluator completed without launch handoff")),
+            Err(error) => return Err(internal(error)),
+        },
+    };
+    if thread_id != reserved_thread_id {
+        return Err(internal(
+            "candidate evaluator launch changed its reserved root identity",
+        ));
+    }
+    Ok(json!({
+        "launch_id":req.launch_id,
+        "thread_id":thread_id,
+        "chain_root_id":thread_id,
+        "candidate_operation":evaluation_authority,
+    }))
+}
+
+fn frozen_candidate_closure_evidence(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_snapshot_hash: &str,
+    candidate_validation_hash: &str,
+) -> Result<(String, Value), HandlerError> {
+    if candidate_validation_identity(candidate_snapshot_hash)? != candidate_validation_hash {
+        return Err(HandlerError::BadRequest(
+            "candidate validation identity is not canonical for its snapshot".into(),
+        ));
+    }
+    let (source, _, _) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("dedicated placement disappeared from its authoritative chain"))?;
+    let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+        base_snapshot_hash,
+        ..
+    } = source.project_authority
+    else {
+        return Err(internal("dedicated candidate authority is not pinned"));
+    };
+    let cas_read = state.acquire_cas_read().map_err(internal)?;
+    let cas = cas_read.cas();
+    let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
+        cas,
+        [candidate_snapshot_hash.to_owned()],
+        ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport(),
+    )
+    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+    if !closure.is_complete() {
+        return Err(HandlerError::BadRequest(
+            "candidate snapshot closure is incomplete or unsupported".into(),
+        ));
+    }
+    if !super::project_apply_snapshot::snapshot_history_contains(
+        cas,
+        candidate_snapshot_hash,
+        &base_snapshot_hash,
+    )
+    .map_err(internal)?
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate does not descend from the admitted base generation".into(),
+        ));
+    }
+    let candidate = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
+        cas,
+        candidate_snapshot_hash,
+    )
+    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+    let base = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
+        cas,
+        &base_snapshot_hash,
+    )
+    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+    let mut paths = BTreeSet::new();
+    paths.extend(candidate.tree().tree().files.keys().cloned());
+    paths.extend(base.tree().tree().files.keys().cloned());
+    let changed_paths = paths
+        .into_iter()
+        .filter(|path| {
+            candidate.tree().tree().files.get(path) != base.tree().tree().files.get(path)
+        })
+        .collect::<Vec<_>>();
+    let changed_paths_digest =
+        ryeos_state::objects::canonical_value_digest(&changed_paths).map_err(internal)?;
+    let evidence = json!({
+        "schema":"ryeos.hosted_candidate_closure_and_base_validation.v2",
+        "checks":{
+            "canonical_snapshot_closure":true,
+            "base_ancestry":true,
+        },
+        "candidate_snapshot_hash":candidate_snapshot_hash,
+        "candidate_validation_hash":candidate_validation_hash,
+        "base_snapshot_hash":base_snapshot_hash,
+        "candidate_tree_hash":candidate.snapshot().project_tree_hash,
+        "base_tree_hash":base.snapshot().project_tree_hash,
+        "candidate_policy_hash":candidate.snapshot().effective_policy_hash,
+        "changed_path_count":changed_paths.len(),
+        "changed_paths_digest":changed_paths_digest,
+        "object_count":closure.object_hashes.len(),
+        "blob_count":closure.blob_hashes.len(),
+    });
+    Ok((base_snapshot_hash, evidence))
+}
+
+fn candidate_validation_identity(candidate_snapshot_hash: &str) -> Result<String, HandlerError> {
+    ryeos_app::thread_lifecycle::candidate_validation_identity(candidate_snapshot_hash)
+        .map_err(|error| HandlerError::BadRequest(error.to_string()))
+}
+
+struct VerifiedCandidateSource {
+    base_snapshot_hash: String,
+    closure_evidence: Value,
+    integration_evidence: Option<Value>,
+    integration_operation_hash: Option<String>,
+}
+
+/// Re-prove the immutable evaluator and the owner-authorized adoption fact
+/// behind one mutable dedicated-session projection. Publication and recovery
+/// call this every time; SQLite testimony alone is never publication
+/// authority.
+fn verify_candidate_evaluation_testimony(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_evaluation_hash: &str,
+    evaluation: &Value,
+) -> Result<(), HandlerError> {
+    if ryeos_state::objects::canonical_value_digest(evaluation).map_err(internal)?
+        != candidate_evaluation_hash
+        || evaluation.get("schema").and_then(Value::as_str)
+            != Some("ryeos.hosted_candidate_evaluation.v1")
+        || evaluation
+            .pointer("/result/accepted")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(internal(
+            "retained candidate evaluation has invalid identity or is not accepted",
+        ));
+    }
+    let candidate_snapshot_hash = evaluation
+        .pointer("/candidate/candidate_snapshot_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| lillux::valid_hash(hash))
+        .ok_or_else(|| internal("candidate evaluation has no canonical candidate identity"))?;
+    let base_snapshot_hash = evaluation
+        .pointer("/candidate/base_snapshot_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| lillux::valid_hash(hash))
+        .ok_or_else(|| internal("candidate evaluation has no canonical base identity"))?;
+    let qualification_root_id = evaluation
+        .pointer("/qualification/root_thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| internal("candidate evaluation has no qualification root"))?;
+    if qualification_root_id == session.chain_root_id {
+        return Err(internal(
+            "candidate qualification fact cannot reopen the terminal worker root",
+        ));
+    }
+    let reserved_integration_launch_id = evaluation
+        .pointer("/qualification/reserved_integration_launch_id")
+        .and_then(Value::as_str);
+    let reserved_integration_thread_id = evaluation
+        .pointer("/qualification/reserved_integration_thread_id")
+        .and_then(Value::as_str);
+    if reserved_integration_launch_id.is_some() != reserved_integration_thread_id.is_some()
+        || reserved_integration_launch_id
+            .is_some_and(|launch_id| !ryeos_app::state_store::is_canonical_launch_id(launch_id))
+        || (evaluation
+            .get("integration")
+            .is_some_and(|value| !value.is_null())
+            && reserved_integration_launch_id.is_some())
+    {
+        return Err(internal(
+            "candidate qualification carries an invalid integration reservation",
+        ));
+    }
+    if let (Some(launch_id), Some(thread_id)) = (
+        reserved_integration_launch_id,
+        reserved_integration_thread_id,
+    ) {
+        let planning = state
+            .state_store
+            .launch_planning_record_for_owner(launch_id, &session.owner_principal)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                internal("qualified integration launch lost its durable planning reservation")
+            })?;
+        if planning.reserved_thread_id != thread_id
+            || !matches!(
+                planning.state.as_str(),
+                "qualified" | "planning" | "bound" | "cancelled" | "failed" | "expired"
+            )
+        {
+            return Err(internal(
+                "qualified integration launch planning contradicts its pre-minted thread",
+            ));
+        }
+    }
+
+    let evaluator_chain_root_id = evaluation
+        .pointer("/evaluator/chain_root_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| internal("candidate evaluation has no evaluator chain root"))?;
+    let evaluator_terminal_thread_id = evaluation
+        .pointer("/evaluator/terminal_thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| internal("candidate evaluation has no evaluator terminal"))?;
+    let evaluator_capsule_hash = evaluation
+        .pointer("/evaluator/capsule_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| lillux::valid_hash(hash))
+        .ok_or_else(|| internal("candidate evaluation has no canonical evaluator capsule"))?;
+    if evaluator_chain_root_id == session.chain_root_id
+        || qualification_root_id == evaluator_chain_root_id
+    {
+        return Err(internal(
+            "candidate evaluation does not name independent operation roots",
+        ));
+    }
+
+    let (source, _, _) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate source root disappeared"))?;
+    let source_project_identity = match &source.project_authority {
+        ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+            stable_project_identity,
+            base_snapshot_hash: source_base,
+            ..
+        } if source_base == base_snapshot_hash => stable_project_identity,
+        _ => {
+            return Err(internal(
+                "candidate evaluation base differs from source project authority",
+            ));
+        }
+    };
+
+    let (evaluator, evaluator_last_event, evaluator_chain_head_hash) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            evaluator_chain_root_id,
+            evaluator_terminal_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate evaluator terminal disappeared"))?;
+    let evaluator_last_event = evaluator_last_event
+        .ok_or_else(|| internal("candidate evaluator has no terminal event"))?;
+    let evaluator_last_event_hash = evaluator_last_event
+        .event_hash
+        .as_deref()
+        .ok_or_else(|| internal("candidate evaluator terminal event has no CAS hash"))?;
+    if evaluator.thread_id != evaluator_terminal_thread_id
+        || evaluator.chain_root_id != evaluator_chain_root_id
+        || evaluator.status != ryeos_state::objects::ThreadStatus::Completed
+        || evaluator.outcome_code.as_deref() != Some("success")
+        || evaluator.error.is_some()
+        || evaluator.requested_by.as_deref() != Some(session.owner_principal.as_str())
+        || evaluator.current_site_id != source.current_site_id
+        || evaluator.origin_site_id != source.origin_site_id
+        || evaluator.admitted_launch_capsule_hash.as_deref() != Some(evaluator_capsule_hash)
+        || evaluator_last_event.event_type != ryeos_state::event_types::THREAD_COMPLETED
+        || evaluator_last_event.chain_root_id != evaluator_chain_root_id
+        || evaluator_last_event.thread_id != evaluator_terminal_thread_id
+        || evaluator.last_event_hash.as_deref() != Some(evaluator_last_event_hash)
+        || u64::try_from(evaluator_last_event.chain_seq).ok() != Some(evaluator.last_chain_seq)
+        || u64::try_from(evaluator_last_event.thread_seq).ok() != Some(evaluator.last_thread_seq)
+    {
+        return Err(internal(
+            "retained evaluator coordinate no longer proves exact successful completion",
+        ));
+    }
+    if evaluation
+        .pointer("/evaluator/terminal_event_hash")
+        .and_then(Value::as_str)
+        != Some(evaluator_last_event_hash)
+        || evaluation
+            .pointer("/evaluator/authoritative_chain_head_hash")
+            .and_then(Value::as_str)
+            != Some(evaluator_chain_head_hash.as_str())
+    {
+        return Err(internal(
+            "candidate evaluator terminal chain differs from retained testimony",
+        ));
+    }
+    let evaluator_capsule = state
+        .state_store
+        .admitted_launch_capsule(evaluator_terminal_thread_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate evaluator capsule disappeared"))?;
+    if evaluator_capsule.content_hash().map_err(internal)? != evaluator_capsule_hash
+        || evaluator_capsule.project_authority != evaluator.project_authority
+    {
+        return Err(internal(
+            "candidate evaluator capsule contradicts its terminal authority",
+        ));
+    }
+    let sealed =
+        ryeos_app::thread_lifecycle::SealedRootExecutionRequest::decode_from_admitted_capsule(
+            &evaluator_capsule,
+        )
+        .map_err(internal)?;
+    let operation = sealed
+        .candidate_evaluation_authority()
+        .ok_or_else(|| internal("retained evaluator capsule has no candidate authority"))?;
+    let integration_operation_hash = evaluation
+        .get("integration_operation_hash")
+        .and_then(Value::as_str);
+    if operation.source_chain_root_id != session.chain_root_id
+        || operation.source_placement_thread_id != session.placement_thread_id
+        || operation.owner_principal != session.owner_principal
+        || operation.base_snapshot_hash != base_snapshot_hash
+        || operation.candidate_snapshot_hash != candidate_snapshot_hash
+        || operation.candidate_validation_hash
+            != evaluation
+                .pointer("/candidate/candidate_validation_hash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| internal("candidate evaluation has no validation identity"))?
+        || operation.integration_operation_hash.as_deref() != integration_operation_hash
+        || operation.integration_launch_id.is_some()
+        || !matches!(
+            &operation.purpose,
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate
+        )
+    {
+        return Err(internal(
+            "retained evaluator capsule is sealed to another candidate operation",
+        ));
+    }
+    if sealed.item_ref()
+        != evaluation
+            .pointer("/evaluator/item_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| internal("candidate evaluation has no evaluator item"))?
+        || sealed.effective_definition_digest().as_str()
+            != evaluation
+                .pointer("/evaluator/effective_definition_digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| internal("candidate evaluation has no evaluator definition"))?
+        || sealed.admitted_parameters_digest().map_err(internal)?
+            != evaluation
+                .pointer("/evaluator/parameters_digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| internal("candidate evaluation has no parameters digest"))?
+    {
+        return Err(internal(
+            "retained evaluator invocation differs from its testimony",
+        ));
+    }
+    let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+        stable_project_identity,
+        base_snapshot_hash: evaluator_base,
+        snapshot_hash: evaluator_snapshot,
+        realization,
+        environment,
+        capability_ceiling,
+        ..
+    } = &evaluator.project_authority
+    else {
+        return Err(internal("retained evaluator authority is not pinned"));
+    };
+    let realization_kind = match realization {
+        ryeos_state::objects::PinnedProjectRealization::ReadOnly => "read_only",
+        ryeos_state::objects::PinnedProjectRealization::Cow {
+            terminal_publication: ryeos_state::objects::PinnedTerminalPublication::Discard,
+        } => "cow_discard",
+        _ => {
+            return Err(internal(
+                "retained evaluator has publishing workspace authority",
+            ));
+        }
+    };
+    let binding_matches = match (realization, sealed.project_binding_subject_authority()) {
+        (
+            ryeos_state::objects::PinnedProjectRealization::ReadOnly,
+            ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration { snapshot_hash },
+        ) => snapshot_hash.as_str() == candidate_snapshot_hash,
+        (
+            ryeos_state::objects::PinnedProjectRealization::Cow {
+                terminal_publication: ryeos_state::objects::PinnedTerminalPublication::Discard,
+            },
+            ryeos_engine::contracts::SubjectResolutionAuthority::CowWorkspace {
+                base_snapshot_hash,
+                current_operational_generation,
+            },
+        ) => {
+            base_snapshot_hash.as_str() == candidate_snapshot_hash
+                && current_operational_generation.as_str() == candidate_snapshot_hash
+        }
+        _ => false,
+    };
+    if stable_project_identity != source_project_identity
+        || evaluator_base != candidate_snapshot_hash
+        || evaluator_snapshot != candidate_snapshot_hash
+        || !binding_matches
+        || environment != &ryeos_state::objects::EnvironmentAuthority::None
+        || capability_ceiling.iter().any(|capability| {
+            capability == ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+        })
+        || evaluation
+            .pointer("/evaluator/candidate_realization")
+            .and_then(Value::as_str)
+            != Some(realization_kind)
+    {
+        return Err(internal(
+            "retained evaluator no longer proves an exact non-publishing candidate view",
+        ));
+    }
+    let immutable_program = immutable_base_program_evidence(&sealed, base_snapshot_hash)?;
+    if evaluation.pointer("/evaluator/immutable_definition_authority") != Some(&immutable_program) {
+        return Err(internal(
+            "retained evaluator immutable program testimony has diverged",
+        ));
+    }
+    let evaluator_project_authority_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&evaluator.project_authority).map_err(internal)?,
+    )
+    .map_err(internal)?;
+    let evaluator_terminal_snapshot_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&evaluator).map_err(internal)?,
+    )
+    .map_err(internal)?;
+    if evaluation
+        .pointer("/evaluator/project_authority_digest")
+        .and_then(Value::as_str)
+        != Some(evaluator_project_authority_digest.as_str())
+        || evaluation
+            .pointer("/evaluator/terminal_snapshot_digest")
+            .and_then(Value::as_str)
+            != Some(evaluator_terminal_snapshot_digest.as_str())
+    {
+        return Err(internal(
+            "retained evaluator authority or terminal snapshot digest has diverged",
+        ));
+    }
+    let evaluator_result_value = evaluator
+        .result
+        .as_ref()
+        .ok_or_else(|| internal("retained successful evaluator has no result"))?;
+    let evaluator_result = validate_candidate_evaluation_result(
+        evaluator_result_value.clone(),
+        candidate_snapshot_hash,
+        base_snapshot_hash,
+    )?;
+    let evaluator_result_digest =
+        ryeos_state::objects::canonical_value_digest(evaluator_result_value).map_err(internal)?;
+    let evaluator_claim_evidence_digest =
+        ryeos_state::objects::canonical_value_digest(&evaluator_result.evidence)
+            .map_err(internal)?;
+    if !evaluator_result.accepted
+        || evaluation
+            .pointer("/result/result_digest")
+            .and_then(Value::as_str)
+            != Some(evaluator_result_digest.as_str())
+        || evaluation
+            .pointer("/result/claim_evidence_digest")
+            .and_then(Value::as_str)
+            != Some(evaluator_claim_evidence_digest.as_str())
+    {
+        return Err(internal(
+            "retained evaluator result differs from accepted testimony",
+        ));
+    }
+
+    // The append-only adoption fact is the durable commit boundary. Do not
+    // require this recorded-service root to have reached its later handler
+    // terminal event: a daemon crash after fact+projection commit must remain
+    // recoverable and idempotent.
+    let qualification = state
+        .state_store
+        .get_thread(qualification_root_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate qualification root disappeared"))?;
+    if qualification.thread_id != qualification_root_id
+        || qualification.chain_root_id != qualification_root_id
+        || qualification.item_ref != "service:worker-executions/qualify-candidate"
+        || qualification.requested_by.as_deref() != Some(session.owner_principal.as_str())
+        || qualification.current_site_id != source.current_site_id
+        || qualification.origin_site_id != source.origin_site_id
+    {
+        return Err(internal(
+            "candidate qualification root has contradictory owner authority",
+        ));
+    }
+    let operation_id =
+        candidate_qualification_operation_id(qualification_root_id, candidate_evaluation_hash)?;
+    let mut expected_fact =
+        candidate_qualification_fact_payload(session, candidate_evaluation_hash, evaluation);
+    expected_fact
+        .as_object_mut()
+        .expect("candidate qualification fact is an object")
+        .insert("operation_id".into(), Value::String(operation_id.clone()));
+    let fact = ryeos_app::authoritative_root_fact::lookup(
+        state,
+        qualification_root_id,
+        "hosted_candidate.qualified",
+        &operation_id,
+    )
+    .map_err(internal)?;
+    if fact.count != 1 || fact.payload.as_ref() != Some(&expected_fact) {
+        return Err(internal(
+            "candidate qualification projection has no exact append-only adoption fact",
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_publication_authority(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+) -> Result<CandidatePublicationAuthority, HandlerError> {
+    let source_candidate_snapshot_hash = session
+        .candidate_snapshot_hash
+        .as_ref()
+        .ok_or_else(|| HandlerError::BadRequest("session candidate is not ready".into()))?
+        .clone();
+    let source_candidate_validation_hash = session
+        .candidate_validation_hash
+        .as_ref()
+        .ok_or_else(|| {
+            HandlerError::BadRequest("session candidate has no validation identity".into())
+        })?
+        .clone();
+    let candidate_evaluation_hash = session
+        .candidate_evaluation_hash
+        .as_ref()
+        .ok_or_else(|| {
+            HandlerError::BadRequest(
+                "candidate publication requires accepted immutable evaluator testimony".into(),
+            )
+        })?
+        .clone();
+    let evaluation = session
+        .candidate_evaluation
+        .as_ref()
+        .ok_or_else(|| internal("candidate evaluation identity has no retained testimony"))?;
+    verify_candidate_evaluation_testimony(state, session, &candidate_evaluation_hash, evaluation)?;
+    let candidate_snapshot_hash = evaluation
+        .pointer("/candidate/candidate_snapshot_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| lillux::valid_hash(hash))
+        .ok_or_else(|| internal("candidate evaluation has no canonical candidate identity"))?
+        .to_owned();
+    let base_snapshot_hash = evaluation
+        .pointer("/candidate/base_snapshot_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| lillux::valid_hash(hash))
+        .ok_or_else(|| internal("candidate evaluation has no canonical base identity"))?
+        .to_owned();
+
+    let (source, _, _) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate source root disappeared"))?;
+    let (source_base, source_realization) = match &source.project_authority {
+        ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+            base_snapshot_hash,
+            realization,
+            ..
+        } => (base_snapshot_hash, realization),
+        _ => return Err(internal("candidate source authority is not pinned")),
+    };
+    if source_base != &base_snapshot_hash {
+        return Err(internal(
+            "candidate evaluation base differs from source project authority",
+        ));
+    }
+
+    let (candidate_validation_hash, principal_key, project_hash) = if let Some(integration) =
+        evaluation
+            .get("integration")
+            .filter(|value| !value.is_null())
+    {
+        let integration_operation_hash = evaluation
+            .get("integration_operation_hash")
+            .and_then(Value::as_str)
+            .filter(|hash| lillux::valid_hash(hash))
+            .ok_or_else(|| internal("integrated evaluation has no operation identity"))?;
+        if ryeos_state::objects::canonical_value_digest(integration).map_err(internal)?
+            != integration_operation_hash
+        {
+            return Err(internal(
+                "integrated evaluation operation identity is contradictory",
+            ));
+        }
+        let coordinate: CandidateIntegrationCoordinate = serde_json::from_value(
+            integration
+                .pointer("/operation/coordinate")
+                .cloned()
+                .ok_or_else(|| internal("integrated evaluation has no operation coordinate"))?,
+        )
+        .map_err(internal)?;
+        let candidate_validation_hash = integration
+            .get("result_candidate_validation_hash")
+            .and_then(Value::as_str)
+            .filter(|hash| lillux::valid_hash(hash))
+            .ok_or_else(|| internal("integrated evaluation has no validation identity"))?
+            .to_owned();
+        if integration
+            .get("result_candidate_snapshot_hash")
+            .and_then(Value::as_str)
+            != Some(candidate_snapshot_hash.as_str())
+        {
+            return Err(internal(
+                "integrated evaluation candidate identity is contradictory",
+            ));
+        }
+        let observed = verify_candidate_integration_terminal(
+            state,
+            session,
+            &coordinate,
+            &candidate_snapshot_hash,
+            &candidate_validation_hash,
+            &base_snapshot_hash,
+        )?;
+        if &observed != integration {
+            return Err(internal(
+                "retained integration testimony differs from authoritative terminal facts",
+            ));
+        }
+        let principal_key = integration
+            .pointer("/publication_destination/principal_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| internal("integration has no principal HEAD destination"))?
+            .to_owned();
+        let project_hash = integration
+            .pointer("/publication_destination/project_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| internal("integration has no project HEAD destination"))?
+            .to_owned();
+        (candidate_validation_hash, principal_key, project_hash)
+    } else {
+        if evaluation
+            .get("integration_operation_hash")
+            .is_some_and(|value| !value.is_null())
+            || candidate_snapshot_hash != source_candidate_snapshot_hash
+            || session.candidate_disposition
+                == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+        {
+            return Err(HandlerError::BadRequest(
+                    "bounded retained candidates require isolated integration and re-evaluation before publication"
+                        .into(),
+                ));
+        }
+        let ryeos_state::objects::PinnedProjectRealization::Cow {
+            terminal_publication:
+                ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
+                    principal_key,
+                    project_hash,
+                    expected_hash,
+                },
+        } = source_realization
+        else {
+            return Err(internal(
+                "direct candidate publication has no admitted HEAD destination",
+            ));
+        };
+        if expected_hash != &base_snapshot_hash {
+            return Err(internal(
+                "direct candidate publication HEAD fence differs from its base",
+            ));
+        }
+        (
+            source_candidate_validation_hash,
+            principal_key.clone(),
+            project_hash.clone(),
+        )
+    };
+
+    Ok(CandidatePublicationAuthority {
+        source_candidate_snapshot_hash,
+        candidate_snapshot_hash,
+        candidate_validation_hash,
+        base_snapshot_hash,
+        principal_key,
+        project_hash,
+        candidate_evaluation_hash,
+    })
+}
+
+fn accepted_source_evaluation(
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    evaluation_hash: &str,
+    candidate_snapshot_hash: &str,
+    base_snapshot_hash: &str,
+) -> Result<Value, HandlerError> {
+    let current = session.candidate_evaluation.as_ref().ok_or_else(|| {
+        HandlerError::BadRequest("source candidate has no evaluator testimony".into())
+    })?;
+    let testimony = if session.candidate_evaluation_hash.as_deref() == Some(evaluation_hash) {
+        current
+    } else if current
+        .pointer("/integration/source_evaluation_hash")
+        .and_then(Value::as_str)
+        == Some(evaluation_hash)
+    {
+        current
+            .pointer("/integration/source_evaluation")
+            .ok_or_else(|| internal("integrated evaluation lost its source testimony"))?
+    } else {
+        return Err(HandlerError::BadRequest(
+            "candidate integration references unretained evaluator testimony".into(),
+        ));
+    };
+    if ryeos_state::objects::canonical_value_digest(testimony).map_err(internal)? != evaluation_hash
+        || testimony
+            .pointer("/candidate/candidate_snapshot_hash")
+            .and_then(Value::as_str)
+            != Some(candidate_snapshot_hash)
+        || testimony
+            .pointer("/candidate/base_snapshot_hash")
+            .and_then(Value::as_str)
+            != Some(base_snapshot_hash)
+        || testimony
+            .pointer("/result/accepted")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration source evaluation is not exact accepted testimony".into(),
+        ));
+    }
+    Ok(testimony.clone())
+}
+
+fn verify_candidate_integration_terminal(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    coordinate: &CandidateIntegrationCoordinate,
+    candidate_snapshot_hash: &str,
+    candidate_validation_hash: &str,
+    base_snapshot_hash: &str,
+) -> Result<Value, HandlerError> {
+    if coordinate.chain_root_id == session.chain_root_id
+        || !lillux::valid_hash(&coordinate.capsule_hash)
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration requires an exact independent terminal-root coordinate".into(),
+        ));
+    }
+    if candidate_validation_identity(candidate_snapshot_hash)? != candidate_validation_hash {
+        return Err(HandlerError::BadRequest(
+            "integrated candidate validation identity is not canonical".into(),
+        ));
+    }
+    let source_candidate = session
+        .candidate_snapshot_hash
+        .as_deref()
+        .ok_or_else(|| internal("retained source candidate has no snapshot identity"))?;
+    let source_validation = session
+        .candidate_validation_hash
+        .as_deref()
+        .ok_or_else(|| internal("retained source candidate has no validation identity"))?;
+    let cas_read = state.acquire_cas_read().map_err(internal)?;
+    if !super::project_apply_snapshot::snapshot_history_contains(
+        cas_read.cas(),
+        candidate_snapshot_hash,
+        source_candidate,
+    )
+    .map_err(internal)?
+    {
+        return Err(HandlerError::BadRequest(
+            "integrated candidate does not descend from its exact frozen source candidate".into(),
+        ));
+    }
+    drop(cas_read);
+    let (source, _, _) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate source disappeared"))?;
+    let (source_project_identity, source_display_path, source_origin_site) =
+        match &source.project_authority {
+            ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+                stable_project_identity,
+                display_path: Some(display_path),
+                base_snapshot_hash: source_base,
+                ..
+            } if source_base == base_snapshot_hash => (
+                stable_project_identity,
+                display_path,
+                source.origin_site_id.as_str(),
+            ),
+            _ => {
+                return Err(HandlerError::BadRequest(
+                    "integration source has no exact pinned project authority".into(),
+                ));
+            }
+        };
+
+    let (integration, terminal_event, chain_head_hash) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &coordinate.chain_root_id,
+            &coordinate.terminal_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or(HandlerError::NotFound)?;
+    let terminal_event = terminal_event
+        .ok_or_else(|| HandlerError::BadRequest("integration has no terminal event".into()))?;
+    let terminal_event_hash = terminal_event
+        .event_hash
+        .as_deref()
+        .ok_or_else(|| internal("integration terminal event has no CAS hash"))?;
+    if integration.thread_id != coordinate.terminal_thread_id
+        || integration.chain_root_id != coordinate.chain_root_id
+        || integration.status != ryeos_state::objects::ThreadStatus::Completed
+        || integration.outcome_code.as_deref() != Some("success")
+        || integration.error.is_some()
+        || integration.requested_by.as_deref() != Some(session.owner_principal.as_str())
+        || integration.current_site_id != source.current_site_id
+        || integration.origin_site_id != source_origin_site
+        || integration.result_project_snapshot_hash.as_deref() != Some(candidate_snapshot_hash)
+        || terminal_event.event_type != ryeos_state::event_types::THREAD_COMPLETED
+        || terminal_event.chain_root_id != coordinate.chain_root_id
+        || terminal_event.thread_id != coordinate.terminal_thread_id
+        || integration.last_event_hash.as_deref() != Some(terminal_event_hash)
+        || u64::try_from(terminal_event.chain_seq).ok() != Some(integration.last_chain_seq)
+        || u64::try_from(terminal_event.thread_seq).ok() != Some(integration.last_thread_seq)
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration terminal does not prove exact successful completion".into(),
+        ));
+    }
+    if integration.admitted_launch_capsule_hash.as_deref() != Some(coordinate.capsule_hash.as_str())
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration capsule differs from its requested coordinate".into(),
+        ));
+    }
+    let capsule = state
+        .state_store
+        .admitted_launch_capsule(&coordinate.terminal_thread_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate integration capsule disappeared"))?;
+    if capsule.content_hash().map_err(internal)? != coordinate.capsule_hash
+        || capsule.project_authority != integration.project_authority
+    {
+        return Err(internal(
+            "candidate integration capsule contradicts its terminal project authority",
+        ));
+    }
+    let sealed =
+        ryeos_app::thread_lifecycle::SealedRootExecutionRequest::decode_from_admitted_capsule(
+            &capsule,
+        )
+        .map_err(internal)?;
+    let operation = sealed.candidate_evaluation_authority().ok_or_else(|| {
+        HandlerError::BadRequest(
+            "integration was not launched through candidate-integration authority".into(),
+        )
+    })?;
+    let accepted_evaluation_hash = match &operation.purpose {
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate {
+            accepted_evaluation_hash,
+        } => accepted_evaluation_hash,
+        ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate => {
+            return Err(HandlerError::BadRequest(
+                "candidate integration coordinate names an evaluator operation".into(),
+            ));
+        }
+    };
+    let source_evaluation = accepted_source_evaluation(
+        session,
+        accepted_evaluation_hash,
+        source_candidate,
+        base_snapshot_hash,
+    )?;
+    verify_candidate_evaluation_testimony(
+        state,
+        session,
+        accepted_evaluation_hash,
+        &source_evaluation,
+    )?;
+    let reserved_integration_launch_id = source_evaluation
+        .pointer("/qualification/reserved_integration_launch_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HandlerError::BadRequest(
+                "candidate integration source has no reserved launch identity".into(),
+            )
+        })?;
+    let reserved_integration_thread_id = source_evaluation
+        .pointer("/qualification/reserved_integration_thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HandlerError::BadRequest(
+                "candidate integration source has no pre-minted thread identity".into(),
+            )
+        })?;
+    if operation.integration_operation_hash.is_some()
+        || operation.integration_launch_id.as_deref() != Some(reserved_integration_launch_id)
+        || coordinate.chain_root_id != reserved_integration_thread_id
+        || operation.source_chain_root_id != session.chain_root_id
+        || operation.source_placement_thread_id != session.placement_thread_id
+        || operation.owner_principal != session.owner_principal
+        || operation.base_snapshot_hash != base_snapshot_hash
+        || operation.candidate_snapshot_hash != source_candidate
+        || operation.candidate_validation_hash != source_validation
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration capsule is sealed to another source candidate".into(),
+        ));
+    }
+    let (
+        integration_project_identity,
+        integration_display_path,
+        integration_base,
+        integration_snapshot,
+        integration_realization,
+        integration_environment,
+        integration_capabilities,
+    ) = match &integration.project_authority {
+        ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+            stable_project_identity,
+            display_path: Some(display_path),
+            base_snapshot_hash,
+            snapshot_hash,
+            realization,
+            environment,
+            capability_ceiling,
+            ..
+        } => (
+            stable_project_identity,
+            display_path,
+            base_snapshot_hash,
+            snapshot_hash,
+            realization,
+            environment,
+            capability_ceiling,
+        ),
+        _ => {
+            return Err(HandlerError::BadRequest(
+                "candidate integration did not execute in a pinned retained workspace".into(),
+            ));
+        }
+    };
+    let project_path = source_display_path
+        .to_str()
+        .ok_or_else(|| internal("candidate project identity is not UTF-8"))?;
+    let expected_principal_key =
+        ryeos_state::refs::principal_storage_key(&session.owner_principal).map_err(internal)?;
+    let expected_project_hash = ryeos_state::refs::deployed_project_key(project_path);
+    let exact_realization = matches!(
+        integration_realization,
+        ryeos_state::objects::PinnedProjectRealization::Cow {
+            terminal_publication:
+                ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
+                    principal_key,
+                    project_hash,
+                    expected_hash,
+                },
+        } if principal_key == expected_principal_key
+            && project_hash == &expected_project_hash
+            && expected_hash == base_snapshot_hash
+    );
+    let binding_matches = matches!(
+        sealed.project_binding_subject_authority(),
+        ryeos_engine::contracts::SubjectResolutionAuthority::CowWorkspace {
+            base_snapshot_hash: binding_base,
+            current_operational_generation,
+        } if binding_base == base_snapshot_hash
+            && current_operational_generation == source_candidate
+    );
+    if integration_project_identity != source_project_identity
+        || integration_display_path != source_display_path
+        || integration_base != base_snapshot_hash
+        || integration_snapshot != source_candidate
+        || !exact_realization
+        || !binding_matches
+        || integration_environment != &ryeos_state::objects::EnvironmentAuthority::None
+        || integration_capabilities.iter().any(|capability| {
+            capability == ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+        })
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate integration authority is not the exact isolated retained workspace".into(),
+        ));
+    }
+    let completion_operation_id =
+        ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact::operation_id(
+            operation,
+            &coordinate.chain_root_id,
+            &coordinate.capsule_hash,
+        )
+        .map_err(internal)?;
+    let completion_fact = ryeos_app::authoritative_root_fact::lookup(
+        state,
+        &coordinate.chain_root_id,
+        ryeos_app::thread_lifecycle::CANDIDATE_INTEGRATION_PROCESS_COMPLETED_EVENT,
+        &completion_operation_id,
+    )
+    .map_err(internal)?;
+    if completion_fact.count != 1 {
+        return Err(internal(
+            "candidate integration has no unique durable process-completion fact",
+        ));
+    }
+    let completion_fact: ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact =
+        serde_json::from_value(
+            completion_fact.payload.ok_or_else(|| {
+                internal("candidate integration completion payload is unavailable")
+            })?,
+        )
+        .map_err(internal)?;
+    completion_fact
+        .validate_for(
+            operation,
+            &coordinate.chain_root_id,
+            &coordinate.capsule_hash,
+        )
+        .map_err(internal)?;
+    let canonical_completion = completion_fact
+        .canonical_completion(candidate_snapshot_hash)
+        .map_err(internal)?;
+    if integration.result.as_ref() != canonical_completion.result.as_ref() {
+        return Err(internal(
+            "candidate integration terminal result is not the daemon-canonical frozen-generation testimony",
+        ));
+    }
+    let immutable_program = immutable_base_program_evidence(&sealed, base_snapshot_hash)?;
+    let result_digest = integration
+        .result
+        .as_ref()
+        .map(ryeos_state::objects::canonical_value_digest)
+        .transpose()
+        .map_err(internal)?;
+    let terminal_snapshot_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&integration).map_err(internal)?,
+    )
+    .map_err(internal)?;
+    let project_authority_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&integration.project_authority).map_err(internal)?,
+    )
+    .map_err(internal)?;
+    Ok(json!({
+        "schema":"ryeos.hosted_candidate_integration.v1",
+        "source_candidate_snapshot_hash":source_candidate,
+        "source_candidate_validation_hash":source_validation,
+        "source_evaluation_hash":accepted_evaluation_hash,
+        "source_evaluation":source_evaluation,
+        "operation":{
+            "coordinate":{
+                "chain_root_id":coordinate.chain_root_id,
+                "terminal_thread_id":coordinate.terminal_thread_id,
+                "capsule_hash":coordinate.capsule_hash,
+            },
+            "chain_root_id":coordinate.chain_root_id,
+            "terminal_thread_id":coordinate.terminal_thread_id,
+            "capsule_hash":coordinate.capsule_hash,
+            "item_ref":sealed.item_ref(),
+            "effective_definition_digest":sealed.effective_definition_digest(),
+            "parameters_digest":sealed.admitted_parameters_digest().map_err(internal)?,
+            "immutable_definition_authority":immutable_program,
+            "project_authority_digest":project_authority_digest,
+            "terminal_snapshot_digest":terminal_snapshot_digest,
+            "terminal_event_hash":terminal_event_hash,
+            "authoritative_chain_head_hash":chain_head_hash,
+            "result_digest":result_digest,
+        },
+        "publication_destination":{
+            "principal_key":expected_principal_key,
+            "project_hash":expected_project_hash,
+            "expected_hash":base_snapshot_hash,
+        },
+        "result_candidate_snapshot_hash":candidate_snapshot_hash,
+        "result_candidate_validation_hash":candidate_validation_hash,
+    }))
+}
+
+fn verified_candidate_source(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_snapshot_hash: &str,
+    candidate_validation_hash: &str,
+    integration: Option<&CandidateIntegrationCoordinate>,
+) -> Result<VerifiedCandidateSource, HandlerError> {
+    let (base_snapshot_hash, closure_evidence) = frozen_candidate_closure_evidence(
+        state,
+        session,
+        candidate_snapshot_hash,
+        candidate_validation_hash,
+    )?;
+    let direct = session.candidate_snapshot_hash.as_deref() == Some(candidate_snapshot_hash)
+        && session.candidate_validation_hash.as_deref() == Some(candidate_validation_hash);
+    if integration.is_none() && direct {
+        if !candidate_evaluation_source_ready(
+            session,
+            candidate_snapshot_hash,
+            candidate_validation_hash,
+        ) {
+            return Err(HandlerError::BadRequest(
+                "direct retained candidate is not available for independent evaluation".into(),
+            ));
+        }
+        return Ok(VerifiedCandidateSource {
+            base_snapshot_hash,
+            closure_evidence,
+            integration_evidence: None,
+            integration_operation_hash: None,
+        });
+    }
+    let integration = integration.ok_or_else(|| {
+        HandlerError::BadRequest(
+            "integrated candidate requires its exact integration terminal coordinate".into(),
+        )
+    })?;
+    let source_candidate = session
+        .candidate_snapshot_hash
+        .as_deref()
+        .ok_or_else(|| internal("retained source candidate has no snapshot identity"))?;
+    let source_validation = session
+        .candidate_validation_hash
+        .as_deref()
+        .ok_or_else(|| internal("retained source candidate has no validation identity"))?;
+    if !candidate_evaluation_source_ready(session, source_candidate, source_validation) {
+        return Err(HandlerError::BadRequest(
+            "integration source is no longer an exact retained candidate".into(),
+        ));
+    }
+    let integration_evidence = verify_candidate_integration_terminal(
+        state,
+        session,
+        integration,
+        candidate_snapshot_hash,
+        candidate_validation_hash,
+        &base_snapshot_hash,
+    )?;
+    let integration_operation_hash =
+        ryeos_state::objects::canonical_value_digest(&integration_evidence).map_err(internal)?;
+    Ok(VerifiedCandidateSource {
+        base_snapshot_hash,
+        closure_evidence,
+        integration_evidence: Some(integration_evidence),
+        integration_operation_hash: Some(integration_operation_hash),
+    })
+}
+
+fn immutable_base_program_evidence(
+    sealed: &ryeos_app::thread_lifecycle::SealedRootExecutionRequest,
+    base_snapshot_hash: &str,
+) -> Result<Value, HandlerError> {
+    use ryeos_engine::contracts::{ItemSourceRoot, ItemSpace};
+    use ryeos_engine::resolution::TrustClass;
+
+    let resolution = sealed.admitted_effective_resolution().map_err(internal)?;
+    if !matches!(
+        sealed.resolution_subject_authority(),
+        ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+            snapshot_hash,
+        } if snapshot_hash == base_snapshot_hash
+    ) {
+        return Err(HandlerError::BadRequest(
+            "candidate operation program was not resolved in the exact immutable base context"
+                .into(),
+        ));
+    }
+    // A bundle-owned root remains bundle authority even though resolution ran
+    // with the exact base overlay available. A project-owned root is admitted
+    // from that base. The distinction follows the resolved root, not merely
+    // the surrounding project context.
+    let authority_kind = match (&resolution.root.source_space, &resolution.root.source_root) {
+        (ItemSpace::Bundle, ItemSourceRoot::Bundle { .. }) => "installed_bundle",
+        (ItemSpace::Project, ItemSourceRoot::Project) => "base_project_generation",
+        _ => {
+            return Err(HandlerError::BadRequest(
+                "candidate operation root is outside immutable bundle/base authority".into(),
+            ));
+        }
+    };
+    let trusted_effective = match authority_kind {
+        "installed_bundle" => resolution.effective_trust_class == TrustClass::TrustedBundle,
+        "base_project_generation" => matches!(
+            resolution.effective_trust_class,
+            TrustClass::TrustedBundle | TrustClass::TrustedProject
+        ),
+        _ => unreachable!("evaluator authority kind is selected above"),
+    };
+    if !trusted_effective {
+        return Err(HandlerError::BadRequest(
+            "candidate operation definition is not trusted by its immutable authority".into(),
+        ));
+    }
+    let contributors = std::iter::once(&resolution.root)
+        .chain(resolution.ancestors.iter())
+        .chain(resolution.referenced_items.iter())
+        .collect::<Vec<_>>();
+    let mut bundles = BTreeSet::new();
+    let mut signers = BTreeSet::new();
+    for contributor in &contributors {
+        match (
+            &contributor.source_space,
+            &contributor.source_root,
+            contributor.trust_class,
+        ) {
+            (ItemSpace::Bundle, ItemSourceRoot::Bundle { name }, TrustClass::TrustedBundle) => {
+                bundles.insert(name.clone());
+            }
+            (ItemSpace::Project, ItemSourceRoot::Project, TrustClass::TrustedProject)
+                if authority_kind == "base_project_generation" => {}
+            _ => {
+                return Err(HandlerError::BadRequest(
+                    "candidate operation closure contains content outside its immutable trusted authority"
+                        .into(),
+                ));
+            }
+        }
+        let signer = contributor.signer_fingerprint.as_deref().ok_or_else(|| {
+            HandlerError::BadRequest(
+                "trusted candidate-operation contributor has no signer identity".into(),
+            )
+        })?;
+        if !lillux::valid_hash(signer) {
+            return Err(HandlerError::BadRequest(
+                "trusted candidate-operation contributor has a non-canonical signer identity"
+                    .into(),
+            ));
+        }
+        signers.insert(signer.to_owned());
+    }
+    if authority_kind == "installed_bundle"
+        && resolution
+            .references_edges
+            .iter()
+            .any(|edge| edge.to_source_space != ItemSpace::Bundle)
+    {
+        return Err(HandlerError::BadRequest(
+            "candidate operation resolution edge escapes immutable bundle content".into(),
+        ));
+    }
+    if resolution.references_edges.iter().any(|edge| {
+        !matches!(
+            edge.trust_class,
+            TrustClass::TrustedBundle | TrustClass::TrustedProject
+        ) || (authority_kind == "installed_bundle" && edge.trust_class != TrustClass::TrustedBundle)
+            || !matches!(edge.to_source_space, ItemSpace::Bundle | ItemSpace::Project)
+    }) {
+        return Err(HandlerError::BadRequest(
+            "candidate operation references content outside its immutable trusted authority".into(),
+        ));
+    }
+    Ok(json!({
+        "authority_kind":authority_kind,
+        "resolution_subject_authority":sealed.resolution_subject_authority(),
+        "resolution_digest":ryeos_state::objects::canonical_value_digest(resolution)
+            .map_err(internal)?,
+        "contributor_count":contributors.len(),
+        "bundles":bundles,
+        "signer_fingerprints":signers,
+    }))
+}
+
+fn validate_candidate_evaluation_result(
+    value: Value,
+    candidate_snapshot_hash: &str,
+    base_snapshot_hash: &str,
+) -> Result<CandidateEvaluationResult, HandlerError> {
+    let result: CandidateEvaluationResult = serde_json::from_value(value)
+        .map_err(|error| HandlerError::BadRequest(format!("invalid evaluator result: {error}")))?;
+    if result.schema_version != 1
+        || result.candidate_snapshot_hash != candidate_snapshot_hash
+        || result.base_snapshot_hash != base_snapshot_hash
+        || !result.evidence.is_object()
+    {
+        return Err(HandlerError::BadRequest(
+            "evaluator result contradicts the exact frozen candidate or base".into(),
+        ));
+    }
+    Ok(result)
+}
+
+fn candidate_qualification_operation_id(
+    qualification_root_id: &str,
+    candidate_evaluation_hash: &str,
+) -> Result<String, HandlerError> {
+    ryeos_state::objects::canonical_value_digest(&json!({
+        "schema":"ryeos.hosted_candidate_qualification_operation.v1",
+        "qualification_root_id":qualification_root_id,
+        "candidate_evaluation_hash":candidate_evaluation_hash,
+    }))
+    .map_err(internal)
+}
+
+fn candidate_qualification_fact_payload(
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_evaluation_hash: &str,
+    candidate_evaluation: &Value,
+) -> Value {
+    json!({
+        "schema":1,
+        "origin":"owner_authorized",
+        "source_chain_root_id":session.chain_root_id,
+        "source_placement_thread_id":session.placement_thread_id,
+        "candidate_evaluation_hash":candidate_evaluation_hash,
+        "candidate_evaluation":candidate_evaluation,
+    })
+}
+
+fn candidate_qualification_reservation(
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+) -> Result<CandidateQualificationReservation, HandlerError> {
+    let value = session
+        .candidate_qualification
+        .clone()
+        .ok_or_else(|| internal("qualifying candidate has no durable reservation"))?;
+    let reservation: CandidateQualificationReservation =
+        serde_json::from_value(value).map_err(internal)?;
+    if reservation.schema != "ryeos.hosted_candidate_qualification_reservation.v1"
+        || !lillux::valid_hash(&reservation.candidate_evaluation_hash)
+        || !lillux::valid_hash(&reservation.qualification_operation_id)
+        || reservation
+            .previous_candidate_evaluation_hash
+            .as_deref()
+            .is_some_and(|hash| !lillux::valid_hash(hash))
+        || ryeos_state::objects::canonical_value_digest(&reservation.candidate_evaluation)
+            .map_err(internal)?
+            != reservation.candidate_evaluation_hash
+        || session.candidate_disposition_root_id.as_deref()
+            != Some(reservation.qualification_root_id.as_str())
+        || session.candidate_disposition_operation_id.as_deref()
+            != Some(reservation.qualification_operation_id.as_str())
+        || session.candidate_evaluation_hash.as_deref()
+            != reservation.previous_candidate_evaluation_hash.as_deref()
+        || candidate_qualification_operation_id(
+            &reservation.qualification_root_id,
+            &reservation.candidate_evaluation_hash,
+        )? != reservation.qualification_operation_id
+    {
+        return Err(internal(
+            "candidate qualification reservation contradicts its durable projection",
+        ));
+    }
+    Ok(reservation)
+}
+
+/// Settle an exact rooted qualification after a crash, or roll back only when
+/// complete root replay proves the append-only fact was never contacted. The
+/// caller holds the candidate disposition lock, so no live handler can race
+/// this decision.
+fn reconcile_candidate_qualification(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+) -> Result<bool, HandlerError> {
+    if session.state != "qualifying" {
+        return Ok(false);
+    }
+    let reservation = candidate_qualification_reservation(session)?;
+    let fact = ryeos_app::authoritative_root_fact::lookup(
+        state,
+        &reservation.qualification_root_id,
+        "hosted_candidate.qualified",
+        &reservation.qualification_operation_id,
+    )
+    .map_err(internal)?;
+    if fact.count == 0 {
+        let reserved_launch_id = reservation
+            .candidate_evaluation
+            .pointer("/qualification/reserved_integration_launch_id")
+            .and_then(Value::as_str);
+        let reserved_thread_id = reservation
+            .candidate_evaluation
+            .pointer("/qualification/reserved_integration_thread_id")
+            .and_then(Value::as_str);
+        let reserved_integration_launch = match (reserved_launch_id, reserved_thread_id) {
+            (Some(launch_id), Some(thread_id)) => {
+                Some((launch_id, thread_id, session.owner_principal.as_str()))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(internal(
+                    "uncommitted candidate qualification has a partial integration reservation",
+                ));
+            }
+        };
+        state
+            .state_store
+            .rollback_dedicated_candidate_evaluation(
+                &session.placement_thread_id,
+                &reservation.qualification_root_id,
+                &reservation.qualification_operation_id,
+                reserved_integration_launch,
+            )
+            .map_err(internal)?;
+        return Ok(false);
+    }
+    verify_candidate_evaluation_testimony(
+        state,
+        session,
+        &reservation.candidate_evaluation_hash,
+        &reservation.candidate_evaluation,
+    )?;
+    let candidate_snapshot_hash = session
+        .candidate_snapshot_hash
+        .as_deref()
+        .ok_or_else(|| internal("qualifying candidate has no source snapshot"))?;
+    let candidate_validation_hash = session
+        .candidate_validation_hash
+        .as_deref()
+        .ok_or_else(|| internal("qualifying candidate has no validation identity"))?;
+    state
+        .state_store
+        .settle_dedicated_candidate_evaluation(
+            &session.placement_thread_id,
+            candidate_snapshot_hash,
+            candidate_validation_hash,
+            reservation.previous_candidate_evaluation_hash.as_deref(),
+            &reservation.candidate_evaluation_hash,
+            &reservation.candidate_evaluation,
+            &reservation.qualification_root_id,
+            &reservation.qualification_operation_id,
+        )
+        .map_err(internal)?;
+    Ok(true)
+}
+
 fn append_root_fact_once(
     state: &AppState,
     session: &ryeos_app::state_store::DedicatedSessionRecord,
@@ -6440,135 +8633,540 @@ async fn validate_candidate_closure_and_base(
     ctx: HandlerContext,
     state: Arc<AppState>,
 ) -> Result<Value, HandlerError> {
+    let session = owned_session(&state, &ctx, &req.chain_root_id)?;
+    if !candidate_evaluation_source_ready(
+        &session,
+        &req.candidate_snapshot_hash,
+        &req.candidate_validation_hash,
+    ) {
+        return Err(HandlerError::BadRequest(
+            "validation identity differs from the exact retained candidate".into(),
+        ));
+    }
+    let (_base_snapshot_hash, evidence) = frozen_candidate_closure_evidence(
+        &state,
+        &session,
+        &req.candidate_snapshot_hash,
+        &req.candidate_validation_hash,
+    )?;
+    Ok(json!({
+        "chain_root_id":session.chain_root_id,
+        "placement_thread_id":session.placement_thread_id,
+        "state":"frozen",
+        "candidate_snapshot_hash":req.candidate_snapshot_hash,
+        "candidate_validation_hash":req.candidate_validation_hash,
+        "qualification":"closure_verified",
+        "publication_authority":false,
+        "evidence":evidence,
+    }))
+}
+
+fn candidate_qualification_request_matches(
+    evaluation: &Value,
+    req: &QualifyCandidateRequest,
+    compare_reserved_launch: bool,
+) -> bool {
+    let integration_matches = match &req.integration {
+        None => evaluation.get("integration").is_none_or(Value::is_null),
+        Some(coordinate) => {
+            evaluation
+                .pointer("/integration/operation/coordinate/chain_root_id")
+                .and_then(Value::as_str)
+                == Some(coordinate.chain_root_id.as_str())
+                && evaluation
+                    .pointer("/integration/operation/coordinate/terminal_thread_id")
+                    .and_then(Value::as_str)
+                    == Some(coordinate.terminal_thread_id.as_str())
+                && evaluation
+                    .pointer("/integration/operation/coordinate/capsule_hash")
+                    .and_then(Value::as_str)
+                    == Some(coordinate.capsule_hash.as_str())
+        }
+    };
+    integration_matches
+        && evaluation
+            .pointer("/candidate/candidate_snapshot_hash")
+            .and_then(Value::as_str)
+            == Some(req.candidate_snapshot_hash.as_str())
+        && evaluation
+            .pointer("/candidate/candidate_validation_hash")
+            .and_then(Value::as_str)
+            == Some(req.candidate_validation_hash.as_str())
+        && evaluation
+            .pointer("/evaluator/chain_root_id")
+            .and_then(Value::as_str)
+            == Some(req.evaluator_chain_root_id.as_str())
+        && evaluation
+            .pointer("/evaluator/terminal_thread_id")
+            .and_then(Value::as_str)
+            == Some(req.evaluator_terminal_thread_id.as_str())
+        && evaluation
+            .pointer("/evaluator/capsule_hash")
+            .and_then(Value::as_str)
+            == Some(req.evaluator_capsule_hash.as_str())
+        && evaluation
+            .pointer("/evaluator/item_ref")
+            .and_then(Value::as_str)
+            == Some(req.evaluator_item_ref.as_str())
+        && evaluation
+            .pointer("/evaluator/effective_definition_digest")
+            .and_then(Value::as_str)
+            == Some(req.evaluator_definition_digest.as_str())
+        && evaluation
+            .pointer("/evaluator/parameters_digest")
+            .and_then(Value::as_str)
+            == Some(req.evaluator_parameters_digest.as_str())
+        && (!compare_reserved_launch
+            || evaluation
+                .pointer("/qualification/reserved_integration_launch_id")
+                .and_then(Value::as_str)
+                == req.integration_launch_id.as_deref())
+}
+
+async fn qualify_candidate(
+    req: QualifyCandidateRequest,
+    ctx: HandlerContext,
+    state: Arc<AppState>,
+) -> Result<Value, HandlerError> {
+    let qualification_root_id = ctx
+        .recorded_service_root_id()
+        .ok_or_else(|| {
+            internal("candidate qualification requires its recorded service invocation root")
+        })?
+        .to_owned();
     let initial = owned_session(&state, &ctx, &req.chain_root_id)?;
     let placement_thread_id = initial.placement_thread_id.clone();
     let operation_lock = disposition_operation_lock(&placement_thread_id);
     let _operation_guard = operation_lock.lock_owned().await;
-    let session = owned_session(&state, &ctx, &req.chain_root_id)?;
+    let mut session = owned_session(&state, &ctx, &req.chain_root_id)?;
     if session.placement_thread_id != placement_thread_id {
         return Err(HandlerError::BadRequest(
-            "hosted execution placement changed while candidate validation was reserved".into(),
+            "hosted execution placement changed while candidate qualification was reserved".into(),
         ));
     }
-    let _root_operation = ryeos_app::hosted_operation::begin_hosted_root_operation(
-        &state.state_store,
-        &session.placement_thread_id,
-    )
-    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
-    if session.state == "publish_ready"
-        && session.candidate_snapshot_hash.as_deref() == Some(req.candidate_snapshot_hash.as_str())
-        && session.candidate_validation_hash.as_deref()
-            == Some(req.candidate_validation_hash.as_str())
-    {
-        return Ok(json!({
-            "chain_root_id":session.chain_root_id,
-            "placement_thread_id":session.placement_thread_id,
-            "state":"publish_ready",
-            "candidate_snapshot_hash":req.candidate_snapshot_hash,
-            "candidate_validation_hash":req.candidate_validation_hash,
-            "idempotent":true,
-        }));
+    if req.evaluator_chain_root_id == session.chain_root_id {
+        return Err(HandlerError::BadRequest(
+            "candidate qualification requires an independent evaluator execution chain".into(),
+        ));
     }
-    if !matches!(session.state.as_str(), "frozen" | "verifying")
-        || session.candidate_snapshot_hash.as_deref() != Some(req.candidate_snapshot_hash.as_str())
-        || session.candidate_validation_hash.as_deref()
-            != Some(req.candidate_validation_hash.as_str())
+    if req
+        .integration_launch_id
+        .as_deref()
+        .is_some_and(|launch_id| !ryeos_app::state_store::is_canonical_launch_id(launch_id))
     {
         return Err(HandlerError::BadRequest(
-            "validation identity differs from the frozen candidate".into(),
+            "reserved candidate-integration launch id is not canonical".into(),
         ));
     }
-    let operation_id = ryeos_state::objects::canonical_value_digest(&json!({
-        "schema":"ryeos.hosted_candidate_validation_operation.v1",
-        "chain_root_id":session.chain_root_id,
-        "placement_thread_id":session.placement_thread_id,
-        "candidate_snapshot_hash":req.candidate_snapshot_hash,
-        "candidate_validation_hash":req.candidate_validation_hash,
-    }))
-    .map_err(internal)?;
-    let thread = state
+    if req.integration.is_some() && req.integration_launch_id.is_some() {
+        return Err(HandlerError::BadRequest(
+            "final integrated-candidate qualification cannot reserve another integration".into(),
+        ));
+    }
+    if req.integration.is_none()
+        && session.candidate_disposition
+            == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+        && req.integration_launch_id.is_none()
+    {
+        return Err(HandlerError::BadRequest(
+            "bounded retained candidate qualification must reserve its sole integration launch"
+                .into(),
+        ));
+    }
+    if session.state == "qualifying" {
+        reconcile_candidate_qualification(&state, &session)?;
+        session = owned_session(&state, &ctx, &req.chain_root_id)?;
+    }
+    if let (Some(incumbent_hash), Some(incumbent)) = (
+        session.candidate_evaluation_hash.as_deref(),
+        session.candidate_evaluation.as_ref(),
+    ) {
+        verify_candidate_evaluation_testimony(&state, &session, incumbent_hash, incumbent)?;
+        let incumbent_launch_id = incumbent
+            .pointer("/qualification/reserved_integration_launch_id")
+            .and_then(Value::as_str);
+        if candidate_qualification_request_matches(incumbent, &req, true) {
+            return Ok(json!({
+                "chain_root_id":session.chain_root_id,
+                "placement_thread_id":session.placement_thread_id,
+                "state":"publish_ready",
+                "candidate_snapshot_hash":req.candidate_snapshot_hash,
+                "candidate_validation_hash":req.candidate_validation_hash,
+                "candidate_evaluation_hash":incumbent_hash,
+                "qualification_root_id":incumbent
+                    .pointer("/qualification/root_thread_id")
+                    .and_then(Value::as_str),
+                "accepted":true,
+                "idempotent":true,
+            }));
+        }
+        let incumbent_is_integrated = incumbent
+            .get("integration")
+            .is_some_and(|value| !value.is_null());
+        if req.integration.is_some() {
+            if incumbent_is_integrated || incumbent_launch_id.is_none() {
+                return Err(HandlerError::BadRequest(
+                    "accepted candidate qualification is immutable; only its already-reserved integration result may replace it".into(),
+                ));
+            }
+        } else {
+            let old_launch_id = incumbent_launch_id.ok_or_else(|| {
+                HandlerError::BadRequest(
+                    "accepted candidate qualification cannot acquire or change integration intent"
+                        .into(),
+                )
+            })?;
+            if !candidate_qualification_request_matches(incumbent, &req, false)
+                || req.integration_launch_id.is_none()
+                || req.integration_launch_id.as_deref() == Some(old_launch_id)
+            {
+                return Err(HandlerError::BadRequest(
+                    "replacement integration reservation must preserve the accepted evaluator and use one fresh launch coordinate".into(),
+                ));
+            }
+            let old = state
+                .state_store
+                .launch_planning_status(old_launch_id, &session.owner_principal)
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    HandlerError::BadRequest(
+                        "reserved integration launch no longer has authoritative pre-birth state"
+                            .into(),
+                    )
+                })?;
+            let proved_never_bound = old.thread_id.is_none()
+                && matches!(old.status.as_str(), "cancelled" | "failed" | "expired")
+                && matches!(
+                    old.outcome_code.as_deref(),
+                    Some("cancelled_by_requester")
+                        | Some("thread_creation_failed")
+                        | Some("launch_admission_failed")
+                        | Some("daemon_restarted_before_thread_bind")
+                );
+            if !proved_never_bound {
+                return Err(HandlerError::BadRequest(
+                    "accepted candidate integration reservation is immutable after launch planning may have contacted execution"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let verified_source = verified_candidate_source(
+        &state,
+        &session,
+        &req.candidate_snapshot_hash,
+        &req.candidate_validation_hash,
+        req.integration.as_ref(),
+    )?;
+    let base_snapshot_hash = verified_source.base_snapshot_hash.clone();
+    let closure_evidence = verified_source.closure_evidence.clone();
+
+    let (source, _, _) = state
         .state_store
-        .get_thread(&session.placement_thread_id)
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
         .map_err(internal)?
-        .ok_or_else(|| internal("dedicated root thread disappeared"))?;
+        .ok_or_else(|| internal("dedicated placement disappeared from its authoritative chain"))?;
     let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
-        base_snapshot_hash,
+        stable_project_identity: source_project_identity,
+        base_snapshot_hash: source_base,
         ..
-    } = thread
-        .project_authority
-        .ok_or_else(|| internal("dedicated root has no project authority"))?
+    } = &source.project_authority
     else {
         return Err(internal("dedicated candidate authority is not pinned"));
     };
-    let pinned = state
-        .state_store
-        .with_state_db(|db| db.pinned_authority())
-        .map_err(internal)?;
-    let _guard = pinned.acquire_shared_guard().map_err(internal)?;
-    let cas = pinned.cas_store().map_err(internal)?;
-    let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
-        &cas,
-        [req.candidate_snapshot_hash.clone()],
-        ryeos_state::object_closure::ObjectClosureLimits::for_project_snapshot_transport(),
-    )
-    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
-    if !closure.is_complete() {
-        return Err(HandlerError::BadRequest(
-            "candidate snapshot closure is incomplete or unsupported".into(),
+    if source_base != &base_snapshot_hash {
+        return Err(internal(
+            "candidate closure base differs from its admitted project authority",
         ));
     }
-    if !super::project_apply_snapshot::snapshot_history_contains(
-        &cas,
-        &req.candidate_snapshot_hash,
-        &base_snapshot_hash,
-    )
-    .map_err(internal)?
+
+    let (evaluator, evaluator_last_event, evaluator_chain_head_hash) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &req.evaluator_chain_root_id,
+            &req.evaluator_terminal_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or(HandlerError::NotFound)?;
+    let evaluator_last_event = evaluator_last_event
+        .ok_or_else(|| HandlerError::BadRequest("evaluator has no terminal event".into()))?;
+    let evaluator_last_event_hash = evaluator_last_event
+        .event_hash
+        .as_deref()
+        .ok_or_else(|| internal("evaluator terminal event has no CAS hash"))?;
+    if evaluator.thread_id != req.evaluator_terminal_thread_id
+        || evaluator.chain_root_id != req.evaluator_chain_root_id
+        || evaluator.status != ryeos_state::objects::ThreadStatus::Completed
+        || evaluator.outcome_code.as_deref() != Some("success")
+        || evaluator.error.is_some()
+        || evaluator.requested_by.as_deref() != Some(session.owner_principal.as_str())
+        || evaluator_last_event.event_type != ryeos_state::event_types::THREAD_COMPLETED
+        || evaluator_last_event.chain_root_id != req.evaluator_chain_root_id
+        || evaluator_last_event.thread_id != req.evaluator_terminal_thread_id
+        || evaluator.last_event_hash.as_deref() != Some(evaluator_last_event_hash)
+        || u64::try_from(evaluator_last_event.chain_seq).ok() != Some(evaluator.last_chain_seq)
+        || u64::try_from(evaluator_last_event.thread_seq).ok() != Some(evaluator.last_thread_seq)
     {
         return Err(HandlerError::BadRequest(
-            "candidate does not descend from the admitted base generation".into(),
+            "evaluator terminal does not prove exact successful owner-authorized completion".into(),
         ));
     }
-    let evidence = json!({
-        "schema":"ryeos.hosted_candidate_closure_and_base_validation.v1",
-        "checks":{
-            "canonical_snapshot_closure":true,
-            "base_ancestry":true,
-        },
-        "object_count":closure.object_hashes.len(),
-        "blob_count":closure.blob_hashes.len(),
-    });
-    state
+    let evaluator_capsule_hash = evaluator
+        .admitted_launch_capsule_hash
+        .as_deref()
+        .ok_or_else(|| HandlerError::BadRequest("evaluator has no admitted capsule".into()))?;
+    if evaluator_capsule_hash != req.evaluator_capsule_hash {
+        return Err(HandlerError::BadRequest(
+            "evaluator capsule differs from the requested qualification coordinate".into(),
+        ));
+    }
+    let evaluator_capsule = state
         .state_store
-        .reserve_dedicated_candidate_validation(
-            &session.placement_thread_id,
-            &req.candidate_snapshot_hash,
-            &req.candidate_validation_hash,
+        .admitted_launch_capsule(&req.evaluator_terminal_thread_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("evaluator admitted capsule disappeared"))?;
+    if evaluator_capsule.content_hash().map_err(internal)? != req.evaluator_capsule_hash
+        || evaluator_capsule.project_authority != evaluator.project_authority
+    {
+        return Err(internal(
+            "evaluator capsule contradicts its authoritative terminal snapshot",
+        ));
+    }
+    let sealed =
+        ryeos_app::thread_lifecycle::SealedRootExecutionRequest::decode_from_admitted_capsule(
+            &evaluator_capsule,
         )
-        .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
-    append_root_fact_once(
-        &state,
-        &session,
-        "hosted_candidate.validation_completed",
-        &operation_id,
-        json!({
-            "schema":1,
-            "origin":"filesystem_verified",
+        .map_err(internal)?;
+    let evaluator_operation = sealed.candidate_evaluation_authority().ok_or_else(|| {
+        HandlerError::BadRequest(
+            "evaluator was not launched through exact candidate-evaluation authority".into(),
+        )
+    })?;
+    if evaluator_operation.source_chain_root_id != session.chain_root_id
+        || evaluator_operation.source_placement_thread_id != session.placement_thread_id
+        || evaluator_operation.owner_principal != session.owner_principal
+        || evaluator_operation.base_snapshot_hash != base_snapshot_hash
+        || evaluator_operation.candidate_snapshot_hash != req.candidate_snapshot_hash
+        || evaluator_operation.candidate_validation_hash != req.candidate_validation_hash
+        || evaluator_operation.integration_operation_hash.as_deref()
+            != verified_source.integration_operation_hash.as_deref()
+        || !matches!(
+            &evaluator_operation.purpose,
+            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Evaluate
+        )
+    {
+        return Err(HandlerError::BadRequest(
+            "evaluator capsule is sealed to another retained candidate operation".into(),
+        ));
+    }
+    if sealed.item_ref() != req.evaluator_item_ref
+        || evaluator.item_ref != req.evaluator_item_ref
+        || sealed.effective_definition_digest().as_str() != req.evaluator_definition_digest
+        || sealed.admitted_parameters_digest().map_err(internal)? != req.evaluator_parameters_digest
+    {
+        return Err(HandlerError::BadRequest(
+            "evaluator invocation differs from the exact requested definition or parameters".into(),
+        ));
+    }
+
+    let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
+        stable_project_identity,
+        base_snapshot_hash: evaluator_base,
+        snapshot_hash: evaluator_snapshot,
+        realization,
+        capability_ceiling,
+        ..
+    } = &evaluator.project_authority
+    else {
+        return Err(HandlerError::BadRequest(
+            "candidate evaluator did not execute against an immutable candidate generation".into(),
+        ));
+    };
+    let realization_kind = match realization {
+        ryeos_state::objects::PinnedProjectRealization::ReadOnly => "read_only",
+        ryeos_state::objects::PinnedProjectRealization::Cow {
+            terminal_publication: ryeos_state::objects::PinnedTerminalPublication::Discard,
+        } => "cow_discard",
+        _ => {
+            return Err(HandlerError::BadRequest(
+                "candidate evaluator may not retain or publish evaluator workspace changes".into(),
+            ));
+        }
+    };
+    let binding_matches = match (realization, sealed.project_binding_subject_authority()) {
+        (
+            ryeos_state::objects::PinnedProjectRealization::ReadOnly,
+            ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration { snapshot_hash },
+        ) => snapshot_hash == &req.candidate_snapshot_hash,
+        (
+            ryeos_state::objects::PinnedProjectRealization::Cow {
+                terminal_publication: ryeos_state::objects::PinnedTerminalPublication::Discard,
+            },
+            ryeos_engine::contracts::SubjectResolutionAuthority::CowWorkspace {
+                base_snapshot_hash,
+                current_operational_generation,
+            },
+        ) => {
+            base_snapshot_hash == &req.candidate_snapshot_hash
+                && current_operational_generation == &req.candidate_snapshot_hash
+        }
+        _ => false,
+    };
+    if stable_project_identity != source_project_identity
+        || evaluator_base != &req.candidate_snapshot_hash
+        || evaluator_snapshot != &req.candidate_snapshot_hash
+        || !binding_matches
+        || capability_ceiling.iter().any(|capability| {
+            capability == ryeos_app::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
+        })
+    {
+        return Err(HandlerError::BadRequest(
+            "evaluator execution authority is not the exact read-only/discard candidate view"
+                .into(),
+        ));
+    }
+    let immutable_evaluator = immutable_base_program_evidence(&sealed, &base_snapshot_hash)?;
+    let evaluator_result_value = evaluator
+        .result
+        .clone()
+        .ok_or_else(|| HandlerError::BadRequest("successful evaluator has no result".into()))?;
+    let evaluator_result = validate_candidate_evaluation_result(
+        evaluator_result_value.clone(),
+        &req.candidate_snapshot_hash,
+        &base_snapshot_hash,
+    )?;
+    let evaluator_result_digest =
+        ryeos_state::objects::canonical_value_digest(&evaluator_result_value).map_err(internal)?;
+    let evaluator_claim_evidence_digest =
+        ryeos_state::objects::canonical_value_digest(&evaluator_result.evidence)
+            .map_err(internal)?;
+    let evaluator_terminal_snapshot_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&evaluator).map_err(internal)?,
+    )
+    .map_err(internal)?;
+    let evaluator_project_authority_digest = ryeos_state::objects::canonical_value_digest(
+        &serde_json::to_value(&evaluator.project_authority).map_err(internal)?,
+    )
+    .map_err(internal)?;
+    let reserved_integration_launch_id = evaluator_result
+        .accepted
+        .then(|| req.integration_launch_id.clone())
+        .flatten();
+    let reserved_integration_thread_id = reserved_integration_launch_id
+        .as_ref()
+        .map(|_| ryeos_app::thread_lifecycle::new_thread_id());
+    let evaluation_evidence = json!({
+        "schema":"ryeos.hosted_candidate_evaluation.v1",
+        "candidate":closure_evidence,
+        "integration":verified_source.integration_evidence,
+        "integration_operation_hash":verified_source.integration_operation_hash,
+        "evaluator":{
+            "chain_root_id":req.evaluator_chain_root_id,
+            "terminal_thread_id":req.evaluator_terminal_thread_id,
+            "capsule_hash":req.evaluator_capsule_hash,
+            "item_ref":req.evaluator_item_ref,
+            "effective_definition_digest":req.evaluator_definition_digest,
+            "parameters_digest":req.evaluator_parameters_digest,
+            "immutable_definition_authority":immutable_evaluator,
+            "project_authority_digest":evaluator_project_authority_digest,
+            "candidate_realization":realization_kind,
+            "terminal_snapshot_digest":evaluator_terminal_snapshot_digest,
+            "terminal_event_hash":evaluator_last_event_hash,
+            "authoritative_chain_head_hash":evaluator_chain_head_hash,
+        },
+        "result":{
+            "accepted":evaluator_result.accepted,
+            "result_digest":evaluator_result_digest,
+            "claim_evidence_digest":evaluator_claim_evidence_digest,
+        },
+        "qualification":{
+            "root_thread_id":qualification_root_id,
+            "reserved_integration_launch_id":reserved_integration_launch_id,
+            "reserved_integration_thread_id":reserved_integration_thread_id,
+        },
+    });
+    let candidate_evaluation_hash =
+        ryeos_state::objects::canonical_value_digest(&evaluation_evidence).map_err(internal)?;
+    if !evaluator_result.accepted {
+        return Ok(json!({
             "chain_root_id":session.chain_root_id,
             "placement_thread_id":session.placement_thread_id,
+            "state":session.state,
             "candidate_snapshot_hash":req.candidate_snapshot_hash,
             "candidate_validation_hash":req.candidate_validation_hash,
-            "evidence":evidence,
-        }),
+            "candidate_evaluation_hash":candidate_evaluation_hash,
+            "accepted":false,
+        }));
+    }
+    let qualification_operation_id =
+        candidate_qualification_operation_id(&qualification_root_id, &candidate_evaluation_hash)?;
+    let source_candidate_snapshot_hash = session
+        .candidate_snapshot_hash
+        .as_deref()
+        .ok_or_else(|| internal("retained source candidate has no snapshot identity"))?;
+    let source_candidate_validation_hash = session
+        .candidate_validation_hash
+        .as_deref()
+        .ok_or_else(|| internal("retained source candidate has no validation identity"))?;
+    let reserved_integration_launch = match (
+        reserved_integration_launch_id.as_deref(),
+        reserved_integration_thread_id.as_deref(),
+    ) {
+        (Some(launch_id), Some(thread_id)) => {
+            Some((launch_id, thread_id, session.owner_principal.as_str()))
+        }
+        (None, None) => None,
+        _ => return Err(internal("candidate integration reservation is partial")),
+    };
+    state
+        .state_store
+        .reserve_dedicated_candidate_evaluation(
+            &session.placement_thread_id,
+            source_candidate_snapshot_hash,
+            source_candidate_validation_hash,
+            session.candidate_evaluation_hash.as_deref(),
+            &candidate_evaluation_hash,
+            &evaluation_evidence,
+            &qualification_root_id,
+            &qualification_operation_id,
+            reserved_integration_launch,
+        )
+        .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
+    ryeos_app::authoritative_root_fact::append_once(
+        &state,
+        &qualification_root_id,
+        "hosted_candidate.qualified",
+        &qualification_operation_id,
+        candidate_qualification_fact_payload(
+            &session,
+            &candidate_evaluation_hash,
+            &evaluation_evidence,
+        ),
+    )
+    .map_err(internal)?;
+    verify_candidate_evaluation_testimony(
+        &state,
+        &session,
+        &candidate_evaluation_hash,
+        &evaluation_evidence,
     )?;
     state
         .state_store
-        .settle_dedicated_candidate_validation(
+        .settle_dedicated_candidate_evaluation(
             &session.placement_thread_id,
-            &req.candidate_snapshot_hash,
-            &req.candidate_validation_hash,
-            &evidence,
+            source_candidate_snapshot_hash,
+            source_candidate_validation_hash,
+            session.candidate_evaluation_hash.as_deref(),
+            &candidate_evaluation_hash,
+            &evaluation_evidence,
+            &qualification_root_id,
+            &qualification_operation_id,
         )
-        .map_err(internal)?;
+        .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
     ryeos_app::dedicated_session_service::notify_projection_change(&session.placement_thread_id);
     Ok(json!({
         "chain_root_id":session.chain_root_id,
@@ -6576,7 +9174,11 @@ async fn validate_candidate_closure_and_base(
         "state":"publish_ready",
         "candidate_snapshot_hash":req.candidate_snapshot_hash,
         "candidate_validation_hash":req.candidate_validation_hash,
-        "evidence":evidence,
+        "candidate_evaluation_hash":candidate_evaluation_hash,
+        "qualification_root_id":qualification_root_id,
+        "qualification_operation_id":qualification_operation_id,
+        "accepted":true,
+        "idempotent":false,
     }))
 }
 
@@ -6587,25 +9189,231 @@ pub struct DiscardRequest {
     candidate_snapshot_hash: String,
 }
 
+fn candidate_discard_operation_id(
+    disposition_root_id: &str,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_snapshot_hash: &str,
+) -> Result<String, HandlerError> {
+    ryeos_state::objects::canonical_value_digest(&json!({
+        "schema":"ryeos.hosted_candidate_discard_operation.v2",
+        "disposition_root_id":disposition_root_id,
+        "source_chain_root_id":session.chain_root_id,
+        "source_placement_thread_id":session.placement_thread_id,
+        "candidate_snapshot_hash":candidate_snapshot_hash,
+    }))
+    .map_err(internal)
+}
+
+fn candidate_discard_payload(
+    disposition_root_id: &str,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    candidate_snapshot_hash: &str,
+) -> Value {
+    json!({
+        "schema":2,
+        "origin":"owner_authorized",
+        "owner_principal":session.owner_principal,
+        "disposition_root_id":disposition_root_id,
+        "source_chain_root_id":session.chain_root_id,
+        "source_placement_thread_id":session.placement_thread_id,
+        "candidate_snapshot_hash":candidate_snapshot_hash,
+    })
+}
+
+fn expected_candidate_discard_fact(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    disposition_root_id: &str,
+    operation_id: &str,
+    candidate_snapshot_hash: &str,
+) -> Result<Value, HandlerError> {
+    if session.candidate_snapshot_hash.as_deref() != Some(candidate_snapshot_hash)
+        || candidate_discard_operation_id(disposition_root_id, session, candidate_snapshot_hash)?
+            != operation_id
+    {
+        return Err(internal(
+            "candidate discard operation identity is contradictory",
+        ));
+    }
+    let disposition = state
+        .state_store
+        .get_thread(disposition_root_id)
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate discard operation root disappeared"))?;
+    let (source, _, _) = state
+        .state_store
+        .get_authoritative_thread_snapshot_with_last_event(
+            &session.chain_root_id,
+            &session.placement_thread_id,
+        )
+        .map_err(internal)?
+        .ok_or_else(|| internal("candidate source root disappeared"))?;
+    if disposition.thread_id != disposition_root_id
+        || disposition.chain_root_id != disposition_root_id
+        || disposition_root_id == session.chain_root_id
+        || disposition.item_ref != "service:worker-executions/discard"
+        || disposition.requested_by.as_deref() != Some(session.owner_principal.as_str())
+        || disposition.current_site_id != source.current_site_id
+        || disposition.origin_site_id != source.origin_site_id
+    {
+        return Err(internal(
+            "candidate discard root has contradictory authority",
+        ));
+    }
+    let mut expected =
+        candidate_discard_payload(disposition_root_id, session, candidate_snapshot_hash);
+    expected
+        .as_object_mut()
+        .expect("candidate discard fact is an object")
+        .insert(
+            "operation_id".into(),
+            Value::String(operation_id.to_owned()),
+        );
+    Ok(expected)
+}
+
+fn verify_candidate_discard_fact(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+    disposition_root_id: &str,
+    operation_id: &str,
+    candidate_snapshot_hash: &str,
+) -> Result<(), HandlerError> {
+    let expected = expected_candidate_discard_fact(
+        state,
+        session,
+        disposition_root_id,
+        operation_id,
+        candidate_snapshot_hash,
+    )?;
+    let fact = ryeos_app::authoritative_root_fact::lookup(
+        state,
+        disposition_root_id,
+        "hosted_candidate.discarded",
+        operation_id,
+    )
+    .map_err(internal)?;
+    if fact.count != 1 || fact.payload.as_ref() != Some(&expected) {
+        return Err(internal(
+            "candidate discard projection has no exact owner fact",
+        ));
+    }
+    Ok(())
+}
+
+/// The caller holds the disposition lock. Absence is accepted only after a
+/// complete replay of the exact reserved root; a unique owner fact commits
+/// the discard regardless of whether the service root itself was settled.
+fn reconcile_candidate_discard(
+    state: &AppState,
+    session: &ryeos_app::state_store::DedicatedSessionRecord,
+) -> Result<bool, HandlerError> {
+    if session.state != "discarding" {
+        return Ok(false);
+    }
+    let candidate = session
+        .candidate_snapshot_hash
+        .as_deref()
+        .ok_or_else(|| internal("discarding candidate has no snapshot identity"))?;
+    let root_id = session
+        .candidate_disposition_root_id
+        .as_deref()
+        .ok_or_else(|| internal("discarding candidate has no disposition root"))?;
+    let operation_id = session
+        .candidate_disposition_operation_id
+        .as_deref()
+        .ok_or_else(|| internal("discarding candidate has no disposition operation"))?;
+    let expected =
+        expected_candidate_discard_fact(state, session, root_id, operation_id, candidate)?;
+    let fact = ryeos_app::authoritative_root_fact::lookup(
+        state,
+        root_id,
+        "hosted_candidate.discarded",
+        operation_id,
+    )
+    .map_err(internal)?;
+    if !candidate_discard_fact_committed(fact.count, fact.payload.as_ref(), &expected)? {
+        state
+            .state_store
+            .rollback_dedicated_candidate_discard(
+                &session.placement_thread_id,
+                candidate,
+                root_id,
+                operation_id,
+            )
+            .map_err(internal)?;
+        return Ok(false);
+    }
+    state
+        .state_store
+        .settle_dedicated_candidate_discard(
+            &session.placement_thread_id,
+            candidate,
+            root_id,
+            operation_id,
+        )
+        .map_err(internal)?;
+    Ok(true)
+}
+
+fn candidate_discard_fact_committed(
+    count: u8,
+    payload: Option<&Value>,
+    expected: &Value,
+) -> Result<bool, HandlerError> {
+    match (count, payload) {
+        (0, None) => Ok(false),
+        (1, Some(payload)) if payload == expected => Ok(true),
+        _ => Err(internal(
+            "candidate discard journal has contradictory rooted facts",
+        )),
+    }
+}
+
 async fn discard(
     req: DiscardRequest,
     ctx: HandlerContext,
     state: Arc<AppState>,
 ) -> Result<Value, HandlerError> {
     let initial = owned_session(&state, &ctx, &req.chain_root_id)?;
+    let disposition_root_id = ctx
+        .recorded_service_root_id()
+        .ok_or_else(|| internal("candidate discard requires a recorded service root"))?
+        .to_owned();
     let placement_thread_id = initial.placement_thread_id.clone();
     let operation_lock = disposition_operation_lock(&placement_thread_id);
     let _operation_guard = operation_lock.lock_owned().await;
-    let root_operation = ryeos_app::hosted_operation::begin_hosted_root_operation_if_appendable(
-        &state.state_store,
-        &initial.placement_thread_id,
-    )
-    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
-    let session = owned_session(&state, &ctx, &req.chain_root_id)?;
+    let mut session = owned_session(&state, &ctx, &req.chain_root_id)?;
     if session.placement_thread_id != placement_thread_id {
         return Err(HandlerError::BadRequest(
             "hosted execution placement changed while candidate discard was reserved".into(),
         ));
+    }
+    if session.state == "discarding"
+        && session
+            .publication_result
+            .as_deref()
+            .is_some_and(|result| matches!(result, "retained" | "retained_for_review"))
+    {
+        if session.candidate_snapshot_hash.as_deref() != Some(req.candidate_snapshot_hash.as_str())
+        {
+            return Err(HandlerError::BadRequest(
+                "discard retry changed candidate identity".into(),
+            ));
+        }
+        let committed = reconcile_candidate_discard(&state, &session)?;
+        ryeos_app::dedicated_session_service::notify_projection_change(
+            &session.placement_thread_id,
+        );
+        if committed {
+            return Ok(json!({
+                "chain_root_id":session.chain_root_id,
+                "placement_thread_id":session.placement_thread_id,
+                "discarded":true,
+                "idempotent":true,
+            }));
+        }
+        session = owned_session(&state, &ctx, &req.chain_root_id)?;
     }
     if session.publication_result.as_deref() == Some("discarded") {
         if session.candidate_snapshot_hash.as_deref() != Some(req.candidate_snapshot_hash.as_str())
@@ -6614,6 +9422,21 @@ async fn discard(
                 "discard retry changed candidate identity".into(),
             ));
         }
+        let retained_root_id = session
+            .candidate_disposition_root_id
+            .as_deref()
+            .ok_or_else(|| internal("discarded candidate has no disposition root"))?;
+        let retained_operation_id = session
+            .candidate_disposition_operation_id
+            .as_deref()
+            .ok_or_else(|| internal("discarded candidate has no disposition operation"))?;
+        verify_candidate_discard_fact(
+            &state,
+            &session,
+            retained_root_id,
+            retained_operation_id,
+            &req.candidate_snapshot_hash,
+        )?;
         return Ok(json!({
             "chain_root_id":session.chain_root_id,
             "placement_thread_id":session.placement_thread_id,
@@ -6621,41 +9444,44 @@ async fn discard(
             "idempotent":true,
         }));
     }
-    let _root_operation = root_operation.ok_or_else(|| {
-        HandlerError::BadRequest("nonterminal discard has a terminal hosted execution root".into())
-    })?;
-    let operation_id = ryeos_state::objects::canonical_value_digest(&json!({
-        "schema":"ryeos.hosted_candidate_discard_operation.v1",
-        "chain_root_id":session.chain_root_id,
-        "placement_thread_id":session.placement_thread_id,
-        "candidate_snapshot_hash":req.candidate_snapshot_hash,
-    }))
-    .map_err(internal)?;
+    let operation_id = candidate_discard_operation_id(
+        &disposition_root_id,
+        &session,
+        &req.candidate_snapshot_hash,
+    )?;
+    // Persist the exact root coordinate, and reject a wrong candidate or
+    // disposition, before the owner fact becomes an irreversible commit.
     state
         .state_store
         .reserve_dedicated_candidate_discard(
             &session.placement_thread_id,
             &req.candidate_snapshot_hash,
+            &disposition_root_id,
+            &operation_id,
         )
         .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
-    append_root_fact_once(
+    ryeos_app::authoritative_root_fact::append_once(
         &state,
-        &session,
+        &disposition_root_id,
         "hosted_candidate.discarded",
         &operation_id,
-        json!({
-            "schema":1,
-            "origin":"owner_authorized",
-            "chain_root_id":session.chain_root_id,
-            "placement_thread_id":session.placement_thread_id,
-            "candidate_snapshot_hash":req.candidate_snapshot_hash,
-        }),
+        candidate_discard_payload(&disposition_root_id, &session, &req.candidate_snapshot_hash),
+    )
+    .map_err(internal)?;
+    verify_candidate_discard_fact(
+        &state,
+        &session,
+        &disposition_root_id,
+        &operation_id,
+        &req.candidate_snapshot_hash,
     )?;
     state
         .state_store
         .settle_dedicated_candidate_discard(
             &session.placement_thread_id,
             &req.candidate_snapshot_hash,
+            &disposition_root_id,
+            &operation_id,
         )
         .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
     ryeos_app::dedicated_session_service::notify_projection_change(&session.placement_thread_id);
@@ -6686,81 +9512,59 @@ async fn publish(
             ))
         })?;
     let initial = owned_session(&state, &ctx, &req.chain_root_id)?;
+    let invocation_root_id = ctx
+        .recorded_service_root_id()
+        .ok_or_else(|| internal("candidate publication requires a recorded service root"))?
+        .to_owned();
     let placement_thread_id = initial.placement_thread_id.clone();
     let operation_lock = disposition_operation_lock(&placement_thread_id);
     let _operation_guard = operation_lock.lock_owned().await;
-    let root_operation = ryeos_app::hosted_operation::begin_hosted_root_operation_if_appendable(
-        &state.state_store,
-        &initial.placement_thread_id,
-    )
-    .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
     let session = owned_session(&state, &ctx, &req.chain_root_id)?;
     if session.placement_thread_id != placement_thread_id {
         return Err(HandlerError::BadRequest(
             "hosted execution placement changed while candidate publication was reserved".into(),
         ));
     }
-    if !matches!(
-        session.state.as_str(),
-        "publish_ready" | "publishing" | "terminal"
-    ) {
+    let owner_publishable = session.candidate_disposition
+        == ryeos_app::runtime_db::DedicatedCandidateDisposition::OwnerDecision
+        && matches!(
+            session.state.as_str(),
+            "publish_ready" | "publishing" | "terminal"
+        );
+    let bounded_publishable = session.candidate_disposition
+        == ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview
+        && matches!(
+            session.state.as_str(),
+            "publish_ready" | "publishing" | "terminal"
+        )
+        && session.terminal_reason.as_deref() == Some("completed");
+    if !owner_publishable && !bounded_publishable {
         return Err(HandlerError::BadRequest(
             "session has no unpublished retained candidate".into(),
         ));
     }
-    let candidate = session
-        .candidate_snapshot_hash
-        .as_deref()
-        .ok_or_else(|| HandlerError::BadRequest("session candidate is not ready".into()))?;
-    let candidate_validation_hash =
-        session
-            .candidate_validation_hash
-            .as_deref()
-            .ok_or_else(|| {
-                HandlerError::BadRequest(
-                    "session candidate has no retained validation identity".into(),
-                )
-            })?;
+    let publication_authority = candidate_publication_authority(&state, &session)?;
+    let source_candidate = publication_authority
+        .source_candidate_snapshot_hash
+        .as_str();
+    let candidate = publication_authority.candidate_snapshot_hash.as_str();
+    let candidate_validation_hash = publication_authority.candidate_validation_hash.as_str();
+    let base_snapshot_hash = publication_authority.base_snapshot_hash.as_str();
+    let principal_key = publication_authority.principal_key.as_str();
+    let project_hash = publication_authority.project_hash.as_str();
+    let candidate_evaluation_hash = publication_authority.candidate_evaluation_hash.as_str();
     let published_result = format!("published:{candidate}");
     let already_published =
         session.publication_result.as_deref() == Some(published_result.as_str());
-    if session.publication_result.as_deref() != Some("retained") && !already_published {
+    let retained = match session.candidate_disposition {
+        ryeos_app::runtime_db::DedicatedCandidateDisposition::OwnerDecision => "retained",
+        ryeos_app::runtime_db::DedicatedCandidateDisposition::RetainedForReview => {
+            "retained_for_review"
+        }
+    };
+    if session.publication_result.as_deref() != Some(retained) && !already_published {
         return Err(HandlerError::BadRequest(
             "session has no publishable retained candidate".into(),
-        ));
-    }
-    let thread = state
-        .state_store
-        .get_thread(&session.placement_thread_id)
-        .map_err(internal)?
-        .ok_or_else(|| internal("dedicated root thread disappeared"))?;
-    let authority = thread
-        .project_authority
-        .ok_or_else(|| internal("dedicated root has no project authority"))?;
-    let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
-        base_snapshot_hash,
-        realization,
-        ..
-    } = authority
-    else {
-        return Err(internal("dedicated publication authority is not pinned"));
-    };
-    let ryeos_state::objects::PinnedProjectRealization::Cow {
-        terminal_publication:
-            ryeos_state::objects::PinnedTerminalPublication::RetainCurrentHead {
-                principal_key,
-                project_hash,
-                expected_hash,
-            },
-    } = realization
-    else {
-        return Err(internal(
-            "dedicated publication authority has no admitted explicit HEAD destination",
-        ));
-    };
-    if expected_hash != base_snapshot_hash {
-        return Err(internal(
-            "dedicated publication HEAD fence differs from its admitted base",
         ));
     }
     if ryeos_state::refs::principal_storage_key(&ctx.fingerprint).map_err(internal)?
@@ -6776,63 +9580,45 @@ async fn publish(
         ));
     }
     if already_published {
+        let publication_root_id = session
+            .candidate_disposition_root_id
+            .as_deref()
+            .ok_or_else(|| internal("published candidate has no publication root"))?;
+        let publication_operation_id = session
+            .candidate_disposition_operation_id
+            .as_deref()
+            .ok_or_else(|| internal("published candidate has no publication operation"))?;
+        verify_candidate_publication_reservation(
+            &state,
+            &session,
+            &publication_authority,
+            publication_root_id,
+            publication_operation_id,
+        )?;
+        let has_result = verify_candidate_publication_result(
+            &state,
+            &session,
+            &publication_authority,
+            publication_root_id,
+            publication_operation_id,
+            "hosted_candidate.published",
+            "published",
+        )?;
+        if !has_result {
+            return Err(internal(
+                "published candidate has no exact rooted publication result",
+            ));
+        }
         return Ok(json!({
             "chain_root_id":session.chain_root_id,
             "placement_thread_id":session.placement_thread_id,
             "snapshot_hash":candidate,
             "previous_hash":base_snapshot_hash,
             "candidate_validation_hash":candidate_validation_hash,
+            "candidate_evaluation_hash":candidate_evaluation_hash,
             "published":true,
             "idempotent":true,
         }));
-    }
-    let _root_operation = root_operation.ok_or_else(|| {
-        HandlerError::BadRequest(
-            "unpublished candidate has a terminal hosted execution root".into(),
-        )
-    })?;
-    let operation_id = ryeos_state::objects::canonical_value_digest(&json!({
-        "schema":"ryeos.hosted_candidate_publication_operation.v1",
-        "chain_root_id":session.chain_root_id,
-        "placement_thread_id":session.placement_thread_id,
-        "candidate_snapshot_hash":candidate,
-        "expected_previous_hash":base_snapshot_hash,
-        "candidate_validation_hash":candidate_validation_hash,
-        "principal_key":principal_key,
-        "project_hash":project_hash,
-    }))
-    .map_err(internal)?;
-    append_root_fact_once(
-        &state,
-        &session,
-        "hosted_candidate.publication_reserved",
-        &operation_id,
-        json!({
-            "schema":1,
-            "origin":"owner_authorized",
-            "owner_principal":session.owner_principal,
-            "chain_root_id":session.chain_root_id,
-            "placement_thread_id":session.placement_thread_id,
-            "candidate_snapshot_hash":candidate,
-            "expected_previous_hash":base_snapshot_hash,
-            "candidate_validation_hash":candidate_validation_hash,
-            "principal_key":principal_key,
-            "project_hash":project_hash,
-        }),
-    )?;
-    if !has_authoritative_candidate_publication_reservation(
-        &state,
-        &session,
-        &operation_id,
-        candidate,
-        &base_snapshot_hash,
-        candidate_validation_hash,
-        &principal_key,
-        &project_hash,
-    )? {
-        return Err(internal(
-            "candidate publication reservation disappeared after authoritative append",
-        ));
     }
     let project_lock = super::project_apply_snapshot::project_apply_lock(&project_hash);
     let _project_guard = project_lock.lock_owned().await;
@@ -6845,7 +9631,7 @@ async fn publish(
     if !super::project_apply_snapshot::snapshot_history_contains(
         &cas,
         candidate,
-        &base_snapshot_hash,
+        base_snapshot_hash,
     )
     .map_err(internal)?
     {
@@ -6853,38 +9639,61 @@ async fn publish(
             "candidate does not descend from the admitted base generation".into(),
         ));
     }
+    let publication_operation_id =
+        candidate_publication_operation_id(&invocation_root_id, &session, &publication_authority)?;
+    ryeos_app::authoritative_root_fact::append_once(
+        &state,
+        &invocation_root_id,
+        "hosted_candidate.publication_reserved",
+        &publication_operation_id,
+        candidate_publication_reservation_payload(
+            &session,
+            &publication_authority,
+            &invocation_root_id,
+        ),
+    )
+    .map_err(internal)?;
+    verify_candidate_publication_reservation(
+        &state,
+        &session,
+        &publication_authority,
+        &invocation_root_id,
+        &publication_operation_id,
+    )?;
     let _permit = state
         .write_barrier
         .acquire_with_timeout(ryeos_app::write_barrier::ONLINE_WRITE_PERMIT_TIMEOUT)
         .map_err(internal)?;
     state
         .state_store
-        .reserve_dedicated_candidate_publication(&session.placement_thread_id, candidate)
+        .reserve_dedicated_candidate_publication(
+            &session.placement_thread_id,
+            source_candidate,
+            &invocation_root_id,
+            &publication_operation_id,
+        )
         .map_err(|error| HandlerError::BadRequest(error.to_string()))?;
     let signer = ryeos_app::state_store::NodeIdentitySigner::from_identity(&state.identity);
     let current = state
         .state_store
         .with_state_db(|db| db.read_project_head(&principal_key, &project_hash))
         .map_err(internal)?;
-    let publication = if current.as_deref() == Some(candidate) {
-        Ok(())
-    } else if current.as_deref() != Some(base_snapshot_hash.as_str()) {
-        Err(anyhow::anyhow!(
-            "publication conflict: expected HEAD {}, current HEAD is {:?}",
-            base_snapshot_hash,
-            current
-        ))
-    } else {
-        state.state_store.advance_project_head_ref(
-            &principal_key,
-            &project_hash,
-            candidate,
-            &base_snapshot_hash,
-            &signer,
-            &cas_guard,
+    if current.as_deref() != Some(candidate) && current.as_deref() != Some(base_snapshot_hash) {
+        ryeos_app::authoritative_root_fact::append_once(
+            &state,
+            &invocation_root_id,
+            "hosted_candidate.publication_not_applied",
+            &publication_operation_id,
+            candidate_publication_result_payload(
+                &session,
+                &publication_authority,
+                &invocation_root_id,
+                &publication_operation_id,
+                "not_applied",
+                false,
+            ),
         )
-    };
-    if let Err(error) = publication {
+        .map_err(internal)?;
         state
             .state_store
             .fail_dedicated_candidate_disposition(&session.placement_thread_id, "publishing")
@@ -6892,32 +9701,78 @@ async fn publish(
         ryeos_app::dedicated_session_service::notify_projection_change(
             &session.placement_thread_id,
         );
-        return Err(HandlerError::BadRequest(error.to_string()));
+        return Err(HandlerError::BadRequest(format!(
+            "publication conflict: expected HEAD {}, current HEAD is {:?}",
+            base_snapshot_hash, current
+        )));
     }
-    append_root_fact_once(
+    let publication = if current.as_deref() == Some(candidate) {
+        Ok(())
+    } else {
+        state.state_store.advance_project_head_ref(
+            &principal_key,
+            &project_hash,
+            candidate,
+            base_snapshot_hash,
+            &signer,
+            &cas_guard,
+        )
+    };
+    if let Err(error) = publication {
+        ryeos_app::authoritative_root_fact::append_once(
+            &state,
+            &invocation_root_id,
+            "hosted_candidate.publication_unknown",
+            &publication_operation_id,
+            candidate_publication_result_payload(
+                &session,
+                &publication_authority,
+                &invocation_root_id,
+                &publication_operation_id,
+                "unknown",
+                false,
+            ),
+        )
+        .map_err(internal)?;
+        state
+            .state_store
+            .settle_dedicated_candidate_publication(
+                &session.placement_thread_id,
+                source_candidate,
+                &invocation_root_id,
+                &publication_operation_id,
+                &format!("publication_unknown:{candidate}"),
+            )
+            .map_err(internal)?;
+        ryeos_app::dedicated_session_service::notify_projection_change(
+            &session.placement_thread_id,
+        );
+        return Err(HandlerError::Internal(format!(
+            "candidate publication outcome is unknown after HEAD contact: {error}"
+        )));
+    }
+    ryeos_app::authoritative_root_fact::append_once(
         &state,
-        &session,
+        &invocation_root_id,
         "hosted_candidate.published",
-        &operation_id,
-        json!({
-            "schema":1,
-            "origin":"filesystem_verified",
-            "owner_principal":session.owner_principal,
-            "chain_root_id":session.chain_root_id,
-            "placement_thread_id":session.placement_thread_id,
-            "candidate_snapshot_hash":candidate,
-            "expected_previous_hash":base_snapshot_hash,
-            "candidate_validation_hash":candidate_validation_hash,
-            "principal_key":principal_key,
-            "project_hash":project_hash,
-            "reservation_operation_id":operation_id,
-        }),
-    )?;
+        &publication_operation_id,
+        candidate_publication_result_payload(
+            &session,
+            &publication_authority,
+            &invocation_root_id,
+            &publication_operation_id,
+            "published",
+            false,
+        ),
+    )
+    .map_err(internal)?;
     state
         .state_store
         .settle_dedicated_candidate_publication(
             &session.placement_thread_id,
-            candidate,
+            source_candidate,
+            &invocation_root_id,
+            &publication_operation_id,
             &format!("published:{candidate}"),
         )
         .map_err(internal)?;
@@ -6928,6 +9783,7 @@ async fn publish(
         "snapshot_hash":candidate,
         "previous_hash":base_snapshot_hash,
         "candidate_validation_hash":candidate_validation_hash,
+        "candidate_evaluation_hash":candidate_evaluation_hash,
         "published":true,
     }))
 }
@@ -7099,6 +9955,50 @@ pub const VALIDATE_CANDIDATE_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
     },
 };
 
+pub const START_CANDIDATE_EVALUATION_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
+    service_ref: "service:worker-executions/start-candidate-evaluation",
+    endpoint: "worker-executions.start-candidate-evaluation",
+    availability: ServiceAvailability::DaemonOnly,
+    required_caps: &["ryeos.execute.service.worker-executions/start-candidate-evaluation"],
+    handler: |params, ctx, state| {
+        Box::pin(async move {
+            let req: StartCandidateEvaluationRequest = crate::handler_error::parse_request(params)?;
+            start_candidate_evaluation(req, ctx, state)
+                .await
+                .map_err(Into::into)
+        })
+    },
+};
+
+pub const START_CANDIDATE_INTEGRATION_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
+    service_ref: "service:worker-executions/start-candidate-integration",
+    endpoint: "worker-executions.start-candidate-integration",
+    availability: ServiceAvailability::DaemonOnly,
+    required_caps: &["ryeos.execute.service.worker-executions/start-candidate-integration"],
+    handler: |params, ctx, state| {
+        Box::pin(async move {
+            let req: StartCandidateIntegrationRequest =
+                crate::handler_error::parse_request(params)?;
+            start_candidate_integration(req, ctx, state)
+                .await
+                .map_err(Into::into)
+        })
+    },
+};
+
+pub const QUALIFY_CANDIDATE_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
+    service_ref: "service:worker-executions/qualify-candidate",
+    endpoint: "worker-executions.qualify-candidate",
+    availability: ServiceAvailability::DaemonOnly,
+    required_caps: &["ryeos.execute.service.worker-executions/qualify-candidate"],
+    handler: |params, ctx, state| {
+        Box::pin(async move {
+            let req: QualifyCandidateRequest = crate::handler_error::parse_request(params)?;
+            qualify_candidate(req, ctx, state).await.map_err(Into::into)
+        })
+    },
+};
+
 pub const DISCARD_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
     service_ref: "service:worker-executions/discard",
     endpoint: "worker-executions.discard",
@@ -7116,7 +10016,8 @@ pub const DISCARD_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
 mod tests {
     use super::{
         CandidatePublicationRecovery, CheckpointRequest, CommandObservationRequest, CommandRequest,
-        HandoffPreflightRequest, HandoffRequest, ResumeRequest,
+        HandoffPreflightRequest, HandoffRequest, QualifyCandidateRequest, ResumeRequest,
+        StartCandidateEvaluationRequest, StartCandidateIntegrationRequest,
         classify_candidate_publication_recovery, decode_worker_handoff_service_response,
         exact_reaped_source_worker_authority, handoff_status_value, latest_handoff_job_for_chain,
         validate_source_handoff_job_coordinates,
@@ -7125,6 +10026,21 @@ mod tests {
         WORKER_SESSION_HANDOFF_OPERATION, WorkerHandoffJobRole, WorkerSessionHandoffJobOperation,
     };
     use ryeos_state::{NewSyncJob, StateDb, TrustStore};
+
+    #[test]
+    fn discard_recovery_requires_exact_absence_or_unique_committed_fact() {
+        let expected = serde_json::json!({
+            "operation_id":"a".repeat(64),
+            "candidate_snapshot_hash":"c".repeat(64),
+        });
+        assert!(!super::candidate_discard_fact_committed(0, None, &expected).unwrap());
+        assert!(super::candidate_discard_fact_committed(1, Some(&expected), &expected).unwrap());
+        assert!(super::candidate_discard_fact_committed(2, Some(&expected), &expected).is_err());
+        assert!(super::candidate_discard_fact_committed(1, None, &expected).is_err());
+        assert!(super::candidate_discard_fact_committed(0, Some(&expected), &expected).is_err());
+        let other = serde_json::json!({"candidate_snapshot_hash":"d".repeat(64)});
+        assert!(super::candidate_discard_fact_committed(1, Some(&other), &expected).is_err());
+    }
 
     fn status_job(
         operation: &WorkerSessionHandoffJobOperation,
@@ -7482,6 +10398,61 @@ mod tests {
         assert_eq!(
             classify_candidate_publication_recovery(None, "base", "candidate"),
             CandidatePublicationRecovery::Unknown
+        );
+    }
+
+    #[test]
+    fn candidate_operations_require_exact_integration_coordinates() {
+        let hash = || "a".repeat(64);
+        let coordinate = serde_json::json!({
+            "chain_root_id":"T-integration",
+            "terminal_thread_id":"T-integration",
+            "capsule_hash":hash(),
+        });
+        assert!(
+            serde_json::from_value::<StartCandidateEvaluationRequest>(serde_json::json!({
+                "chain_root_id":"T-source",
+                "candidate_snapshot_hash":hash(),
+                "candidate_validation_hash":hash(),
+                "evaluator_item_ref":"tool:project/evaluate",
+                "evaluator_parameters":{},
+                "evaluator_ref_bindings":{},
+                "integration":coordinate,
+                "launch_id":"L-evaluate",
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<StartCandidateIntegrationRequest>(serde_json::json!({
+                "chain_root_id":"T-source",
+                "candidate_snapshot_hash":hash(),
+                "candidate_validation_hash":hash(),
+                "accepted_evaluation_hash":hash(),
+                "authoring_wrapper_item_ref":"tool:project/integrate",
+                "authoring_parameters":{},
+                "authoring_ref_bindings":{},
+                "launch_id":"L-integrate",
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<QualifyCandidateRequest>(serde_json::json!({
+                "chain_root_id":"T-source",
+                "candidate_snapshot_hash":hash(),
+                "candidate_validation_hash":hash(),
+                "evaluator_chain_root_id":"T-evaluator",
+                "evaluator_terminal_thread_id":"T-evaluator",
+                "evaluator_capsule_hash":hash(),
+                "evaluator_item_ref":"tool:project/evaluate",
+                "evaluator_definition_digest":hash(),
+                "evaluator_parameters_digest":hash(),
+                "integration":{
+                    "chain_root_id":"T-integration",
+                    "terminal_thread_id":"T-integration"
+                }
+            }))
+            .is_err(),
+            "qualification must not accept an incomplete integration coordinate"
         );
     }
 }

@@ -381,6 +381,7 @@ fn check_imports(
         current_site_id: "site:doctor".into(),
         origin_site_id: "site:doctor".into(),
         execution_hints: Default::default(),
+        scheduled_fire: None,
         validate_only: true,
     };
 

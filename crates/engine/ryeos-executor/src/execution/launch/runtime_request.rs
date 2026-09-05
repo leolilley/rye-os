@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 
 use ryeos_engine::canonical_ref::CanonicalRef;
 
+use crate::dispatch_error::DispatchError;
+
 use super::{EnvelopeCallback, LaunchEnvelope, RuntimeResult};
 use ryeos_runtime::envelope::RuntimeResultStatus;
 use ryeos_runtime::process_outcome::RuntimeProcessOutcome;
@@ -31,6 +33,10 @@ pub(super) struct SpawnRuntimeParams<'a> {
     pub owns_workspace: bool,
     pub envelope: &'a LaunchEnvelope,
     pub timeout_secs: u64,
+    /// Durable execution-tree deadline minted under the shared accounting
+    /// scope. Kept absolute until the final pre-spawn boundary so queueing and
+    /// launch preparation cannot restart or extend the remaining window.
+    pub aggregate_deadline_at_ms: Option<i64>,
     pub callback: &'a EnvelopeCallback,
     pub thread_id: &'a str,
     pub launch_owner: &'a str,
@@ -152,6 +158,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
         owns_workspace,
         envelope,
         timeout_secs,
+        aggregate_deadline_at_ms,
         callback,
         thread_id,
         launch_owner,
@@ -192,6 +199,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
         socket_path: callback_socket_path,
         token: callback.token.clone(),
     };
+    let timeout = effective_runtime_timeout(timeout_secs, aggregate_deadline_at_ms)?;
     let build_request = ryeos_engine::protocols::BuildRequest {
         item_ref,
         binary_path: Path::new(binary),
@@ -202,7 +210,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
         thread_id,
         callback: Some(&callback_bindings),
         launch_envelope: Some(envelope),
-        timeout: std::time::Duration::from_secs(timeout_secs),
+        timeout,
         acting_principal,
         cas_root,
         thread_auth_token: Some(thread_auth_token),
@@ -473,6 +481,36 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
         external_realizations,
         source_closure,
         immediate_result: None,
+    })
+}
+
+fn effective_runtime_timeout(
+    execution_timeout_secs: u64,
+    aggregate_deadline_at_ms: Option<i64>,
+) -> Result<std::time::Duration> {
+    let execution = (execution_timeout_secs != 0)
+        .then(|| std::time::Duration::from_secs(execution_timeout_secs));
+    let aggregate = aggregate_deadline_at_ms
+        .map(|deadline| {
+            let remaining_ms = deadline
+                .checked_sub(lillux::time::timestamp_millis())
+                .filter(|remaining| *remaining > 0)
+                .ok_or_else(|| DispatchError::LaunchPreparationFailed {
+                    code: "budget_exhausted".to_owned(),
+                    message: "aggregate execution duration elapsed before runtime spawn".to_owned(),
+                    classification: "policy".to_owned(),
+                    binding: None,
+                    details: Box::new(BTreeMap::new()),
+                })?;
+            Ok::<_, anyhow::Error>(std::time::Duration::from_millis(u64::try_from(
+                remaining_ms,
+            )?))
+        })
+        .transpose()?;
+    Ok(match (execution, aggregate) {
+        (Some(execution), Some(aggregate)) => execution.min(aggregate),
+        (Some(timeout), None) | (None, Some(timeout)) => timeout,
+        (None, None) => std::time::Duration::ZERO,
     })
 }
 

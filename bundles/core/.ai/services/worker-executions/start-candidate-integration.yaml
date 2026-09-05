@@ -1,0 +1,7 @@
+category: worker-executions
+name: start-candidate-integration
+kind: service
+endpoint: worker-executions.start-candidate-integration
+required_caps: ["ryeos.execute.service.worker-executions/start-candidate-integration"]
+schema: {chain_root_id: string, candidate_snapshot_hash: string, candidate_validation_hash: string, accepted_evaluation_hash: string, authoring_wrapper_item_ref: string, authoring_parameters: object?, authoring_ref_bindings: object?, launch_id: string}
+description: Launch the one qualified immutable-base authoring wrapper in an isolated retained candidate-integration workspace without advancing project HEAD.
