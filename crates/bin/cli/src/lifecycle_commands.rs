@@ -753,7 +753,10 @@ fn run_execution_history_reset_command(
         ),
         crate::tty::Row::key_value(
             "scheduler rows",
-            report.scheduler_rows.total_rows().to_string(),
+            report.scheduler_rows.total_rows().map_or_else(
+                || "unavailable (incompatible schema)".to_string(),
+                |rows| rows.to_string(),
+            ),
         ),
         crate::tty::Row::key_value(
             "scheduler journal artifacts",

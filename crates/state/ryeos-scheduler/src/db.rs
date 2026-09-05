@@ -444,6 +444,17 @@ fn validate_scheduler_sidecar_types(path: &Path) -> Result<()> {
 }
 
 fn assert_recognized_stale_scheduler_projection(conn: &Connection, path: &Path) -> Result<()> {
+    let unsupported: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('view', 'trigger')",
+        [],
+        |row| row.get(0),
+    )?;
+    if unsupported != 0 {
+        anyhow::bail!(
+            "refusing to replace scheduler database with views or triggers at {}",
+            path.display()
+        );
+    }
     let mut table_statement = conn.prepare(
         "SELECT name FROM sqlite_master
          WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -547,7 +558,68 @@ impl SchedulerFireHistoryDiscardReport {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SchedulerFireHistoryAccounting {
+    Exact {
+        counts: SchedulerFireHistoryDiscardReport,
+    },
+    UnavailableIncompatibleSchema,
+}
+
+impl SchedulerFireHistoryAccounting {
+    pub fn total_rows(&self) -> Option<usize> {
+        match self {
+            Self::Exact { counts } => Some(counts.total_rows()),
+            Self::UnavailableIncompatibleSchema => None,
+        }
+    }
+}
+
 impl SchedulerDb {
+    /// Inspect a disposable copy for explicit offline history retirement.
+    /// Reuse the owning store's stale-projection recognition, but never rebuild
+    /// the copy or decode predecessor rows to manufacture an empty count.
+    /// Unlike retention reads, retirement does not require a complete fire
+    /// projection: all fire history has been selected for discard.
+    pub fn inspect_history_reset(path: &Path) -> Result<SchedulerFireHistoryAccounting> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            anyhow::bail!("scheduler inspection requires a regular non-symlink file");
+        }
+        validate_scheduler_sidecar_types(path)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            anyhow::bail!(
+                "scheduler database integrity check failed for {}: {integrity}",
+                path.display()
+            );
+        }
+        let spec = scheduler_schema_spec();
+        let app_id: i32 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        if app_id != spec.application_id {
+            anyhow::bail!(
+                "scheduler database application_id is {app_id}, expected {}; foreign database at {}",
+                spec.application_id,
+                path.display()
+            );
+        }
+        let exact = sqlite_schema::assert_owned(&conn, &spec, path)
+            .and_then(|_| sqlite_schema::assert_complete_schema_sql(&conn, SCHEMA_SQL, path));
+        if exact.is_err() {
+            assert_recognized_stale_scheduler_projection(&conn, path)?;
+            return Ok(SchedulerFireHistoryAccounting::UnavailableIncompatibleSchema);
+        }
+        let db = Self {
+            inner: std::sync::Mutex::new(conn),
+            outbox_drain: std::sync::Mutex::new(()),
+        };
+        Ok(SchedulerFireHistoryAccounting::Exact {
+            counts: db.discard_fire_history(true)?,
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         // `:memory:` is SQLite's process-local database identity, not a
         // filesystem pathname. Keep the fresh-projection semantics of
@@ -2065,6 +2137,78 @@ mod tests {
         let path = temp.path().join("scheduler.sqlite3");
         assert!(SchedulerDb::open_existing_current(&path).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn history_reset_inspection_accepts_incomplete_current_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scheduler.sqlite3");
+        let db = SchedulerDb::open(&path).unwrap();
+        assert!(!db.fire_projection_is_current().unwrap());
+        drop(db);
+        assert_eq!(
+            SchedulerDb::inspect_history_reset(&path)
+                .unwrap()
+                .total_rows(),
+            Some(0)
+        );
+        assert!(
+            SchedulerDb::open_existing_current(&path).is_err(),
+            "retention must still fail closed"
+        );
+    }
+
+    #[test]
+    fn history_reset_inspection_keeps_stale_projection_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scheduler.sqlite3");
+        drop(SchedulerDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE schedule_specs ADD COLUMN retired_field TEXT;")
+            .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            SchedulerDb::inspect_history_reset(&path)
+                .unwrap()
+                .total_rows(),
+            None
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // The same owned layout remains eligible for the confirmed rebuild.
+        let rebuilt = SchedulerDb::open(&path).unwrap();
+        rebuilt.discard_fire_history(false).unwrap();
+        drop(rebuilt);
+        assert_eq!(
+            SchedulerDb::inspect_history_reset(&path)
+                .unwrap()
+                .total_rows(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn history_reset_inspection_rejects_foreign_and_unrecognized_stores() {
+        for mutation in [
+            "PRAGMA application_id=1234;",
+            "PRAGMA application_id=0;",
+            "CREATE TABLE unrelated (value TEXT);",
+            "CREATE VIEW unrelated AS SELECT * FROM schedule_specs;",
+            "CREATE TRIGGER unrelated AFTER DELETE ON schedule_specs BEGIN DELETE FROM schedule_fires; END;",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("scheduler.sqlite3");
+            drop(SchedulerDb::open(&path).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(mutation).unwrap();
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                SchedulerDb::inspect_history_reset(&path).is_err(),
+                "{mutation}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]

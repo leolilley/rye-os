@@ -16,8 +16,10 @@ pub const NODE_MAINTENANCE_POLICY_SOURCE: &str = "policies/maintenance.yaml";
 
 /// The one current wire shape for signed schedule sources.
 ///
-/// Every scheduler consumer deserializes this type before making policy or
-/// projection decisions. Unknown fields and partial nested records are
+/// Every execution/projection consumer deserializes this type before using a
+/// schedule. Policy-owned document regeneration authenticates ownership
+/// separately; it never reuses the replaced execution payload.
+/// Unknown fields and partial nested records are
 /// rejected instead of being filtered into a different effective schedule.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleSourceRecord {

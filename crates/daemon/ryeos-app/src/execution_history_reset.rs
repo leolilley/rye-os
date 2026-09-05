@@ -118,15 +118,13 @@ pub struct ExecutionHistoryResetReport {
     pub runtime_rows: RuntimeThreadHistoryAccounting,
     pub thread_runtime_artifacts: usize,
     pub scheduler_journal_artifacts: usize,
-    pub scheduler_rows: ryeos_scheduler::db::SchedulerFireHistoryDiscardReport,
+    pub scheduler_rows: ryeos_scheduler::db::SchedulerFireHistoryAccounting,
     pub projection: ProjectionDiscardReport,
 }
 
 impl ExecutionHistoryResetReport {
     pub fn total_discarded_rows(&self) -> Option<usize> {
-        self.runtime_rows
-            .total_rows()
-            .map(|runtime_rows| runtime_rows + self.scheduler_rows.total_rows())
+        Some(self.runtime_rows.total_rows()? + self.scheduler_rows.total_rows()?)
     }
 }
 
@@ -215,7 +213,7 @@ fn run_execution_history_reset_inner(
         options.dry_run,
     )?;
     let scheduler_db_path = runtime_state_dir.join("scheduler.sqlite3");
-    let scheduler_db = open_scheduler_db(&scheduler_db_path, &runtime_directory, options.dry_run)?;
+    let scheduler_preview = inspect_scheduler_db(&scheduler_db_path, &runtime_directory)?;
 
     // Validate every participating namespace before publishing destructive
     // intent. The second pass performs the same descriptor-rooted checks while
@@ -255,13 +253,6 @@ fn run_execution_history_reset_inner(
     .context("inspect per-thread runtime files")?;
     let scheduler_journal_preview = discard_scheduler_fire_journals(&runtime_directory, true)
         .context("inspect scheduler fire journals")?;
-    let scheduler_preview = match scheduler_db.as_ref() {
-        Some(opened) => opened
-            .db
-            .discard_fire_history(true)
-            .context("inspect scheduler fire projection")?,
-        None => Default::default(),
-    };
 
     if options.dry_run {
         publish_progress(&mut observer, ExecutionHistoryResetPhase::Complete, None);
@@ -405,13 +396,12 @@ fn run_execution_history_reset_inner(
     );
     let scheduler_journal_artifacts = discard_scheduler_fire_journals(&runtime_directory, false)
         .context("discard scheduler fire journals")?;
-    let scheduler_rows = match scheduler_db.as_ref() {
-        Some(opened) => opened
-            .db
-            .discard_fire_history(false)
-            .context("discard scheduler fire projection")?,
-        None => Default::default(),
-    };
+    // Rebuild a recognized stale projection only after durable discard intent
+    // and retirement of its authoritative fire journals, never during preview.
+    ryeos_scheduler::SchedulerDb::open(&scheduler_db_path)
+        .context("open scheduler database for confirmed history retirement")?
+        .discard_fire_history(false)
+        .context("discard scheduler fire projection")?;
 
     publish_progress(&mut observer, ExecutionHistoryResetPhase::Finalizing, None);
     state_db
@@ -430,7 +420,7 @@ fn run_execution_history_reset_inner(
         runtime_rows: completed_runtime_accounting(runtime_schema_reset_required, runtime_rows),
         thread_runtime_artifacts,
         scheduler_journal_artifacts,
-        scheduler_rows,
+        scheduler_rows: scheduler_preview,
         projection: ProjectionDiscardReport {
             chains_rebuilt: rebuilt.chains_rebuilt,
             threads_restored: rebuilt.threads_restored,
@@ -496,16 +486,10 @@ fn open_runtime_db(
     .with_context(|| format!("open runtime database {}", config.db_path.display()))
 }
 
-struct OpenedOfflineSchedulerDb {
-    db: ryeos_scheduler::SchedulerDb,
-    _inspection_copy: Option<crate::temp_dir_guard::TempDirGuard>,
-}
-
-fn open_scheduler_db(
+fn inspect_scheduler_db(
     path: &Path,
     runtime_directory: &lillux::PinnedDirectory,
-    dry_run: bool,
-) -> Result<Option<OpenedOfflineSchedulerDb>> {
+) -> Result<ryeos_scheduler::db::SchedulerFireHistoryAccounting> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if runtime_directory.path() != parent {
         anyhow::bail!(
@@ -529,42 +513,21 @@ fn open_scheduler_db(
             )
         })?;
 
-    match (existing, dry_run) {
-        (None, true) => Ok(None),
-        (None, false) => ryeos_scheduler::SchedulerDb::open(path)
-            .map(|db| {
-                Some(OpenedOfflineSchedulerDb {
-                    db,
-                    _inspection_copy: None,
-                })
-            })
-            .context("create scheduler database for confirmed history retirement"),
-        (Some(file), false) => {
+    match existing {
+        None => Ok(ryeos_scheduler::db::SchedulerFireHistoryAccounting::Exact {
+            counts: Default::default(),
+        }),
+        Some(file) => {
             drop(file);
-            ryeos_scheduler::SchedulerDb::open(path)
-                .map(|db| {
-                    Some(OpenedOfflineSchedulerDb {
-                        db,
-                        _inspection_copy: None,
-                    })
-                })
-                .context("open scheduler database for confirmed history retirement")
-        }
-        (Some(file), true) => {
-            drop(file);
-            let (inspection_directory, inspection_guard) =
+            let (inspection_directory, _inspection_guard) =
                 crate::runtime_db::create_sqlite_inspection_copy(
                     runtime_directory,
                     name,
                     "scheduler",
                 )?;
             let inspection_path = inspection_directory.path().join(name);
-            let db = ryeos_scheduler::SchedulerDb::open_existing_current(&inspection_path)
-                .context("open disposable scheduler database inspection copy")?;
-            Ok(Some(OpenedOfflineSchedulerDb {
-                db,
-                _inspection_copy: Some(inspection_guard),
-            }))
+            ryeos_scheduler::SchedulerDb::inspect_history_reset(&inspection_path)
+                .context("inspect disposable scheduler database copy for history retirement")
         }
     }
 }
@@ -827,12 +790,8 @@ mod tests {
         let directory = lillux::PinnedDirectory::open(tmp.path())
             .unwrap()
             .expect("scheduler parent exists");
-        let opened = open_scheduler_db(&path, &directory, true)
-            .unwrap()
-            .expect("scheduler inspection copy opens");
-        opened.db.discard_fire_history(true).unwrap();
-        assert_eq!(source_snapshot(), before);
-        drop(opened);
+        let report = inspect_scheduler_db(&path, &directory).unwrap();
+        assert_eq!(report.total_rows(), Some(0));
         assert_eq!(source_snapshot(), before);
     }
 
@@ -843,11 +802,33 @@ mod tests {
         let directory = lillux::PinnedDirectory::open(tmp.path())
             .unwrap()
             .expect("scheduler parent exists");
-        assert!(
-            open_scheduler_db(&path, &directory, true)
+        assert_eq!(
+            inspect_scheduler_db(&path, &directory)
                 .unwrap()
-                .is_none()
+                .total_rows(),
+            Some(0)
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn scheduler_dry_run_reports_stale_schema_without_changing_source() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("scheduler.sqlite3");
+        drop(ryeos_scheduler::SchedulerDb::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE schedule_specs ADD COLUMN retired_field TEXT;")
+            .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        let directory = lillux::PinnedDirectory::open(tmp.path()).unwrap().unwrap();
+        let report = inspect_scheduler_db(&path, &directory).unwrap();
+        assert_eq!(report.total_rows(), None);
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({"status": "unavailable_incompatible_schema"})
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 }
