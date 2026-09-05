@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T07:07:23Z:de67b53d3156d49e3fdfe9f11b09a255df89d47ba63d0f521aa76d8920ba633a:M5ToRvTsiifzCmwwlGwoauxpyEJ+i9Ru9f2qdlJx2SmnheHvtWZ2dNoYh1KidoLwXrwWf6vxVDA2Eycq+3xLCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T07:15:11Z:3b26e916c0a7f83caaae7cb6b406e4a867c7d8d7a066881733867ae92d690c79:ZPDQ4jg9Wd+JuliWcpLHMvdxl5L0PNJjQ7DvlYI9fK42f4LryJpksksTRmbuF/eAEqoMODN+4wCQq5kLhRT5Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.11.0"
+version: "1.12.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -55,6 +55,13 @@ counterpart in the cloned namespace, then compares device, inode and file type
 against the still-retained original descriptor. Missing, replaced or symlinked
 sources refuse; the location does not independently authorize a mount. This
 reproof happens before the private root obscures host locations.
+
+Native mount classification reuses Lillux's shared regular-file, directory and
+filesystem-Unix-socket classes. An admitted callback socket is pinned and
+reproved like other exact filesystem sources, then attached non-recursively
+over a file-shaped target. This neither exposes arbitrary sockets nor grants
+callback authority to opaque Tools. Replaced socket inodes, anonymous socket
+handles, symlinks and unsupported special files cannot become mount authority.
 
 Fully sealed anonymous regular files have immutable bytes but no bindable
 filesystem mount. Lillux streams exactly their admitted length into its private

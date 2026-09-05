@@ -653,11 +653,10 @@ mod imp {
         Ok(())
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum DescriptorKind {
-        Directory,
-        Regular,
-    }
+    // Keep the native backend aligned with the already-admitted mount-source
+    // classes. Callback protocols may carry an exact filesystem Unix socket;
+    // this does not grant a socket to callback-free or captured-only tools.
+    use crate::secure_fs::OpenMountEntryKind as DescriptorKind;
 
     fn mount_source_stat(fd: RawFd) -> Result<libc::stat, String> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -855,24 +854,15 @@ mod imp {
     }
 
     fn descriptor_kind(fd: u32) -> Result<DescriptorKind, String> {
-        let fd = raw_fd(fd)?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        syscall_zero(
-            unsafe { libc::fstat(fd, stat.as_mut_ptr()) },
-            "inspect mount descriptor",
-        )?;
-        let stat = unsafe { stat.assume_init() };
-        match stat.st_mode & libc::S_IFMT {
-            libc::S_IFDIR => Ok(DescriptorKind::Directory),
-            libc::S_IFREG => Ok(DescriptorKind::Regular),
-            _ => Err("sandbox mount descriptor is not a directory or regular file".to_string()),
-        }
+        let file = unsafe { File::from_raw_fd(duplicate_fd(raw_fd(fd)?)?) };
+        crate::secure_fs::open_mount_entry_kind(&file)
+            .map_err(|error| format!("inspect admitted mount descriptor: {error}"))
     }
 
     fn create_target(path: &PathBuf, kind: DescriptorKind) -> Result<(), String> {
         match kind {
             DescriptorKind::Directory => create_directory_target(path),
-            DescriptorKind::Regular => create_regular_target(path),
+            DescriptorKind::Regular | DescriptorKind::UnixSocket => create_regular_target(path),
         }
     }
 
@@ -1174,7 +1164,7 @@ mod imp {
                 ensure_directory_path(&target, "descriptor mount target")?;
                 true
             }
-            DescriptorKind::Regular => {
+            DescriptorKind::Regular | DescriptorKind::UnixSocket => {
                 ensure_regular_path(&target, "descriptor mount target")?;
                 false
             }
@@ -2450,6 +2440,75 @@ mod imp {
     #[cfg(test)]
     mod namespace_source_tests {
         use super::*;
+
+        #[test]
+        fn filesystem_socket_uses_existing_mount_kind_and_exact_identity() {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("callback.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
+            assert_eq!(
+                descriptor_kind(original.as_raw_fd() as u32).unwrap(),
+                DescriptorKind::UnixSocket
+            );
+            assert!(reanchor_mount_source(original.as_raw_fd()).is_ok());
+            std::fs::rename(&path, temporary.path().join("retained.sock")).unwrap();
+            let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            assert!(
+                reanchor_mount_source_at(original.as_raw_fd(), &path)
+                    .unwrap_err()
+                    .contains("changed across namespace")
+            );
+        }
+
+        #[test]
+        fn anonymous_socket_is_not_filesystem_mount_authority() {
+            let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            assert!(reanchor_mount_source(socket.as_raw_fd()).is_err());
+        }
+
+        #[test]
+        #[ignore = "requires the supported Linux user/mount/network namespace floor"]
+        fn pinned_filesystem_socket_connects_across_namespace_mount() {
+            use std::io::{Read as _, Write as _};
+
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("callback.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let result = (|| {
+                    enter_namespaces(LinuxSandboxNetwork::Isolated)?;
+                    let source = reanchor_mount_source(original.as_raw_fd())?;
+                    mount_private_root()?;
+                    create_private_tmp()?;
+                    let mount = LinuxSandboxMount {
+                        source_fd: source.as_raw_fd() as u32,
+                        destination: PathBuf::from("/tmp/callback.sock"),
+                        access: LinuxSandboxMountAccess::ReadOnly,
+                        layer: 0,
+                    };
+                    let target = rooted(&mount.destination)?;
+                    create_target(&target, descriptor_kind(mount.source_fd)?)?;
+                    bind_descriptor_mount(&mount)?;
+                    std::os::unix::net::UnixStream::connect(target)
+                        .and_then(|mut stream| stream.write_all(b"exact socket"))
+                        .map_err(|error| error.to_string())
+                })();
+                unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            listener.set_nonblocking(true).unwrap();
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut bytes = [0; 12];
+            connection.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"exact socket");
+        }
 
         #[test]
         fn namespace_reanchor_refuses_a_replacement_inode() {
