@@ -543,14 +543,7 @@ pub async fn bind(
         &request.consumer_ref,
         &request.manifest_hash,
     )?;
-    bind_authorized(
-        state,
-        operator_fingerprint,
-        "external-content-import",
-        request,
-        consumer,
-    )
-    .await
+    bind_authorized(state, operator_fingerprint, request, consumer).await
 }
 
 /// Complete a project binding after the API layer has materialized the exact
@@ -580,14 +573,7 @@ pub async fn bind_pinned_project(
         project_snapshot_hash,
         &request.manifest_hash,
     )?;
-    bind_authorized(
-        state,
-        operator_fingerprint,
-        "external-content-import",
-        request,
-        consumer,
-    )
-    .await
+    bind_authorized(state, operator_fingerprint, request, consumer).await
 }
 
 /// Bind one component after a managed-activation caller has authenticated the
@@ -612,20 +598,12 @@ pub async fn bind_managed_activation_component(
         &request.consumer_ref,
         &request.manifest_hash,
     )?;
-    bind_authorized(
-        state,
-        operator_fingerprint,
-        "managed-external-content-import",
-        request,
-        consumer,
-    )
-    .await
+    bind_authorized(state, operator_fingerprint, request, consumer).await
 }
 
 async fn bind_authorized(
     state: Arc<AppState>,
     operator_fingerprint: String,
-    upload_purpose: &'static str,
     request: BindRequest,
     consumer: ResolvedConsumer,
 ) -> anyhow::Result<BindResponse> {
@@ -718,39 +696,7 @@ async fn bind_authorized(
             && current_binding.authorized_by == operator_fingerprint
             && current_binding.authorizer_grant_digest == authorizer_grant_digest
         {
-            if let Some(admitted_target_hash) = stage.admitted_target_hash() {
-                if admitted_target_hash != current.target_hash {
-                    bail!(
-                        "external-content import receipt target contradicts the current idempotent binding"
-                    );
-                }
-            } else {
-                // A retry may open a fresh durable upload after the exact
-                // binding head is already current. The head object was not
-                // uploaded by that fresh stage. While the shared CAS guard
-                // pins the current head and its object, durably protect that
-                // exact root before recording the already-satisfied
-                // publication. GC expands protected object roots through the
-                // typed closure, so copying every transitive edge here would
-                // add no authority. Merely calling `finish_admitted` would
-                // leave the recovery record permanently retryable.
-                stage.protect_cas_closure(
-                    &guard,
-                    std::iter::once(current.target_hash.as_str()),
-                    std::iter::empty(),
-                )?;
-                if let Err(error) = stage.finish_admitted(&guard, &current.target_hash) {
-                    tracing::warn!(%error, staging_id = %request.staging_id, "idempotent binding was current while import receipt remained retryable");
-                }
-            }
-            drop(stage);
-            recovery.settle_durable_cas_uploads_for_existing_publication(
-                &guard,
-                &operator_fingerprint,
-                upload_purpose,
-                &publication_key,
-                &current.target_hash,
-            )?;
+            settle_current_binding_receipt(&mut stage, &guard, &current.target_hash)?;
             return Ok(BindResponse {
                 binding_subject_id,
                 binding_id: current_binding.binding_id,
@@ -922,6 +868,31 @@ async fn bind_authorized(
         publisher_fingerprint: consumer.authority.publisher_fingerprint().to_owned(),
         idempotent: false,
     })
+}
+
+/// The caller has verified the exact current binding under the publication
+/// barrier. Settle only its presented, principal-bound upload capability.
+/// Import request identity commits acquisition, not a consumer: other stages
+/// with the same request may bind the same immutable bytes to different Tools
+/// or project generations. Never bulk-settle those stages as duplicate binds.
+/// Abandoned stages remain subject to the existing explicit maintenance policy.
+fn settle_current_binding_receipt(
+    stage: &mut ryeos_state::DurableCasUploadStage,
+    guard: &ryeos_state::CasMutationGuard,
+    binding_hash: &str,
+) -> anyhow::Result<()> {
+    if let Some(admitted) = stage.admitted_target_hash() {
+        if admitted != binding_hash {
+            bail!(
+                "external-content import receipt target contradicts the current idempotent binding"
+            );
+        }
+        return Ok(());
+    }
+    // A fresh retry did not upload this already-current binding object.
+    // Protect its exact root before settlement; GC traverses its typed closure.
+    stage.protect_cas_closure(guard, std::iter::once(binding_hash), std::iter::empty())?;
+    stage.finish_admitted(guard, binding_hash)
 }
 
 pub async fn scrub(state: Arc<AppState>, context: HandlerContext) -> anyhow::Result<ScrubResponse> {
@@ -1755,6 +1726,57 @@ fn validate_relative_path(value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_retry_settles_only_its_presented_receipt_for_shared_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovery = ryeos_state::RecoveryStore::from_runtime_state_dir(temp.path()).unwrap();
+        let guard = ryeos_state::CasMutationGuard::acquire_shared(temp.path()).unwrap();
+        let owner = "a".repeat(64);
+        let key = ryeos_state::DurableCasPublicationKey::external_content_import(&"b".repeat(64))
+            .unwrap();
+        let first_binding = "c".repeat(64);
+        let second_binding = "d".repeat(64);
+        let mut first = recovery
+            .begin_durable_cas_upload_admitted(
+                &guard,
+                &owner,
+                "external-content-import",
+                &key,
+                None,
+            )
+            .unwrap();
+        let mut second = recovery
+            .begin_durable_cas_upload_admitted(
+                &guard,
+                &owner,
+                "external-content-import",
+                &key,
+                None,
+            )
+            .unwrap();
+        let first_id = first.staging_id().to_owned();
+        let second_id = second.staging_id().to_owned();
+
+        // Identical acquisition request, independent consumer binding targets.
+        // Keep the second lock held: settling the first must neither inspect
+        // nor wait for another caller's upload.
+        settle_current_binding_receipt(&mut first, &guard, &first_binding).unwrap();
+        assert_eq!(second.admitted_target_hash(), None);
+        settle_current_binding_receipt(&mut second, &guard, &second_binding).unwrap();
+        settle_current_binding_receipt(&mut first, &guard, &first_binding).unwrap();
+        assert!(settle_current_binding_receipt(&mut first, &guard, &second_binding).is_err());
+        drop(first);
+        drop(second);
+        for (id, target) in [(first_id, first_binding), (second_id, second_binding)] {
+            let mut reopened = recovery
+                .open_durable_cas_upload_admitted(&guard, &id, &owner)
+                .unwrap();
+            reopened.ensure_publication_contract(&key, None).unwrap();
+            assert_eq!(reopened.admitted_target_hash(), Some(target.as_str()));
+            settle_current_binding_receipt(&mut reopened, &guard, &target).unwrap();
+        }
+    }
 
     #[test]
     fn binding_request_consumer_coordinates_are_clean_cut() {

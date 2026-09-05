@@ -1,9 +1,9 @@
-<!-- ryeos:signed:2026-09-02T00:04:26Z:fd8c4168894cc4e4211f21fca6d2193b5c0d5da04b08c0e908591e1afd5debac:uVAMihvExADt+yR00fabjSusICWWrK1X/qYJyYApyCRN50aoSuf1CS+9YeVVCw7qGoVjTrfjS/I1mULwRxN/DA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T04:28:57Z:a4acca759fa95c3b8fad9be684ba7d71e49eeca1887c5cf98f31834a0cae6e8e:RypbNz5B0NpUG+T9mWYPxu5fzPuO3BZwjoICeIA0PYM7nCL9tietfbsHwSxWau9+bXjx4iAR/q57hU67x+NGCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
 tags: [architecture, cas, state, truth, projection, sqlite]
-version: "1.1.0"
+version: "1.2.0"
 description: >
   The three-tier truth model — CAS objects, signed refs, and the
   rebuildable SQLite projection. Content-addressed storage as the
@@ -169,9 +169,26 @@ of being partially interpreted or reported as an incidental missing field.
 
 RyeOS carries no compatibility decoder, alias, default, or in-place normalizer
 for these execution contracts. When a clean-cut release changes them, startup
-names the explicit offline reset command. That reset retires thread history and
-project heads together before recreating an empty exact-current runtime store;
+names the explicit offline reset command. That reset retires thread history
+before recreating an empty exact-current runtime store. Project heads are
+retired only when separately selected and explicitly confirmed;
 it does not delete project source, bundles, vault values, or node identities.
+
+## External-content receipts and shared bytes
+
+An external-content import request identifies bounded byte acquisition under
+node policy. It does not identify a consumer. Multiple Tools or pinned project
+generations can legitimately reuse identical content through separate
+target-node-authorized bindings.
+
+A binding retry validates its exact current signed binding and settles only
+the presented principal-bound upload receipt. A fresh retry protects that
+already-current binding root before completing its receipt; a receipt already
+completed for another binding is refused. Do not treat every upload with the
+same acquisition digest as a duplicate binding or settle another caller's
+pending receipt. Unused stages remain protected until the existing explicit
+maintenance policy permits their retirement. Content deduplication never
+merges consumer authority or writable worker workspaces.
 
 ## Event Durability Tiers
 
