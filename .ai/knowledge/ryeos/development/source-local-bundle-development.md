@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-05T03:44:28Z:db20af25bb4944106eab7f07db910d1811ab3e9a0fcfce484930a87134fab1d4:/cmqxtrGHxIaeq0Hu6sdoqQcuhYGwPKlHzDPBbeBb8/Fp37yJNT0d7yxde4CtKnKK5gK8apcDFQx7+JuPHxJCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T04:03:24Z:0152d31f1b772782ccea46e99c5caaf1b86bd2adce5ef0e9441a84edcfa78c93:TebKeEkQiumbEAD3rXZdcpQ0Ip6mq2wtVUWv4Niw3NCktb6TiFG646RUiajYwri9bC/Qol4o7Vt7FuP826epCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.6.0"
+version: "1.7.0"
 ```
 
 # Source-Local Bundle Development
@@ -37,6 +37,29 @@ as evidence that remote build/test execution is already available.
   thread ids, and the state root (kept on failure or `keep_state`). See
   `crates/daemon/ryeos-api/src/handlers/bundle_smoke.rs` and
   `ryeos_bundle::manifest::SmokeDecl`.
+
+## Development project versus node initialization
+
+The repository-root `.ai/` is this project's development bundle: it owns
+development Tools, environment composition, exact realization declarations and
+development knowledge. `bundles/.ai/` is the shared installation source-root
+metadata, not another workload bundle. It owns publisher trust and signed
+`node/init/profiles/` seeds. Installers copy those seeds into the installation
+source; explicit node initialization or policy-generation replacement selects
+and node-signs a complete generation. Editing a seed does not change a live
+node's authority.
+
+The opt-in `development` profile admits compiler-sized external content.
+The ordinary content tier retains its 10,000-entry / 1 MiB manifest bounds;
+the large-content tier admits up to 65,536 tree entries while retaining its
+8 MiB serialized manifest bound. The tier-neutral realization set independently
+bounds the aggregate launch to 65,536 entries. Node policy may narrow these
+structural limits, never widen them. The verified Stage-0 platform has about
+384 MB of small-file CAS content plus five large-store files; its development
+profile therefore permits a 512 MiB aggregate CAS blob closure. Local binding,
+verification and launch proof consume the selected node's `object_closure`
+policy, not generic control-plane defaults. No policy entry selects a compiler
+version or grants an unbound project access to that content.
 
 ## Project capture policy
 

@@ -20,6 +20,7 @@ use ryeos_state::{
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::node_policy::sections::object_closure::NodeObjectClosurePolicy;
 use crate::state::AppState;
 
 /// Exact, non-secret reason a retained content realization cannot be admitted.
@@ -479,7 +480,10 @@ fn preview_retained_external_content(
             let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
                 &cas,
                 [digest.to_owned()],
-                ryeos_state::object_closure::ObjectClosureLimits::default(),
+                state
+                    .node_policy
+                    .require::<NodeObjectClosurePolicy>()?
+                    .closure_limits()?,
             )?;
             if !closure.is_complete() {
                 anyhow::bail!("large-content realization closure is incomplete");
@@ -534,7 +538,13 @@ pub fn recover_external_realizations(
         return Ok(None);
     };
     let realized = RealizedExternalContentSet::from_value(value)?;
-    let store = ExternalRealizationStore::new(pinned_state_authority(state)?);
+    let store = ExternalRealizationStore::new(
+        pinned_state_authority(state)?,
+        state
+            .node_policy
+            .require::<NodeObjectClosurePolicy>()?
+            .closure_limits()?,
+    );
     let proof = ryeos_engine::external_realization::prove_external_realizations(realized, &store)?;
     Ok(Some(AdmittedExternalRealizations {
         proof,
@@ -827,7 +837,13 @@ fn admit_declarations_in_publication(
         ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY.to_owned(),
         realized.to_value()?,
     );
-    let store = ExternalRealizationStore::new(proof_authority);
+    let store = ExternalRealizationStore::new(
+        proof_authority,
+        state
+            .node_policy
+            .require::<NodeObjectClosurePolicy>()?
+            .closure_limits()?,
+    );
     let proof = ryeos_engine::external_realization::prove_external_realizations(realized, &store)?;
     let (stored_blobs, reused_blobs) = sink.counts();
     tracing::info!(
@@ -912,7 +928,13 @@ fn inherit_external_realizations(
         ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY.to_owned(),
         realized.to_value()?,
     );
-    let store = ExternalRealizationStore::new(pinned_state_authority(state)?);
+    let store = ExternalRealizationStore::new(
+        pinned_state_authority(state)?,
+        state
+            .node_policy
+            .require::<NodeObjectClosurePolicy>()?
+            .closure_limits()?,
+    );
     let proof = ryeos_engine::external_realization::prove_external_realizations(realized, &store)?;
     Ok(Some(AdmittedExternalRealizations {
         proof,
@@ -923,11 +945,20 @@ fn inherit_external_realizations(
 
 struct ExternalRealizationStore {
     authority: ryeos_state::PinnedStateAuthority,
+    // Retain the selected node's admitted budget across the engine's
+    // meaning-blind proof interface. Never substitute closure defaults here.
+    closure_limits: ryeos_state::object_closure::ObjectClosureLimits,
 }
 
 impl ExternalRealizationStore {
-    fn new(authority: ryeos_state::PinnedStateAuthority) -> Self {
-        Self { authority }
+    fn new(
+        authority: ryeos_state::PinnedStateAuthority,
+        closure_limits: ryeos_state::object_closure::ObjectClosureLimits,
+    ) -> Self {
+        Self {
+            authority,
+            closure_limits,
+        }
     }
 }
 
@@ -948,7 +979,7 @@ impl RealizationStore for ExternalRealizationStore {
             let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
                 &cas,
                 [manifest_hash.to_owned()],
-                ryeos_state::object_closure::ObjectClosureLimits::default(),
+                self.closure_limits,
             )?;
             if !closure.is_complete() {
                 anyhow::bail!("large-content realization closure is incomplete");

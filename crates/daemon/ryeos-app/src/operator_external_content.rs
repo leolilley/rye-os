@@ -12,6 +12,7 @@ use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::handler_context::HandlerContext;
+use crate::node_policy::sections::object_closure::NodeObjectClosurePolicy;
 use crate::state::AppState;
 
 const BINDING_HEAD_NAMESPACE: &str = ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE;
@@ -812,7 +813,10 @@ async fn bind_authorized(
             let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
                 &cas,
                 [request.manifest_hash.clone()],
-                ryeos_state::object_closure::ObjectClosureLimits::default(),
+                state
+                    .node_policy
+                    .require::<NodeObjectClosurePolicy>()?
+                    .closure_limits()?,
             )?;
             if !closure.is_complete() || verified.manifest() != &manifest {
                 bail!("external-content binding closure is incomplete");
@@ -846,7 +850,10 @@ async fn bind_authorized(
             let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
                 &cas,
                 [request.manifest_hash.clone()],
-                ryeos_state::object_closure::ObjectClosureLimits::default(),
+                state
+                    .node_policy
+                    .require::<NodeObjectClosurePolicy>()?
+                    .closure_limits()?,
             )?;
             if !closure.is_complete() {
                 bail!("external-content binding closure is incomplete");
@@ -867,7 +874,10 @@ async fn bind_authorized(
     let binding_closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
         &cas,
         [binding_hash.clone()],
-        ryeos_state::object_closure::ObjectClosureLimits::default(),
+        state
+            .node_policy
+            .require::<NodeObjectClosurePolicy>()?
+            .closure_limits()?,
     )?;
     if !binding_closure.is_complete() {
         bail!("external-content binding closure is incomplete");
@@ -950,7 +960,10 @@ pub async fn scrub(state: Arc<AppState>, context: HandlerContext) -> anyhow::Res
                     ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
                         &cas,
                         [head.target_hash.clone()],
-                        ryeos_state::object_closure::ObjectClosureLimits::default(),
+                        state
+                            .node_policy
+                            .require::<NodeObjectClosurePolicy>()?
+                            .closure_limits()?,
                     )?;
                 if !closure.is_complete() {
                     bail!("active external-content binding closure is incomplete");

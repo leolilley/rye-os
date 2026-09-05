@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T03:35:48Z:57b352bf8d29032d0bf5125a6c5395fd8ebdaa7d89cc8df46283ea81dcd6ba65:E0FEJ/LY2U5hWsU8l1rjgwhjbmo1K/dAL6f9QukN2iUUWpCpDEHn2DJnLMeP6L+lYcdL/iOslZttaqBQIk11Aw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-05T04:03:24Z:19bea0c1d7f87298cbbb41d5826077f44cbebae38492cb64eefd54d90848be03:/xYyI1Wb2Y9HqgKFj5qBKjtbe/jh0uG3GWJfe+d5v3Sf0G8At6LlswYC8X77+x0mlrRZRLBIrFhFW6X4U4fNCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -132,12 +132,14 @@ policies:
     schema: 1
     max_roots: 256
     max_objects: 32768
-    max_blobs: 32768
+    max_blobs: 65536
     max_object_bytes: 33554432
     max_total_object_bytes: 67108864
     max_blob_bytes: 134217728
-    max_total_blob_bytes: 134217728
-    max_response_bytes: 268435456
+    # Development platform small-file CAS closure is about 384 MB. The five
+    # large files use the existing large-object store, not this blob allowance.
+    max_total_blob_bytes: 536870912
+    max_response_bytes: 1073741824
     max_links_per_object: 100000
   thread_history:
     schema: 1

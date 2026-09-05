@@ -22,9 +22,14 @@ pub const EXTERNAL_REALIZATIONS_DERIVED_KEY: &str = "effective_external_realizat
 /// The single manifest path a file-shaped realization stores its content
 /// under. Wire-level: both manifest kinds spell file shape the same way.
 pub const FILE_REALIZATION_ENTRY_PATH: &str = "content";
-/// Matches the generic closure link ceiling: a manifest that cannot be
-/// traversed is unusable however well it hashes.
+/// Ordinary CAS-content tier. Its byte/entry ceilings are deliberately smaller
+/// than the large-content tier and must not constrain the tier-blind wire.
 pub const MAX_EXTERNAL_CONTENT_ENTRIES: usize = 10_000;
+/// Meaning-blind per-launch entry ceiling across both storage tiers. Admission
+/// still applies the selected manifest tier and the node's narrower policy.
+/// This fits the existing remote closure link ceiling; large manifests retain
+/// their independent serialized-byte ceiling as well.
+pub const MAX_EXTERNAL_REALIZATION_ENTRIES: usize = 65_536;
 pub const MAX_EXTERNAL_CONTENT_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_EXTERNAL_CONTENT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_EXTERNAL_CONTENT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -328,9 +333,9 @@ impl ExternalContentRealizationSet {
                 "external realization manifest_hash",
                 &entry.manifest_hash,
             )?;
-            if entry.entry_count > MAX_EXTERNAL_CONTENT_ENTRIES {
+            if entry.entry_count > MAX_EXTERNAL_REALIZATION_ENTRIES {
                 anyhow::bail!(
-                    "external realization `{}` exceeds {MAX_EXTERNAL_CONTENT_ENTRIES} entries",
+                    "external realization `{}` exceeds {MAX_EXTERNAL_REALIZATION_ENTRIES} entries",
                     entry.id
                 );
             }
@@ -346,7 +351,7 @@ impl ExternalContentRealizationSet {
             byte_total = byte_total
                 .checked_add(entry.total_bytes)
                 .ok_or_else(|| anyhow::anyhow!("external realization byte count overflow"))?;
-            if entry_total > MAX_EXTERNAL_CONTENT_ENTRIES
+            if entry_total > MAX_EXTERNAL_REALIZATION_ENTRIES
                 || byte_total > MAX_REALIZATION_CLAIMED_BYTES
             {
                 anyhow::bail!("external realization set exceeds the per-launch aggregate bound");
@@ -861,6 +866,21 @@ mod tests {
         let mut overlapping = set.iter().cloned().collect::<Vec<_>>();
         overlapping.push(nested);
         assert!(ExternalContentRealizationSet::new(overlapping).is_err());
+    }
+
+    #[test]
+    fn realization_entry_budget_is_tier_neutral_and_aggregate_bounded() {
+        let mut large = realization("large", "large");
+        large.entry_count = MAX_EXTERNAL_CONTENT_ENTRIES + 1;
+        ExternalContentRealizationSet::new(vec![large.clone()]).unwrap();
+        large.entry_count = MAX_EXTERNAL_REALIZATION_ENTRIES;
+        ExternalContentRealizationSet::new(vec![large.clone()]).unwrap();
+        assert!(
+            ExternalContentRealizationSet::new(vec![large.clone(), realization("other", "other")])
+                .is_err()
+        );
+        large.entry_count += 1;
+        assert!(ExternalContentRealizationSet::new(vec![large]).is_err());
     }
 
     #[test]
