@@ -1758,7 +1758,9 @@ fn prepare_follow_recovery_actions(
 /// `created|running` set. The startup execution gate keeps every detached
 /// recovery task inert here, so each row must be terminal, attached to a
 /// verified RyeOS process, protected by a launch claim, or owned by a durable
-/// follow/launch-window/remote-adoption state machine.
+/// follow/launch-window/remote-adoption state machine. The same check runs in
+/// live reconciliation: the existing daemon-handler registry is also an exact
+/// live owner there, never a substitute for durable recovery after restart.
 fn ensure_recovery_targets_classified(state: &AppState, targets: &BTreeSet<String>) -> Result<()> {
     for thread_id in targets {
         let thread = state
@@ -1824,6 +1826,10 @@ fn ensure_recovery_targets_classified(state: &AppState, targets: &BTreeSet<Strin
         };
         if status.is_terminal()
             || live_owned_process
+            // Reuse the owner checked by reconcile_in_process_handler. A
+            // reservation alone is not liveness, and this volatile registry
+            // is empty for predecessor handlers after daemon restart.
+            || state.state_store.is_in_process_handler_active(thread_id)?
             || state.state_store.get_launch_claim(thread_id)?.is_some()
             || thread.runtime.recovery_wait.is_some()
             || durable_follow_owner
@@ -1835,7 +1841,7 @@ fn ensure_recovery_targets_classified(state: &AppState, targets: &BTreeSet<Strin
             continue;
         }
         anyhow::bail!(
-            "recovery target {thread_id} reached readiness without terminal state, a verified live process, or durable claim/wait/follow/handoff/window ownership"
+            "recovery target {thread_id} reached readiness without terminal state, a verified live process, an active daemon handler, or durable claim/wait/follow/handoff/window ownership"
         );
     }
     Ok(())

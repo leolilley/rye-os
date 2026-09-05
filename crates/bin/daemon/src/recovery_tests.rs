@@ -484,6 +484,27 @@ fn seed_in_process_handler(state: &AppState, thread_id: &str) -> InProcessHandle
     )
 }
 
+#[tokio::test]
+async fn live_recovery_boundary_recognizes_exact_daemon_handler_owner() {
+    let (_tmpdir, state) = build_test_state();
+    let thread_id = "T-live-daemon-owned-handler";
+    let owner = seed_in_process_handler(&state, thread_id);
+    let report = super::reconcile::reconcile_live_threads(&state)
+        .await
+        .unwrap();
+    assert!(report.active_thread_ids.contains(thread_id));
+    super::ensure_recovery_targets_classified(&state, &report.active_thread_ids).unwrap();
+
+    // A persisted reservation alone must not impersonate a still-running
+    // daemon task after its exact volatile owner has been released.
+    state
+        .state_store
+        .unregister_in_process_handler(thread_id, &owner)
+        .unwrap();
+    super::ensure_recovery_targets_classified(&state, &report.active_thread_ids)
+        .expect_err("ownerless nonterminal handler still needs reconciliation");
+}
+
 fn seed_in_process_reservation_without_root(state: &AppState, thread_id: &str, phase: &str) {
     let launch_metadata = in_process_launch_metadata_json();
     let connection = rusqlite::Connection::open(&state.config.db_path).unwrap();
