@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T06:51:53Z:99deff45c45a55bbc54c17c86bc4daa35c40b6b8e85630440c1aedf2fe508647:/AdAuSexGY9le9ib3oupiIMKLilkOdTNrDETY0hogK8E0yFMjHMQltArPhh2MIo5JF3fTOhBW6iUcBEdVwxICQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T23:19:40Z:79bb166dc012d7bb93621cd2b1c80c48d590f6d7e01b6bffabac1fb6fc48aeaf:oGj48um+z4cxUXJhka+mOTVpRsi4leDIcs811xF0yeqB1Q2kRMK2iES3sMo89v0D99USejo+ARU4djxxiN7rBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/standard
 tags: [cli, quickstart, reference, llm, execute, remote, threads, offline]
-version: "1.4.1"
+version: "1.4.2"
 description: >
   LLM-facing quickstart for using the ryeos CLI from initialization through
   local execution, project execution, thread inspection, and remote execution.
@@ -122,8 +122,18 @@ The signed command supplies a 5000 ms scan budget. Use
 `--time-budget-ms 0` for an explicitly unbounded scan and
 `--include-unchanged` to include unchanged entries. A timeboxed result may have
 `scan_complete: false`; do not treat that as proof the worktree is clean.
+This is a soft budget checked between entries; an in-flight file observation
+may finish after it. Incomplete scans never infer deletions from unvisited paths.
 Direct calls to `service:project/snapshot-status` must provide an absolute
 `project_path` and an explicit `time_budget_ms`.
+
+Preview and creation compose the same signed node ignore patterns, project
+snapshot exclusions and structural capture floor, using the same bounded,
+descriptor-rooted traversal. Status reports `effective_policy_hash`,
+`head_effective_policy_hash` and `policy_changed`; a policy-only change is dirty
+even when the selected file contents match. Status hashes files without writing
+CAS objects or refs. It rechecks the pinned root and policy source before
+returning, but a live worktree inspection is not a frozen execution snapshot.
 
 Runtime Tools keep the existing sealed live-project and manifest-backed
 snapshot callback authority. The terminal status Tool does not load node

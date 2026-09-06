@@ -217,3 +217,146 @@ async fn local_operator_status_reuses_principal_head_comparison_without_creating
         .unwrap();
     assert!(head.is_none());
 }
+
+#[tokio::test]
+async fn status_composes_capture_policy_and_reports_policy_only_changes_without_cas_writes() {
+    use ryeos_state::objects::{ProjectFile, ProjectSnapshot, ProjectTree};
+    use ryeos_state::project_sync::{PROJECT_SNAPSHOT_CONFIG_RELATIVE, ProjectSyncScope};
+    use std::collections::BTreeMap;
+
+    let (_tmp, mut state) = test_state::build_test_state();
+    let project = tempfile::tempdir().unwrap();
+    for (path, bytes) in [
+        (
+            PROJECT_SNAPSHOT_CONFIG_RELATIVE,
+            "schema: 1\nexclusions: [\"/.local/\"]\n",
+        ),
+        ("script", "#!/bin/sh\nexit 0\n"),
+        ("state/kept", "ordinary project source"),
+        (".local/discard", "project-excluded"),
+        ("cache/discard", "node-excluded"),
+        (".ai/state/discard", "structural floor"),
+        (".ai/.bundles.lock", "structural floor"),
+    ] {
+        let path = project.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    // The ordinary state/ directory is not RyeOS runtime state. Its exclusion
+    // must come from policy, not an ad hoc reserved pathname in the preview.
+    let executable =
+        lillux::open_pinned_regular_file_no_follow(&project.path().join("script")).unwrap();
+    executable.set_mode(0o755).unwrap();
+    let old_matcher =
+        ryeos_app::ignore::IgnoreMatcher::from_config(&ryeos_app::ignore::IgnoreConfig {
+            patterns: Vec::new(),
+        })
+        .unwrap();
+    let old_policy = ryeos_state::project_sync::capture_snapshot_policy(
+        project.path(),
+        &old_matcher,
+        ProjectSyncScope::FullProject,
+    )
+    .unwrap();
+    state.ignore_matcher = Arc::new(
+        ryeos_app::ignore::IgnoreMatcher::from_config(&ryeos_app::ignore::IgnoreConfig {
+            patterns: vec!["cache/".to_owned()],
+        })
+        .unwrap(),
+    );
+    let current_policy = ryeos_state::project_sync::capture_snapshot_policy(
+        project.path(),
+        &state.ignore_matcher,
+        ProjectSyncScope::FullProject,
+    )
+    .unwrap();
+    let authority = state.state_store.pinned_state_authority().unwrap();
+    let cas = authority.cas_store().unwrap();
+    let guard = authority.acquire_shared_guard().unwrap();
+    let old_policy_hash = cas.store_object(&old_policy.to_value()).unwrap();
+    let mut files = BTreeMap::new();
+    for path in [PROJECT_SNAPSHOT_CONFIG_RELATIVE, "script", "state/kept"] {
+        let bytes = std::fs::read(project.path().join(path)).unwrap();
+        let file = ProjectFile {
+            blob_hash: cas.store_blob(&bytes).unwrap(),
+            size: bytes.len() as u64,
+            normalized_mode: if path == "script" { 0o755 } else { 0o644 },
+        };
+        files.insert(path.to_owned(), cas.store_object(&file.to_value()).unwrap());
+    }
+    let tree = ProjectTree { files };
+    let snapshot = ProjectSnapshot {
+        project_tree_hash: cas.store_object(&tree.to_value()).unwrap(),
+        effective_policy_hash: old_policy_hash.clone(),
+        parent_hashes: Vec::new(),
+        message: None,
+        created_at: lillux::time::iso8601_now(),
+        source: "test".to_owned(),
+    };
+    let head = cas.store_object(&snapshot.to_value()).unwrap();
+    let caller = local_operator(&state);
+    let principal = ryeos_state::refs::principal_storage_key(&caller.fingerprint).unwrap();
+    let project_path = project.path().canonicalize().unwrap();
+    let project_hash = ryeos_state::refs::deployed_project_key(project_path.to_str().unwrap());
+    state
+        .state_store
+        .write_project_head_ref(
+            principal,
+            &project_hash,
+            &head,
+            &ryeos_app::state_store::NodeIdentitySigner::from_identity(&state.identity),
+            &guard,
+        )
+        .unwrap();
+    drop(guard);
+    let inventory = || {
+        let root = lillux::PinnedDirectory::open(cas.root()).unwrap().unwrap();
+        let mut paths = Vec::new();
+        root.visit_regular_files_bounded(
+            lillux::DirectoryTraversalBudget::new(1024, 16),
+            |_, _| Ok(false),
+            |relative, _| {
+                paths.push(relative.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        paths
+    };
+    let before = inventory();
+    let result = ryeos_api::handlers::project_snapshot_status::handle(
+        Request {
+            project_path,
+            include_unchanged: true,
+            time_budget_ms: 0,
+        },
+        caller.clone(),
+        Arc::new(state),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inventory(), before);
+    assert_eq!(result["head_snapshot_hash"], head);
+    assert_eq!(result["head_effective_policy_hash"], old_policy_hash);
+    assert_eq!(
+        result["effective_policy_hash"],
+        ryeos_state::objects::canonical_value_digest(&current_policy.to_value()).unwrap()
+    );
+    assert_eq!(result["scan_complete"], true);
+    assert_eq!(result["policy_changed"], true);
+    assert_eq!(result["dirty"], true);
+    assert_eq!(
+        result["counts"],
+        json!({"added":0,"modified":0,"deleted":0,"unchanged":3})
+    );
+    let observed = result["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![PROJECT_SNAPSHOT_CONFIG_RELATIVE, "script", "state/kept"]
+    );
+}
