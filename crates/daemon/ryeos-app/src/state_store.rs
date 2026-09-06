@@ -1062,6 +1062,11 @@ pub struct ThreadDetail {
     pub project_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_authority: Option<ryeos_state::objects::ExecutionProjectAuthority>,
+    /// Retained project generation coordinate, or null when none was retained.
+    /// Exact `get_thread` resolves it from immutable testimony; list DTOs keep
+    /// their existing projection-only display contract. Neither follows a
+    /// continuation nor grants import/publication authority.
+    pub result_project_snapshot_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_authority: Option<ryeos_state::objects::ExecutionLifecycleAuthority>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1954,6 +1959,7 @@ fn thread_detail_from_committed_snapshot(
             .project_root
             .map(|path| path.to_string_lossy().into_owned()),
         project_authority: Some(snapshot.project_authority),
+        result_project_snapshot_hash: snapshot.result_project_snapshot_hash,
         lifecycle_authority,
         admitted_launch_capsule_hash: snapshot.admitted_launch_capsule_hash,
         created_at: snapshot.created_at,
@@ -10978,10 +10984,16 @@ impl StateStore {
             .map(|metadata| metadata.lifecycle_authority())
             .transpose()?
             .flatten();
-        let project_authority = g
+        // The projection locates this exact thread. Read both project
+        // coordinates from the same verified immutable snapshot, rather than
+        // treating its SQLite result-hash column or a newer chain tip as proof.
+        let snapshot = g
             .state_db
-            .read_authoritative_thread_snapshot(&thread_row.chain_root_id, thread_id)?
-            .map(|snapshot| snapshot.project_authority);
+            .read_authoritative_thread_snapshot(&thread_row.chain_root_id, thread_id)?;
+        let result_project_snapshot_hash = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.result_project_snapshot_hash.clone());
+        let project_authority = snapshot.map(|snapshot| snapshot.project_authority);
 
         let successor_thread_id = if is_terminal_status(&thread_row.status) {
             queries::continuation_successor(g.state_db.projection(), thread_id)?
@@ -11004,6 +11016,7 @@ impl StateStore {
             requested_by: thread_row.requested_by,
             project_root: thread_row.project_root,
             project_authority,
+            result_project_snapshot_hash,
             lifecycle_authority,
             admitted_launch_capsule_hash: thread_row.admitted_launch_capsule_hash,
             created_at: thread_row.created_at,
@@ -12671,6 +12684,9 @@ impl StateStore {
                 None
             };
             children.push(ThreadDetail {
+                // Display projection, like the other list fields. Exact get
+                // and retained-result import perform immutable verification.
+                result_project_snapshot_hash: row.result_project_snapshot_hash,
                 thread_id: row.thread_id,
                 chain_root_id: row.chain_root_id,
                 kind: row.kind,
@@ -12718,6 +12734,9 @@ impl StateStore {
                 None
             };
             threads.push(ThreadDetail {
+                // Do not reread/revalidate the complete chain head per row.
+                // List data is not retained-result import authority.
+                result_project_snapshot_hash: row.result_project_snapshot_hash,
                 thread_id: row.thread_id,
                 chain_root_id: row.chain_root_id,
                 kind: row.kind,
@@ -12783,6 +12802,9 @@ impl StateStore {
                 None
             };
             details.push(ThreadDetail {
+                // Reconciliation enumerates projected rows; exact authority
+                // remains with the operation that consumes the coordinate.
+                result_project_snapshot_hash: row.result_project_snapshot_hash,
                 thread_id: row.thread_id,
                 chain_root_id: row.chain_root_id,
                 kind: row.kind,

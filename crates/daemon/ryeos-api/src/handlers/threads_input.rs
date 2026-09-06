@@ -969,6 +969,7 @@ mod tests {
                 .project_root_projection()
                 .map(|path| path.display().to_string()),
             project_authority: Some(project_authority),
+            result_project_snapshot_hash: None,
             lifecycle_authority: Some(
                 ryeos_state::objects::ExecutionLifecycleAuthority::DAEMON_RESTARTABLE,
             ),

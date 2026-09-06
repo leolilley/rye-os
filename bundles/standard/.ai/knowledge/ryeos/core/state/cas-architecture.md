@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T07:06:10Z:22a30404a933a906c5a21481f5bfa4481bd0c2192793ee016916848d16d62960:8aSb6WoyIswHA/9UH3aB0WtiHCD+PVVfig1PIQPO7RIKv1yc508FjnmJATGyc4tGIv50+nqrkmmMuFw8kY9cAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T07:38:52Z:31e995f3656c73b1f1ee50a8b2c911264edec549b9cd0e5cd3febbd7ccdc763d:3C1YIaB8zudYF1jlLQxgidFwyQ938cf8GRx0AaDobJOrvbUng3h1ipFkJkMvw6DFO91Srnlh0DUuXJXNbYk9Bw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
@@ -198,6 +198,13 @@ selects a file or nonempty regular-file subtree from an exact successfully
 completed execution's retained result snapshot. It requires the configured local
 operator to own the exact chain root and thread; a snapshot hash alone grants
 no access. Both produce the same staging receipt for separate consumer binding.
+
+Retained-result admission uses the lifecycle owner's completed status from the
+verified immutable thread snapshot, with no error and a finished timestamp.
+An outcome label such as `exit:0` describes the producer's execution; it neither
+replaces that terminal classification nor grants access by matching an importer-
+specific success string. The exact retained snapshot, launch capsule and
+project-retention authority must still agree at the requested coordinate.
 
 The CLI exposes these as:
 

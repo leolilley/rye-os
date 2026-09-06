@@ -3580,6 +3580,7 @@ mod tests {
             requested_by: None,
             project_root: None,
             project_authority: None,
+            result_project_snapshot_hash: None,
             lifecycle_authority: None,
             admitted_launch_capsule_hash: None,
             created_at: "t".into(),

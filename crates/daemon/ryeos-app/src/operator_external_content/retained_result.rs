@@ -195,8 +195,11 @@ fn authorize_result(
     {
         bail!("retained result execution is not owned at the requested coordinate");
     }
+    // The trust-verified thread snapshot carries the lifecycle owner's
+    // terminal classification. Outcome labels belong to the admitted
+    // execution implementation; do not introduce an outcome vocabulary or
+    // reclassify subprocess/runtime results at this generic import boundary.
     if thread.status != ryeos_state::objects::thread_snapshot::ThreadStatus::Completed
-        || thread.outcome_code.as_deref() != Some("success")
         || thread.error.is_some()
         || thread.finished_at.is_none()
     {
@@ -275,12 +278,13 @@ mod tests {
         for alter in [
             |t: &mut ryeos_state::ThreadSnapshot| t.status = ThreadStatus::Running,
             |t: &mut ryeos_state::ThreadSnapshot| t.status = ThreadStatus::Continued,
-            |t: &mut ryeos_state::ThreadSnapshot| t.outcome_code = Some("failed".into()),
+            |t: &mut ryeos_state::ThreadSnapshot| t.status = ThreadStatus::Failed,
             |t: &mut ryeos_state::ThreadSnapshot| t.finished_at = None,
             |t: &mut ryeos_state::ThreadSnapshot| {
                 t.error = Some(serde_json::json!({"code":"failed"}))
             },
             |t: &mut ryeos_state::ThreadSnapshot| t.admitted_launch_capsule_hash = None,
+            |t: &mut ryeos_state::ThreadSnapshot| t.result_project_snapshot_hash = None,
             |t: &mut ryeos_state::ThreadSnapshot| {
                 t.result_project_snapshot_hash = Some("f".repeat(64))
             },
@@ -288,6 +292,8 @@ mod tests {
                 t.project_authority = ExecutionProjectAuthority::PROJECTLESS
             },
             |t: &mut ryeos_state::ThreadSnapshot| t.chain_root_id = "T-other".into(),
+            |t: &mut ryeos_state::ThreadSnapshot| t.thread_id = "T-other".into(),
+            |t: &mut ryeos_state::ThreadSnapshot| t.requested_by = Some("f".repeat(64)),
         ] {
             let mut bad = thread.clone();
             alter(&mut bad);
@@ -296,6 +302,42 @@ mod tests {
         let mut foreign_root = thread.clone();
         foreign_root.requested_by = Some("f".repeat(64));
         assert!(authorize_result(&foreign_root, &thread, &request, &owner).is_err());
+    }
+
+    #[test]
+    fn retained_result_uses_terminal_classification_not_outcome_vocabulary() {
+        let (root, request, owner) = fixture();
+        for outcome in [
+            Some("success"),
+            Some("exit:0"),
+            Some("producer:assembled"),
+            None,
+        ] {
+            let mut thread = root.clone();
+            thread.outcome_code = outcome.map(str::to_owned);
+            authorize_result(&root, &thread, &request, &owner).unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_result_outcome_labels_cannot_authorize_noncompleted_executions() {
+        let (root, request, owner) = fixture();
+        for status in [
+            ThreadStatus::Created,
+            ThreadStatus::Running,
+            ThreadStatus::Failed,
+            ThreadStatus::Cancelled,
+            ThreadStatus::Killed,
+            ThreadStatus::TimedOut,
+            ThreadStatus::Continued,
+        ] {
+            for outcome in ["success", "exit:0"] {
+                let mut thread = root.clone();
+                thread.status = status;
+                thread.outcome_code = Some(outcome.to_owned());
+                assert!(authorize_result(&root, &thread, &request, &owner).is_err());
+            }
+        }
     }
 
     #[test]
