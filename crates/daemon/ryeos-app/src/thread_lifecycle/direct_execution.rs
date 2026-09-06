@@ -72,6 +72,12 @@ impl SpawnedPersistentSessionAwaitingAttachment {
 }
 
 impl RunningItem {
+    /// Protocol observation over the same attached process used by ordinary
+    /// Tools; do not build a second launcher to read framed stdout.
+    pub fn take_stdout_reader(&mut self) -> Option<lillux::ProcessStdoutReader> {
+        self.running.take_stdout_reader()
+    }
+
     pub fn abort(self) {
         self.running.abort();
     }
@@ -79,6 +85,20 @@ impl RunningItem {
     /// Block until subprocess completes.
     pub fn wait(self) -> ExecutionCompletion {
         self.running.wait()
+    }
+
+    pub fn wait_interruptible(self, interrupted: impl FnMut() -> bool) -> ExecutionCompletion {
+        self.running.wait_interruptible(interrupted)
+    }
+
+    pub fn wait_with_stdout<T: Send, E: Send>(
+        self,
+        observe: impl FnOnce(lillux::ProcessStdoutReader) -> std::result::Result<T, E> + Send,
+    ) -> (
+        ExecutionCompletion,
+        std::result::Result<T, lillux::ProcessObservationError<E>>,
+    ) {
+        self.running.wait_with_stdout(observe)
     }
 }
 

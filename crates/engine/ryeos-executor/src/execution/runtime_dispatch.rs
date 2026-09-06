@@ -211,11 +211,7 @@ fn enforce_inline_dispatch_class(
     item_ref: &str,
     class: crate::dispatch::RootDispatchClass,
 ) -> Result<()> {
-    if matches!(
-        class,
-        crate::dispatch::RootDispatchClass::ManagedSubprocess
-            | crate::dispatch::RootDispatchClass::ManagedNonEnvelope
-    ) {
+    if matches!(class, crate::dispatch::RootDispatchClass::ManagedSubprocess) {
         anyhow::bail!(
             "inline callback dispatch of `{item_ref}` is not supported: the exact admitted route \
              executes as a managed thread run. Mark the node `follow: true` to await its result \
@@ -2231,10 +2227,7 @@ mod tests {
     fn inline_thread_run_gate_consumes_the_exact_preflight_class() {
         use crate::dispatch::RootDispatchClass;
 
-        for class in [
-            RootDispatchClass::ManagedSubprocess,
-            RootDispatchClass::ManagedNonEnvelope,
-        ] {
+        for class in [RootDispatchClass::ManagedSubprocess] {
             let error = enforce_inline_dispatch_class("alias:test/run", class).unwrap_err();
             assert!(error.to_string().contains("exact admitted route"));
             assert!(error.to_string().contains("managed thread run"));
@@ -2242,7 +2235,6 @@ mod tests {
         for class in [
             RootDispatchClass::TerminalSubprocess,
             RootDispatchClass::MethodDispatch,
-            RootDispatchClass::UnthreadedStreamingSubprocess,
             RootDispatchClass::InProcess,
         ] {
             enforce_inline_dispatch_class("alias:test/leaf", class).unwrap();

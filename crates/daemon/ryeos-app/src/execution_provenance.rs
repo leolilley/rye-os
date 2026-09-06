@@ -215,9 +215,9 @@ pub fn isolation_live_access_authority_for_project(
     project_authority
         .live_access()
         .map(|authority| match &authority.confinement {
-            ryeos_state::objects::LiveFilesystemConfinement::DescriptorRootedMasked {
+            ryeos_state::objects::LiveFilesystemConfinement::DescriptorRootedFixedParents {
                 denied_control_paths,
-                symlink_policy: ryeos_state::objects::LiveSymlinkPolicy::DescriptorRootedNoEscape,
+                symlink_policy: ryeos_state::objects::LiveSymlinkPolicy::AdmittedExecutionNamespace,
             } => {
                 let root = project_authority
                     .open_environment_root()?
@@ -232,7 +232,7 @@ pub fn isolation_live_access_authority_for_project(
                 drop(ai);
                 let (root_device_id, root_inode) = root.device_inode()?;
                 Ok(
-                    ryeos_engine::isolation::IsolationLiveAccessAuthority::DescriptorRootedMasked {
+                    ryeos_engine::isolation::IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
                         root: Arc::new(root),
                         root_device_id,
                         root_inode,
@@ -1624,7 +1624,7 @@ mod tests {
         let project_authority = policy
             .resolve_live_project_authority(
                 project.path(),
-                ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
                 vec![crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY.to_string()],
             )
             .unwrap();
@@ -1636,7 +1636,7 @@ mod tests {
         let live_access = isolation_live_access_authority_for_project(&project_authority)
             .unwrap()
             .expect("live authority");
-        let ryeos_engine::isolation::IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let ryeos_engine::isolation::IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
             root: retained_root,
             root_device_id,
             root_inode,
@@ -1673,14 +1673,14 @@ mod tests {
         let project_authority = policy
             .resolve_live_project_authority(
                 &project,
-                ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
                 vec![crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY.to_string()],
             )
             .unwrap();
         let live_access = isolation_live_access_authority_for_project(&project_authority)
             .unwrap()
             .unwrap();
-        let ryeos_engine::isolation::IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let ryeos_engine::isolation::IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
             root,
             root_device_id,
             root_inode,

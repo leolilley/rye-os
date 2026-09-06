@@ -223,17 +223,36 @@ fn translate_launch(request: &AdapterLaunchRequest) -> Result<lillux::LinuxSandb
             .map(|(name, value)| (OsString::from(name), OsString::from(value)))
             .collect(),
         mounts,
+        fixed_parent_views: request
+            .plan
+            .fixed_parent_views
+            .iter()
+            .map(|view| lillux::LinuxSandboxFixedParentView {
+                destination: PathBuf::from(view.destination.as_str()),
+                denied_paths: view.denied_paths.iter().map(PathBuf::from).collect(),
+                max_entries: view.limits.max_entries,
+                max_depth: view.limits.max_depth,
+            })
+            .collect(),
         overlay,
         network: match request.plan.network {
             IsolationNetwork::Host => lillux::LinuxSandboxNetwork::Host,
             IsolationNetwork::Isolated => lillux::LinuxSandboxNetwork::Isolated,
         },
         private_tmp: request.plan.private_tmp,
+        proc_filesystem: match request.plan.proc_filesystem {
+            ryeos_isolation_protocol::IsolationProcFilesystem::Empty => {
+                lillux::LinuxSandboxProcFilesystem::Empty
+            }
+            ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespace => {
+                lillux::LinuxSandboxProcFilesystem::PidNamespace
+            }
+        },
         minimal_devices: true,
         target_channels,
         lifecycle,
         contain_process_group: request.plan.shared_process_group,
-        // No signed cgroup delegation exists in protocol v4. Lillux exposes an
+        // No signed cgroup delegation exists in this protocol. Lillux exposes an
         // explicit fail-closed integration point rather than treating the
         // adapter process's rlimits as aggregate child-tree containment.
         aggregate_limits: None,
@@ -348,8 +367,14 @@ fn supported_capabilities(
             IsolationCapability::FilesystemWorkspaceDelta,
         ]);
     }
+    if inspection.fixed_parent_views {
+        capabilities.insert(IsolationCapability::FilesystemFixedParentViews);
+    }
     if inspection.private_tmp {
         capabilities.insert(IsolationCapability::FilesystemPrivateTmp);
+    }
+    if inspection.pid_namespace_proc {
+        capabilities.insert(IsolationCapability::FilesystemPidNamespaceProc);
     }
     if inspection.minimal_devices {
         capabilities.insert(IsolationCapability::DevicesMinimal);

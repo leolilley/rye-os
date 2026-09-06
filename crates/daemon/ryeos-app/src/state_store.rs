@@ -5104,6 +5104,17 @@ impl StateStore {
         g.runtime_db.credential_profile(profile_id)
     }
 
+    pub fn list_credential_profiles_for_owner(
+        &self,
+        owner_principal: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<runtime_db::CredentialProfilePage> {
+        self.lock()?
+            .runtime_db
+            .list_credential_profiles_for_owner(owner_principal, after, limit)
+    }
+
     pub fn acquire_credential_profile(
         &self,
         profile_id: &str,
@@ -15434,6 +15445,34 @@ impl StateStore {
         thread_id: &str,
         events: &[NewEventRecord],
     ) -> Result<Option<Vec<PersistedEventRecord>>> {
+        self.append_events_if_thread_running_inner(chain_root_id, thread_id, events, None)
+    }
+
+    /// Process-observer admission must fence the exact launch owner under the
+    /// same lock as the journal append. A payload's launch_id is testimony,
+    /// not permission for a stale observer to write into a successor launch.
+    pub fn append_events_if_thread_running_owned(
+        &self,
+        chain_root_id: &str,
+        thread_id: &str,
+        events: &[NewEventRecord],
+        launch_owner: &str,
+    ) -> Result<Option<Vec<PersistedEventRecord>>> {
+        self.append_events_if_thread_running_inner(
+            chain_root_id,
+            thread_id,
+            events,
+            Some(launch_owner),
+        )
+    }
+
+    fn append_events_if_thread_running_inner(
+        &self,
+        chain_root_id: &str,
+        thread_id: &str,
+        events: &[NewEventRecord],
+        launch_owner: Option<&str>,
+    ) -> Result<Option<Vec<PersistedEventRecord>>> {
         let has_cas_events = events
             .iter()
             .any(|event| event.storage_class != "ephemeral");
@@ -15451,6 +15490,12 @@ impl StateStore {
         };
         if thread.status != ThreadStatus::Running.as_str() {
             return Ok(None);
+        }
+        if let Some(expected) = launch_owner {
+            let claim = g.runtime_db.get_launch_claim(thread_id)?;
+            if !claim.is_some_and(|claim| claim.claimed_by == expected) {
+                return Ok(None);
+            }
         }
         let runtime = g
             .runtime_db
@@ -19894,6 +19939,61 @@ mod tests {
             store
                 .release_thread_launch_claim(thread_id, "claim-fresh")
                 .expect("release launch reservation")
+        );
+    }
+
+    #[test]
+    fn running_output_observations_are_fenced_by_exact_launch_owner() {
+        let store = test_store();
+        let thread_id = "T-output-owner";
+        store
+            .create_thread_for_test(&thread_record(thread_id, thread_id))
+            .unwrap();
+        store
+            .claim_thread_launch(thread_id, "claim-1", "daemon:test")
+            .unwrap();
+        let first = store
+            .get_launch_claim(thread_id)
+            .unwrap()
+            .unwrap()
+            .claimed_by;
+        store.mark_thread_running(thread_id, None).unwrap();
+        let events = [NewEventRecord {
+            event_type: ryeos_state::event_types::SUBPROCESS_OUTPUT_OBSERVED.into(),
+            storage_class: "indexed".into(),
+            payload: json!({"data": "first"}),
+        }];
+        assert!(
+            store
+                .append_events_if_thread_running_owned(thread_id, thread_id, &events, &first)
+                .unwrap()
+                .is_some()
+        );
+        store
+            .release_thread_launch_claim(thread_id, "claim-1")
+            .unwrap();
+        store
+            .claim_thread_launch(thread_id, "claim-2", "daemon:test")
+            .unwrap();
+        let second = store
+            .get_launch_claim(thread_id)
+            .unwrap()
+            .unwrap()
+            .claimed_by;
+        assert_ne!(first, second);
+        let before = replayed_event_types(&store, thread_id);
+        assert!(
+            store
+                .append_events_if_thread_running_owned(thread_id, thread_id, &events, &first)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(replayed_event_types(&store, thread_id), before);
+        assert!(
+            store
+                .append_events_if_thread_running_owned(thread_id, thread_id, &events, &second)
+                .unwrap()
+                .is_some()
         );
     }
 

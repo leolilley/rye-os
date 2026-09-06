@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T01:24:55Z:492e4e2ae98050ce87d791c7afafba346bd9474d45a935864a56bf72961f46f4:TNDdcKEx8QODiXi5nHWU7J/9VXQtf6N9S7mOd9WdsBD9DF+9eMzhe9siCspnOH4ExGsyY+bJ2pCEO5YCJXAyAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-05T02:30:04Z:2f32504805760b564f85bde444868e160753492bd28d139b1aa4263b2bb819c1:FnkbCxYpaQzPg6kBf6I6MdhcWcvX5YDKDZJ0mfid5W+O9knwtJqEEkJNzTB/pGP4OnjpeR5Jx+n89VGBj1wdBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [codex, hosted-execution, structured-session, credentials, acceptance]
-version: "1.7.0"
+version: "1.8.0"
 description: >
   Activation, credential ceremony, command routes, and release acceptance for
   the pinned Codex structured-session workload.
@@ -31,6 +31,28 @@ contract beneath it is documented by
 knowledge bundle.
 
 ## Activation
+
+Before creating another login, discover the existing profiles on the selected
+node through the CLI:
+
+```sh
+ryeos codex profile list
+ryeos codex profile get <profile-id>
+```
+
+The list is restricted to the authenticated operator and contains profile IDs,
+lifecycle state, credential generation, whether the profile is in use, and
+creation/update timestamps. It does not read private homes or expose account,
+login, or token contents. An empty `profiles` array means this owner has no
+registered profiles on that node; it says nothing about another node or the
+ordinary Codex CLI login. Deleted profiles are omitted. The default page size
+is 50 (maximum 200); pass `--limit` and then `--after <next_cursor>` for further
+pages until `next_cursor` is null.
+
+This is the generic owner-authorized `service:credential-profiles/list` surface.
+A configured remote operator must have the explicit
+`ryeos.execute.service.credential-profiles/list` capability and use the normal
+configured-operator forwarding route to inspect profiles on a remote node.
 
 1. Publish the `hosted-workflow` set containing `core`, `central-auth`,
    `standard`, `hosted-node`, and `codex`. Generic worker-execution runtime/preparer

@@ -8,7 +8,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAcc
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v4";
+pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v6";
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -148,7 +148,7 @@ impl<'de> Visitor<'de> for StrictJsonValueVisitor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IsolationAdapterProtocolVersion {
-    #[serde(rename = "ryeos.isolation-adapter/v4")]
+    #[serde(rename = "ryeos.isolation-adapter/v6")]
     Current,
 }
 
@@ -194,12 +194,16 @@ pub enum IsolationCapability {
     FilesystemFdWritable,
     #[serde(rename = "filesystem.ordered_overlays")]
     FilesystemOrderedOverlays,
+    #[serde(rename = "filesystem.fixed_parent_views")]
+    FilesystemFixedParentViews,
     #[serde(rename = "filesystem.project_workspace_cow")]
     FilesystemProjectWorkspaceCow,
     #[serde(rename = "filesystem.workspace_delta")]
     FilesystemWorkspaceDelta,
     #[serde(rename = "filesystem.private_tmp")]
     FilesystemPrivateTmp,
+    #[serde(rename = "filesystem.pid_namespace_proc")]
+    FilesystemPidNamespaceProc,
     #[serde(rename = "devices.minimal")]
     DevicesMinimal,
     #[serde(rename = "environment.exact")]
@@ -372,6 +376,85 @@ pub struct IsolationMount {
     pub layer: u32,
 }
 
+/// Mechanical bounds selected by node policy. The wire has no fallback values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixedParentViewLimits {
+    pub max_entries: usize,
+    pub max_depth: usize,
+}
+
+impl FixedParentViewLimits {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.max_entries == 0
+            || self.max_entries > MAX_MOUNTS
+            || self.max_depth == 0
+            || self.max_depth > MAX_JSON_DEPTH
+        {
+            return Err(ProtocolValidationError::new(
+                "fixed-parent view bounds exceed the wire contract",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Restriction on an existing exact directory mount. Connector entry membership
+/// is fixed; allowed child mounts retain that directory's admitted RO/RW access.
+/// Denied paths are authority input, not paths discovered by an adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationFixedParentView {
+    pub destination: IsolationPath,
+    pub denied_paths: Vec<String>,
+    pub limits: FixedParentViewLimits,
+}
+
+impl IsolationFixedParentView {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        self.limits.validate()?;
+        if self.denied_paths.is_empty() || self.denied_paths.len() > self.limits.max_entries {
+            return Err(ProtocolValidationError::new(
+                "fixed-parent view requires a bounded denial set",
+            ));
+        }
+        let mut previous: Option<&str> = None;
+        let mut denied = BTreeSet::new();
+        let mut prefixes = BTreeSet::new();
+        for path in &self.denied_paths {
+            validate_string("fixed-parent denied path", path)?;
+            let count = path.split('/').count();
+            if count < 2
+                || count > self.limits.max_depth
+                || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+                || previous.is_some_and(|prev| prev >= path.as_str())
+            {
+                return Err(ProtocolValidationError::new(
+                    "fixed-parent denied paths must be normalized, nonoverlapping and sorted beneath an ancestor",
+                ));
+            }
+            for (offset, _) in path.match_indices('/') {
+                let prefix = &path[..offset];
+                if denied.contains(prefix) {
+                    return Err(ProtocolValidationError::new(
+                        "fixed-parent denied paths overlap",
+                    ));
+                }
+                prefixes.insert(prefix);
+            }
+            denied.insert(path.as_str());
+            prefixes.insert(path.as_str());
+            if prefixes.len() > self.limits.max_entries {
+                return Err(ProtocolValidationError::new(
+                    "fixed-parent path tree exceeds entry bound",
+                ));
+            }
+            previous = Some(path);
+        }
+        Ok(())
+    }
+}
+
 /// One verified writable project view. RyeOS owns the canonical project
 /// generation while the signed adapter exclusively interprets its opaque
 /// backend state. The adapter must compose the view at `destination`;
@@ -418,6 +501,15 @@ pub enum IsolationDeviceSurface {
     Minimal,
 }
 
+/// Finite node-owned process-filesystem surface, never an arbitrary host
+/// mount. PID-only procfs requires an isolated PID namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationProcFilesystem {
+    Empty,
+    PidNamespace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IsolationEnvironment {
@@ -438,6 +530,7 @@ pub struct IsolationTarget {
 pub struct IsolationPlan {
     pub target: IsolationTarget,
     pub mounts: Vec<IsolationMount>,
+    pub fixed_parent_views: Vec<IsolationFixedParentView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_workspace: Option<IsolationProjectWorkspace>,
     pub target_channels: Vec<IsolationTargetChannel>,
@@ -445,6 +538,7 @@ pub struct IsolationPlan {
     pub network: IsolationNetwork,
     pub devices: IsolationDeviceSurface,
     pub private_tmp: bool,
+    pub proc_filesystem: IsolationProcFilesystem,
     pub pid_namespace: IsolationPidNamespace,
     pub shared_process_group: bool,
 }
@@ -459,6 +553,94 @@ impl IsolationPlan {
         }
         if self.mounts.len() > MAX_MOUNTS {
             return Err(ProtocolValidationError::new("too many mounts"));
+        }
+        if self.fixed_parent_views.len() > MAX_MOUNTS {
+            return Err(ProtocolValidationError::new("too many fixed-parent views"));
+        }
+        if self.proc_filesystem == IsolationProcFilesystem::PidNamespace
+            && self.pid_namespace != IsolationPidNamespace::Isolated
+        {
+            return Err(ProtocolValidationError::new(
+                "PID procfs requires isolated PID namespace",
+            ));
+        }
+        // Empty also means an empty surface, not permission to substitute an
+        // arbitrary (possibly host) proc filesystem through ordinary mounts.
+        {
+            let proc_path = std::path::Path::new("/proc");
+            if self.mounts.iter().any(|mount| {
+                std::path::Path::new(mount.destination.as_str()).starts_with(proc_path)
+            }) || self.project_workspace.as_ref().is_some_and(|workspace| {
+                let destination = std::path::Path::new(workspace.destination.as_str());
+                destination.starts_with(proc_path) || proc_path.starts_with(destination)
+            }) {
+                return Err(ProtocolValidationError::new(
+                    "mount conflicts with reserved PID procfs",
+                ));
+            }
+        }
+        let mut destinations = BTreeSet::new();
+        for mount in &self.mounts {
+            if mount.destination.as_str() == "/" || !destinations.insert(&mount.destination) {
+                return Err(ProtocolValidationError::new(
+                    "mount destinations must be unique and cannot replace the private root",
+                ));
+            }
+            for ancestor in &self.mounts {
+                if mount.destination != ancestor.destination
+                    && std::path::Path::new(mount.destination.as_str())
+                        .starts_with(ancestor.destination.as_str())
+                    && ancestor.layer > mount.layer
+                {
+                    return Err(ProtocolValidationError::new(
+                        "mount ancestor would hide a child layer",
+                    ));
+                }
+            }
+            if self.project_workspace.as_ref().is_some_and(|workspace| {
+                std::path::Path::new(workspace.destination.as_str())
+                    .starts_with(mount.destination.as_str())
+            }) {
+                return Err(ProtocolValidationError::new(
+                    "ordinary mount would hide the private workspace",
+                ));
+            }
+        }
+        let mut view_destinations = BTreeSet::new();
+        let mut view_budget = 0usize;
+        for view in &self.fixed_parent_views {
+            view.validate()?;
+            view_budget = view_budget
+                .checked_add(view.limits.max_entries)
+                .ok_or_else(|| ProtocolValidationError::new("fixed-parent budget overflow"))?;
+            if view_budget > MAX_MOUNTS
+                || !view_destinations.insert(&view.destination)
+                || !self
+                    .mounts
+                    .iter()
+                    .any(|mount| mount.destination == view.destination)
+            {
+                return Err(ProtocolValidationError::new(
+                    "fixed-parent view lacks a unique mount or exceeds aggregate bounds",
+                ));
+            }
+            for mount in &self.mounts {
+                if mount.destination == view.destination {
+                    continue;
+                }
+                for path in &view.denied_paths {
+                    let denied = std::path::Path::new(view.destination.as_str()).join(path);
+                    let destination = std::path::Path::new(mount.destination.as_str());
+                    if destination.starts_with(&denied)
+                        || (denied.starts_with(destination)
+                            && destination.starts_with(view.destination.as_str()))
+                    {
+                        return Err(ProtocolValidationError::new(
+                            "positive mount conflicts with fixed-parent restriction",
+                        ));
+                    }
+                }
+            }
         }
         if self.environment.values.len() > MAX_ENVIRONMENT_ENTRIES {
             return Err(ProtocolValidationError::new("too many environment entries"));
@@ -677,11 +859,17 @@ impl IsolationPlan {
             capabilities.insert(IsolationCapability::FilesystemProjectWorkspaceCow);
             capabilities.insert(IsolationCapability::FilesystemWorkspaceDelta);
         }
+        if !self.fixed_parent_views.is_empty() {
+            capabilities.insert(IsolationCapability::FilesystemFixedParentViews);
+        }
         if !self.target_channels.is_empty() {
             capabilities.insert(IsolationCapability::IpcTargetUnixStream);
         }
         if self.private_tmp {
             capabilities.insert(IsolationCapability::FilesystemPrivateTmp);
+        }
+        if self.proc_filesystem == IsolationProcFilesystem::PidNamespace {
+            capabilities.insert(IsolationCapability::FilesystemPidNamespaceProc);
         }
         capabilities.insert(match self.network {
             IsolationNetwork::Host => IsolationCapability::NetworkHost,
@@ -1295,6 +1483,7 @@ mod tests {
                         layer: 2,
                     },
                 ],
+                fixed_parent_views: Vec::new(),
                 project_workspace: None,
                 target_channels: Vec::new(),
                 environment: IsolationEnvironment {
@@ -1303,6 +1492,7 @@ mod tests {
                 network: IsolationNetwork::Isolated,
                 devices: IsolationDeviceSurface::Minimal,
                 private_tmp: true,
+                proc_filesystem: IsolationProcFilesystem::Empty,
                 pid_namespace: IsolationPidNamespace::Host,
                 shared_process_group: true,
             },
@@ -1412,8 +1602,8 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_duplicate_keys_at_every_depth() {
-        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v4","protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
-        let nested = r#"{"protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
+        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v6","protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let nested = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
         for document in [top_level, nested] {
             let error = from_json_str_strict::<AdapterInspectionRequest>(document).unwrap_err();
             assert!(error.to_string().contains("duplicate JSON object key"));
@@ -1422,7 +1612,7 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_unknown_fields_trailing_data_and_excessive_depth() {
-        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
+        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(unknown)
                 .unwrap_err()
@@ -1430,7 +1620,7 @@ mod tests {
                 .contains("unknown field")
         );
 
-        let valid = r#"{"protocol":"ryeos.isolation-adapter/v4","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let valid = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(&format!("{valid} true"))
                 .unwrap_err()
@@ -1453,7 +1643,7 @@ mod tests {
 
     #[test]
     fn predecessor_adapter_protocol_is_refused() {
-        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v3","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v5","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         let error = from_json_str_strict::<AdapterInspectionRequest>(predecessor).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
@@ -1476,6 +1666,158 @@ mod tests {
                 IsolationCapability::ProcessTargetPidReporting,
                 IsolationCapability::LifecycleSharedProcessGroup,
             ])
+        );
+    }
+
+    fn fixed_view() -> IsolationFixedParentView {
+        IsolationFixedParentView {
+            destination: IsolationPath::new("/project").unwrap(),
+            denied_paths: vec!["control/secret".to_string()],
+            limits: FixedParentViewLimits {
+                max_entries: 32,
+                max_depth: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn pid_proc_is_explicit_capability_gated_and_cannot_be_replaced() {
+        let (mut plan, authorities) = complete_plan();
+        let mut missing = serde_json::to_value(&plan).unwrap();
+        missing.as_object_mut().unwrap().remove("proc_filesystem");
+        assert!(serde_json::from_value::<IsolationPlan>(missing).is_err());
+        plan.proc_filesystem = IsolationProcFilesystem::PidNamespace;
+        assert!(
+            plan.validate(&authorities)
+                .unwrap_err()
+                .to_string()
+                .contains("isolated PID")
+        );
+        plan.pid_namespace = IsolationPidNamespace::Isolated;
+        assert!(
+            plan.validate(&authorities)
+                .unwrap()
+                .contains(&IsolationCapability::FilesystemPidNamespaceProc)
+        );
+        for path in ["/proc", "/proc/self", "/proc/1/fd"] {
+            plan.mounts[1].destination = IsolationPath::new(path).unwrap();
+            assert!(
+                plan.validate(&authorities)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reserved PID procfs")
+            );
+        }
+        plan.mounts[1].destination = IsolationPath::new("/process-inputs").unwrap();
+        assert!(plan.validate(&authorities).is_ok());
+        plan.proc_filesystem = IsolationProcFilesystem::Empty;
+        plan.mounts[1].destination = IsolationPath::new("/proc/self").unwrap();
+        assert!(
+            plan.validate(&authorities)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved PID procfs")
+        );
+    }
+
+    #[test]
+    fn fixed_parent_views_are_required_explicit_and_capability_gated() {
+        let (mut plan, authorities) = complete_plan();
+        let mut encoded = serde_json::to_value(&plan).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("fixed_parent_views");
+        assert!(serde_json::from_value::<IsolationPlan>(encoded).is_err());
+        assert!(
+            !plan
+                .validate(&authorities)
+                .unwrap()
+                .contains(&IsolationCapability::FilesystemFixedParentViews)
+        );
+        plan.fixed_parent_views.push(fixed_view());
+        assert!(
+            plan.validate(&authorities)
+                .unwrap()
+                .contains(&IsolationCapability::FilesystemFixedParentViews)
+        );
+        let mut encoded = serde_json::to_value(fixed_view()).unwrap();
+        encoded.as_object_mut().unwrap().remove("limits");
+        assert!(serde_json::from_value::<IsolationFixedParentView>(encoded).is_err());
+    }
+
+    #[test]
+    fn fixed_parent_plan_rejects_conflicting_topology_and_bounds() {
+        let (base, authorities) = complete_plan();
+        let mut interleaved = fixed_view();
+        interleaved.denied_paths = vec![
+            "control/a".into(),
+            "control/a-b".into(),
+            "control/a/secret".into(),
+        ];
+        assert!(
+            interleaved
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+        let mut bounded = fixed_view();
+        bounded.limits.max_entries = 1;
+        assert!(
+            bounded
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("entry bound")
+        );
+        for path in [
+            "control",
+            "control/../secret",
+            "control//secret",
+            "/control/secret",
+        ] {
+            let mut plan = base.clone();
+            let mut view = fixed_view();
+            view.denied_paths = vec![path.to_string()];
+            plan.fixed_parent_views = vec![view];
+            assert!(plan.validate(&authorities).is_err(), "{path}");
+        }
+        for bound in [0, MAX_MOUNTS + 1] {
+            let mut plan = base.clone();
+            let mut view = fixed_view();
+            view.limits.max_entries = bound;
+            plan.fixed_parent_views = vec![view];
+            assert!(plan.validate(&authorities).is_err());
+        }
+        for destination in [
+            "/project/control",
+            "/project/control/secret",
+            "/project/control/secret/child",
+        ] {
+            let mut plan = base.clone();
+            plan.fixed_parent_views = vec![fixed_view()];
+            let mut mount = plan.mounts[1].clone();
+            mount.layer = 3;
+            mount.destination = IsolationPath::new(destination).unwrap();
+            plan.mounts.push(mount);
+            assert!(
+                plan.validate(&authorities)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicts")
+            );
+        }
+        let mut plan = base.clone();
+        plan.fixed_parent_views = vec![fixed_view(), fixed_view()];
+        assert!(plan.validate(&authorities).is_err());
+        let mut plan = base;
+        plan.mounts[1].destination = IsolationPath::new("/workspace/child").unwrap();
+        assert!(
+            plan.validate(&authorities)
+                .unwrap_err()
+                .to_string()
+                .contains("ancestor")
         );
     }
 
@@ -1894,11 +2236,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_v4_exposes_only_project_and_opaque_backend_state() {
+    fn workspace_exposes_only_project_and_opaque_backend_state() {
         let request = workspace_request(WorkspaceLifecycleOperation::Create);
         request.validate().unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v4");
+        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v6");
         let purposes = encoded["authorities"]
             .as_array()
             .unwrap()

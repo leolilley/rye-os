@@ -1502,7 +1502,10 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // Neither the source-local epoch 22 nor the
 // separately checkpointed campaign epochs 22–24 can authorize this combined
 // execution contract; there is no open-time migration.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 25;
+// Epoch 26 admits fixed-parent live authority in project envelope 4, sealed
+// request 17, thread snapshot 12, launch metadata 28 and launch capsule 24.
+// Previous live-path-mask authority is never reinterpreted on open.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 26;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -3289,7 +3292,8 @@ const PROJECT_AUTHORITY_ENVELOPE_KIND: &str = "execution_project_authority";
 // Epoch 3 adds the exact principal/project/base destination for explicit
 // retained-current-HEAD publication. There is deliberately no compatibility
 // reader: a predecessor authority cannot be upgraded into publication rights.
-const PROJECT_AUTHORITY_SCHEMA_EPOCH: u32 = 3;
+// Epoch 4 records fixed-parent rather than path-mask live confinement.
+const PROJECT_AUTHORITY_SCHEMA_EPOCH: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncompatibleRuntimeExecutionSchema {
@@ -3980,6 +3984,26 @@ pub struct CredentialProfileRecord {
     pub lock_owner: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+pub const CREDENTIAL_PROFILE_LIST_MAX_LIMIT: usize = 200;
+
+/// Discovery metadata only. Private homes, account documents, login ceremonies,
+/// and exact session/lease coordinates belong to the selected-profile surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialProfileSummary {
+    pub profile_id: String,
+    pub state: String,
+    pub credential_generation: u64,
+    pub in_use: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialProfilePage {
+    pub profiles: Vec<CredentialProfileSummary>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5659,6 +5683,55 @@ impl RuntimeDb {
         Ok(self
             .credential_profile_projection(profile_id)?
             .filter(|profile| profile.state != "deleted"))
+    }
+
+    pub fn list_credential_profiles_for_owner(
+        &self,
+        owner_principal: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<CredentialProfilePage> {
+        validate_bounded_runtime_text("credential profile owner", owner_principal, 256)?;
+        if let Some(after) = after {
+            validate_bounded_runtime_text("credential profile cursor", after, 256)?;
+        }
+        if !(1..=CREDENTIAL_PROFILE_LIST_MAX_LIMIT).contains(&limit) {
+            bail!(
+                "credential profile list limit must be between 1 and {CREDENTIAL_PROFILE_LIST_MAX_LIMIT}"
+            );
+        }
+        // Filter ownership before pagination. Do not load account/private-home
+        // fields at all, even for the authenticated owner.
+        let mut statement = self.conn.prepare(
+            "SELECT profile_id, state, credential_generation, lock_owner IS NOT NULL,
+                    created_at_ms, updated_at_ms
+             FROM credential_profile
+             WHERE owner_principal = ?1 AND state != 'deleted'
+               AND (?2 IS NULL OR profile_id > ?2)
+             ORDER BY profile_id LIMIT ?3",
+        )?;
+        let mut profiles = statement
+            .query_map(params![owner_principal, after, (limit + 1) as i64], |row| {
+                Ok(CredentialProfileSummary {
+                    profile_id: row.get(0)?,
+                    state: row.get(1)?,
+                    credential_generation: row.get(2)?,
+                    in_use: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                    updated_at_ms: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if profiles.len() > limit {
+            profiles.truncate(limit);
+            profiles.last().map(|profile| profile.profile_id.clone())
+        } else {
+            None
+        };
+        Ok(CredentialProfilePage {
+            profiles,
+            next_cursor,
+        })
     }
 
     fn credential_profile_projection(

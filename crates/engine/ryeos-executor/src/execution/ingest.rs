@@ -29,14 +29,7 @@ pub fn ingest_project_tree_with_operational_exclusions(
 ) -> Result<ProjectTree> {
     authority.ensure_guard(guard)?;
     policy.validate()?;
-    let mut previous: Option<&str> = None;
-    for exclusion in operational_exclusions {
-        ryeos_state::project_sync::validate_safe_relative_path(exclusion)?;
-        if previous.is_some_and(|value| value >= exclusion.as_str()) {
-            anyhow::bail!("operational project exclusions are not uniquely path-sorted");
-        }
-        previous = Some(exclusion);
-    }
+    validate_operational_exclusions(operational_exclusions)?;
     let matcher = policy.matcher()?;
     let cas = authority.cas_store()?;
     let mut files = std::collections::BTreeMap::new();
@@ -109,7 +102,19 @@ pub fn ingest_project_tree_with_operational_exclusions(
     Ok(tree)
 }
 
-fn is_operationally_excluded(path: &str, exclusions: &[String]) -> bool {
+pub(super) fn validate_operational_exclusions(exclusions: &[String]) -> Result<()> {
+    let mut previous: Option<&str> = None;
+    for exclusion in exclusions {
+        ryeos_state::project_sync::validate_safe_relative_path(exclusion)?;
+        if previous.is_some_and(|value| value >= exclusion.as_str()) {
+            anyhow::bail!("operational project exclusions are not uniquely path-sorted");
+        }
+        previous = Some(exclusion);
+    }
+    Ok(())
+}
+
+pub(super) fn is_operationally_excluded(path: &str, exclusions: &[String]) -> bool {
     exclusions.iter().any(|root| {
         path == root
             || path

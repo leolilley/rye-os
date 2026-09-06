@@ -409,7 +409,10 @@ pub(crate) async fn dispatch_runtime_method(
         ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD => {
             // Launch preparation retains a large future. Keep it out of the
             // inline dispatcher used by every callback, including small reads.
-            Box::pin(ryeos_executor::execution::runtime_dispatch::handle(params, state)).await
+            Box::pin(ryeos_executor::execution::runtime_dispatch::handle(
+                params, state,
+            ))
+            .await
         }
         "runtime.spawn_follow_child" => {
             Box::pin(ryeos_executor::execution::spawn_follow_child::handle(
@@ -626,12 +629,7 @@ fn enforce_aggregate_work_deadline(
     state: &AppState,
     cap: Option<&ryeos_app::callback_token::CallbackCapability>,
 ) -> Result<()> {
-    enforce_aggregate_work_deadline_at_ms(
-        method,
-        state,
-        cap,
-        lillux::time::timestamp_millis(),
-    )
+    enforce_aggregate_work_deadline_at_ms(method, state, cap, lillux::time::timestamp_millis())
 }
 
 fn enforce_aggregate_work_deadline_at_ms(
@@ -691,14 +689,16 @@ fn enforce_aggregate_deadline(
         .deadline_at_ms
         .is_some_and(|deadline| now_ms >= deadline)
     {
-        return Err(ryeos_executor::dispatch_error::DispatchError::LaunchPreparationFailed {
-            code: "budget_exhausted".to_owned(),
-            message: "aggregate execution duration elapsed".to_owned(),
-            classification: "policy".to_owned(),
-            binding: None,
-            details: Box::new(std::collections::BTreeMap::new()),
-        }
-        .into());
+        return Err(
+            ryeos_executor::dispatch_error::DispatchError::LaunchPreparationFailed {
+                code: "budget_exhausted".to_owned(),
+                message: "aggregate execution duration elapsed".to_owned(),
+                classification: "policy".to_owned(),
+                binding: None,
+                details: Box::new(std::collections::BTreeMap::new()),
+            }
+            .into(),
+        );
     }
     Ok(())
 }
@@ -1838,7 +1838,7 @@ mod tests {
                 access: ryeos_state::objects::LiveProjectAccess::ReadWrite,
                 authorized_write_namespaces: vec!["project".to_string()],
                 confinement:
-                    ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                    ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
             },
             environment: ryeos_state::objects::EnvironmentAuthority::ProjectOverlay {
                 project_authority_id: authority_id,
@@ -5502,7 +5502,10 @@ mod tests {
                 directive_budget_id: None,
             },
         ));
-        let root = state.callback_tokens.validate_token_only(&root.token).unwrap();
+        let root = state
+            .callback_tokens
+            .validate_token_only(&root.token)
+            .unwrap();
         let workload = generate_test_callback(
             &state,
             thread_id,
@@ -5512,18 +5515,27 @@ mod tests {
             test_provenance(&state, "/p"),
             "0".repeat(64),
         );
-        assert!(state.callback_tokens.set_accounting_scope(
-            &workload.token,
-            root.accounting_scope.clone().unwrap(),
-        ));
-        assert!(state.callback_tokens.restrict_runtime_methods(
-            &workload.token,
-            ryeos_app::callback_token::CallbackRuntimeMethodSurface::exact(vec![
-                ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD.to_owned(),
-            ])
-            .unwrap(),
-        ).unwrap());
-        let workload = state.callback_tokens.validate_token_only(&workload.token).unwrap();
+        assert!(
+            state
+                .callback_tokens
+                .set_accounting_scope(&workload.token, root.accounting_scope.clone().unwrap(),)
+        );
+        assert!(
+            state
+                .callback_tokens
+                .restrict_runtime_methods(
+                    &workload.token,
+                    ryeos_app::callback_token::CallbackRuntimeMethodSurface::exact(vec![
+                        ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD.to_owned(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap()
+        );
+        let workload = state
+            .callback_tokens
+            .validate_token_only(&workload.token)
+            .unwrap();
         assert_eq!(workload.accounting_scope, root.accounting_scope);
         enforce_aggregate_work_deadline_at_ms(
             ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD,
@@ -5553,31 +5565,31 @@ mod tests {
             "runtime.provider_attempt_local_stream_control",
             "runtime.get_thread",
         ] {
-            enforce_aggregate_work_deadline_at_ms(
-                method,
-                &state,
-                Some(&root),
-                deadline_at_ms,
-            )
-            .unwrap();
+            enforce_aggregate_work_deadline_at_ms(method, &state, Some(&root), deadline_at_ms)
+                .unwrap();
             assert!(workload.runtime_method_surface.authorize(method).is_err());
         }
         assert_eq!(
-            ledger.execution_resource_budget_snapshot(execution_budget_id).unwrap(),
+            ledger
+                .execution_resource_budget_snapshot(execution_budget_id)
+                .unwrap(),
             Some(budget),
         );
 
         // The internal entry point requires no kernel peer for dispatch, but
         // cannot bypass a missing inherited ledger to reach child decoding.
-        let tat = state.thread_auth.mint(
-            thread_id,
-            "user:test".to_owned(),
-            workload.effective_caps.clone(),
-            None,
-            state.threads.site_id(),
-            state.threads.site_id(),
-            std::time::Duration::from_secs(300),
-        ).unwrap();
+        let tat = state
+            .thread_auth
+            .mint(
+                thread_id,
+                "user:test".to_owned(),
+                workload.effective_caps.clone(),
+                None,
+                state.threads.site_id(),
+                state.threads.site_id(),
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap();
         state.accounting = None;
         let error = dispatch_runtime_method(
             ryeos_runtime::RUNTIME_DISPATCH_ACTION_METHOD,

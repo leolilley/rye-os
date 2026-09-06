@@ -348,7 +348,7 @@ pub fn resolve_execution_project_authority(
                     }
                 },
                 ryeos_app::execution_policy::live_filesystem_confinement_for_isolation(
-                    isolation.mode(),
+                    isolation.inspection(),
                 ),
                 environment,
                 capability_ceiling.clone(),

@@ -427,6 +427,14 @@ pub struct RunningExecution {
 }
 
 impl RunningExecution {
+    /// Observe the existing bounded raw-byte capture. This grants no process
+    /// lifecycle authority: the caller must keep the normal wait/abort owner
+    /// advancing concurrently. Protocol decoders must not reconstruct binary
+    /// frames from the ordinary human-readable completion string.
+    pub fn take_stdout_reader(&mut self) -> Option<lillux::ProcessStdoutReader> {
+        self.running.take_stdout_reader()
+    }
+
     /// Read the fixed-size diagnostic tail already captured by Lillux without
     /// changing process ownership or settlement.
     pub fn stderr_diagnostic_tail(&self) -> Option<String> {
@@ -468,13 +476,37 @@ impl RunningExecution {
 
     /// Block until the subprocess completes and return the completion.
     pub fn wait(self) -> ExecutionCompletion {
-        let result = self.running.wait();
+        self.wait_interruptible(|| false)
+    }
+
+    /// Protocol failure is settled by the existing exact process wait owner,
+    /// never by an observer retaining a second signal authority.
+    pub fn wait_interruptible(self, interrupted: impl FnMut() -> bool) -> ExecutionCompletion {
+        let result = self.running.wait_interruptible(interrupted);
         let debug = self.debug.map(|c| c.into_block(&result));
         let mut completion = translate_result(result);
         if let Some(debug) = debug {
             inject_debug(&mut completion, debug);
         }
         completion
+    }
+
+    /// Lillux coordinates observation and settlement under one wait owner;
+    /// do not split them into competing jobs on a bounded blocking pool.
+    pub fn wait_with_stdout<T: Send, E: Send>(
+        self,
+        observe: impl FnOnce(lillux::ProcessStdoutReader) -> Result<T, E> + Send,
+    ) -> (
+        ExecutionCompletion,
+        Result<T, lillux::ProcessObservationError<E>>,
+    ) {
+        let (result, observation) = self.running.wait_with_stdout(observe);
+        let debug = self.debug.map(|c| c.into_block(&result));
+        let mut completion = translate_result(result);
+        if let Some(debug) = debug {
+            inject_debug(&mut completion, debug);
+        }
+        (completion, observation)
     }
 }
 

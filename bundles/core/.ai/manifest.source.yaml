@@ -6,7 +6,7 @@ runtime_authority:
   project_snapshots: [status, log, show, create]
 isolation_backends:
   - id: linux-lillux
-    protocol: ryeos.isolation-adapter/v4
+    protocol: ryeos.isolation-adapter/v6
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
@@ -17,9 +17,11 @@ isolation_backends:
       - filesystem.fd_read_only
       - filesystem.fd_writable
       - filesystem.ordered_overlays
+      - filesystem.fixed_parent_views
       - filesystem.project_workspace_cow
       - filesystem.workspace_delta
       - filesystem.private_tmp
+      - filesystem.pid_namespace_proc
       - devices.minimal
       - environment.exact
       - network.host

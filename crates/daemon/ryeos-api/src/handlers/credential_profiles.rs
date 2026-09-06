@@ -115,6 +115,49 @@ pub struct GetRequest {
     profile_id: String,
 }
 
+fn default_list_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListRequest {
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+async fn list(
+    req: ListRequest,
+    ctx: HandlerContext,
+    state: Arc<AppState>,
+) -> Result<Value, HandlerError> {
+    let owner = require_operator(&state, &ctx)?;
+    let max_limit = ryeos_app::runtime_db::CREDENTIAL_PROFILE_LIST_MAX_LIMIT;
+    if !(1..=max_limit).contains(&req.limit) {
+        return Err(HandlerError::BadRequest(format!(
+            "limit must be between 1 and {max_limit}"
+        )));
+    }
+    if req.after.as_ref().is_some_and(|after| {
+        after.is_empty()
+            || after.trim() != after
+            || after.len() > 256
+            || after.chars().any(char::is_control)
+    }) {
+        return Err(HandlerError::BadRequest(
+            "after must be a nonempty profile ID of at most 256 bytes without control characters"
+                .into(),
+        ));
+    }
+    let page = state
+        .state_store
+        .list_credential_profiles_for_owner(owner, req.after.as_deref(), req.limit)
+        .map_err(internal)?;
+    serde_json::to_value(page).map_err(internal)
+}
+
 async fn get(
     req: GetRequest,
     ctx: HandlerContext,
@@ -510,6 +553,19 @@ pub const GET_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
         Box::pin(async move {
             let req: GetRequest = crate::handler_error::parse_request(params)?;
             get(req, ctx, state).await.map_err(Into::into)
+        })
+    },
+};
+
+pub const LIST_DESCRIPTOR: ServiceDescriptor = ServiceDescriptor {
+    service_ref: "service:credential-profiles/list",
+    endpoint: "credential-profiles.list",
+    availability: ServiceAvailability::DaemonOnly,
+    required_caps: &["ryeos.execute.service.credential-profiles/list"],
+    handler: |params, ctx, state| {
+        Box::pin(async move {
+            let req: ListRequest = crate::handler_error::parse_request(params)?;
+            list(req, ctx, state).await.map_err(Into::into)
         })
     },
 };

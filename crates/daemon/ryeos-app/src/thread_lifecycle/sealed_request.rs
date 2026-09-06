@@ -133,7 +133,9 @@ where
 /// authority.
 /// v16 combines candidate/scheduler authority with the current exact
 /// filesystem/network and realization-root execution contract.
-pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 16;
+/// v17 seals fixed-parent live confinement and explicit namespace symlink
+/// semantics. Old path-mask claims cannot be decoded as this authority.
+pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1484,8 +1486,7 @@ impl SealedRootExecutionRequest {
             let mut base_request = self.clone();
             base_request.candidate_evaluation = None;
             base_request.project_context = scope.base_plan_context().project_context.clone();
-            base_request.project_authority =
-                scope.base_project_binding().exact_authority().clone();
+            base_request.project_authority = scope.base_project_binding().exact_authority().clone();
             base_request.project_binding_subject_authority = scope
                 .base_project_binding()
                 .subject_resolution_authority()
@@ -1495,8 +1496,7 @@ impl SealedRootExecutionRequest {
             candidate_plan.project_context = ProjectContext::LocalPath {
                 path: provenance.effective_path().to_path_buf(),
             };
-            candidate_plan.subject_resolution_authority =
-                provenance.subject_resolution_authority();
+            candidate_plan.subject_resolution_authority = provenance.subject_resolution_authority();
             let base_admission = request
                 .root_admission
                 .take()

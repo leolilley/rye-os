@@ -26,6 +26,9 @@ fn development_source_policy_keeps_source_and_excludes_generated_payloads() {
         ".local/node/state.sqlite3",
         "target/release/ryeos",
         "bundles/.publisher-locks/core.lock",
+        ".ai/bin/ryeos-development-operation",
+        ".ai/objects/generated-object",
+        ".ai/refs/generated-head",
     ] {
         assert!(matcher.is_ignored(generated), "captured {generated}");
     }

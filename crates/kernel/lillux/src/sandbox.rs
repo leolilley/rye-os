@@ -26,6 +26,17 @@ pub struct LinuxSandboxMount {
     pub layer: u32,
 }
 
+/// A filtered view of one already-authorized directory mount. Parent entries
+/// along `denied_paths` are fixed for this launch; permitted mounted children
+/// retain the access of the original mount. No policy paths are chosen here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxSandboxFixedParentView {
+    pub destination: PathBuf,
+    pub denied_paths: Vec<PathBuf>,
+    pub max_entries: usize,
+    pub max_depth: usize,
+}
+
 /// Descriptor-backed overlay workspace. The lower, upper, and work
 /// descriptors are all retained by the caller through sandbox creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +51,12 @@ pub struct LinuxSandboxOverlay {
 pub enum LinuxSandboxNetwork {
     Host,
     Isolated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxSandboxProcFilesystem {
+    Empty,
+    PidNamespace,
 }
 
 /// Final target-release boundary. EOF is refusal, never permission to run.
@@ -72,9 +89,11 @@ pub struct LinuxSandboxRequest {
     pub cwd: PathBuf,
     pub environment: BTreeMap<OsString, OsString>,
     pub mounts: Vec<LinuxSandboxMount>,
+    pub fixed_parent_views: Vec<LinuxSandboxFixedParentView>,
     pub overlay: Option<LinuxSandboxOverlay>,
     pub network: LinuxSandboxNetwork,
     pub private_tmp: bool,
+    pub proc_filesystem: LinuxSandboxProcFilesystem,
     pub minimal_devices: bool,
     pub target_channels: Vec<(u32, u32)>,
     pub lifecycle: LinuxSandboxLifecycle,
@@ -85,6 +104,7 @@ pub struct LinuxSandboxRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxSandboxInspection {
     pub descriptor_mounts: bool,
+    pub fixed_parent_views: bool,
     pub overlay_workspace: bool,
     pub isolated_network: bool,
     pub private_root: bool,
@@ -92,6 +112,7 @@ pub struct LinuxSandboxInspection {
     pub minimal_devices: bool,
     pub exact_environment: bool,
     pub isolated_pid_namespace: bool,
+    pub pid_namespace_proc: bool,
     pub process_group_containment: bool,
     pub aggregate_resource_isolation: bool,
 }
@@ -104,6 +125,7 @@ impl LinuxSandboxInspection {
     pub const fn declared_native_contract() -> Self {
         Self {
             descriptor_mounts: true,
+            fixed_parent_views: true,
             overlay_workspace: true,
             isolated_network: true,
             private_root: true,
@@ -111,6 +133,7 @@ impl LinuxSandboxInspection {
             minimal_devices: true,
             exact_environment: true,
             isolated_pid_namespace: true,
+            pid_namespace_proc: true,
             process_group_containment: true,
             aggregate_resource_isolation: false,
         }
@@ -329,8 +352,11 @@ mod imp {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
     use std::os::unix::ffi::OsStrExt as _;
 
+    mod fixed_parents;
+
     const ROOT: &str = "/tmp";
     const OLD_ROOT: &str = "/tmp/.lillux-old-root";
+    const SEALED_STAGING_NAME: &str = ".lillux-sealed-staging";
     const CHILD_READY: u8 = 0;
     const CHILD_ERROR: u8 = 1;
     const MAX_CHILD_ERROR_BYTES: usize = 64 * 1024;
@@ -392,10 +418,13 @@ mod imp {
                 mount_private_root()?;
                 create_minimal_devices()?;
                 create_private_tmp()?;
-                let bytes = materialize_sealed_mount_source(inherited_bytes.as_raw_fd())?;
+                let staging = SealedSourceStaging::create()?;
+                let bytes =
+                    materialize_sealed_mount_source(inherited_bytes.as_raw_fd(), &staging.content)?;
                 probe_inherited_descriptor_mounts(&directory, &bytes)?;
-                remove_sealed_mount_source(inherited_bytes.as_raw_fd(), &bytes)?;
+                staging.detach()?;
                 probe_descriptor_mount()?;
+                fixed_parents::probe()?;
                 probe_overlay()?;
                 probe_isolated_pid_child()?;
                 Ok::<(), String>(())
@@ -445,7 +474,12 @@ mod imp {
         // descriptors remain the identity authority, never a caller pathname.
         let mut sources = reanchor_request_sources(&request)?;
         mount_private_root()?;
-        let mut sealed_sources = Vec::new();
+        let sealed_staging = request
+            .mounts
+            .iter()
+            .any(|mount| !sources.contains_key(&mount.source_fd))
+            .then(SealedSourceStaging::create)
+            .transpose()?;
         for mount in &request.mounts {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 sources.entry(mount.source_fd)
@@ -453,8 +487,13 @@ mod imp {
                 if mount.access != LinuxSandboxMountAccess::ReadOnly {
                     return Err("sealed mount source cannot grant writable access".to_string());
                 }
-                entry.insert(materialize_sealed_mount_source(raw_fd(mount.source_fd)?)?);
-                sealed_sources.push(mount.source_fd);
+                let staging = sealed_staging
+                    .as_ref()
+                    .ok_or_else(|| "sealed source lacks private staging authority".to_string())?;
+                entry.insert(materialize_sealed_mount_source(
+                    raw_fd(mount.source_fd)?,
+                    &staging.content,
+                )?);
             }
         }
         for mount in &mut request.mounts {
@@ -470,11 +509,8 @@ mod imp {
         if request.private_tmp {
             create_private_tmp()?;
         }
-        // Prepare children only after their private parent mounts exist.
-        // Otherwise mounting /tmp hides every previously created destination
-        // below it, including installed bundles on disposable target nodes.
-        prepare_mount_targets(&request)?;
         if let Some(overlay) = &request.overlay {
+            create_directory_target(&rooted(&overlay.destination)?)?;
             mount_overlay(overlay)?;
         }
         let mut mounts = request.mounts.clone();
@@ -483,22 +519,68 @@ mod imp {
                 .cmp(&right.layer)
                 .then_with(|| left.destination.cmp(&right.destination))
         });
-        for mount in &mounts {
+        for (index, mount) in mounts.iter().enumerate() {
+            // Source-backed ancestors must already contain their targets.
+            // Creating a missing child after binding a live source would
+            // mutate that source; precreating it before binding hides it.
+            if !mounts[..index]
+                .iter()
+                .any(|parent| mount.destination.starts_with(&parent.destination))
+            {
+                create_target(
+                    &rooted(&mount.destination)?,
+                    descriptor_kind(mount.source_fd)?,
+                )?;
+            }
             bind_descriptor_mount(mount)
                 .map_err(|error| format!("mount {}: {error}", mount.destination.display()))?;
+            if let Some(view) = request
+                .fixed_parent_views
+                .iter()
+                .find(|view| view.destination == mount.destination)
+            {
+                fixed_parents::install(mount, view, index)?;
+            }
         }
-        for source in sealed_sources {
-            remove_sealed_mount_source(raw_fd(source)?, &sources[&source])?;
+        if let Some(staging) = sealed_staging {
+            staging.detach()?;
         }
         let executable = rooted(&request.executable)?;
         ensure_regular_path(&executable, "sandbox executable")?;
         let cwd = rooted(&request.cwd)?;
         ensure_directory_path(&cwd, "sandbox cwd")?;
-        pivot_into_private_root()?;
         spawn_target(request)
     }
 
     fn validate_request(request: &LinuxSandboxRequest) -> Result<(), String> {
+        let staging_path = PathBuf::from(format!("/{SEALED_STAGING_NAME}"));
+        if request
+            .mounts
+            .iter()
+            .any(|mount| mount.destination.starts_with(&staging_path))
+            || request.overlay.as_ref().is_some_and(|overlay| {
+                overlay.destination.starts_with(&staging_path)
+                    || staging_path.starts_with(&overlay.destination)
+            })
+        {
+            return Err("mount conflicts with private sealed-source staging".to_string());
+        }
+        // Reserve the surface even for Empty; an admitted mount must not
+        // silently replace that choice with a host procfs alias.
+        {
+            let proc_path = std::path::Path::new("/proc");
+            if request
+                .mounts
+                .iter()
+                .any(|mount| mount.destination.starts_with(proc_path))
+                || request.overlay.as_ref().is_some_and(|overlay| {
+                    overlay.destination.starts_with(proc_path)
+                        || proc_path.starts_with(&overlay.destination)
+                })
+            {
+                return Err("mount conflicts with reserved PID procfs".to_string());
+            }
+        }
         validate_absolute_path(&request.executable, "sandbox executable")?;
         validate_absolute_path(&request.cwd, "sandbox cwd")?;
         if request.argv0.as_bytes().is_empty() || request.argv0.as_bytes().contains(&0) {
@@ -531,6 +613,7 @@ mod imp {
                 return Err("sandbox mount destinations must be unique".to_string());
             }
         }
+        fixed_parents::validate(request)?;
         if let Some(overlay) = &request.overlay {
             for fd in [overlay.lower_fd, overlay.state_fd] {
                 validate_inherited_directory(fd, "sandbox overlay")?;
@@ -638,19 +721,9 @@ mod imp {
             Some("mode=0755"),
         )
         .map_err(|error| format!("mount private sandbox root: {error}"))?;
+        mkdir_one(&format!("{ROOT}/proc"), 0o555)
+            .map_err(|error| format!("create private proc mountpoint: {error}"))?;
         mkdir_path(OLD_ROOT, 0o700)
-    }
-
-    fn prepare_mount_targets(request: &LinuxSandboxRequest) -> Result<(), String> {
-        if let Some(overlay) = &request.overlay {
-            create_directory_target(&rooted(&overlay.destination)?)?;
-        }
-        for mount in &request.mounts {
-            let target = rooted(&mount.destination)?;
-            let source = descriptor_kind(mount.source_fd)?;
-            create_target(&target, source)?;
-        }
-        Ok(())
     }
 
     // Keep the native backend aligned with the already-admitted mount-source
@@ -749,7 +822,74 @@ mod imp {
         Ok(sources)
     }
 
-    fn materialize_sealed_mount_source(fd: RawFd) -> Result<File, String> {
+    struct SealedSourceStaging {
+        root: crate::PinnedDirectory,
+        mountpoint: crate::PinnedDirectory,
+        content: crate::PinnedDirectory,
+    }
+
+    impl SealedSourceStaging {
+        fn create() -> Result<Self, String> {
+            let root = crate::PinnedDirectory::open(std::path::Path::new(ROOT))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "private materialization root is missing".to_string())?;
+            let mountpoint = root
+                .create_child(OsStr::new(SEALED_STAGING_NAME), 0o700)
+                .map_err(|error| format!("create private sealed staging: {error}"))?;
+            let path = root.path().join(SEALED_STAGING_NAME);
+            mount_raw(
+                Some("tmpfs"),
+                path_string(&path)?,
+                Some("tmpfs"),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some("mode=0700"),
+            )
+            .map_err(|error| format!("mount private sealed staging: {error}"))?;
+            let content = root
+                .open_child_directory(OsStr::new(SEALED_STAGING_NAME))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "private sealed staging mount disappeared".to_string())?;
+            Ok(Self {
+                root,
+                mountpoint,
+                content,
+            })
+        }
+
+        fn detach(self) -> Result<(), String> {
+            let name = OsStr::new(SEALED_STAGING_NAME);
+            let current = self
+                .root
+                .open_child_directory(name)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "sealed staging disappeared before detach".to_string())?;
+            if !self
+                .content
+                .is_same_directory(&current)
+                .map_err(|error| error.to_string())?
+            {
+                return Err("sealed staging mount identity changed".to_string());
+            }
+            // Do not unlink source files: that marks the executable dentry
+            // deleted even through its admitted bind mount, breaking self
+            // lookup. Detach the private filesystem instead. Only the exact
+            // read-only target mounts keep these linked inodes alive.
+            unmount_path(&self.root.path().join(name))?;
+            if !self
+                .root
+                .remove_empty_child_if_same(name, &self.mountpoint)
+                .map_err(|error| format!("remove detached sealed mountpoint: {error}"))?
+            {
+                return Err("detached sealed mountpoint is not empty".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    fn materialize_sealed_mount_source(
+        fd: RawFd,
+        root: &crate::PinnedDirectory,
+    ) -> Result<File, String> {
         use std::os::unix::fs::FileExt as _;
 
         if !mount_source_is_sealed(fd)? {
@@ -762,9 +902,6 @@ mod imp {
         if !metadata.is_file() {
             return Err("sealed mount source is not a regular file".to_string());
         }
-        let root = crate::PinnedDirectory::open(std::path::Path::new(ROOT))
-            .map_err(|error| format!("open private materialization root: {error}"))?
-            .ok_or_else(|| "private materialization root is missing".to_string())?;
         let name = OsString::from(format!(".lillux-sealed-source-{fd}"));
         let root_fd = root
             .try_clone_descriptor()
@@ -825,32 +962,10 @@ mod imp {
         // parent: Linux correctly refuses ETXTBSY while such a handle exists.
         drop(output);
         // Keep the source name until move_mount: the kernel refuses attaching
-        // an unlinked source. The caller removes this private alias immediately
-        // after mounting and before releasing any workload.
+        // an unlinked source. The caller detaches the whole private staging
+        // filesystem after mounting, preserving linked executable identity
+        // without exposing this setup alias to the workload.
         Ok(pinned)
-    }
-
-    fn remove_sealed_mount_source(original_fd: RawFd, source: &File) -> Result<(), String> {
-        let root = crate::PinnedDirectory::open(std::path::Path::new(ROOT))
-            .map_err(|error| format!("open private materialization cleanup root: {error}"))?
-            .ok_or_else(|| "private materialization root disappeared".to_string())?;
-        let name = OsString::from(format!(".lillux-sealed-source-{original_fd}"));
-        let pinned = root
-            .open_pinned_regular(&name, false)
-            .map_err(|error| format!("pin private materialization cleanup: {error}"))?
-            .ok_or_else(|| "private materialization disappeared before attachment".to_string())?;
-        let expected = mount_source_stat(source.as_raw_fd())?;
-        let observed = mount_source_stat(
-            pinned
-                .try_clone_descriptor()
-                .map_err(|error| error.to_string())?
-                .as_raw_fd(),
-        )?;
-        if expected.st_dev != observed.st_dev || expected.st_ino != observed.st_ino {
-            return Err("private materialization cleanup identity changed".to_string());
-        }
-        root.remove_pinned_regular_if_same(&pinned)
-            .map_err(|error| format!("remove private materialization alias: {error}"))
     }
 
     fn descriptor_kind(fd: u32) -> Result<DescriptorKind, String> {
@@ -1017,23 +1132,45 @@ mod imp {
 
     fn probe_overlay() -> Result<(), String> {
         let probe = format!("{ROOT}/.overlay-probe");
-        for name in ["lower", "upper", "work", "merged", "final"] {
+        for name in ["lower", "state/upper", "state/work", "final"] {
             mkdir_path(&format!("{probe}/{name}"), 0o700)?;
         }
-        let options =
-            format!("lowerdir={probe}/lower,upperdir={probe}/upper,workdir={probe}/work,userxattr");
-        mount_raw(
-            Some("overlay"),
-            &format!("{probe}/merged"),
-            Some("overlay"),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            Some(&options),
-        )
-        .map_err(|error| format!("probe unprivileged overlay mount: {error}"))?;
-        let merged = PathBuf::from(format!("{probe}/merged"));
-        set_mount_attributes(&merged, false, true, true)?;
-        let final_target = open_mount_target_no_symlinks(&PathBuf::from("/.overlay-probe/final"))?;
-        move_path_mount_to_target(&merged, final_target.as_raw_fd())?;
+        let lower = crate::PinnedDirectory::open(std::path::Path::new(&format!("{probe}/lower")))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "overlay probe lower is missing".to_string())?;
+        let state = crate::PinnedDirectory::open(std::path::Path::new(&format!("{probe}/state")))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "overlay probe state is missing".to_string())?;
+        lower
+            .atomic_write_if_same(OsStr::new("copy-up"), None, b"lower", 0o600)
+            .map_err(|error| error.to_string())?;
+        let lower_fd = lower
+            .try_clone_descriptor()
+            .map_err(|error| error.to_string())?;
+        let state_fd = state
+            .try_clone_descriptor()
+            .map_err(|error| error.to_string())?;
+        // Probe the production construction, including its private staging
+        // point and descriptor move. A parallel hand-written overlay mount
+        // misses setup regressions in the path actual workspaces use.
+        mount_overlay(&LinuxSandboxOverlay {
+            lower_fd: lower_fd.as_raw_fd() as u32,
+            state_fd: state_fd.as_raw_fd() as u32,
+            destination: PathBuf::from("/.overlay-probe/final"),
+        })?;
+        let visible = format!("{probe}/final/copy-up");
+        if std::fs::read(&visible).map_err(|error| error.to_string())? != b"lower" {
+            return Err("overlay probe changed lower content".into());
+        }
+        std::fs::write(&visible, b"upper").map_err(|error| error.to_string())?;
+        if std::fs::read(format!("{probe}/lower/copy-up")).map_err(|error| error.to_string())?
+            != b"lower"
+            || std::fs::read(format!("{probe}/state/upper/copy-up"))
+                .map_err(|error| error.to_string())?
+                != b"upper"
+        {
+            return Err("overlay probe did not preserve private copy-up".into());
+        }
         unmount_path(&PathBuf::from(format!("{probe}/final")))
     }
 
@@ -1133,6 +1270,11 @@ mod imp {
         // that mount, then move the mount onto the exact no-follow destination
         // descriptor. No untrusted path is resolved after the proof above.
         let staging = PathBuf::from(format!("{ROOT}/.lillux-overlay-staging"));
+        // This staging point belongs solely to the fresh private root, never
+        // to a source-backed workspace. Create it here, before ordinary mounts
+        // are installed; refuse an incumbent instead of adopting its identity.
+        mkdir_one(path_string(&staging)?, 0o700)
+            .map_err(|error| format!("create private overlay staging target: {error}"))?;
         ensure_directory_path(&staging, "overlay staging target")?;
         mount_raw(
             Some("overlay"),
@@ -1369,27 +1511,80 @@ mod imp {
     }
 
     fn probe_isolated_pid_child() -> Result<(), String> {
+        let mut report = [0; 2];
+        syscall_zero(
+            unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
+            "create PID namespace probe report",
+        )?;
+        let parent_pid = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
+            close_fd(report[0]);
+            close_fd(report[1]);
             return Err(format!(
                 "fork isolated PID namespace probe: {}",
                 std::io::Error::last_os_error()
             ));
         }
         if pid == 0 {
+            close_fd(report[0]);
             let result = (|| {
                 if unsafe { libc::getpid() } != 1 {
                     return Err("sandbox child is not PID 1 in its isolated namespace".to_string());
                 }
+                mount_pid_namespace_proc()?;
                 pivot_into_private_root()?;
+                if std::fs::read_link("/proc/self").map_err(|error| error.to_string())?
+                    != PathBuf::from("1")
+                    || std::path::Path::new(&format!("/proc/{parent_pid}")).exists()
+                    || std::path::Path::new("/proc/sys").exists()
+                    || std::path::Path::new("/proc/meminfo").exists()
+                {
+                    return Err("PID procfs exposes a foreign or non-task surface".to_string());
+                }
+                let flags = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/proc/self/oom_score_adj");
+                if !matches!(flags, Err(ref error) if error.raw_os_error() == Some(libc::EROFS)) {
+                    return Err("PID procfs is not read-only".to_string());
+                }
+                let descendant = unsafe { libc::fork() };
+                if descendant < 0 {
+                    return Err("fork PID procfs visibility probe failed".to_string());
+                }
+                if descendant == 0 {
+                    let own = unsafe { libc::getpid() }.to_string();
+                    let visible = std::fs::read_link("/proc/self").ok() == Some(PathBuf::from(own));
+                    unsafe { libc::_exit(if visible { 0 } else { 125 }) };
+                }
+                let visible = std::path::Path::new(&format!("/proc/{descendant}")).exists();
+                let mut status = 0;
+                if unsafe { libc::waitpid(descendant, &mut status, 0) } != descendant
+                    || !visible
+                    || !libc::WIFEXITED(status)
+                    || libc::WEXITSTATUS(status) != 0
+                {
+                    return Err("PID procfs descendant visibility probe failed".to_string());
+                }
                 syscall_zero(
                     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
                     "set no_new_privs during sandbox probe",
                 )?;
                 install_confinement_filter(true)
             })();
+            match &result {
+                Ok(()) => {
+                    let _ = write_all_fd(report[1], &[CHILD_READY]);
+                }
+                Err(error) => {
+                    let _ = write_child_error(report[1], error);
+                }
+            }
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
         }
+        close_fd(report[1]);
+        let outcome = read_child_ready(report[0]);
+        close_fd(report[0]);
         let mut status = 0;
         if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
             return Err(format!(
@@ -1398,9 +1593,14 @@ mod imp {
             ));
         }
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-            Ok(())
+            outcome
         } else {
-            Err("isolated PID namespace probe failed".to_string())
+            Err(format!(
+                "isolated PID namespace probe failed: {}",
+                outcome
+                    .err()
+                    .unwrap_or_else(|| "child exited without failure report".to_string())
+            ))
         }
     }
 
@@ -1462,9 +1662,13 @@ mod imp {
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) },
             "bind sandbox target lifetime to adapter",
         )?;
-        if unsafe { libc::getppid() } == 1 {
-            return Err("sandbox adapter disappeared before child setup".to_string());
+        // An outside-namespace parent appears as PID 0 here, so getppid
+        // cannot prove adapter liveness. The exact readiness pipe refuses a
+        // missing parent even if it died before PDEATHSIG was installed.
+        if request.proc_filesystem == LinuxSandboxProcFilesystem::PidNamespace {
+            mount_pid_namespace_proc()?;
         }
+        pivot_into_private_root()?;
         let mut mapped_channels = Vec::with_capacity(request.target_channels.len());
         for (source, target) in &request.target_channels {
             let source = raw_fd(*source)?;
@@ -1529,6 +1733,32 @@ mod imp {
         }
         close_fd(ready_fd);
         exec_target(request)
+    }
+
+    /// Called only in the actual PID-namespace child before pivot_root. A
+    /// parent which merely unshared CLONE_NEWPID still belongs to its old PID
+    /// namespace and must never mount this filesystem. Linux's unprivileged
+    /// mount visibility check needs the original proc mount still present at
+    /// this setup boundary. Immediately pivot/detach the old root afterwards,
+    /// before descriptor closure, confinement, readiness or untrusted exec.
+    /// No host procfs is bound into the target view.
+    fn mount_pid_namespace_proc() -> Result<(), String> {
+        if unsafe { libc::getpid() } != 1 {
+            return Err("PID procfs must be mounted by the isolated namespace init".to_string());
+        }
+        let target = CString::new(format!("{ROOT}/proc")).expect("static proc mountpoint");
+        syscall_zero(
+            unsafe {
+                libc::mount(
+                    c"proc".as_ptr(),
+                    target.as_ptr(),
+                    c"proc".as_ptr(),
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    c"subset=pid".as_ptr().cast(),
+                )
+            },
+            "mount isolated PID-only procfs",
+        )
     }
 
     fn exec_target(request: &LinuxSandboxRequest) -> Result<(), String> {
@@ -1714,6 +1944,47 @@ mod imp {
     ) -> Result<LinuxOverlayWorkspaceObservation, String> {
         let _project = inherited_directory(project_fd, "overlay project")?;
         let state = inherited_directory(state_fd, "overlay state")?;
+        if operation == LinuxOverlayWorkspaceOperation::Destroy {
+            // The journal retains this exact backend-state authority until
+            // destruction settles. A prior attempt may have removed either
+            // child already; absence is completion, never permission to
+            // recreate state. Validate the complete remaining layout first.
+            let entries = state
+                .entries_no_follow_bounded(3)
+                .map_err(|error| format!("inventory overlay destruction state: {error}"))?;
+            if entries.iter().any(|entry| {
+                entry.entry_type != crate::PinnedEntryType::Directory
+                    || !matches!(entry.name.to_str(), Some("upper" | "work"))
+            }) {
+                return Err("overlay destruction state has an invalid layout".to_string());
+            }
+            for entry in entries {
+                let child = state
+                    .open_child_directory(&entry.name)
+                    .map_err(|error| format!("open overlay destruction child: {error}"))?
+                    .ok_or_else(|| "overlay destruction child disappeared".to_string())?;
+                child
+                    .remove_contents_recursive_bounded(crate::DirectoryTraversalBudget::new(
+                        max_mutations.saturating_add(2),
+                        256,
+                    ))
+                    .map_err(|error| {
+                        format!("remove overlay {:?} contents: {error:#}", entry.name)
+                    })?;
+                if !state
+                    .remove_empty_child_if_same(&entry.name, &child)
+                    .map_err(|error| format!("remove overlay destruction child: {error:#}"))?
+                {
+                    return Err("overlay destruction child remained non-empty".to_string());
+                }
+            }
+            return Ok(LinuxOverlayWorkspaceObservation {
+                project_identity: directory_identity(project_fd)?,
+                state_identity: directory_identity(state_fd)?,
+                mutation_content_root: None,
+                mutations: Vec::new(),
+            });
+        }
         let upper = match operation {
             LinuxOverlayWorkspaceOperation::Create => state
                 .open_or_create_child(OsStr::new("upper"), 0o700)
@@ -1755,35 +2026,6 @@ mod imp {
         } else {
             Vec::new()
         };
-        if operation == LinuxOverlayWorkspaceOperation::Destroy {
-            for (name, child) in [(OsStr::new("upper"), &upper), (OsStr::new("work"), &_work)] {
-                child
-                    .remove_contents_recursive_bounded(crate::DirectoryTraversalBudget::new(
-                        max_mutations.saturating_add(2),
-                        256,
-                    ))
-                    .map_err(|error| {
-                        format!(
-                            "remove overlay {} contents: {error}",
-                            name.to_string_lossy()
-                        )
-                    })?;
-                if !state
-                    .remove_empty_child_if_same(name, child)
-                    .map_err(|error| {
-                        format!(
-                            "remove overlay {} directory: {error}",
-                            name.to_string_lossy()
-                        )
-                    })?
-                {
-                    return Err(format!(
-                        "overlay {} directory remained non-empty during destroy",
-                        name.to_string_lossy()
-                    ));
-                }
-            }
-        }
         Ok(LinuxOverlayWorkspaceObservation {
             project_identity: directory_identity(project_fd)?,
             state_identity: directory_identity(state_fd)?,
@@ -2540,9 +2782,13 @@ mod imp {
         #[test]
         fn private_mount_copy_refuses_unsealed_source() {
             let temporary = tempfile::tempfile().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let staging = crate::PinnedDirectory::open(directory.path())
+                .unwrap()
+                .unwrap();
             assert!(!mount_source_is_sealed(temporary.as_raw_fd()).unwrap());
             assert!(
-                materialize_sealed_mount_source(temporary.as_raw_fd())
+                materialize_sealed_mount_source(temporary.as_raw_fd(), &staging)
                     .unwrap_err()
                     .contains("requires a sealed source")
             );
@@ -2578,6 +2824,194 @@ mod imp {
         fn inherited_sources_cross_the_real_namespace_boundary() {
             inspect().unwrap();
         }
+
+        // Invoked only by the isolated test-harness exec below. Ordinary test
+        // runs do nothing here; no host executable discovery enters production.
+        #[test]
+        fn pid_proc_after_exec_target() {
+            let Ok(stage) = std::env::var("LILLUX_PROC_EXEC_PROBE") else {
+                return;
+            };
+            let executable = std::env::current_exe().unwrap();
+            assert_eq!(executable, PathBuf::from("/probe"));
+            assert!(std::fs::File::open(&executable).is_ok());
+            assert!(!std::path::Path::new(&format!("/{SEALED_STAGING_NAME}")).exists());
+            let write = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&executable)
+                .unwrap_err();
+            // Linux may report ETXTBSY before testing mount writeability for
+            // the currently executing inode. Verify the mount flag as well.
+            assert!(matches!(
+                write.raw_os_error(),
+                Some(libc::EROFS) | Some(libc::ETXTBSY)
+            ));
+            let mut filesystem = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            assert_eq!(
+                unsafe { libc::statvfs(c"/probe".as_ptr(), filesystem.as_mut_ptr()) },
+                0
+            );
+            assert_ne!(
+                unsafe { filesystem.assume_init() }.f_flag & libc::ST_RDONLY,
+                0
+            );
+            assert!(!std::path::Path::new("/.lillux-old-root").exists());
+            assert!(!std::path::Path::new("/proc/sys").exists());
+            assert!(!std::path::Path::new("/proc/meminfo").exists());
+            let authority_fd: RawFd = std::env::var("LILLUX_PROBE_CLOSED_FD")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::fcntl(authority_fd, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            assert_eq!(
+                unsafe {
+                    libc::mount(
+                        c"proc".as_ptr(),
+                        c"/proc".as_ptr(),
+                        c"proc".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            if stage == "root" {
+                assert_eq!(unsafe { libc::getpid() }, 1);
+                assert!(
+                    std::process::Command::new(executable)
+                        .args([
+                            "--exact",
+                            "sandbox::imp::namespace_source_tests::pid_proc_after_exec_target",
+                            "--nocapture"
+                        ])
+                        .env("LILLUX_PROC_EXEC_PROBE", "child")
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            } else {
+                assert_eq!(stage, "child");
+                assert!(unsafe { libc::getpid() } > 1);
+            }
+        }
+
+        #[test]
+        #[ignore = "executes the test harness in real Linux namespaces"]
+        fn pid_proc_supports_exact_realized_and_sealed_executable_after_exec() {
+            let executable = std::env::current_exe().unwrap();
+            // Test-only inventory of this harness's exact loader/library
+            // mappings. No host directory or PATH is exposed to the target.
+            let mut libraries = std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(5))
+                .filter(|path| path.starts_with('/') && std::path::Path::new(path) != executable)
+                .map(PathBuf::from)
+                .collect::<BTreeSet<_>>();
+            let library_path = std::env::join_paths(
+                libraries
+                    .iter()
+                    .filter_map(|path| path.parent())
+                    .collect::<BTreeSet<_>>(),
+            )
+            .unwrap();
+            // The test harness uses the platform ELF interpreter alias,
+            // unlike the produced runtime artifact's explicit loader path.
+            #[cfg(target_arch = "x86_64")]
+            libraries.insert(PathBuf::from("/lib64/ld-linux-x86-64.so.2"));
+            #[cfg(target_arch = "aarch64")]
+            libraries.insert(PathBuf::from("/lib/ld-linux-aarch64.so.1"));
+            for sealed in [false, true] {
+                let entry = if sealed {
+                    crate::sealed_memfd(c"proc-exec-test", &std::fs::read(&executable).unwrap())
+                        .unwrap()
+                        .try_clone()
+                        .unwrap()
+                } else {
+                    crate::secure_fs::pin_canonical_mount_source(&executable).unwrap()
+                };
+                let high = unsafe { libc::fcntl(entry.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+                assert!(high >= 200);
+                let sentinel = unsafe { File::from_raw_fd(high) };
+                let retained = libraries
+                    .iter()
+                    .map(|path| {
+                        crate::secure_fs::pin_canonical_mount_source(
+                            &std::fs::canonicalize(path).unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut request = super::super::tests::minimal_request();
+                request.executable = PathBuf::from("/probe");
+                request.argv0 = OsString::from("probe");
+                request.cwd = PathBuf::from("/");
+                request.proc_filesystem = LinuxSandboxProcFilesystem::PidNamespace;
+                request.arguments = [
+                    "--exact",
+                    "sandbox::imp::namespace_source_tests::pid_proc_after_exec_target",
+                    "--nocapture",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+                request.environment = [
+                    (OsString::from("LD_LIBRARY_PATH"), library_path.clone()),
+                    (
+                        OsString::from("LILLUX_PROC_EXEC_PROBE"),
+                        OsString::from("root"),
+                    ),
+                    (
+                        OsString::from("LILLUX_PROBE_CLOSED_FD"),
+                        OsString::from(sentinel.as_raw_fd().to_string()),
+                    ),
+                ]
+                .into();
+                request.mounts = libraries
+                    .iter()
+                    .zip(&retained)
+                    .map(|(path, file)| LinuxSandboxMount {
+                        source_fd: file.as_raw_fd() as u32,
+                        destination: path.clone(),
+                        access: LinuxSandboxMountAccess::ReadOnly,
+                        layer: 0,
+                    })
+                    .collect();
+                request.mounts.push(LinuxSandboxMount {
+                    source_fd: entry.as_raw_fd() as u32,
+                    destination: PathBuf::from("/probe"),
+                    access: LinuxSandboxMountAccess::ReadOnly,
+                    layer: 0,
+                });
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0);
+                if pid == 0 {
+                    let result = launch(request).and_then(LinuxSandboxProcess::wait);
+                    if let Err(error) = &result {
+                        eprintln!("proc exec qualification: {error}");
+                    }
+                    unsafe {
+                        libc::_exit(if result == Ok(LinuxSandboxExit::Code(0)) {
+                            0
+                        } else {
+                            125
+                        })
+                    };
+                }
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0, "sealed={sealed}");
+            }
+        }
     }
 }
 
@@ -2596,9 +3030,11 @@ mod tests {
             cwd: PathBuf::from("/workspace"),
             environment: BTreeMap::new(),
             mounts: Vec::new(),
+            fixed_parent_views: Vec::new(),
             overlay: None,
             network: LinuxSandboxNetwork::Isolated,
             private_tmp: true,
+            proc_filesystem: LinuxSandboxProcFilesystem::Empty,
             minimal_devices: true,
             target_channels: Vec::new(),
             lifecycle: LinuxSandboxLifecycle::Run,
@@ -2684,12 +3120,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn overlay_destroy_removes_exact_upper_and_work_children() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temporary = tempfile::tempdir().unwrap();
         let project_path = temporary.path().join("project");
         let state_path = temporary.path().join("state");
         std::fs::create_dir_all(&project_path).unwrap();
         std::fs::create_dir_all(state_path.join("upper/nested")).unwrap();
-        std::fs::create_dir_all(state_path.join("work")).unwrap();
+        std::fs::create_dir_all(state_path.join("work/work")).unwrap();
+        std::fs::set_permissions(
+            state_path.join("work/work"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
         std::fs::write(state_path.join("upper/nested/result.txt"), b"bytes").unwrap();
         let project = crate::PinnedDirectory::open(&project_path)
             .unwrap()
@@ -2705,5 +3148,51 @@ mod tests {
         )
         .unwrap();
         assert!(state.entries_no_follow().unwrap().is_empty());
+        // The same retained state authority remains valid after a lost
+        // success response, with neither child recreated by a retry.
+        operate_linux_overlay_workspace(
+            project_fd.as_raw_fd() as u32,
+            state_fd.as_raw_fd() as u32,
+            LinuxOverlayWorkspaceOperation::Destroy,
+            16,
+        )
+        .unwrap();
+        assert!(state.entries_no_follow().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_destroy_resumes_partial_removal_but_refuses_foreign_layout() {
+        for remaining in ["upper", "work"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let project_path = temporary.path().join("project");
+            let state_path = temporary.path().join("state");
+            std::fs::create_dir(&project_path).unwrap();
+            std::fs::create_dir_all(state_path.join(remaining)).unwrap();
+            std::fs::write(state_path.join(remaining).join("kept"), b"owned").unwrap();
+            std::fs::write(state_path.join("unexpected"), b"foreign").unwrap();
+            let project = crate::PinnedDirectory::open(&project_path)
+                .unwrap()
+                .unwrap();
+            let state = crate::PinnedDirectory::open(&state_path).unwrap().unwrap();
+            let project_fd = project.try_clone_descriptor().unwrap();
+            let state_fd = state.try_clone_descriptor().unwrap();
+            let destroy = || {
+                operate_linux_overlay_workspace(
+                    project_fd.as_raw_fd() as u32,
+                    state_fd.as_raw_fd() as u32,
+                    LinuxOverlayWorkspaceOperation::Destroy,
+                    16,
+                )
+            };
+            assert!(destroy().unwrap_err().contains("invalid layout"));
+            assert_eq!(
+                std::fs::read(state_path.join(remaining).join("kept")).unwrap(),
+                b"owned"
+            );
+            std::fs::remove_file(state_path.join("unexpected")).unwrap();
+            destroy().unwrap();
+            assert!(state.entries_no_follow().unwrap().is_empty());
+        }
     }
 }

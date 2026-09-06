@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub enum IsolationLiveAccessAuthority {
-    DescriptorRootedMasked {
+    DescriptorRootedFixedParents {
         /// Exact live root retained from authority resolution through adapter
         /// spawn. Isolation mounts clone this descriptor; they never reopen the
         /// ambient project pathname after identity validation.
@@ -23,7 +23,7 @@ pub enum IsolationLiveAccessAuthority {
 impl IsolationLiveAccessAuthority {
     pub fn authorized_write_namespaces(&self) -> &[String] {
         match self {
-            Self::DescriptorRootedMasked {
+            Self::DescriptorRootedFixedParents {
                 authorized_write_namespaces,
                 ..
             }

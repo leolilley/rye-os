@@ -383,7 +383,7 @@ pub fn resolve_pinned_snapshot_context(
 /// does not gain a second project loader or trust interpretation.
 pub struct PreparedPinnedProjectExternalConsumer {
     resolution: ryeos_engine::resolution::ResolutionOutput,
-    _source_closure: ryeos_app::source_closure_admission::AdmittedSourceClosure,
+    _source_closure: Option<ryeos_app::source_closure_admission::AdmittedSourceClosure>,
     _project_context: ResolvedProjectContext,
 }
 
@@ -461,12 +461,7 @@ pub fn prepare_pinned_project_external_consumer(
         .kinds
         .get(item_kind)
         .and_then(|schema| schema.execution.as_ref())
-        .and_then(|execution| execution.source_closure.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "project external-content consumer kind has no signed source-closure contract"
-            )
-        })?;
+        .and_then(|execution| execution.source_closure.as_ref());
     let roots = project_context
         .request_engine
         .resolution_roots(Some(project_context.effective_path.clone()));
@@ -478,10 +473,12 @@ pub fn prepare_pinned_project_external_consumer(
         project_context.effective_path.as_path(),
         materialization as &dyn ryeos_engine::project_content::AuthoritativeProjectContent,
     ));
-    let source_policy = if matches!(
-        &source_contract.location,
-        ryeos_engine::kind_registry::SourceClosureLocationDecl::ItemNamespace
-    ) {
+    let source_policy = if source_contract.is_some_and(|contract| {
+        matches!(
+            &contract.location,
+            ryeos_engine::kind_registry::SourceClosureLocationDecl::ItemNamespace
+        )
+    }) {
         let executor_id = verified
             .resolved
             .metadata
@@ -510,10 +507,7 @@ pub fn prepare_pinned_project_external_consumer(
         &roots,
         project_authority.map(|(root, content)| (root, content, project_snapshot_hash.to_owned())),
         source_policy.as_ref(),
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!("project external-content consumer produced no admitted source closure")
-    })?;
+    )?;
     Ok(PreparedPinnedProjectExternalConsumer {
         resolution,
         _source_closure: source_closure,

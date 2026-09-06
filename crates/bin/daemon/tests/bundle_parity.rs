@@ -78,15 +78,7 @@ fn core_bundle_owns_engine_kinds_only() {
 
     let kinds: Vec<&str> = registry.kinds().collect();
     for expected in [
-        "config",
-        "handler",
-        "parser",
-        "protocol",
-        "service",
-        "node",
-        "tool",
-        "streaming_tool",
-        "runtime",
+        "config", "handler", "parser", "protocol", "service", "node", "tool", "runtime",
     ] {
         assert!(
             registry.contains(expected),

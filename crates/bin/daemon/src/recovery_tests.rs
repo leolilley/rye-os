@@ -216,7 +216,7 @@ fn live_resume(project: &std::path::Path) -> ResumeContext {
         project.clone(),
         format!("local:{}", project.display()),
         ryeos_state::objects::LiveProjectAccess::ReadWrite,
-        ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+        ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
         ryeos_state::objects::EnvironmentAuthority::None,
         Vec::new(),
     )

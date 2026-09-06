@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T03:44:28Z:d099f1645271e9a7e06d75fc3b67d99858d39bbed0a173c7e96bbb02154d81c3:zJ5OaUD2UUYEf2ZdcPwpHCKfobxiQO51sdYxNNqt5wGAMGWl88NbZVRXdiOiC9uMqeUy96EWINU0mWPk1O91Dw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T01:06:23Z:308c175dad50945f24527940f155da2926b3b2f183e2710a0d803b400f9b8e2e:HXhBzuLLXhzhBylyAorZqW+8xN79/RhqkdEV3ha8vWMcGq/91WpCz/e7UQ3KncDb+XWxUrJa23q9JP33IG9oCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 # Repository capture intent, composed with the target's signed node patterns.
 # Git ignores are not snapshot authority. Keep source and the public developer
 # signing fixture, but never send local artifacts or nested worktrees as source.
@@ -7,6 +7,11 @@ exclusions:
   - "/.local/"
   - "/.tmp/"
   - "/.worktrees/"
+  # The source-local development bundle is also published during qualification.
+  # Its derived payload/CAS/ref trees are not repository authoring inputs.
+  - "/.ai/bin/"
+  - "/.ai/objects/"
+  - "/.ai/refs/"
   # These are literal anchored prefixes in RyeOS's existing policy language,
   # not Git-style path globs. Add a source bundle's generated roots here when
   # adding that bundle; retain its authored descriptors and implementation.

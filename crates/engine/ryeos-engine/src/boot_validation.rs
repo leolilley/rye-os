@@ -142,14 +142,6 @@ pub enum BootIssue {
         protocol_ref: String,
         expected: String,
     },
-    /// A streaming_tool kind item's terminator declares a
-    /// `protocol_ref` that doesn't match the expected streaming
-    /// protocol.
-    StreamingToolProtocolMismatch {
-        kind: String,
-        protocol_ref: String,
-        expected: String,
-    },
     /// A runtime launch contract names a handler that is not registered.
     UnknownLaunchPreparerHandler {
         runtime_ref: String,

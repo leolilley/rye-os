@@ -958,9 +958,7 @@ impl CandidateEvaluationAuthority {
             ("candidate snapshot", &self.candidate_snapshot_hash),
             ("candidate validation", &self.candidate_validation_hash),
         ] {
-            if !lillux::valid_hash(hash)
-                || hash.bytes().any(|byte| byte.is_ascii_uppercase())
-            {
+            if !lillux::valid_hash(hash) || hash.bytes().any(|byte| byte.is_ascii_uppercase()) {
                 bail!("candidate-evaluation {label} hash is not canonical");
             }
         }
@@ -1053,9 +1051,10 @@ impl CandidateIntegrationProcessCompletionFact {
         else {
             bail!("candidate evaluator has no integration completion operation");
         };
-        let integration_launch_id = authority.integration_launch_id.as_deref().ok_or_else(|| {
-            anyhow!("candidate integration has no sealed launch identity")
-        })?;
+        let integration_launch_id = authority
+            .integration_launch_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("candidate integration has no sealed launch identity"))?;
         ryeos_state::objects::canonical_value_digest(&json!({
             "schema":"ryeos.hosted_candidate_integration_process_operation.v1",
             "root_thread_id":root_thread_id,
@@ -1082,11 +1081,7 @@ impl CandidateIntegrationProcessCompletionFact {
         };
         let fact = Self {
             schema_version: Self::SCHEMA_VERSION,
-            operation_id: Self::operation_id(
-                authority,
-                root_thread_id,
-                admitted_capsule_hash,
-            )?,
+            operation_id: Self::operation_id(authority, root_thread_id, admitted_capsule_hash)?,
             root_thread_id: root_thread_id.to_owned(),
             admitted_capsule_hash: admitted_capsule_hash.to_owned(),
             integration_launch_id: authority
@@ -1729,6 +1724,16 @@ impl AdmittedProjectBinding {
             }
         }
     }
+
+    /// The project-definition root, distinct from a projectless execution's
+    /// owned scratch directory. Scratch remains retained for execution but
+    /// cannot contribute definitions, policy, or resolution-cache identity.
+    fn resolution_workspace(&self) -> Option<&Path> {
+        match self.subject_resolution_authority {
+            ryeos_engine::contracts::SubjectResolutionAuthority::Projectless => None,
+            _ => self.execution_workspace(),
+        }
+    }
 }
 
 /// In-memory half of [`CandidateEvaluationAuthority`].  The base binding owns
@@ -1760,10 +1765,8 @@ impl CandidateEvaluationExecutionScope {
         base_project_binding: AdmittedProjectBinding,
     ) -> Result<Self> {
         authority.validate()?;
-        base_project_binding.validate_for(
-            &base_project_binding.request_engine,
-            &base_plan_context,
-        )?;
+        base_project_binding
+            .validate_for(&base_project_binding.request_engine, &base_plan_context)?;
         let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
             stable_project_identity,
             base_snapshot_hash,
@@ -1773,7 +1776,9 @@ impl CandidateEvaluationExecutionScope {
             ..
         } = base_project_binding.exact_authority()
         else {
-            bail!("candidate evaluator base must be a read-only pinned generation without environment authority");
+            bail!(
+                "candidate evaluator base must be a read-only pinned generation without environment authority"
+            );
         };
         if base_snapshot_hash != &authority.base_snapshot_hash
             || snapshot_hash != &authority.base_snapshot_hash
@@ -1814,10 +1819,8 @@ impl CandidateEvaluationExecutionScope {
         }
         let mut resolution = execution.clone();
         resolution.project_context = self.base_plan_context.project_context.clone();
-        resolution.subject_resolution_authority = self
-            .base_plan_context
-            .subject_resolution_authority
-            .clone();
+        resolution.subject_resolution_authority =
+            self.base_plan_context.subject_resolution_authority.clone();
         Ok(resolution)
     }
 
@@ -1900,9 +1903,9 @@ impl CandidateEvaluationExecutionScope {
                                     ryeos_state::objects::PinnedTerminalPublication::Discard
                             }
                     )
-                    && !candidate_caps.iter().any(|cap| {
-                        cap == crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
-                    })
+                    && !candidate_caps
+                        .iter()
+                        .any(|cap| cap == crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY)
             }
             CandidateOperationPurpose::Integrate { .. } => {
                 candidate_base == &self.authority.base_snapshot_hash
@@ -1916,16 +1919,19 @@ impl CandidateEvaluationExecutionScope {
                                 }
                         } if expected_hash == &self.authority.base_snapshot_hash
                     )
-                    && !candidate_caps.iter().any(|cap| {
-                        cap == crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY
-                    })
+                    && !candidate_caps
+                        .iter()
+                        .any(|cap| cap == crate::execution_policy::LIVE_PROJECT_WRITE_CAPABILITY)
             }
         };
         if base_project_identity != candidate_project_identity
             || base_snapshot != &self.authority.base_snapshot_hash
             || candidate_snapshot != &self.authority.candidate_snapshot_hash
             || plan_principal_identifier(candidate_plan_context) != self.authority.owner_principal
-            || !matches!(candidate_environment, ryeos_state::objects::EnvironmentAuthority::None)
+            || !matches!(
+                candidate_environment,
+                ryeos_state::objects::EnvironmentAuthority::None
+            )
             || !execution_authority_matches
         {
             bail!("candidate operation execution binding contradicts its admitted purpose");
@@ -2118,9 +2124,7 @@ impl RootExecutionAdmission {
         &self.project_binding.request_engine
     }
 
-    pub fn candidate_evaluation_scope(
-        &self,
-    ) -> Option<&Arc<CandidateEvaluationExecutionScope>> {
+    pub fn candidate_evaluation_scope(&self) -> Option<&Arc<CandidateEvaluationExecutionScope>> {
         self.candidate_evaluation.as_ref()
     }
 
@@ -2197,7 +2201,9 @@ impl RootExecutionAdmission {
                 .as_deref()
                 .map(CandidateEvaluationExecutionScope::authority)
         {
-            bail!("execution provenance candidate-evaluation scope differs from the sealed root admission");
+            bail!(
+                "execution provenance candidate-evaluation scope differs from the sealed root admission"
+            );
         }
         Ok(())
     }
@@ -2261,7 +2267,7 @@ impl RootExecutionAdmission {
     }
 
     pub fn resolution_workspace(&self) -> Option<&Path> {
-        self.resolution_project_binding().execution_workspace()
+        self.resolution_project_binding().resolution_workspace()
     }
 
     pub fn resolution_subject_authority(
@@ -2613,12 +2619,10 @@ impl RootExecutionAdmission {
         match self.candidate_evaluation.as_deref() {
             Some(scope) => {
                 scope.validate_candidate_binding(&self.plan_context, &self.project_binding)?;
-                let resolution_plan =
-                    scope.resolution_plan_context_for(&self.plan_context)?;
-                scope.base_project_binding().validate_for(
-                    scope.request_engine(),
-                    &resolution_plan,
-                )?;
+                let resolution_plan = scope.resolution_plan_context_for(&self.plan_context)?;
+                scope
+                    .base_project_binding()
+                    .validate_for(scope.request_engine(), &resolution_plan)?;
                 scope
                     .base_project_binding()
                     .validate_resolution_closure(&self.resolution_closure)?;
@@ -5865,6 +5869,25 @@ impl ThreadLifecycleService {
         Ok(persisted)
     }
 
+    pub fn append_thread_events_owned(
+        &self,
+        chain_root_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+        events: &[NewEventRecord],
+    ) -> Result<Option<Vec<PersistedEventRecord>>> {
+        let persisted = self.state_store.append_events_if_thread_running_owned(
+            chain_root_id,
+            thread_id,
+            events,
+            launch_owner,
+        )?;
+        if let Some(records) = &persisted {
+            self.publish_records(records);
+        }
+        Ok(persisted)
+    }
+
     /// Persist and publish the daemon-authored authority audit for one claimed
     /// managed-runtime launch attempt. This is intentionally distinct from
     /// [`Self::append_thread_events`]: a continuation successor may still be
@@ -6999,7 +7022,7 @@ pub fn admit_non_execution_root(
         canonical_project_path.clone(),
         format!("local:{}", canonical_project_path.display()),
         ryeos_state::objects::LiveProjectAccess::ReadOnly,
-        ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+        ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
         ryeos_state::objects::EnvironmentAuthority::None,
         capability_ceiling,
     )?;
@@ -7640,7 +7663,7 @@ mod tests {
             canonical_root.clone(),
             format!("local:{}", canonical_root.display()),
             ryeos_state::objects::LiveProjectAccess::ReadOnly,
-            ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+            ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
             ryeos_state::objects::EnvironmentAuthority::None,
             Vec::new(),
         )
@@ -7668,6 +7691,85 @@ mod tests {
             ryeos_engine::contracts::SubjectResolutionAuthority::LiveFs,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn projectless_resolution_excludes_retained_execution_scratch() {
+        let engine = empty_test_engine();
+        let scratch = tempfile::tempdir().unwrap().keep();
+        let lifeline = Arc::new(crate::temp_dir_guard::TempDirGuard::new(scratch.clone()));
+        let provenance = crate::execution_provenance::ExecutionProvenance::root_projectless(
+            scratch.clone(),
+            engine.clone(),
+            lifeline,
+            ryeos_state::objects::ExecutionProjectAuthority::PROJECTLESS,
+        )
+        .unwrap();
+        let plan_context = PlanContext {
+            requested_by: EffectivePrincipal::Local(Principal {
+                fingerprint: "fp:projectless-resolution-test".to_string(),
+                scopes: Vec::new(),
+            }),
+            project_context: ProjectContext::None,
+            subject_resolution_authority:
+                ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+            current_site_id: "site:test".to_string(),
+            origin_site_id: "site:test".to_string(),
+            execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
+            validate_only: false,
+        };
+        let binding =
+            AdmittedProjectBinding::from_provenance(&engine, &plan_context, &provenance).unwrap();
+        drop(provenance);
+
+        // Both cache admission and managed launch must resolve without a
+        // project overlay while the admitted cwd remains alive and usable.
+        assert!(scratch.is_dir());
+        assert_eq!(binding.execution_workspace(), Some(scratch.as_path()));
+        assert!(binding.resolution_workspace().is_none());
+        assert!(
+            binding
+                .resolution_materialization_binding()
+                .unwrap()
+                .active_project_root()
+                .is_none()
+        );
+        let error = engine
+            .effective_request_snapshot(
+                binding.execution_workspace(),
+                binding.subject_resolution_authority(),
+            )
+            .err()
+            .expect("scratch must still be refused as projectless resolution authority");
+        assert!(
+            error
+                .to_string()
+                .contains("projectless subject resolution cannot carry a project root")
+        );
+        engine
+            .effective_request_snapshot(
+                binding.resolution_workspace(),
+                binding.subject_resolution_authority(),
+            )
+            .expect("the managed-launch request snapshot must exclude scratch");
+        drop(binding);
+        assert!(
+            !scratch.exists(),
+            "resolution must not retain the private scratch lifeline"
+        );
+    }
+
+    #[test]
+    fn live_resolution_keeps_the_admitted_project_root() {
+        let engine = empty_test_engine();
+        let workspace = tempfile::tempdir().unwrap();
+        let binding = live_test_binding(&engine, workspace.path());
+        assert_eq!(
+            binding.resolution_workspace(),
+            binding.execution_workspace()
+        );
+        assert_eq!(binding.resolution_workspace(), Some(workspace.path()));
     }
 
     #[test]
@@ -7741,6 +7843,10 @@ mod tests {
         let binding =
             AdmittedProjectBinding::restore(&engine, &plan_context, authority_b, subject_b)
                 .unwrap();
+        assert_eq!(
+            binding.resolution_workspace(),
+            Some(generation_b_workspace.path())
+        );
         let sealed = sealed_cow_resolution(subject_a, generation_a_workspace.path().to_path_buf());
         binding.validate_resolution_closure(&sealed).unwrap();
     }

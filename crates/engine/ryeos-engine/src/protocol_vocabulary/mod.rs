@@ -7,7 +7,8 @@ pub use stdin_shape::{StdinShape, build_stdin};
 mod stdout_shape;
 pub use stdout_shape::{
     DecodedFrame, DecodedStdout, FrameReadError, MAX_FRAME_BYTES, StdoutShape, StreamingChunk,
-    StreamingChunkKind, decode_stdout_frame, decode_stdout_terminal, read_all_frames,
+    StreamingChunkKind, StreamingFrameReader, decode_stdout_frame, decode_stdout_terminal,
+    read_all_frames,
 };
 
 mod stdout_mode;

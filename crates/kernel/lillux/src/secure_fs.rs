@@ -1583,6 +1583,27 @@ impl PinnedDirectory {
         for entry in entries {
             let name_c = std::ffi::CString::new(entry.name.as_bytes())?;
             if entry.entry_type == PinnedEntryType::Directory {
+                if depth >= max_depth {
+                    anyhow::bail!("recursive removal exceeds its directory depth bound");
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // Removing an empty directory requires access to its
+                    // parent, not read access to the child. OverlayFS leaves
+                    // mode-000 work directories: pin them without opening
+                    // their contents, and let rmdir prove emptiness. Never
+                    // chmod an entry or follow an alias to make cleanup pass.
+                    let pinned = self
+                        .open_mount_entry(&entry.name)?
+                        .ok_or_else(|| anyhow::anyhow!("directory disappeared during removal"))?;
+                    let child = Self::from_open_directory(self.path.join(&entry.name), pinned)?;
+                    if child.directory.metadata()?.dev() != root_device {
+                        anyhow::bail!("refusing to cross mounted filesystem during removal");
+                    }
+                    if self.remove_empty_child_if_same(&entry.name, &child)? {
+                        continue;
+                    }
+                }
                 let child = self
                     .open_child_directory(&entry.name)?
                     .ok_or_else(|| anyhow::anyhow!("directory disappeared during removal"))?;
@@ -4776,13 +4797,19 @@ impl PinnedDirectory {
             validate_child_name(name)?;
             let name_c = std::ffi::CString::new(name.as_bytes())?;
             let path = self.path.join(name);
+            #[cfg(target_os = "linux")]
+            let current = self.open_mount_entry(name)?.ok_or_else(|| {
+                anyhow::anyhow!("secure child directory disappeared: {}", path.display())
+            })?;
+            #[cfg(not(target_os = "linux"))]
             let current =
                 open_child_directory(&self.directory, &name_c, &path)?.ok_or_else(|| {
                     anyhow::anyhow!("secure child directory disappeared: {}", path.display())
                 })?;
             let current_metadata = current.metadata()?;
             let expected_metadata = expected.directory.metadata()?;
-            if current_metadata.dev() != expected_metadata.dev()
+            if !current_metadata.is_dir()
+                || current_metadata.dev() != expected_metadata.dev()
                 || current_metadata.ino() != expected_metadata.ino()
             {
                 anyhow::bail!(

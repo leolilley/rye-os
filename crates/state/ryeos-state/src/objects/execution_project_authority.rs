@@ -82,7 +82,9 @@ pub enum LiveProjectAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveSymlinkPolicy {
-    DescriptorRootedNoEscape,
+    /// Symlinks resolve within the complete admitted execution namespace,
+    /// including separately admitted mounts, not only within the project.
+    AdmittedExecutionNamespace,
 }
 
 /// The actual filesystem confinement carried by a live-project authority.
@@ -94,7 +96,12 @@ pub enum LiveSymlinkPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LiveFilesystemConfinement {
-    DescriptorRootedMasked {
+    /// Source-backed live access, with immutable immediate membership in
+    /// connector directories leading to denied leaves. Permitted child mounts
+    /// retain live writes; connector mutations refuse instead of being lost.
+    /// This masks paths, not pre-existing hardlink/inode aliases, and does not
+    /// fence host-side writers outside the execution namespace.
+    DescriptorRootedFixedParents {
         denied_control_paths: Vec<String>,
         symlink_policy: LiveSymlinkPolicy,
     },
@@ -102,10 +109,10 @@ pub enum LiveFilesystemConfinement {
 }
 
 impl LiveFilesystemConfinement {
-    pub fn standard_descriptor_rooted() -> Self {
-        Self::DescriptorRootedMasked {
+    pub fn standard_fixed_parents() -> Self {
+        Self::DescriptorRootedFixedParents {
             denied_control_paths: crate::project_sync::live_execution_denied_control_paths(),
-            symlink_policy: LiveSymlinkPolicy::DescriptorRootedNoEscape,
+            symlink_policy: LiveSymlinkPolicy::AdmittedExecutionNamespace,
         }
     }
 }
@@ -952,9 +959,9 @@ impl ExecutionProjectAuthority {
 impl LiveAccessAuthority {
     pub fn validate(&self) -> anyhow::Result<()> {
         match &self.confinement {
-            LiveFilesystemConfinement::DescriptorRootedMasked {
+            LiveFilesystemConfinement::DescriptorRootedFixedParents {
                 denied_control_paths,
-                symlink_policy: LiveSymlinkPolicy::DescriptorRootedNoEscape,
+                symlink_policy: LiveSymlinkPolicy::AdmittedExecutionNamespace,
             } => validate_sorted_relative_paths("denied live control path", denied_control_paths)?,
             LiveFilesystemConfinement::UnconfinedHost => {
                 if self.access == LiveProjectAccess::ReadOnly {
@@ -1067,9 +1074,9 @@ mod tests {
             root.to_path_buf(),
             "test-project".to_string(),
             access,
-            LiveFilesystemConfinement::DescriptorRootedMasked {
+            LiveFilesystemConfinement::DescriptorRootedFixedParents {
                 denied_control_paths: Vec::new(),
-                symlink_policy: LiveSymlinkPolicy::DescriptorRootedNoEscape,
+                symlink_policy: LiveSymlinkPolicy::AdmittedExecutionNamespace,
             },
             EnvironmentAuthority::None,
             Vec::new(),
@@ -1104,13 +1111,16 @@ mod tests {
         let confined = LiveAccessAuthority {
             access: LiveProjectAccess::ReadOnly,
             authorized_write_namespaces: Vec::new(),
-            confinement: LiveFilesystemConfinement::DescriptorRootedMasked {
+            confinement: LiveFilesystemConfinement::DescriptorRootedFixedParents {
                 denied_control_paths: vec![".ai".to_string()],
-                symlink_policy: LiveSymlinkPolicy::DescriptorRootedNoEscape,
+                symlink_policy: LiveSymlinkPolicy::AdmittedExecutionNamespace,
             },
         };
         let encoded = serde_json::to_value(&confined).unwrap();
-        assert_eq!(encoded["confinement"]["kind"], "descriptor_rooted_masked");
+        assert_eq!(
+            encoded["confinement"]["kind"],
+            "descriptor_rooted_fixed_parents"
+        );
         assert_eq!(
             serde_json::from_value::<LiveAccessAuthority>(encoded).unwrap(),
             confined
@@ -1339,7 +1349,7 @@ mod tests {
             root.path().to_path_buf(),
             stable_identity.clone(),
             LiveProjectAccess::ReadWrite,
-            LiveFilesystemConfinement::standard_descriptor_rooted(),
+            LiveFilesystemConfinement::standard_fixed_parents(),
             EnvironmentAuthority::None,
             Vec::new(),
         )

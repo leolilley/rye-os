@@ -1066,27 +1066,27 @@ fn admit_follow_child_requests(
             let child_runtime_ref = child_runtime.canonical_ref.to_string();
             let child_preflight =
                 ryeos_app::thread_lifecycle::preflight_root_execution_for_provenance(
-                ryeos_app::thread_lifecycle::ResolveRootExecutionParams {
-                    engine: resolution_engine,
-                    plan_context: child_plan_context.clone(),
-                    project_binding: child_project_binding.clone(),
-                    node_history_policy: state.node_history_policy()?,
-                    item_ref: &child.item_ref,
-                    launch_mode: "detached",
-                    parameters: child.parameters.clone(),
-                    ref_bindings: child.ref_bindings.clone(),
-                    usage_subject: None,
-                    usage_subject_asserted_by: None,
-                    creates_chain_root: true,
-                },
-                admission_provenance,
-            )
-            .with_context(|| {
-                format!(
-                    "follow: verified history-policy preflight for child '{}'",
-                    child.item_ref
+                    ryeos_app::thread_lifecycle::ResolveRootExecutionParams {
+                        engine: resolution_engine,
+                        plan_context: child_plan_context.clone(),
+                        project_binding: child_project_binding.clone(),
+                        node_history_policy: state.node_history_policy()?,
+                        item_ref: &child.item_ref,
+                        launch_mode: "detached",
+                        parameters: child.parameters.clone(),
+                        ref_bindings: child.ref_bindings.clone(),
+                        usage_subject: None,
+                        usage_subject_asserted_by: None,
+                        creates_chain_root: true,
+                    },
+                    admission_provenance,
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "follow: verified history-policy preflight for child '{}'",
+                        child.item_ref
+                    )
+                })?;
             let child_execution = child_preflight.root_admission.execution_request(
                 ryeos_app::thread_lifecycle::RootExecutionRoute::ManagedRuntimeForKind(
                     &child_runtime.canonical_ref,
@@ -1845,7 +1845,7 @@ mod tests {
             project.path().canonicalize().unwrap(),
             "project:test".to_string(),
             LiveProjectAccess::ReadWrite,
-            ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+            ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
             EnvironmentAuthority::None,
             Vec::new(),
         )

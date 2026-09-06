@@ -107,7 +107,7 @@ mod integration_tests {
             project_root.clone(),
             format!("local:{}", project_root.display()),
             ryeos_state::objects::LiveProjectAccess::ReadWrite,
-            ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+            ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
             ryeos_state::objects::EnvironmentAuthority::None,
             Vec::new(),
         )
@@ -304,9 +304,7 @@ mod integration_tests {
                 id,
                 &RuntimeLaunchMetadata::default()
                     .with_native_resume(ryeos_engine::contracts::NativeResumeSpec::default())
-                    .with_launch_driver(
-                        ryeos_state::objects::ExecutionLaunchDriver::ManagedRuntime,
-                    )
+                    .with_launch_driver(ryeos_state::objects::ExecutionLaunchDriver::ManagedRuntime)
                     .with_resume_context(ResumeContext {
                         kind: kind.into(),
                         item_ref: item_ref.into(),
@@ -320,7 +318,8 @@ mod integration_tests {
                             std::env::temp_dir(),
                             format!("local:{}", std::env::temp_dir().display()),
                             ryeos_state::objects::LiveProjectAccess::ReadWrite,
-                            ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                            ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(
+                            ),
                             ryeos_state::objects::EnvironmentAuthority::None,
                             Vec::new(),
                         )
@@ -1560,7 +1559,7 @@ mod integration_tests {
                 std::env::temp_dir(),
                 format!("local:{}", std::env::temp_dir().display()),
                 ryeos_state::objects::LiveProjectAccess::ReadWrite,
-                ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
                 ryeos_state::objects::EnvironmentAuthority::None,
                 Vec::new(),
             )
@@ -1704,7 +1703,7 @@ mod integration_tests {
                 std::env::temp_dir(),
                 format!("local:{}", std::env::temp_dir().display()),
                 ryeos_state::objects::LiveProjectAccess::ReadWrite,
-                ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
                 ryeos_state::objects::EnvironmentAuthority::None,
                 Vec::new(),
             )

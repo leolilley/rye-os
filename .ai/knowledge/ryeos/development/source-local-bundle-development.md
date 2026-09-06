@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-05T04:03:24Z:0152d31f1b772782ccea46e99c5caaf1b86bd2adce5ef0e9441a84edcfa78c93:TebKeEkQiumbEAD3rXZdcpQ0Ip6mq2wtVUWv4Niw3NCktb6TiFG646RUiajYwri9bC/Qol4o7Vt7FuP826epCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T04:41:04Z:d095efa18b51ada3186242192e8c39ad0616c6c3bec705fe9d1961f19a73f1a4:68mfU6PF1vUNLcQE9CvAKTuCNWpQYn5LOVs6nHANu8Kzgh8igjmz8P53sfkXS4ZZC/fZ5dPWKk++tfY2k81iDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.7.0"
+version: "1.8.0"
 ```
 
 # Source-Local Bundle Development
@@ -73,7 +73,10 @@ Repository-specific exclusions are authored in the existing
 `.ai/config/execution/project-snapshot.yaml` contract. It excludes local
 qualification artifacts, nested worktrees, local nodes and each active source
 bundle's generated `bin`, `objects` and `refs` trees. These compose with node
-patterns; `.gitignore` is not capture authority. RyeOS's current anchored-path
+patterns. The root source-local development bundle's generated `.ai/bin`,
+`.ai/objects` and `.ai/refs` are excluded by this same project policy, while its
+authored Tools, config, knowledge and manifest source remain inputs.
+`.gitignore` is not capture authority. RyeOS's current anchored-path
 patterns are literal prefixes, so Git-style `bundles/*/...` patterns must not
 be pasted into this policy. The focused source-policy test checks every bundle
 in the development profile while retaining source, Tools and the public key
@@ -135,7 +138,7 @@ publication, or remote authority.
 ## Development execution confinement
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
-clean-cut isolation-adapter v4 protocol. The backend is available signed data,
+clean-cut isolation-adapter v6 protocol. The backend is available signed data,
 not ambient host setup: bundle membership does not activate it and every
 ordinary init profile remains explicitly disabled. The separately selectable
 `development` init profile maps to the existing `full` bundle set and enables
@@ -146,8 +149,18 @@ policy generation additionally requires the explicit
 `--reset-node-policy-generation` decision. Hosted-worker profiles retain their
 independently selected network policy.
 
-The v4 plan carries a bounded, sorted collection of daemon-created target
-channels and an explicit PID-namespace choice. Lillux owns namespace, mount,
+Policy v3 explicitly supplies the fixed-parent live-project selection and
+construction limits. State supplies the existing protected-path floor; Lillux
+creates only private connector mounts, preserving authorized source writes
+outside those fixed-entry parents. See Standard execution-isolation knowledge
+for the exact supported filesystem and symlink boundaries. Policy or runtime
+history from the prior authority contract requires explicit scoped retirement,
+not a decoder fallback or automatic install-time reset.
+
+The v6 plan carries bounded fixed-parent views, a sorted collection of
+daemon-created target channels and explicit PID-namespace and proc-filesystem
+choices. The development profile selects fresh PID-local, read-only procfs for
+ordinary compiler/executable self lookup, never the host proc mount. Lillux owns namespace, mount,
 pivot-root, seccomp, descriptor, pidfd/procfs and process-settle mechanics.
 RyeOS layers own only typed authorities, exact adapter identity and signed
 policy/data. Do not recreate those OS mechanics in an executor, daemon,
@@ -372,6 +385,10 @@ ryeos external-content import \
   <named-root-id> <relative-tree> tree content <maximum-bytes>
 ```
 
+Select `large_content` instead of `content` when the exact tree exceeds the
+ordinary tier; the qualified Stage-0 compiler tree uses `large_content`.
+The selected node must independently admit that tier and its actual totals.
+
 The result supplies `staging_id`, `request_digest`, and the real
 `manifest_hash`. Only then may the project Tool be authored with a locator-free
 `mode: pinned` tree declaration naming that exact hash, an explicit permitted
@@ -380,16 +397,24 @@ project snapshot, and bind the staging
 capability to that pinned project consumer:
 
 ```bash
-ryeos external-content bind \
+ryeos --project <project-path> external-content bind \
   <staging_id> <request_digest> <manifest_hash> \
   tool:ryeos/development/<tool> pinned_project \
-  <project_snapshot_hash> <project-path>
+  <project_snapshot_hash>
 ```
 
 The same sequence runs independently on every placement target. Portable
 content may move through RyeOS object-closure transfer, but each node creates
 its own operator-authorized binding. Managed activation remains restricted to
 trusted installed-bundle consumers.
+
+These declarative Tools have no separately executed source tree. Their binding
+therefore retains explicit null source-closure evidence plus the mandatory
+exact generation, verified publisher and effective-program digest. This does
+not relax source admission for Python or worker programs that do execute a
+source closure. Binding v3 / head epoch 4 expresses this distinction; use the
+existing scoped binding reset for a predecessor installed namespace, not a
+history reset, fabricated source closure or generic subprocess source policy.
 
 The Stage-0 dependency realization cannot be authored honestly before the
 compiler payload, its exact runtime-root dependencies, and their real RyeOS
@@ -399,3 +424,55 @@ build descendants use only the resulting exact offline tree with `--locked
 --frozen --offline`. A shell process using publisher-image Cargo, an ambient
 Cargo home, or a checked-in placeholder manifest would create a competing
 bootstrap authority, so none is included here.
+
+For ordinary Tools that need child executable search, use the existing
+`env_config.env_paths` owner. Seed `env_config.env.PATH` with an explicit empty
+string, then prepend only the declared realization directories. The seed
+prevents host inheritance; the path operation supplies the existing typed
+`RuntimePathMutation` provenance. Do not put `PATH` in `config.env`, which is
+ordinary descriptor data and correctly refuses protected environment names.
+Do not weaken the vault/environment contract, append host directories, or add
+a parallel Tool environment field. The main command remains an exact
+`realization:` command, and its captured-filesystem ceiling still confines
+all descendants. Worker environments separately use their already-owned
+`executable_search` contract.
+
+## Development operation and script ownership
+
+The source-local Tools currently authored under `tools/ryeos/development/`
+are `platform-inspect`, `format-check`, and `format-file`. They select the
+real imported platform manifest, captured-filesystem execution and isolated
+network. Inspection/checking borrow an immutable current generation;
+formatting borrows the exclusive workspace. They still require target-local
+binding and actual CLI qualification. Cargo operations must not be advertised
+as ready before the locked dependency realization exists.
+
+Resolved operation timeouts use the existing project execution configuration
+at `.ai/config/execution/execution.yaml`. Its per-item selections override
+bundle-wide defaults. A descriptor's `config.timeout_secs` is lower-precedence
+input, not an immutable ceiling; do not infer an executed deadline from that
+field alone. Inspect the admitted plan and its configuration provenance. Node
+limits and parent workload-client lifetime/authority remain independent limits.
+
+The `scripts/` inventory is divided by caller and authority, not by language.
+Moving a file under `.ai/tools/` does not by itself make it an admitted operation.
+
+| Current scripts | Owner and disposition |
+| --- | --- |
+| `pkg/`, `populate-bundles.sh`, `lib/ryeos-terminal.sh` | Host installation and signed bundle publication. Remain externally callable; never grant a hosted worker install/publication authority. |
+| `release/package-*`, `release/verify-bundle-artifact.sh`, `release/prepare-aur.sh`, `release/resolve-version.sh`, `release/official-publisher-fingerprint.sh` | Release/package provenance and external distribution. Remain release operations, not project worker operations. |
+| `release/produce-development-toolchain-stage0.sh`, `release/development-toolchain-stage0-runtime.sh`, `release/verify-development-toolchain-stage0.sh`, `release/fixtures/development-toolchain-stage0/` | Explicit compiler bootstrap authoring and its bounded qualification fixture. Retire duplicated reproduction behavior only after the admitted Stage-1 operation proves identical manifests. |
+| `release/package-workload-client-realization.sh`, `release/verify-workload-client-realization.sh` | Packaging of an already built restricted-client artifact; not a worker-side compiler or client installer. |
+| `release/author-local-inference-realizations.py`, `release/local-inference-*.json`, `release/verify-local-inference-release.py`, `release/qualify-local-inference-node.sh` | Separate local-inference realization and qualification workstream. Not prerequisites or fallback dependencies for hosted development. |
+| `release/qualify-container-image.sh`, `release/container-mock-chat-provider.py`, `dev/qualify-configured-remote.sh`, `smoke-execute-stream.sh`, `smoke-installed-resume.sh` | External node/deployment acceptance harnesses. Keep operator credentials, restart/reset and remote-admission authority outside workers. |
+| `ci/`, `gate.sh`, `check-ui-wasm-fresh.sh`, `dev-tui.sh`, `dev-ui-assets.sh` | CI/host/UI orchestration. The gate is not the default development child operation; UI workflows need their own exact dependencies before conversion. |
+| `lint-cli-presentation.sh`, `lint-dependency-layers.py`, `lint-naming.sh`, `lint-no-content-wrap.sh` | Ordinary repository validation behavior to expose as finite project Tools once their exact interpreter/utility closures are admitted. Do not duplicate their checks in a new dispatcher. |
+| `dev/sign-dev.sh`, `dev/revert-sig-churn.sh`, `dev/free-build-space.py` | Maintainer signing, working-tree maintenance and host resource cleanup. Not worker grants, even though the development signing fixture is public. |
+| `pkg/test-*`, `release/test-*`, `dev/test-*`, `ci/test-*` | Focused tests of the corresponding external scripts. Keep with that owner; run only the relevant tests for a change. |
+
+Retained human/CI wrappers can become thin calls to qualified project Tools.
+Do not delete their existing implementation or silently move host assumptions
+into the worker before the replacement executes with its complete declared
+inputs. Locked dependency production, Cargo check/build/focused-test Tools,
+Stage-1 reproduction and the worker-to-child loop remain explicit completion
+gates; the bootstrap artifact and three declarations above do not close them.

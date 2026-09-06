@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-05T04:28:57Z:a4acca759fa95c3b8fad9be684ba7d71e49eeca1887c5cf98f31834a0cae6e8e:RypbNz5B0NpUG+T9mWYPxu5fzPuO3BZwjoICeIA0PYM7nCL9tietfbsHwSxWau9+bXjx4iAR/q57hU67x+NGCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T03:29:24Z:5d834e19dc8d828ba39a6d7d6c237791586a97c8b379deda4cc8429402bb6d86:oB2Srg/06AiOQCAeRLhNFQ5O03ZlZ8ryLZjGmCAxknFhLY+JxHzZXEp/YNj800qqaewou2yUeRoeuF0dZ4E2BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
@@ -181,6 +181,17 @@ node policy. It does not identify a consumer. Multiple Tools or pinned project
 generations can legitimately reuse identical content through separate
 target-node-authorized bindings.
 
+Pinned-project binding identity commits to the exact generation, verified
+publisher and pre-realization effective-program digest. Separately executed
+source, when required by the signed program/executor contract, additionally
+contributes its admitted source-closure projection and retained CAS edges.
+A declarative exact-realization command has no such source tree: its current
+binding records explicit null, never an invented empty closure. Omission is
+invalid. Binding and launch use the same authority projection after source
+admission; adding, removing or changing source evidence changes the binding
+subject and cannot reuse a prior grant. Content use still requires the exact
+active target-local binding and current authorizer.
+
 A binding retry validates its exact current signed binding and settles only
 the presented principal-bound upload receipt. A fresh retry protects that
 already-current binding root before completing its receipt; a receipt already
@@ -189,6 +200,25 @@ same acquisition digest as a duplicate binding or settle another caller's
 pending receipt. Unused stages remain protected until the existing explicit
 maintenance policy permits their retirement. Content deduplication never
 merges consumer authority or writable worker workspaces.
+
+Synchronous external-content capture holds the existing shared CAS mutation
+guard while writing bytes and verifying its completed manifest. Before returning
+the import receipt, it durably stages that manifest root; GC follows its typed
+edges. It does not enumerate every small blob again in the receipt. Explicit
+large-object roots remain because binding verifies their import authority.
+Binding likewise verifies the complete closure, stages the already-written
+binding root, and publishes the signed binding head before receipt settlement.
+An interrupted capture before root publication leaves unacknowledged bytes for
+GC, not a durable root pointing to a missing manifest. Multi-request upload
+acknowledgements retain their existing per-request staging contract.
+
+Staging-root records have one symmetric bounded reader/writer envelope, separate
+from small recovery journals. It accounts for object, blob and large-object
+roots across their distinct stores; it does not expand node-policy admission.
+Deterministic capacity refusal leaves the handle unchanged. A publication I/O
+failure fences the handle, retaining its lock until drop, because rename may
+have succeeded before sync failed. Normal reopen determines the actual durable
+state; the old handle cannot continue using stale roots or undo settlement.
 
 ## Event Durability Tiers
 

@@ -1,7 +1,7 @@
-use ryeos_isolation_protocol::IsolationBackendSelection;
+use ryeos_isolation_protocol::{FixedParentViewLimits, IsolationBackendSelection};
 use serde::{Deserialize, Serialize};
 
-pub const ISOLATION_POLICY_VERSION: u32 = 1;
+pub const ISOLATION_POLICY_VERSION: u32 = 3;
 #[cfg(any(test, feature = "test-support"))]
 pub const TEST_ISOLATION_POLICY_RELATIVE_PATH: &str = "test-fixtures/isolation-policy.yaml";
 
@@ -26,6 +26,16 @@ impl IsolationPolicy {
             mode: IsolationMode::Disabled,
             backend: None,
             filesystem: IsolationFilesystemPolicy {
+                proc_filesystem: ryeos_isolation_protocol::IsolationProcFilesystem::Empty,
+                // Values for this explicit non-enforcing authoring fixture
+                // only. Never call this constructor to fill missing node
+                // policy: enforced launch limits come from its signed member.
+                live_project: IsolationLiveProjectPolicy::FixedParents {
+                    limits: FixedParentViewLimits {
+                        max_entries: 2048,
+                        max_depth: 64,
+                    },
+                },
                 readable: vec![
                     "{node_public_identity}".to_string(),
                     "{daemon_socket}".to_string(),
@@ -63,8 +73,26 @@ pub enum IsolationMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IsolationFilesystemPolicy {
+    pub proc_filesystem: ryeos_isolation_protocol::IsolationProcFilesystem,
+    pub live_project: IsolationLiveProjectPolicy,
     pub readable: Vec<String>,
     pub writable: Vec<String>,
+}
+
+/// Explicit node-owned confined-live contract, never selected by a workload.
+/// Fixed parent entries are an admitted restriction, not silent CoW behavior.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IsolationLiveProjectPolicy {
+    FixedParents { limits: FixedParentViewLimits },
+}
+
+impl IsolationLiveProjectPolicy {
+    pub fn limits(self) -> FixedParentViewLimits {
+        match self {
+            Self::FixedParents { limits } => limits,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1156,6 +1156,34 @@ mod tests {
     }
 
     #[test]
+    fn declarative_project_external_binding_roots_only_its_external_manifest() {
+        let consumer = crate::objects::ExternalContentConsumerAuthority::pinned_project(
+            "tool:project/build".to_owned(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            None,
+        )
+        .unwrap();
+        let binding = crate::objects::ExternalContentBinding::active(
+            "a".repeat(64),
+            crate::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
+            consumer,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .unwrap();
+        let links = links_external_content_binding(&binding.to_value().unwrap()).unwrap();
+        assert_eq!(links.object_edges.len(), 1);
+        assert_eq!(links.object_edges[0].hash, "a".repeat(64));
+        assert_eq!(
+            links.object_edges[0].expected,
+            ExpectedObject::Kind(crate::objects::EXTERNAL_CONTENT_MANIFEST_KIND)
+        );
+    }
+
+    #[test]
     fn project_external_binding_roots_its_manifest_and_source_authority() {
         let source_binding = "e".repeat(64);
         let consumer = crate::objects::ExternalContentConsumerAuthority::pinned_project(
@@ -1163,14 +1191,14 @@ mod tests {
             "b".repeat(64),
             "c".repeat(64),
             "d".repeat(64),
-            crate::objects::EffectiveSourceClosureProjection {
+            Some(crate::objects::EffectiveSourceClosureProjection {
                 schema: crate::objects::EFFECTIVE_SOURCE_BINDING_SCHEMA,
                 binding_hash: source_binding.clone(),
                 content_manifest_hash: "f".repeat(64),
                 owner_key: "1".repeat(64),
                 file_count: 1,
                 total_bytes: 1,
-            },
+            }),
         )
         .unwrap();
         let binding = crate::objects::ExternalContentBinding::active(

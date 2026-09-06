@@ -58,7 +58,10 @@ fn require_admission_binding(
         })
 }
 
-fn consumer_authority(
+/// Called after the existing source-admission pass, by both binding and launch.
+/// Declarative programs can have no executable source closure; do not invent
+/// one or infer source-loading authority from the external-content declaration.
+pub(crate) fn consumer_authority(
     resolution: &ryeos_engine::resolution::ResolutionOutput,
     subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
 ) -> anyhow::Result<ryeos_state::objects::ExternalContentConsumerAuthority> {
@@ -90,10 +93,8 @@ fn consumer_authority(
                 .composed
                 .derived
                 .get(ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("project external-content consumer has no source closure")
-                })
-                .and_then(ryeos_state::objects::EffectiveSourceClosureProjection::from_value)?;
+                .map(ryeos_state::objects::EffectiveSourceClosureProjection::from_value)
+                .transpose()?;
             let effective_consumer_digest =
                 ryeos_engine::external_content::pre_external_realization_consumer_digest(
                     resolution,
@@ -1139,4 +1140,68 @@ fn capture_kind(kind: ExternalContentKind) -> ExternalContentCaptureKind {
 
 fn pinned_state_authority(state: &AppState) -> anyhow::Result<ryeos_state::PinnedStateAuthority> {
     state.state_store.pinned_state_authority()
+}
+
+#[cfg(test)]
+mod consumer_authority_tests {
+    use super::*;
+    use ryeos_engine::contracts::{ItemSourceRoot, SubjectResolutionAuthority};
+    use ryeos_engine::resolution::{
+        KindComposedView, ResolutionOutput, ResolutionStepName, ResolvedAncestor, TrustClass,
+    };
+
+    #[test]
+    fn exact_consumer_projection_preserves_source_presence_and_rejects_malformed_evidence() {
+        let mut resolution = ResolutionOutput {
+            root: ResolvedAncestor {
+                requested_id: "project/build".into(),
+                resolved_ref: "tool:project/build".into(),
+                source_path: "/fixture/.ai/tools/project/build.yaml".into(),
+                source_space: ItemSpace::Project,
+                source_root: ItemSourceRoot::Project,
+                trust_class: TrustClass::TrustedProject,
+                signer_fingerprint: Some("a".repeat(64)),
+                alias_resolution: None,
+                added_by: ResolutionStepName::PipelineInit,
+                raw_content: String::new(),
+                source_content_digest: "b".repeat(64),
+                raw_content_digest: "c".repeat(64),
+            },
+            ancestors: Vec::new(),
+            references_edges: Vec::new(),
+            referenced_items: Vec::new(),
+            step_outputs: Default::default(),
+            effective_trust_class: TrustClass::TrustedProject,
+            composed: KindComposedView::identity(serde_json::json!({
+                "executor_id": "@subprocess",
+                "config": {"command": "realization:platform/bin/compiler"}
+            })),
+        };
+        let generation = SubjectResolutionAuthority::PinnedGeneration {
+            snapshot_hash: "d".repeat(64),
+        };
+        let declarative = consumer_authority(&resolution, &generation).unwrap();
+        assert!(declarative.source_closure().is_none());
+        assert!(consumer_authority(&resolution, &SubjectResolutionAuthority::LiveFs).is_err());
+        let source = ryeos_state::objects::EffectiveSourceClosureProjection {
+            schema: ryeos_state::objects::EFFECTIVE_SOURCE_BINDING_SCHEMA,
+            binding_hash: "e".repeat(64),
+            content_manifest_hash: "f".repeat(64),
+            owner_key: "1".repeat(64),
+            file_count: 1,
+            total_bytes: 1,
+        };
+        resolution.composed.derived.insert(
+            ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY.to_owned(),
+            serde_json::to_value(&source).unwrap(),
+        );
+        let source_owning = consumer_authority(&resolution, &generation).unwrap();
+        assert_eq!(source_owning.source_closure(), Some(&source));
+        assert_ne!(source_owning, declarative);
+        resolution.composed.derived.insert(
+            ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY.to_owned(),
+            Value::Null,
+        );
+        assert!(consumer_authority(&resolution, &generation).is_err());
+    }
 }

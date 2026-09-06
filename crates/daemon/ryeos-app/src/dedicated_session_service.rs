@@ -44,6 +44,7 @@ struct WorkerObservationBatch {
 }
 
 const MAX_SESSION_OBSERVATIONS_PER_WORKER_EVENT: usize = 16;
+const MAX_WORKER_EVENTS_PER_RESPONSE: usize = 512;
 const APPROVAL_REQUEST_TTL_MS: i64 = 15 * 60 * 1000;
 
 fn validate_worker_observation_batch_shape(batch: &WorkerObservationBatch) -> Result<u64> {
@@ -74,6 +75,30 @@ fn validate_session_observation_cardinality(result: &Value, limit: usize) -> Res
         bail!("worker emitted too many session observations for its admitted ingress");
     }
     Ok(())
+}
+
+fn canonical_command_observation_batch(result: &Value, observation_limit: usize) -> Result<Value> {
+    // Command replies carry session observations, but asynchronous events use
+    // the pushed-batch channel and need not appear in a reply. Normalize that
+    // omission once for every fact/projection consumer, without changing the
+    // raw response (its digest and ephemeral retention remain authoritative).
+    validate_session_observation_cardinality(result, observation_limit)?;
+    let events = match result.get("events") {
+        None => json!([]),
+        Some(value) => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| anyhow!("worker events are not a bounded array"))?;
+            if values.len() > MAX_WORKER_EVENTS_PER_RESPONSE {
+                bail!("worker emitted too many events in one response");
+            }
+            value.clone()
+        }
+    };
+    Ok(json!({
+        "events":events,
+        "session_observations":result["session_observations"],
+    }))
 }
 
 fn pushed_observation_limit(result: &Value) -> Result<usize> {
@@ -2500,7 +2525,7 @@ fn project_worker_events(
     let values = values
         .as_array()
         .ok_or_else(|| anyhow!("worker events are not a bounded array"))?;
-    if values.len() > 512 {
+    if values.len() > MAX_WORKER_EVENTS_PER_RESPONSE {
         bail!("worker emitted too many events in one response");
     }
     for value in values {
@@ -2608,7 +2633,8 @@ pub async fn execute_command(
     let _root_operation = crate::hosted_operation::begin_hosted_root_operation_async(
         &state.state_store,
         &initial.placement_thread_id,
-    ).await?;
+    )
+    .await?;
     let _credential_contact =
         acquire_credential_profile_contact(&initial.credential_profile_id, placement_thread_id)
             .await?;
@@ -2824,16 +2850,14 @@ pub async fn execute_command(
             let _transition_guard = transition_gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Err(error) = validate_session_observation_cardinality(&result, observation_limit)
-                .and_then(|()| {
+            if let Err(error) = canonical_command_observation_batch(&result, observation_limit)
+                .and_then(|canonical_batch| {
                     validate_new_state_transition_sequence(
                         state,
                         placement_thread_id,
                         worker_boot_epoch,
-                        &result,
-                    )
-                })
-                .and_then(|()| {
+                        &canonical_batch,
+                    )?;
                     append_command_observation_batch(
                         state,
                         &session,
@@ -2841,15 +2865,14 @@ pub async fn execute_command(
                         record.command_sequence,
                         &request_digest,
                         &result,
-                    )
-                })
-                .and_then(|()| project_worker_events(state, &session, worker_boot_epoch, &result))
-                .and_then(|()| {
+                        &canonical_batch,
+                    )?;
+                    project_worker_events(state, &session, worker_boot_epoch, &canonical_batch)?;
                     apply_worker_observations(
                         state,
                         placement_thread_id,
                         worker_boot_epoch,
-                        &result,
+                        &canonical_batch,
                         observation_limit,
                     )
                 })
@@ -3459,15 +3482,8 @@ fn append_command_observation_batch(
     command_sequence: u64,
     request_digest: &str,
     result: &Value,
+    canonical_batch: &Value,
 ) -> Result<()> {
-    let events = result.get("events").cloned().unwrap_or_else(|| json!([]));
-    let observations = result
-        .get("session_observations")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    if !events.is_array() || !observations.is_array() {
-        bail!("command observation batch fields are not arrays");
-    }
     let response_digest = ryeos_state::objects::canonical_value_digest(result)?;
     let batch_operation_id = command_fact_operation_id(
         session,
@@ -3478,7 +3494,7 @@ fn append_command_observation_batch(
     let mut followups = state_transition_fact_events(
         session,
         worker_boot_epoch,
-        result,
+        canonical_batch,
         json!({
             "kind":"command_response",
             "batch_operation_id":batch_operation_id,
@@ -3491,7 +3507,7 @@ fn append_command_observation_batch(
     followups.extend(approval_request_fact_events(
         session,
         worker_boot_epoch,
-        result,
+        canonical_batch,
     )?);
     append_command_fact_once_with_followups(
         state,
@@ -3504,10 +3520,7 @@ fn append_command_observation_batch(
             "origin":"daemon_observed_io",
             "worker_boot_epoch":worker_boot_epoch,
             "response_digest":response_digest,
-            "canonical_batch":{
-                "events":events,
-                "session_observations":observations,
-            },
+            "canonical_batch":canonical_batch,
         }),
         &followups,
     )
@@ -4859,10 +4872,13 @@ pub async fn terminate_session_with_bounded_outcome(
     } else {
         // Draining a workload child may require that child's async task to
         // resume and release its root lease. Never park a Tokio worker here.
-        Some(crate::hosted_operation::begin_hosted_root_terminalization_async(
-            &state.state_store,
-            &initial.placement_thread_id,
-        ).await?)
+        Some(
+            crate::hosted_operation::begin_hosted_root_terminalization_async(
+                &state.state_store,
+                &initial.placement_thread_id,
+            )
+            .await?,
+        )
     };
     let _credential_operation =
         acquire_credential_profile_operation(&initial.credential_profile_id).await?;
@@ -5580,6 +5596,157 @@ mod tests {
     }
 
     #[test]
+    fn command_reply_without_events_preserves_enrollment_and_raw_response_identity() {
+        let result = json!({
+            "response":{"device_code":"fixture-ephemeral-code"},
+            "result_retention":"ephemeral",
+            "session_observations":[{
+                "kind":"credential_enrollment_started",
+                "login_id":"login-one",
+                "ttl_seconds":600,
+            }],
+        });
+        let original = result.clone();
+        let response_digest = ryeos_state::objects::canonical_value_digest(&result).unwrap();
+        let batch = canonical_command_observation_batch(&result, 16).unwrap();
+        assert_eq!(batch["events"], json!([]));
+        assert_eq!(
+            batch["session_observations"],
+            result["session_observations"]
+        );
+        assert_eq!(batch.as_object().unwrap().len(), 2);
+        assert!(!batch.to_string().contains("fixture-ephemeral-code"));
+        assert_eq!(result, original);
+        assert_eq!(
+            ryeos_state::objects::canonical_value_digest(&result).unwrap(),
+            response_digest
+        );
+        assert_ne!(
+            ryeos_state::objects::canonical_value_digest(&batch).unwrap(),
+            response_digest
+        );
+        let session = session_fixture();
+        validate_new_state_transition_sequence_for_session(&session, 3, &batch).unwrap();
+        assert!(
+            approval_request_fact_events(&session, 3, &batch)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state_transition_fact_events(
+                &session,
+                3,
+                &batch,
+                json!({"kind":"command_response"}),
+                Some((1, &"b".repeat(64))),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn command_batch_rejects_malformed_arrays_and_requires_session_observations() {
+        for invalid in [Value::Null, json!({}), json!(true), json!("[]")] {
+            assert!(
+                canonical_command_observation_batch(
+                    &json!({"events":invalid,"session_observations":[]}),
+                    16,
+                )
+                .is_err()
+            );
+            assert!(
+                canonical_command_observation_batch(
+                    &json!({"events":[],"session_observations":invalid}),
+                    16,
+                )
+                .is_err()
+            );
+        }
+        assert!(canonical_command_observation_batch(&json!({"events":[]}), 16).is_err());
+        assert!(
+            canonical_command_observation_batch(&json!({"session_observations":[]}), 16).is_ok()
+        );
+    }
+
+    #[test]
+    fn command_batch_bounds_apply_before_authoritative_append() {
+        let mut result = json!({
+            "events":vec![json!({"event_type":"fixture","payload":{}}); MAX_WORKER_EVENTS_PER_RESPONSE],
+            "session_observations":vec![json!({"kind":"remote_thread","id":"upstream-thread"}); 17],
+        });
+        assert!(
+            canonical_command_observation_batch(
+                &result,
+                command_observation_limit("route").unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            canonical_command_observation_batch(
+                &result,
+                command_observation_limit("reattach").unwrap()
+            )
+            .is_ok()
+        );
+        result["events"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"event_type":"fixture","payload":{}}));
+        let error = canonical_command_observation_batch(
+            &result,
+            command_observation_limit("reattach").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("too many events"));
+    }
+
+    #[test]
+    fn command_batch_preserves_approval_authority() {
+        let mut session = session_fixture();
+        session.current_turn_id = Some("turn-one".to_owned());
+        session.state = "turn_running".to_owned();
+        let result = json!({
+            "events":[{"event_type":"approval.requested","payload":{
+                "request_id":5,
+                "request_digest":"b".repeat(64),
+                "operation_class":"command",
+                "display":{},
+                "upstream_session_id":"upstream-thread",
+                "operation_id":"turn-one",
+            }}],
+            "session_observations":[],
+        });
+        let batch = canonical_command_observation_batch(&result, 16).unwrap();
+        assert_eq!(batch, result);
+        let facts = approval_request_fact_events(&session, 3, &batch).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].payload["turn_id"], "turn-one");
+        assert_eq!(facts[0].payload["chain_root_id"], session.chain_root_id);
+        assert_eq!(
+            facts[0].payload["admitted_capsule_hash"],
+            session.admitted_capsule_hash
+        );
+        session.current_turn_id = Some("another-turn".to_owned());
+        assert!(approval_request_fact_events(&session, 3, &batch).is_err());
+    }
+
+    #[test]
+    fn command_optional_events_do_not_relax_pushed_batch_contract() {
+        let result = json!({"session_observations":[]});
+        let batch = canonical_command_observation_batch(&result, 16).unwrap();
+        assert!(pushed_observation_limit(&result).is_err());
+        assert!(pushed_observation_limit(&batch).is_err());
+        assert!(
+            serde_json::from_value::<WorkerObservationBatch>(json!({
+                "first_sequence":1,"count":1,"previous_digest":null,"batch_digest":"a".repeat(64),
+                "session_observations":[],
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn observation_shape_matches_the_admitted_per_event_cardinality() {
         let admitted = batch_with_observation_count(MAX_SESSION_OBSERVATIONS_PER_WORKER_EVENT);
         assert_eq!(
@@ -5617,11 +5784,8 @@ mod tests {
     fn fast_turn_gets_exact_start_and_completion_facts_from_one_command_batch() {
         let session = session_fixture();
         let request_digest = "b".repeat(64);
-        let facts = state_transition_fact_events(
-            &session,
-            3,
+        let batch = canonical_command_observation_batch(
             &json!({
-                "events":[{"event_type":"turn.completed","payload":{"turn_id":"turn-one"}}],
                 "session_observations":[
                     {
                         "kind":"state",
@@ -5637,6 +5801,19 @@ mod tests {
                     },
                 ],
             }),
+            command_observation_limit("route").unwrap(),
+        )
+        .unwrap();
+        validate_new_state_transition_sequence_for_session(&session, 3, &batch).unwrap();
+        assert!(
+            approval_request_fact_events(&session, 3, &batch)
+                .unwrap()
+                .is_empty()
+        );
+        let facts = state_transition_fact_events(
+            &session,
+            3,
+            &batch,
             json!({"kind":"command_response","batch_operation_id":"batch-one"}),
             Some((2, &request_digest)),
         )

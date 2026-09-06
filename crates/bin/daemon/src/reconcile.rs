@@ -2711,8 +2711,7 @@ fn reconcile_execution_workspaces(
                     );
                     continue;
                 }
-                let recovered = if mode == ActiveReconcileMode::Startup
-                    && workspace_claim.is_none()
+                let recovered = if mode == ActiveReconcileMode::Startup && workspace_claim.is_none()
                 {
                     // Startup deliberately clears dead-generation launch
                     // claims before driving any replacement launch. A
@@ -3492,7 +3491,7 @@ mod tests {
             canonical_root.clone(),
             format!("local:{}", canonical_root.display()),
             ryeos_state::objects::LiveProjectAccess::ReadWrite,
-            ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+            ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
             ryeos_state::objects::EnvironmentAuthority::None,
             Vec::new(),
         )

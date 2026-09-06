@@ -2611,6 +2611,59 @@ mod tests {
     }
 
     #[test]
+    fn authored_external_binding_command_uses_only_canonical_project_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command: CommandDef = serde_yaml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../bundles/core/.ai/node/commands/external-content-bind.yaml"
+        )))
+        .unwrap();
+        let mut project_args = s(&[
+            "external-content",
+            "bind",
+            "stage",
+            "request",
+            "manifest",
+            "tool:fixture/build",
+            "pinned_project",
+            "snapshot",
+            "--project",
+        ]);
+        project_args.push(tmp.path().to_str().unwrap().into());
+        let resolved = resolve_command_for_daemon_with_commands(
+            &project_args,
+            std::slice::from_ref(&command),
+            &ryeos_runtime::CommandRegistrationPolicy::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.item_ref, "service:external-content/bind");
+        assert_eq!(
+            resolved.parameters["project_path"],
+            tmp.path().to_str().unwrap()
+        );
+        assert_eq!(resolved.parameters["project_snapshot_hash"], "snapshot");
+        let installed = resolve_command_for_daemon_with_commands(
+            &s(&[
+                "external-content",
+                "bind",
+                "stage",
+                "request",
+                "manifest",
+                "worker:fixture/hosted",
+                "installed_bundle",
+                "--no-project",
+            ]),
+            &[command],
+            &ryeos_runtime::CommandRegistrationPolicy::default(),
+            Some(tmp.path()),
+        )
+        .unwrap();
+        assert!(installed.parameters.get("project_path").is_none());
+        assert!(installed.parameters.get("project_snapshot_hash").is_none());
+    }
+
+    #[test]
     fn project_named_binding_accepts_canonical_project_selector() {
         let tmp = tempfile::tempdir().unwrap();
         let mut command = command(

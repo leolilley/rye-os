@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T00:45:07Z:ac11132ca9d0ad6a7a2c1b6096f8e726462a69e00ac7241d9211a6b33bfdd508:nDxFH3Vmg0kOwZCwFhIzqwRyPx0V2PQ/Wu43JMTewU7cRAPJiI0gGGvIOFwZAjxpRACiQ/UyixlXYoa13LxkDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T02:30:59Z:8be80a065621b5f1e70991e633f6ac9b08fd17de72d9e498cb3395bbf3a12915:/oD3m7gJfq5XUjqw+uXgKbhz7e31S4SsWs+s+dI7jzInLoEuy6RCUILjpC+I4mOXO25/HNQ/dpoFp8dhhYdyDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 tokens: [external-content, bind]
 description: Bind a staged external-content manifest to one exact consumer authority
 forms:
@@ -9,13 +9,21 @@ forms:
       - field: consumer_ref
       - field: consumer_kind
       - field: project_snapshot_hash
-      - field: project_path
   - slots:
       - field: staging_id
       - field: request_digest
       - field: manifest_hash
       - field: consumer_ref
       - field: consumer_kind
+project:
+  resolution: optional
+  bind_parameter: project_path
+  no_project_flag: true
+help:
+  usage: ryeos external-content bind <staging-id> <request-digest> <manifest-hash> <consumer-ref> <consumer-kind> [project-snapshot-hash] --project <project-root>
+  examples:
+    - ryeos --project /absolute/project external-content bind <stage> <request> <manifest> tool:project/build pinned_project <snapshot>
+    - ryeos --no-project external-content bind <stage> <request> <manifest> worker:provider/hosted installed_bundle
 dispatch:
   kind: execute_ref
   execute: service:external-content/bind

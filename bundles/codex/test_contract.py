@@ -68,6 +68,18 @@ def source_manifest_digest() -> str:
 
 
 class CodexContractTests(unittest.TestCase):
+    def test_profile_discovery_uses_owner_scoped_generic_service(self) -> None:
+        command = yaml.safe_load((BUNDLE / ".ai/node/commands/profile-list.yaml").read_text())
+        service = yaml.safe_load((BUNDLE.parent / "core/.ai/services/credential-profiles/list.yaml").read_text())
+        self.assertEqual(command["tokens"], ["codex", "profile", "list"])
+        self.assertEqual(command["dispatch"]["execute"], "service:credential-profiles/list")
+        self.assertEqual(command["dispatch"]["availability"], "daemon")
+        self.assertEqual(service["endpoint"], "credential-profiles.list")
+        self.assertEqual(service["required_caps"], ["ryeos.execute.service.credential-profiles/list"])
+        self.assertEqual(service["state_access"], "read_only_existing")
+        self.assertTrue(service["ui_read_only"])
+        self.assertEqual(set(service["schema"]), {"limit", "after"})
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
@@ -214,6 +226,7 @@ class CodexContractTests(unittest.TestCase):
         match = re.search(r"(?m)^HOSTED_SCOPES='([^']+)'$", readme)
         self.assertIsNotNone(match, "runbook HOSTED_SCOPES declaration is absent")
         hosted_scopes = set(match.group(1).split(","))
+        self.assertIn("ryeos.execute.service.credential-profiles/list", hosted_scopes)
         declared_runtime_scopes = set()
         for path in WORKER_EXECUTION_PATHS:
             execution = yaml.safe_load(path.read_text(encoding="utf-8"))

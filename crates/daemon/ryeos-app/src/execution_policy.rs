@@ -137,7 +137,7 @@ pub fn resolve_standard_local_live_authority(
     Ok(ResolvedStandardLocalLiveAuthority {
         project: policy.resolve_live_project_authority(
             project_path,
-            live_filesystem_confinement_for_isolation(isolation.mode()),
+            live_filesystem_confinement_for_isolation(isolation.inspection()),
             capability_ceiling,
         )?,
         lifecycle: policy.lifecycle_authority(),
@@ -169,17 +169,21 @@ pub fn resolve_offline_local_live_project_authority(
     policy.validate()?;
     policy.resolve_live_project_authority(
         project_path,
-        live_filesystem_confinement_for_isolation(isolation.mode()),
+        live_filesystem_confinement_for_isolation(isolation.inspection()),
         vec![LIVE_PROJECT_WRITE_CAPABILITY.to_string()],
     )
 }
 
 pub fn live_filesystem_confinement_for_isolation(
-    mode: ryeos_engine::isolation::IsolationMode,
+    isolation: &ryeos_engine::isolation::IsolationInspection,
 ) -> ryeos_state::objects::LiveFilesystemConfinement {
-    match mode {
+    match isolation.mode {
         ryeos_engine::isolation::IsolationMode::Enforce => {
-            ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted()
+            match isolation.filesystem.live_project {
+                ryeos_engine::isolation::IsolationLiveProjectPolicy::FixedParents { .. } => {
+                    ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents()
+                }
+            }
         }
         ryeos_engine::isolation::IsolationMode::Disabled => {
             ryeos_state::objects::LiveFilesystemConfinement::UnconfinedHost
@@ -246,7 +250,7 @@ pub(crate) fn synthetic_test_live_project_authority(
         live_access: LiveAccessAuthority {
             access: LiveProjectAccess::ReadWrite,
             authorized_write_namespaces: vec!["project".to_string()],
-            confinement: LiveFilesystemConfinement::standard_descriptor_rooted(),
+            confinement: LiveFilesystemConfinement::standard_fixed_parents(),
         },
         environment: EnvironmentAuthority::ProjectOverlay {
             project_authority_id: authority_id,
@@ -418,11 +422,13 @@ mod policy_tests {
             ryeos_state::objects::ExecutionLifecycleAuthority::DAEMON_RESTARTABLE
         );
 
+        let mut inspection = ryeos_engine::isolation::IsolationRuntime::disabled_for_authoring()
+            .inspection()
+            .clone();
+        inspection.mode = ryeos_engine::isolation::IsolationMode::Enforce;
         assert!(matches!(
-            live_filesystem_confinement_for_isolation(
-                ryeos_engine::isolation::IsolationMode::Enforce
-            ),
-            ryeos_state::objects::LiveFilesystemConfinement::DescriptorRootedMasked { .. }
+            live_filesystem_confinement_for_isolation(&inspection),
+            ryeos_state::objects::LiveFilesystemConfinement::DescriptorRootedFixedParents { .. }
         ));
     }
 

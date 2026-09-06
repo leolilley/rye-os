@@ -1,0 +1,15 @@
+# ryeos:signed:2026-09-06T02:30:59Z:acf4cb27f6eb3f135c1ba13b25f921370707ca3079ae7118589c66efdaf31b26:taB3uGtRuRSh9Ik2cz2XMxKX9q4Pnhub8B2uCss9WG8DAqpIIHrMGAQxohKkGyHZKLWxGZUBNHDBcUmV+oqYCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+category: execution
+version: "1.0.0"
+schema_version: "2.1.0"
+# Existing execution-config precedence owns the resolved per-operation values.
+# A Tool descriptor's timeout_secs is not a ceiling over bundle/project config.
+# Node limits and the parent's admitted workload-client grant still intersect.
+items:
+  tool:
+    ryeos/development/platform-inspect:
+      timeout: 30
+    ryeos/development/format-check:
+      timeout: 60
+    ryeos/development/format-file:
+      timeout: 60

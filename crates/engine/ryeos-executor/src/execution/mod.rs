@@ -7,6 +7,7 @@
 pub(crate) mod admitted_trust;
 pub mod arch_check;
 pub mod cache;
+mod direct_output;
 pub mod effective_program_projection;
 pub(crate) mod execution_realization;
 pub(crate) mod external_content;
@@ -755,6 +756,7 @@ pub(crate) fn fold_back_outputs(
             pre_tree,
             policy,
             &lifecycle.evidence.mutations,
+            operational_shadow_paths,
         )?
     } else {
         let project = lillux::PinnedDirectory::open(&layout.project)?
@@ -1775,7 +1777,7 @@ mod pinned_child_authority_tests {
             root.path().canonicalize().unwrap(),
             "project:test".to_string(),
             LiveProjectAccess::ReadWrite,
-            LiveFilesystemConfinement::standard_descriptor_rooted(),
+            LiveFilesystemConfinement::standard_fixed_parents(),
             EnvironmentAuthority::None,
             vec!["sealed.project.cap".to_string()],
         )
@@ -1807,7 +1809,7 @@ mod pinned_child_authority_tests {
             root.path().canonicalize().unwrap(),
             "project:test".to_string(),
             LiveProjectAccess::ReadWrite,
-            LiveFilesystemConfinement::standard_descriptor_rooted(),
+            LiveFilesystemConfinement::standard_fixed_parents(),
             EnvironmentAuthority::None,
             Vec::new(),
         )

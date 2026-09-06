@@ -1,6 +1,6 @@
-# ryeos:signed:2026-09-05T00:45:06Z:56734d65bcb9f6f3363fc5eb5829ac8613f4887479549e9bf6380db1ed88291b:T7LXg+cTKYFQDNElH8CHlVmcH7+v/WwH0IlJ6e+lBZx3xldrINEWuTOFhaQpGkXko3dNlgZCt6hLqY2oxKm6CA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T01:54:48Z:c419dfbb9183d4c1ebe54080fcd9da0a58d16895b8a13e619612b972627b9fe4:MlFU0ICS0WWqK3UObdoMcAEIKgJbtcsKr+4b8FC3nMUUsxOlLudHAyLl30eYA1wRB5V845wK+FMwaSZTBYepBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "engine/kinds/tool"
-version: "1.1.0"
+version: "1.2.0"
 location:
   directory: tools
   excluded_directories: [lib]
@@ -50,6 +50,7 @@ execution:
       allowed:
         - protocol:ryeos/core/tool_callback
         - protocol:ryeos/core/opaque
+        - protocol:ryeos/core/tool_streaming
   thread_profile:
     name: tool_run
     root_executable: true

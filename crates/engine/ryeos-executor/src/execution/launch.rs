@@ -6837,7 +6837,7 @@ async fn run_claimed_thread_row_inner(
                     ))
                 })?;
             let workspace_lifeline = provenance.workspace_lifeline();
-            if let Err(error) = super::runner::close_managed_runtime_workspace(
+            if let Err(error) = super::runner::close_terminal_workspace(
                 state,
                 workspace_lifeline.as_ref(),
                 &thread_id,
@@ -7051,7 +7051,7 @@ async fn run_claimed_thread_row_inner(
                 ))
             })?;
         let workspace_lifeline = provenance.workspace_lifeline();
-        if let Err(error) = super::runner::close_managed_runtime_workspace(
+        if let Err(error) = super::runner::close_terminal_workspace(
             state,
             workspace_lifeline.as_ref(),
             &thread_id,
@@ -8631,7 +8631,7 @@ async fn finalize_recovered_hosted_candidate_disposition(
             ))
         })?;
         let workspace_lifeline = provenance.workspace_lifeline();
-        if let Err(error) = super::runner::close_managed_runtime_workspace(
+        if let Err(error) = super::runner::close_terminal_workspace(
             state,
             workspace_lifeline.as_ref(),
             thread_id,
@@ -8730,12 +8730,13 @@ async fn finalize_recovered_hosted_candidate_disposition(
     );
     let terminal_status = runtime_terminal_status(runtime_result.status);
     let fallback = fallback_finalization(thread_id, &runtime_result, terminal_status);
-    let mut root_terminalization = ryeos_app::hosted_operation::begin_hosted_root_terminalization_async(
-        &state.state_store,
-        thread_id,
-    )
-    .await
-    .map_err(BuildAndLaunchError::Internal)?;
+    let mut root_terminalization =
+        ryeos_app::hosted_operation::begin_hosted_root_terminalization_async(
+            &state.state_store,
+            thread_id,
+        )
+        .await
+        .map_err(BuildAndLaunchError::Internal)?;
     let finalized = state.threads.finalize_thread_with_managed_envelope_owned(
         &fallback.params,
         fallback.managed_envelope,
@@ -8925,7 +8926,7 @@ fn finalize_recovered_candidate_integration(
                 ))
             })?;
     let workspace_lifeline = provenance.workspace_lifeline();
-    if let Err(error) = super::runner::close_managed_runtime_workspace(
+    if let Err(error) = super::runner::close_terminal_workspace(
         state,
         workspace_lifeline.as_ref(),
         thread_id,

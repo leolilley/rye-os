@@ -85,7 +85,11 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // as current launch authority.
 // v27 combines that source-local authority with sealed scheduled fires and
 // independent candidate evaluation/integration in capsule 23/request 16.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 27;
+// v28 carries explicit fixed-parent live confinement and namespace-scoped
+// symlink semantics in capsule v24. Older live authority stays opaque history.
+// v29 requires the current adapter protocol's explicit node-owned proc
+// surface. Classify prior launch evidence before decoding its protocol enum.
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 29;
 
 /// Per-thread daemon-owned state directory.
 ///
@@ -1491,7 +1495,7 @@ mod tests {
                     path.clone(),
                     format!("local:{}", path.display()),
                     ryeos_state::objects::LiveProjectAccess::ReadWrite,
-                    ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                    ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
                     ryeos_state::objects::EnvironmentAuthority::None,
                     Vec::new(),
                 )

@@ -27,7 +27,9 @@ use super::validate_object_kind;
 /// destination and admitted compare-and-swap base.
 /// v11: captured node-history policy provenance uses the flat exact signed
 /// item identity rather than the predecessor tagged config wrapper.
-pub const THREAD_SNAPSHOT_SCHEMA_VERSION: u32 = 11;
+/// v12: live project authority records fixed-parent confinement and the
+/// admitted execution namespace as the symlink boundary.
+pub const THREAD_SNAPSHOT_SCHEMA_VERSION: u32 = 12;
 
 /// Maximum compact-JSON bytes retained across a terminal snapshot's result and
 /// error values. Terminal content has its own bounded contract: it is not an

@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-08-11T02:28:31Z:5e69c3282aecb5dc45d341d6a134aecd211cd68941cb591142d1f9226c4a73aa:/NzeFJzSYisqjCHRvRvM1kMKHUZsWPjE/JDNuPQZ4JqJIR5v7rB10QHW/nR7G00PmLPPjffZqCQp7maV2Q30DQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T01:55:10Z:6295013452ffa2a8a1b195b33c4f4694d3d87249c956880712fdaf5be1d05a0e:k1aUZxRbGJJ0xcR8GCxs+wg/vmV4AZl5NTTrixhTak7/FVAHk5imF1BTga3x9u498jWYUjUT+vMR4ABAFwKxDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core
 tags: [fundamentals, architecture, overview]
-version: "1.0.0"
+version: "1.1.0"
 description: >
   The Rye OS mental model — how items, kinds, bundles, spaces, and the
   daemon fit together. Read this first to understand the system.
@@ -49,7 +49,7 @@ for the full tree. The conceptual directory mapping:
 | Directory      | Kind(s)          | What Lives Here                     |
 |----------------|------------------|-------------------------------------|
 | `directives/`  | directive        | `.md` prompt workflows              |
-| `tools/`       | tool, streaming_tool | `.py`, `.yaml`, `.js` executables |
+| `tools/`       | tool             | `.py`, `.yaml`, `.js` executables |
 | `knowledge/`   | knowledge        | `.md`, `.yaml` context entries      |
 | `config/`      | config           | `.yaml` configuration items         |
 | `graphs/`      | graph            | `.yaml` state machines / DAGs       |
@@ -67,8 +67,9 @@ A **kind** is a schema + behavior contract. Each kind defines:
 - What composer handles inheritance/merging
 - How execution works (subprocess, in-process, delegated)
 
-There are 12 built-in kinds: `directive`, `tool`, `streaming_tool`, `knowledge`,
-`graph`, `config`, `handler`, `parser`, `protocol`, `runtime`, `service`, `node`.
+The installed signed bundle set determines available kinds. These include
+`directive`, `tool`, `knowledge`, `graph`, `config`, `handler`, `parser`,
+`protocol`, `runtime`, `service`, `node`, `worker` and `worker_execution`.
 
 ### Canonical Refs
 Items are addressed by **canonical ref**: `kind:path/to/item`

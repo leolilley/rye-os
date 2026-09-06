@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T07:15:11Z:3b26e916c0a7f83caaae7cb6b406e4a867c7d8d7a066881733867ae92d690c79:ZPDQ4jg9Wd+JuliWcpLHMvdxl5L0PNJjQ7DvlYI9fK42f4LryJpksksTRmbuF/eAEqoMODN+4wCQq5kLhRT5Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T04:39:23Z:f1166da4924bdc75ae11d2837cb9128476e52e28f4309eb4406d36636baff069:6bgVxXoSo09V/hvctyyh2qzuEIYluqJyO8iZlZQGejuF+eYnMvL2RS4INUaB83JzVTe7iijd8oJPKksk44vmDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.12.0"
+version: "1.15.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -21,10 +21,10 @@ The engine resolves typed isolation requirements against signed backend
 declarations and live inspected capabilities. It emits a strict backend-neutral
 plan; the selected adapter owns backend-specific inspection and launch
 compilation. Core ships the self-contained `linux-lillux` implementation as
-available signed data, but no ordinary init profile selects a backend or
-enables enforcement by default.
+available signed data. The explicit development profile selects enforced
+execution; the general installation profiles retain their explicit disabled choice.
 
-Durable execution workspaces use the isolation-adapter v4 contract. RyeOS owns
+Durable execution workspaces use the isolation-adapter v6 contract. RyeOS owns
 one canonical private `project/` generation. Disabled/native execution creates
 no other workspace directory and uses Lillux descriptor-relative filesystem
 mechanics directly. Enforced execution additionally grants the selected signed
@@ -38,7 +38,7 @@ relative content-root name below its still-pinned opaque state authority. RyeOS
 opens that returned root without following links and verifies each regular
 file's mode, size, and content digest before admitting bytes to CAS. Thus
 publication remains backend-neutral without granting the adapter CAS or project
-HEAD authority. The v4 contract additionally permits a self-contained adapter
+HEAD authority. The current contract also permits a self-contained adapter
 with no external artifact roles, requires an explicit PID-namespace choice,
 and carries a bounded, sorted collection of typed target channels. Predecessor
 workspace journals require the explicit runtime-history retirement ceremony and
@@ -56,6 +56,41 @@ against the still-retained original descriptor. Missing, replaced or symlinked
 sources refuse; the location does not independently authorize a mount. This
 reproof happens before the private root obscures host locations.
 
+### Confined live projects
+
+Signed node isolation policy v3 selects `filesystem.live_project.mode:
+fixed_parents` and supplies its construction `limits.max_entries` and
+`limits.max_depth`. Protected relative paths come from State's existing central
+project control-path classification, not another adapter-specific list.
+The current protocol carries these compiled views and requires the separately probed
+`filesystem.fixed_parent_views` capability. Missing policy, bounds, capability,
+or source authority refuses execution; none selects a fallback.
+
+The live source root remains a real source-backed mount. For each protected
+path, Lillux constructs a private directory tree for its parent directories,
+omits the protected leaf, mounts allowed siblings from their exact descriptors,
+and seals only those parent directories read-only. Moving that completed tree
+onto an existing ancestor does not create or modify source entries. Protected
+leaves may be files, directories, or absent. Later positive mounts may not
+replace these parents or expose protected paths; known raw-source aliases are
+refused. Ordinary nested mounts must already have targets inside source-backed
+ancestors, never create placeholders in a live source.
+
+Immediate entry membership of these connector directories is fixed for the
+launch: create, delete, or atomic replacement there refuses. Writes inside
+allowed child directories, and content writes to allowed mounted files, still
+reach the original source according to its read/write grant. The view is not
+silent copy-on-write. Top protected-path ancestors must already exist as real
+directories; a missing top ancestor refuses rather than freezing the entire
+project root. Pinned-CoW worker workspaces keep their separate existing contract.
+
+Symlinks resolve within the complete admitted execution namespace, including
+other admitted mounts—not a project-only jail. Connector symlink entries are
+fixed for the launch. Path protection does not revoke pre-existing hardlink or
+host bind-mount aliases, and external host topology writers must coordinate;
+this is not hostile same-UID multi-tenant fencing. Every setup descriptor is
+closed by the existing target-release boundary before workload execution.
+
 Native mount classification reuses Lillux's shared regular-file, directory and
 filesystem-Unix-socket classes. An admitted callback socket is pinned and
 reproved like other exact filesystem sources, then attached non-recursively
@@ -64,10 +99,15 @@ callback authority to opaque Tools. Replaced socket inodes, anonymous socket
 handles, symlinks and unsupported special files cannot become mount authority.
 
 Fully sealed anonymous regular files have immutable bytes but no bindable
-filesystem mount. Lillux streams exactly their admitted length into its private
-tmpfs, preserving only read/execute mode bits and leaving the sender's offset
-unchanged. It closes every write handle, attaches read-only descriptor mounts,
-and removes each exact staging alias before any workload starts. Unsealed bytes
+filesystem mount. Lillux streams exactly their admitted length into a fresh
+private staging tmpfs, preserving only read/execute mode bits and leaving the
+sender's offset unchanged. It closes every write handle, attaches read-only
+descriptor mounts, proves staging ownership, detaches that filesystem, then
+removes only its empty underlying mountpoint before any workload starts.
+Materialized files stay linked on the detached filesystem; unlinking them would
+make executable self lookup report a deleted path even through the admitted
+mount. The target retains neither staging paths nor authority descriptors.
+Unsealed bytes
 cannot use this materialization path, and sealed sources cannot grant writable
 mounts. These are backend mechanics, not a new realization, host-path fallback,
 or permission to weaken the node policy.
@@ -112,10 +152,16 @@ The policy has two modes:
 ```yaml
 schema: 1
 policy:
-  version: 1
+  version: 3
   mode: disabled
   backend: null
   filesystem:
+    proc_filesystem: empty
+    live_project:
+      mode: fixed_parents
+      limits:
+        max_entries: 2048
+        max_depth: 64
     readable:
       - "{node_public_identity}"
       - "{daemon_socket}"
@@ -357,12 +403,29 @@ The native Lillux backend uses a private root and new user, mount, PID, IPC, and
 UTS namespaces. An isolated network plan also creates a network namespace; host
 mode deliberately keeps host networking. The sandbox target is PID 1 inside
 its namespace, while the adapter reports its exact host PID to daemon lifecycle
-ownership. The namespace contains an empty `/proc` directory rather than the
-host procfs: exposing the host mount would let a same-UID workload traverse
-another process's `root`, `cwd`, or `fd` links and bypass the selected
+ownership. Signed `filesystem.proc_filesystem` explicitly selects `empty` or
+`pid_namespace`; omission refuses admission. The latter requires the inspected
+`filesystem.pid_namespace_proc` capability and an isolated PID namespace.
+It mounts a new procfs with `subset=pid` and read-only, nosuid, nodev, noexec
+flags. No host procfs is bound: that would let a same-UID workload traverse
+another host process's `root`, `cwd`, or `fd` links and bypass the selected
 filesystem surface. Ordinary signal syscalls remain available for sandbox
 descendants; namespace PID translation prevents them from naming host
 processes.
+
+The actual PID-1 child mounts procfs before pivoting into the prepared private
+root. It then detaches the old root, closes filesystem authority descriptors,
+installs confinement, and only then reports readiness and accepts release.
+Merely unsharing `CLONE_NEWPID` in the adapter parent does not move that parent
+into the new PID namespace. Mounting after old-root detachment can also fail
+Linux's unprivileged filesystem-visibility check. This construction exposes
+only namespace tasks, not `/proc/sys` or other non-task top-level entries.
+Positive mounts and workspaces cannot replace the selected proc surface.
+No workload-specific executable wrapper or host-path extension is involved.
+The kernel's [PID namespace documentation](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
+and [mount visibility check](https://github.com/torvalds/linux/blob/master/fs/namespace.c)
+describe these mounting constraints; actual backend qualification remains
+required on the selected host.
 
 Process attachment is orthogonal to this isolation mode. Every daemon-owned
 launch is created awaiting attachment, its exact target identity is persisted,
@@ -440,7 +503,8 @@ Verified node or bundle commands without a content identity are refused;
 project and node-selected commands are copied from one opened byte sequence and
 run from the same synthetic read-only namespace. `/usr`, `/bin`, `/lib`, and
 `/lib64` are descriptor-pinned read-only; the small required `/etc` runtime
-surface is pinned separately, `/dev` is backend-provided, `/proc` is empty,
+surface is pinned separately, `/dev` is backend-provided, `/proc` follows the
+explicit node-owned process-filesystem choice,
 and `/tmp` is private tmpfs.
 
 `limits.open_files` becomes `RLIMIT_NOFILE` before exec. Output is retained only
@@ -449,6 +513,17 @@ drained so the child cannot deadlock, and overflow terminates the supervised
 workload with an explicit truncated-output result. When a request already has
 a lower cap, the lower value wins. Any validation, mount, backend, or limit
 failure refuses the spawn.
+
+Lillux's existing bounded stdout capture supports one byte-preserving live
+reader after process release. Protocol code must decode binary framing through
+that reader, never through the ordinary text result's lossy UTF-8 conversion.
+The reader shares the capture and drainer, has no independent process authority
+or unbounded output queue, and retains unread bytes across process settlement.
+Reading must run concurrently with the existing wait/abort owner so deadlines
+and output-limit supervision continue to advance. Capture closure, a protocol
+terminal frame, and actual process settlement are separate facts; cleanup can
+close capture without natural pipe EOF. Neither EOF nor a claimed successful
+terminal frame overrides cancellation, overflow, timeout or a failing exit.
 
 ## Launch coverage
 

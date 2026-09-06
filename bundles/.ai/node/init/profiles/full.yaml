@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T00:45:04Z:7d41bc87a8fe4b939a6334f631b1d47f3956417da77b384d0c578cca530679c7:dES4IXTM2tV7Hn/aLEPRHY+4MIPn+1JeXQ/mjgKhtJJnl4unDw8foMSNH9S3lK0SYs3d8JJkk8VtALyVGRSBAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T04:39:23Z:8b96ddb76c01061571b36879318fde4e03405a37bb4fbee84632d33bbbd9bd98:oVQudAsoBabxpjPl044yMb4i44SvWB+JMT91b3Ip6irynAAb/Mbu6f3UTvLzhWkVskK8fELDllRLSF+ZYtqBDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -161,10 +161,16 @@ policies:
   isolation:
     schema: 1
     policy:
-      version: 1
+      version: 3
       mode: disabled
       backend: null
       filesystem:
+        proc_filesystem: empty
+        live_project:
+          mode: fixed_parents
+          limits:
+            max_entries: 2048
+            max_depth: 64
         readable:
           - "{node_public_identity}"
           - "{daemon_socket}"

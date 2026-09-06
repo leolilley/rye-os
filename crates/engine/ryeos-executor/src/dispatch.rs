@@ -56,7 +56,6 @@ use ryeos_engine::kind_registry::{
     DelegationVia, ExecutionSchema, InProcessRegistryKind, MethodDecl,
     MethodRuntimeConfigRequirement, MethodScope, TerminatorDecl,
 };
-use ryeos_engine::protocol_vocabulary::CallbackChannel;
 use ryeos_engine::runtime_registry::VerifiedRuntime;
 
 use crate::dispatch_error::DispatchError;
@@ -81,7 +80,9 @@ use ryeos_app::thread_lifecycle::ResolvedExecutionRequest;
 
 mod subprocess_execution;
 mod subprocess_policy;
-pub(crate) use subprocess_execution::{dispatch_subprocess, validate_ordinary_protocol_contract};
+pub(crate) use subprocess_execution::{
+    dispatch_subprocess, validate_direct_result_retention, validate_ordinary_protocol_contract,
+};
 pub use subprocess_policy::PreparedManagedLaunch;
 pub(crate) use subprocess_policy::strip_binary_ref_prefix;
 use subprocess_policy::{
@@ -4309,21 +4310,16 @@ async fn dispatch_inner(
 /// whether accepted/background launch can honor a pre-minted thread id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootDispatchClass {
-    /// Terminal subprocess (DetachedOk lifecycle), e.g. a wrapper tool.
+    /// Ordinary executor-plan subprocess: terminal output or managed framed
+    /// output. The latter remains non-detachable under its signed protocol.
     /// Honors a pre-minted thread id; requires an `executor_id` on the
     /// resolved root item (checked during classification).
     TerminalSubprocess,
     /// Managed subprocess — directive/graph via runtime-registry delegate,
     /// or a runtime invoked directly. Honors a pre-minted thread id.
     ManagedSubprocess,
-    /// Managed lifecycle protocol that bypasses LaunchEnvelope construction.
-    ManagedNonEnvelope,
     /// Method dispatch (e.g. `knowledge`). Honors a pre-minted thread id.
     MethodDispatch,
-    /// Managed protocol execution with no callback channel. It returns protocol
-    /// frames directly and never creates a lifecycle row, so it cannot honor a
-    /// pre-minted thread id.
-    UnthreadedStreamingSubprocess,
     /// In-process execution (services). Runs synchronously and does NOT
     /// thread a pre-minted id — not eligible for accepted/background launch.
     InProcess,
@@ -4531,15 +4527,12 @@ fn launch_contract_applicability_with_evidence(
                     ctx.engine.protocols.require(protocol_ref).map_err(|_| {
                         DispatchError::ProtocolNotRegistered(protocol_ref.to_owned())
                     })?;
-                use ryeos_engine::protocol_vocabulary::LifecycleMode;
-                if protocol.descriptor.lifecycle.mode != LifecycleMode::Managed {
+                // Applicability, preflight and live dispatch must classify
+                // from the same protocol mechanics, not lifecycle alone.
+                if subprocess_execution::uses_direct_subprocess_plan(protocol) {
+                    validate_ordinary_protocol_contract(protocol, &current.kind)?;
                     return Ok(LaunchContractApplicability::NonEnvelope {
                         class: RootDispatchClass::TerminalSubprocess,
-                    });
-                }
-                if protocol.descriptor.callback_channel == CallbackChannel::None {
-                    return Ok(LaunchContractApplicability::NonEnvelope {
-                        class: RootDispatchClass::ManagedNonEnvelope,
                     });
                 }
                 let runtime = selected_runtime
@@ -4637,9 +4630,7 @@ pub async fn prepare_admitted_launch_contract(
     // likewise retain their separately admitted base binding. Neither an
     // execution input generation nor a projectless workspace may become a
     // project-definition overlay.
-    let resolution_project_root = root_admission
-        .resolution_workspace()
-        .and_then(|root| resolution_project_root(&subject_authority, root));
+    let resolution_project_root = root_admission.resolution_workspace();
     let roots = ctx
         .engine
         .resolution_roots(resolution_project_root.map(Path::to_path_buf));
@@ -4893,9 +4884,7 @@ impl RootDispatchClass {
         match self {
             Self::TerminalSubprocess => "terminal_subprocess",
             Self::ManagedSubprocess => "managed_subprocess",
-            Self::ManagedNonEnvelope => "managed_non_envelope",
             Self::MethodDispatch => "method_dispatch",
-            Self::UnthreadedStreamingSubprocess => "unthreaded_streaming_subprocess",
             Self::InProcess => "in_process",
         }
     }
@@ -5144,6 +5133,38 @@ fn finish_root_dispatch_preflight(
     };
     let root_dispatch_evidence =
         RootDispatchEvidence::new(applicability, &requested_subject, &root_admission);
+    if class == RootDispatchClass::TerminalSubprocess {
+        let kind = &root_admission.verified_subject().resolved.kind;
+        let schema =
+            ctx.engine
+                .kinds
+                .get(kind)
+                .ok_or_else(|| DispatchError::SchemaMisconfigured {
+                    kind: kind.clone(),
+                    detail: "direct admission kind is unavailable".into(),
+                })?;
+        if let Some(TerminatorDecl::Subprocess { protocol }) = schema
+            .execution()
+            .and_then(|execution| execution.terminator.as_ref())
+        {
+            let protocol_ref = protocol
+                .resolve(&root_admission.resolution_output().composed.composed)
+                .map_err(|detail| DispatchError::SchemaMisconfigured {
+                    kind: kind.clone(),
+                    detail,
+                })?;
+            let selected = ctx
+                .engine
+                .protocols
+                .require(&protocol_ref)
+                .map_err(|_| DispatchError::ProtocolNotRegistered(protocol_ref))?;
+            validate_direct_result_retention(
+                selected,
+                root_admission.resolved_result_policy().retention,
+                kind,
+            )?;
+        }
+    }
     let effect_class_ceiling = effect_class_ceiling_for_admission(&ctx.engine, &root_admission)?;
     let workspace_access = workspace_access_for_admission(&ctx.engine, &root_admission)?;
     Ok(RootDispatchPreflight {
@@ -5745,9 +5766,8 @@ pub fn preflight_root_dispatch(
                     let protocol = ctx.engine.protocols.require(protocol_ref).map_err(|_| {
                         DispatchError::ProtocolNotRegistered(protocol_ref.to_owned())
                     })?;
-                    use ryeos_engine::protocol_vocabulary::LifecycleMode;
-                    match protocol.descriptor.lifecycle.mode {
-                        LifecycleMode::DetachedOk => {
+                    match subprocess_execution::uses_direct_subprocess_plan(protocol) {
+                        true => {
                             validate_ordinary_protocol_contract(protocol, &hop_ref.kind)?;
                             require_terminal_executor_id(verified.as_ref(), &hop_ref.to_string())?;
                             // Mirror dispatch_tool_subprocess's FULL pre-thread
@@ -5788,6 +5808,12 @@ pub fn preflight_root_dispatch(
                                     if terminal.kind
                                         == ryeos_engine::plan_builder::TerminalExecutorKind::MethodDispatch
                                     {
+                                        if protocol.descriptor.stdout.mode == ryeos_engine::protocol_vocabulary::StdoutMode::Streaming {
+                                            return Err(DispatchError::SchemaMisconfigured {
+                                                kind: hop_ref.kind.clone(),
+                                                detail: "framed subprocess stdout cannot be supplied by a method-dispatch terminal".into(),
+                                            });
+                                        }
                                         // Preflight a method-dispatch wrapper by
                                         // resolving its target and recursing as a
                                         // method call. This reuses the
@@ -5872,7 +5898,7 @@ pub fn preflight_root_dispatch(
                                 launch_timings,
                             );
                         }
-                        LifecycleMode::Managed => {
+                        false => {
                             let managed_route = if let Some(verified_runtime) = &hop_runtime {
                                 // Keep accepted-launch admission identical to
                                 // live runtime launch for both direct runtime
@@ -5909,29 +5935,18 @@ pub fn preflight_root_dispatch(
                                     "managed root did not resolve and verify".to_string(),
                                 )
                             })?;
-                            let class =
-                                if protocol.descriptor.callback_channel == CallbackChannel::None {
-                                    RootDispatchClass::ManagedNonEnvelope
-                                } else {
-                                    RootDispatchClass::ManagedSubprocess
-                                };
-                            let applicability = if class == RootDispatchClass::ManagedNonEnvelope {
-                                LaunchContractApplicability::NonEnvelope { class }
-                            } else {
-                                let runtime = hop_runtime
-                                        .clone()
-                                        .or_else(|| {
-                                            ctx.engine.runtimes.lookup_by_ref(&hop_ref).cloned()
-                                        })
-                                        .ok_or_else(|| DispatchError::SchemaMisconfigured {
-                                            kind: hop_ref.kind.clone(),
-                                            detail: format!(
-                                                "managed envelope path `{hop_ref}` has no selected runtime"
-                                            ),
-                                        })?;
-                                LaunchContractApplicability::ManagedEnvelope {
-                                    runtime: Box::new(runtime),
-                                }
+                            let class = RootDispatchClass::ManagedSubprocess;
+                            let runtime = hop_runtime
+                                .clone()
+                                .or_else(|| ctx.engine.runtimes.lookup_by_ref(&hop_ref).cloned())
+                                .ok_or_else(|| DispatchError::SchemaMisconfigured {
+                                    kind: hop_ref.kind.clone(),
+                                    detail: format!(
+                                        "managed envelope path `{hop_ref}` has no selected runtime"
+                                    ),
+                                })?;
+                            let applicability = LaunchContractApplicability::ManagedEnvelope {
+                                runtime: Box::new(runtime),
                             };
                             let executor_route = match hop_runtime.as_ref() {
                                 Some(runtime) if subject.resolved.canonical_ref == runtime.canonical_ref => {

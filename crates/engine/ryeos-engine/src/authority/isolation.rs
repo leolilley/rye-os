@@ -17,9 +17,9 @@ use ryeos_isolation_protocol::{
     AdapterLaunchLifecycle, AdapterLaunchRequest, AdapterWorkspaceRequest,
     AdapterWorkspaceResponse, IsolationAdapterProtocolVersion, IsolationAuthority,
     IsolationAuthorityId, IsolationAuthorityPurpose, IsolationDeviceSurface, IsolationEnvironment,
-    IsolationMount, IsolationMountAccess, IsolationNetwork, IsolationPath, IsolationPidNamespace,
-    IsolationPlan, IsolationProjectWorkspace, IsolationTarget, IsolationTargetChannel,
-    MAX_AUTHORITIES, WorkspaceLifecycleOperation,
+    IsolationFixedParentView, IsolationMount, IsolationMountAccess, IsolationNetwork,
+    IsolationPath, IsolationPidNamespace, IsolationPlan, IsolationProjectWorkspace,
+    IsolationTarget, IsolationTargetChannel, MAX_AUTHORITIES, WorkspaceLifecycleOperation,
 };
 
 mod authority;
@@ -43,8 +43,8 @@ pub use inspection::{IsolationBackendInspection, IsolationBackendStatus, Isolati
 pub use policy::TEST_ISOLATION_POLICY_RELATIVE_PATH;
 pub use policy::{
     ISOLATION_POLICY_VERSION, IsolationEnvironmentPolicy, IsolationFilesystemPolicy,
-    IsolationLimitsPolicy, IsolationMode, IsolationNetworkMode, IsolationNetworkPolicy,
-    IsolationPolicy,
+    IsolationLimitsPolicy, IsolationLiveProjectPolicy, IsolationMode, IsolationNetworkMode,
+    IsolationNetworkPolicy, IsolationPolicy,
 };
 use provenance::redacted_plan_digest;
 pub use provenance::{
@@ -97,7 +97,6 @@ pub struct IsolationRuntime {
     runtime_workspaces: Option<Arc<lillux::PinnedDirectory>>,
     /// Empty descriptor-pinned directory overlaid on non-bypassable live
     /// project control paths after the project mount.
-    live_control_mask: Option<Arc<lillux::PinnedDirectory>>,
     /// Node-configured spelling recreated inside the isolation namespace.
     app_root_destination: Option<PathBuf>,
     daemon_socket: Option<PinnedDaemonSocket>,
@@ -1424,7 +1423,7 @@ impl IsolationRuntime {
                 .as_ref()
                 .expect("project command classification requires a project root");
             let opened_root = match live_access {
-                Some(IsolationLiveAccessAuthority::DescriptorRootedMasked { .. }) => None,
+                Some(IsolationLiveAccessAuthority::DescriptorRootedFixedParents { .. }) => None,
                 Some(IsolationLiveAccessAuthority::UnconfinedHost { .. }) | None => Some(
                     lillux::PinnedDirectory::open(canonical_project)
                         .map_err(|error| {
@@ -1440,9 +1439,9 @@ impl IsolationRuntime {
                 ),
             };
             let root = match live_access {
-                Some(IsolationLiveAccessAuthority::DescriptorRootedMasked { root, .. }) => {
-                    root.as_ref()
-                }
+                Some(IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
+                    root, ..
+                }) => root.as_ref(),
                 Some(IsolationLiveAccessAuthority::UnconfinedHost { .. }) | None => opened_root
                     .as_ref()
                     .expect("unconfined capture opened a project descriptor"),
@@ -1956,7 +1955,7 @@ impl IsolationRuntime {
             }
             if let Some(authority) = context.live_access {
                 match authority {
-                    IsolationLiveAccessAuthority::DescriptorRootedMasked { .. } => {
+                    IsolationLiveAccessAuthority::DescriptorRootedFixedParents { .. } => {
                         return Err(refused(
                             "descriptor-rooted live project authority requires enforced isolation"
                                 .to_string(),
@@ -2246,8 +2245,8 @@ impl IsolationRuntime {
         }
         let canonical_project = canonicalize_context_mount("project", &project_destination)?;
         let mut retained_live_project_handle = None;
-        let live_mask_destinations = match context.live_access {
-            Some(IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let fixed_parent_views = match context.live_access {
+            Some(IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
                 root,
                 root_device_id,
                 root_inode,
@@ -2286,18 +2285,6 @@ impl IsolationRuntime {
                         root.path().display()
                     )));
                 }
-                root.open_child_directory(std::ffi::OsStr::new(crate::AI_DIR))
-                    .map_err(|error| {
-                        refused(format!(
-                            "live project .ai directory cannot be opened descriptor-relative: {error}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        refused(
-                            "live project root has no real descriptor-relative .ai directory"
-                                .to_string(),
-                        )
-                    })?;
                 retained_live_project_handle =
                     Some(Arc::new(root.try_clone_descriptor().map_err(|error| {
                         refused(format!("live project descriptor cannot be cloned: {error}"))
@@ -2317,9 +2304,24 @@ impl IsolationRuntime {
                         )));
                     }
                     previous = Some(relative);
-                    destinations.push(project_destination.join(relative));
+                    destinations.push(
+                        relative
+                            .to_str()
+                            .ok_or_else(|| refused("live control paths must be UTF-8".to_string()))?
+                            .to_owned(),
+                    );
                 }
-                destinations
+                // State owns the protected-path classification. Signed node policy
+                // owns construction limits. The kernel receives neither project
+                // conventions nor a second authored path list.
+                vec![IsolationFixedParentView {
+                    destination: IsolationPath::new(
+                        project_destination.to_string_lossy().into_owned(),
+                    )
+                    .map_err(|error| refused(error.to_string()))?,
+                    denied_paths: destinations,
+                    limits: self.inspection.filesystem.live_project.limits(),
+                }]
             }
             Some(IsolationLiveAccessAuthority::UnconfinedHost {
                 authorized_write_namespaces: _,
@@ -3232,24 +3234,6 @@ impl IsolationRuntime {
                     20,
                 )?;
             }
-            if !live_mask_destinations.is_empty() {
-                let mask = self.live_control_mask.as_deref().ok_or_else(|| {
-                    refused("live control-path mask authority is unavailable".to_string())
-                })?;
-                for (index, destination) in live_mask_destinations.iter().enumerate() {
-                    add_mount(
-                        "live-mask",
-                        index,
-                        Arc::new(mask.try_clone_descriptor().map_err(|error| {
-                            refused(format!("live control mask cannot be cloned: {error}"))
-                        })?),
-                        destination,
-                        IsolationMountAccess::ReadOnly,
-                        IsolationAuthorityPurpose::ReadOnlyMount,
-                        25,
-                    )?;
-                }
-            }
             for (index, mount) in readable_mounts
                 .iter()
                 .filter(|mount| mount.layer == 30)
@@ -3427,6 +3411,7 @@ impl IsolationRuntime {
                     .map_err(|error| refused(error.to_string()))?,
             },
             mounts,
+            fixed_parent_views,
             project_workspace: project_workspace_plan,
             target_channels: target_channel_plan,
             environment: IsolationEnvironment {
@@ -3443,6 +3428,7 @@ impl IsolationRuntime {
             },
             devices: IsolationDeviceSurface::Minimal,
             private_tmp: true,
+            proc_filesystem: self.inspection.filesystem.proc_filesystem,
             pid_namespace: IsolationPidNamespace::Isolated,
             shared_process_group: true,
         };
@@ -3644,34 +3630,6 @@ impl IsolationRuntime {
         } else {
             None
         };
-        let live_control_mask = if state == IsolationRuntimeState::Enforced {
-            let app_root = app_root_authority.as_deref().ok_or_else(|| {
-                refused("enforced isolation runtime requires pinned app-root authority".to_string())
-            })?;
-            let mask = open_or_create_relative_directory(
-                app_root,
-                &[crate::AI_DIR, "state", "cache", "live-control-mask-empty"],
-                0o700,
-                "live control-path mask",
-            )?;
-            if !mask
-                .entry_names()
-                .map_err(|error| refused(format!("inspect live control mask: {error}")))?
-                .is_empty()
-            {
-                return Err(refused(
-                    "live control-path mask directory is not empty".to_string(),
-                ));
-            }
-            mask.set_mode(0o500).map_err(|error| {
-                refused(format!(
-                    "live control-path mask cannot be protected: {error}"
-                ))
-            })?;
-            Some(Arc::new(mask))
-        } else {
-            None
-        };
         let bundle_manifest_digest = captured_backend
             .as_ref()
             .map(|backend| backend.bundle_manifest_digest.clone());
@@ -3726,7 +3684,6 @@ impl IsolationRuntime {
             app_root,
             app_root_authority,
             runtime_workspaces,
-            live_control_mask,
             app_root_destination,
             daemon_socket,
             verified_artifacts,
@@ -4154,6 +4111,12 @@ fn validate_descriptor_bound_command(
 }
 
 fn validate_policy_semantics(policy: &IsolationPolicy) -> Result<(), EngineError> {
+    policy
+        .filesystem
+        .live_project
+        .limits()
+        .validate()
+        .map_err(|error| refused(error.to_string()))?;
     if policy.mode == IsolationMode::Enforce && policy.backend.is_none() {
         return Err(refused(
             "enforced isolation requires an explicit backend selection".to_string(),
@@ -5357,11 +5320,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let (root_device_id, root_inode) = root.device_inode().unwrap();
-        let live_access = IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let live_access = IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
             root: Arc::new(root),
             root_device_id,
             root_inode,
-            denied_control_paths: Vec::new(),
+            denied_control_paths: ryeos_state::project_sync::live_execution_denied_control_paths()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             authorized_write_namespaces: vec!["project".to_string()],
         };
 
@@ -5439,11 +5405,14 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         let root = lillux::PinnedDirectory::open(&project).unwrap().unwrap();
         let (root_device_id, root_inode) = root.device_inode().unwrap();
-        let live_access = IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let live_access = IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
             root: Arc::new(root),
             root_device_id,
             root_inode,
-            denied_control_paths: Vec::new(),
+            denied_control_paths: ryeos_state::project_sync::live_execution_denied_control_paths()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             authorized_write_namespaces: vec!["project".to_string()],
         };
 
@@ -5763,12 +5732,14 @@ mod tests {
             IsolationCapability::FilesystemFdReadOnly,
             IsolationCapability::FilesystemFdWritable,
             IsolationCapability::FilesystemOrderedOverlays,
+            IsolationCapability::FilesystemFixedParentViews,
             IsolationCapability::FilesystemPrivateTmp,
             IsolationCapability::DevicesMinimal,
             IsolationCapability::EnvironmentExact,
             IsolationCapability::NetworkIsolated,
             IsolationCapability::NetworkHost,
             IsolationCapability::ProcessHostPidNamespace,
+            IsolationCapability::ProcessIsolatedPidNamespace,
             IsolationCapability::ProcessTargetPidReporting,
             IsolationCapability::LifecycleSharedProcessGroup,
         ]);
@@ -5788,11 +5759,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let (root_device_id, root_inode) = root.device_inode().unwrap();
-        let live_access = IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let live_access = IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
             root: Arc::new(root),
             root_device_id,
             root_inode,
-            denied_control_paths: Vec::new(),
+            denied_control_paths: ryeos_state::project_sync::live_execution_denied_control_paths()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             authorized_write_namespaces: vec!["project".to_string()],
         };
         let applied = runtime
@@ -5882,12 +5856,14 @@ mod tests {
             IsolationCapability::FilesystemFdReadOnly,
             IsolationCapability::FilesystemFdWritable,
             IsolationCapability::FilesystemOrderedOverlays,
+            IsolationCapability::FilesystemFixedParentViews,
             IsolationCapability::FilesystemPrivateTmp,
             IsolationCapability::DevicesMinimal,
             IsolationCapability::EnvironmentExact,
             IsolationCapability::NetworkIsolated,
             IsolationCapability::NetworkHost,
             IsolationCapability::ProcessHostPidNamespace,
+            IsolationCapability::ProcessIsolatedPidNamespace,
             IsolationCapability::ProcessIsolatedPidNamespace,
             IsolationCapability::ProcessTargetPidReporting,
             IsolationCapability::LifecycleSharedProcessGroup,
@@ -6509,7 +6485,7 @@ mod tests {
                 .contains("requires an explicit filesystem confinement")
         );
 
-        let confined = IsolationLiveAccessAuthority::DescriptorRootedMasked {
+        let confined = IsolationLiveAccessAuthority::DescriptorRootedFixedParents {
             root: Arc::new(
                 lillux::PinnedDirectory::open(app_root.path())
                     .unwrap()
@@ -6640,6 +6616,7 @@ mod tests {
                 cwd: IsolationPath::new("/workspace").unwrap(),
             },
             mounts: Vec::new(),
+            fixed_parent_views: Vec::new(),
             project_workspace: None,
             target_channels: Vec::new(),
             environment: IsolationEnvironment {
@@ -6648,6 +6625,7 @@ mod tests {
             network: IsolationNetwork::Isolated,
             devices: IsolationDeviceSurface::Minimal,
             private_tmp: true,
+            proc_filesystem: ryeos_isolation_protocol::IsolationProcFilesystem::Empty,
             pid_namespace: IsolationPidNamespace::Isolated,
             shared_process_group: true,
         };
@@ -6745,7 +6723,7 @@ mod tests {
             IsolationRuntime::load(app_root.path())
                 .unwrap_err()
                 .to_string()
-                .contains("expected 1")
+                .contains(&format!("expected {ISOLATION_POLICY_VERSION}"))
         );
 
         let mut unknown =

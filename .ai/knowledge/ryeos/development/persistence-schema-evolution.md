@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-03T11:56:15Z:235491dd1291a4fc466769af6a9ee6be7c050a0eec6eef15eca4a52b88694b8e:zlYN8tvz37XgPKcYiBhQfatyu2ykh64afaCAU0k1wtKl8ywx+tZKRb22Q8F+X4815PTvVc2+4JhJFe49PqVqCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T04:39:23Z:64b7dc212cf46f3034ee9d5a95e0c112d42c291d9ccec8494e2f78d2fb71a468:C73Y7nx/pMtHGBzvYf7p7E9qJXni/swYj3z1iKP2bIgYJ8aFSi2dS1JmPKKWfZ+oQDz7nehQo/gtXuE+9HNgDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
 title: "Persistence Schema Evolution"
 description: "Rules for immutable CAS wire identities, retained SQLite migrations, rebuildable projections, and explicit history retirement"
 entry_type: reference
-version: "2.1.0"
+version: "2.2.0"
 ```
 
 # Persistence Schema Evolution
@@ -29,20 +29,37 @@ occupied. Removing old readers does not make the number reusable.
 
 The current clean-cut execution formats include:
 
-- sealed root execution request schema 16;
-- thread snapshot schema 11;
+- sealed root execution request schema 17;
+- thread snapshot schema 12;
 - project snapshot schema 5;
-- admitted launch capsule schema 23;
+- admitted launch capsule schema 24;
 - persistent-session capsule schema 8;
-- runtime launch metadata epoch 27;
-- the standalone runtime project-authority envelope epoch 3; and
-- the owned runtime SQLite operator schema epoch 25 (encoded in the RyeOS
+- runtime launch metadata epoch 29;
+- the standalone runtime project-authority envelope epoch 4; and
+- the owned runtime SQLite operator schema epoch 26 (encoded in the RyeOS
   `PRAGMA application_id` family).
 
 The numbers identify independently evolving contracts. A change to a nested
 execution authority advances every enclosing durable contract whose bytes
 change. RyeOS intentionally carries no predecessor reader for these current
 execution formats.
+
+The fixed-parent live-confinement cut advances each enclosing project-authority
+contract together. Isolation policy v2 requires an explicit `live_project`
+selection and bounds; adapter protocol v5 carries the compiled filtered views.
+Runtime epoch 26 and replay-index epoch 9 refuse predecessor execution
+authority. No old mask contract is upgraded, and installed policies are not
+silently filled in. Qualification requires explicit, scoped policy-generation
+and execution/replay retirement before using newly built artifacts. These
+source changes do not themselves mutate an installed node.
+
+The subsequent PID-proc choice uses isolation policy v3 and adapter protocol
+v6. Launch metadata advances to 29 because its nested isolation provenance
+contains the strict adapter-protocol enum; prior rows are classified before
+decoding that enum. Compiled isolation plans are transient and are not embedded
+in sealed requests or launch capsules, so this change alone does not advance
+their epochs or runtime SQLite epoch 26. Installed policy generations require
+explicit replacement; no missing-field defaults or predecessor adapters exist.
 
 Authoritative readers must inspect the outer object kind and numeric epoch from
 generic JSON before deserializing nested typed data. Only after that gate may
@@ -52,6 +69,18 @@ surfacing as an incidental field error or being partially reinterpreted under a
 current parent epoch.
 
 ## Retained SQLite source-of-truth stores
+
+External-content binding objects use `ryeos.external_content_binding.v3`,
+binding-subject v3 and the existing binding-head epoch 4. Pinned consumers
+require an explicit nullable source-closure projection: null records a
+declarative program with no separately executed source tree, not a failure to
+admit required source. Exact generation and pre-realization effective-program
+identity remain mandatory. The source admission pass still rejects invalid
+source contracts. Existing binding heads require the normal explicit
+`ryeos node reset external-content-bindings` cutover and target-local rebinding;
+retained content, project heads, identities and credentials are not discarded.
+This shape occurs in the binding object, not inline in launch capsules, so it
+does not allocate another unrelated launch/history epoch.
 
 Runtime and operational databases retain facts that cannot be reconstructed
 solely from signed heads, but they have different retirement policies.
@@ -186,9 +215,9 @@ store. The exact appended-column intermediate produced by the original v6
 migrator is also recognized and repaired; no unknown layout is modified.
 
 Replay indexes inside that stable database have their own clean-cut epoch,
-currently epoch 8. Epoch 8 binds dispatch-effect replay to admitted launch
-capsule schema 18, including the exact target-node operator grant sealed by a
-remotely adopted invocation. An epoch-7 record cannot prove that authority and
+currently epoch 9. Epoch 9 binds dispatch-effect replay to admitted launch
+capsule schema 24, including explicit fixed-parent live filesystem authority.
+An epoch-8 record cannot prove that authority and
 is therefore retired rather than reinterpreted.
 They are not authority-compatible merely because the surrounding SQLite schema
 is current: a dispatch-effect record retains its complete admitted execution

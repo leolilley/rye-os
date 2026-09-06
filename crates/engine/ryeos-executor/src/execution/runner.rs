@@ -1013,11 +1013,13 @@ fn close_owned_workspace(
     close_owned_workspace_from_states(state, lifeline, thread_id, &[WorkspaceState::Freezing])
 }
 
-/// Destroy a managed runtime's owned workspace only after its process has
+/// Destroy an execution's owned workspace only after its process has
 /// exited and terminal state is authoritative. Retained/advanced generations
 /// must already be frozen and named by terminal state; `Discard` deliberately
-/// skips capture and may close directly from `active`.
-pub(crate) fn close_managed_runtime_workspace(
+/// skips capture and may close directly from `active`. Direct subprocesses
+/// and managed runtimes share this publication owner; don't infer `Freezing`
+/// merely because a process has finished.
+pub(crate) fn close_terminal_workspace(
     state: &AppState,
     lifeline: Option<&Arc<TempDirGuard>>,
     thread_id: &str,
@@ -1038,7 +1040,7 @@ pub(crate) fn close_managed_runtime_workspace(
         .state_store
         .execution_workspace(workspace_id)?
         .ok_or_else(|| anyhow::anyhow!("execution workspace journal row is missing"))?;
-    let expected = managed_workspace_close_source(
+    let expected = terminal_workspace_close_source(
         terminal_publication,
         record.state,
         record.frozen_snapshot_hash.as_deref(),
@@ -1047,7 +1049,7 @@ pub(crate) fn close_managed_runtime_workspace(
     close_owned_workspace_from_states(state, lifeline, thread_id, &[expected])
 }
 
-fn managed_workspace_close_source(
+fn terminal_workspace_close_source(
     terminal_publication: &ryeos_state::objects::PinnedTerminalPublication,
     workspace_state: WorkspaceState,
     frozen_snapshot_hash: Option<&str>,
@@ -1181,15 +1183,16 @@ fn record_candidate_integration_process_completion(
     if completion.status != ryeos_engine::contracts::ThreadTerminalStatus::Completed {
         return Ok(None);
     }
-    if completion.outcome_code.as_deref().is_some_and(|code| code != "success")
+    if completion
+        .outcome_code
+        .as_deref()
+        .is_some_and(|code| code != "success")
         || completion.error.is_some()
         || !completion.artifacts.is_empty()
         || completion.final_cost.is_some()
         || completion.continuation_request.is_some()
     {
-        bail!(
-            "successful candidate integration returned a non-canonical terminal contract"
-        );
+        bail!("successful candidate integration returned a non-canonical terminal contract");
     }
     let thread = state
         .state_store
@@ -1202,9 +1205,8 @@ fn record_candidate_integration_process_completion(
         .admitted_launch_capsule_hash
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("candidate integration root has no admitted capsule"))?;
-    let process_completion_digest = ryeos_state::objects::canonical_value_digest(
-        &serde_json::to_value(completion)?,
-    )?;
+    let process_completion_digest =
+        ryeos_state::objects::canonical_value_digest(&serde_json::to_value(completion)?)?;
     let fact = ryeos_app::thread_lifecycle::CandidateIntegrationProcessCompletionFact::new(
         authority,
         thread_id,
@@ -2057,8 +2059,8 @@ struct ProtocolLaunchEnv {
 }
 
 /// Resolve the signed subprocess protocol declared by the item's actual kind.
-/// Ordinary runner execution owns only `detached_ok` terminators; managed
-/// protocols are launched through the runtime path instead.
+/// Ordinary runner execution owns terminal and callback-free framed output.
+/// Managed callback envelopes remain on the runtime path.
 fn resolved_terminator_protocol<'a>(
     engine: &'a ryeos_engine::engine::Engine,
     resolved: &ResolvedExecutionRequest,
@@ -2102,6 +2104,20 @@ fn resolved_terminator_protocol<'a>(
         .map_err(|error| anyhow::anyhow!("protocol lookup failed for '{protocol_ref}': {error}"))?;
     crate::dispatch::validate_ordinary_protocol_contract(protocol, kind)
         .map_err(|error| anyhow::anyhow!(error))?;
+    if protocol.descriptor.stdout.shape
+        == ryeos_engine::protocol_vocabulary::StdoutShape::StreamingChunks
+    {
+        crate::dispatch::validate_direct_result_retention(
+            protocol,
+            resolved
+                .root_admission
+                .as_ref()
+                .context("direct output lacks root admission")?
+                .resolved_result_policy()
+                .retention,
+            kind,
+        )?;
+    }
     Ok(protocol)
 }
 
@@ -2451,12 +2467,7 @@ mod process_input_selection_tests {
             ProcessInputRootSelection::SparsePrivate
         );
         assert_eq!(
-            select_process_input_root(
-                ProcessProjectClass::PinnedReadOnly,
-                false,
-                false,
-                false,
-            ),
+            select_process_input_root(ProcessProjectClass::PinnedReadOnly, false, false, false,),
             ProcessInputRootSelection::PinnedReadOnlyPrivate
         );
         assert_eq!(
@@ -2523,12 +2534,14 @@ pub(crate) fn prepare_process_inputs(
     super::source_closure::validate_external_mount_separation(state, retained_resolution)?;
     let has_bindings = retained_resolution_has_filesystem_bindings(retained_resolution)?;
     let project_class = process_project_class(provenance);
-    let candidate_integration = provenance.candidate_evaluation_scope().is_some_and(|scope| {
-        matches!(
-            &scope.authority().purpose,
-            ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
-        )
-    });
+    let candidate_integration = provenance
+        .candidate_evaluation_scope()
+        .is_some_and(|scope| {
+            matches!(
+                &scope.authority().purpose,
+                ryeos_app::thread_lifecycle::CandidateOperationPurpose::Integrate { .. }
+            )
+        });
     let root_selection = select_process_input_root(
         project_class,
         has_bindings,
@@ -2542,9 +2555,7 @@ pub(crate) fn prepare_process_inputs(
         root_selection == ProcessInputRootSelection::CandidateIntegrationPrivate;
 
     let (path, lifeline, isolation_project_authority, isolation_live_access_authority) =
-        if live_private_root
-            || pinned_read_only_private_root
-            || candidate_integration_private_root
+        if live_private_root || pinned_read_only_private_root || candidate_integration_private_root
         {
             let (path, lifeline) = ryeos_app::temp_dir_guard::create_admitted_input_workspace(
                 &state.config.runtime_root().cache(),
@@ -2571,11 +2582,10 @@ pub(crate) fn prepare_process_inputs(
         has_bindings,
         state.isolation.is_enforced(),
     );
-    let budget = (private_copy
-        || pinned_read_only_private_root
-        || candidate_integration_private_root)
-        .then(super::external_content::private_materialization_budget)
-        .transpose()?;
+    let budget =
+        (private_copy || pinned_read_only_private_root || candidate_integration_private_root)
+            .then(super::external_content::private_materialization_budget)
+            .transpose()?;
     if pinned_read_only_private_root || candidate_integration_private_root {
         let snapshot_hash = match provenance.project_authority() {
             ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
@@ -3255,6 +3265,7 @@ pub async fn run_and_wait(
         prepared_plan.ensure_no_project_local_interpreter(params.provenance.effective_path())?;
     }
     let protocol = resolved_terminator_protocol(&engine, &params.resolved)?;
+    let stdout_shape = protocol.descriptor.stdout.shape;
     let wait_cas_guard = state
         .state_store
         .pinned_state_authority()?
@@ -3834,12 +3845,15 @@ pub async fn run_and_wait(
     // Wait
     let wait_workspace_lifeline = guard.process_workspace_lifeline();
     let waited_identity = spawned.process_identity.clone();
-    let mut completion = match task::spawn_blocking(move || {
-        // A cancelled HTTP future must not drop an ephemeral cwd while the
-        // blocking wait and its child process are still alive.
-        let _wait_workspace_lifeline = wait_workspace_lifeline;
-        spawned.wait()
-    })
+    let mut completion = match super::direct_output::wait(
+        spawned,
+        stdout_shape,
+        state.clone(),
+        running.chain_root_id.clone(),
+        running.thread_id.clone(),
+        wait_launch_owner.clone(),
+        wait_workspace_lifeline,
+    )
     .await
     {
         Ok(c) => {
@@ -3858,10 +3872,10 @@ pub async fn run_and_wait(
                 &waited_identity,
                 &wait_launch_owner,
             );
-            tracing::error!(error = %join_err, "task panic while waiting for execution");
-            guard.fail_thread("task_panic");
+            tracing::error!(error = %join_err, "failed to observe waiting execution");
+            guard.fail_thread("process_observation_failed");
             guard.cleanup();
-            return Err(anyhow::anyhow!("wait task panic: {join_err}"));
+            return Err(join_err);
         }
     };
 
@@ -3972,9 +3986,7 @@ pub async fn run_and_wait(
     };
     if let Some(fact) = candidate_integration_completion.as_ref() {
         let result_snapshot_hash = result_project_snapshot_hash.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "successful candidate integration produced no frozen result generation"
-            )
+            anyhow::anyhow!("successful candidate integration produced no frozen result generation")
         })?;
         completion = fact.canonical_completion(result_snapshot_hash)?;
     }
@@ -4088,7 +4100,17 @@ pub async fn run_and_wait(
                 Ok(())
             };
             let close = if wait_requires_foldback && !dedicated_workspace_closed {
-                close_owned_workspace(&state, guard.temp_dir.as_ref(), &running.thread_id)
+                close_terminal_workspace(
+                    &state,
+                    guard.temp_dir.as_ref(),
+                    &running.thread_id,
+                    wait_project_authority
+                        .terminal_publication()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("owned workspace has no terminal publication authority")
+                        })?,
+                    result_project_snapshot_hash.as_deref(),
+                )
             } else {
                 Ok(())
             };
@@ -4097,7 +4119,13 @@ pub async fn run_and_wait(
                     workspace.disarm();
                 }
                 guard.mark_finalized();
-                return Err(error.context("close execution workspace journal"));
+                // The immutable thread already records the tool outcome.
+                // Preserve its exact coordinate and the cleanup cause in the
+                // public refusal instead of masking both with an outer label.
+                return Err(anyhow::anyhow!(
+                    "close execution workspace journal for {}: {error:#}",
+                    running.thread_id
+                ));
             }
             guard.mark_finalized();
             publication.context("release owner-bound fold-back publication")?;
@@ -4441,6 +4469,7 @@ pub async fn run_detached(
     let bg_chain_root_id = created.chain_root_id.clone();
     let bg_resolved = params.resolved.clone();
     let bg_prepared_plan = prepared_plan;
+    let bg_stdout_shape = protocol.descriptor.stdout.shape;
     // Per-request engine (pushed_head overlay or daemon startup engine).
     let bg_engine = engine;
     let bg_vault = params.vault_bindings.clone();
@@ -4472,6 +4501,7 @@ pub async fn run_detached(
         bg_engine,
         bg_vault,
         bg_protocol_env_bindings,
+        bg_stdout_shape,
         bg_acting_principal,
         bg_pre_tree_hash,
         bg_pre_policy_hash,
@@ -4596,6 +4626,7 @@ async fn dispatch_detached_bg_task(
     bg_engine: std::sync::Arc<ryeos_engine::engine::Engine>,
     bg_vault: HashMap<String, String>,
     bg_protocol_env_bindings: Vec<EnvBinding>,
+    bg_stdout_shape: ryeos_engine::protocol_vocabulary::StdoutShape,
     bg_acting_principal: String,
     bg_pre_tree_hash: Option<String>,
     bg_pre_policy_hash: Option<String>,
@@ -4717,9 +4748,7 @@ async fn dispatch_detached_bg_task(
     let state_root_for_spawn = bg_state_root;
     let isolation_for_spawn = bg_state.isolation.clone();
     let isolation_daemon_socket_path_for_spawn = bg_isolation_daemon_socket_path;
-    let spawn_workspace_lifeline = bg_process_input_dir
-        .clone()
-        .or_else(|| bg_temp_dir.clone());
+    let spawn_workspace_lifeline = bg_process_input_dir.clone().or_else(|| bg_temp_dir.clone());
 
     match super::process_attachment::finalize_requested_stop_if_present(&bg_state, &bg_thread_id) {
         Ok(true) => {
@@ -5099,14 +5128,17 @@ async fn dispatch_detached_bg_task(
         }
     };
 
-    let wait_workspace_lifeline = bg_process_input_dir
-        .clone()
-        .or_else(|| bg_temp_dir.clone());
+    let wait_workspace_lifeline = bg_process_input_dir.clone().or_else(|| bg_temp_dir.clone());
     let waited_identity = spawned.process_identity.clone();
-    let wait_result = task::spawn_blocking(move || {
-        let _wait_workspace_lifeline = wait_workspace_lifeline;
-        spawned.wait()
-    })
+    let wait_result = super::direct_output::wait(
+        spawned,
+        bg_stdout_shape,
+        bg_state.clone(),
+        bg_chain_root_id.clone(),
+        bg_thread_id.clone(),
+        launch_owner.clone(),
+        wait_workspace_lifeline,
+    )
     .await;
     clear_finished_process(&bg_state, &bg_thread_id, &waited_identity, &launch_owner);
     // Extract the execution dir path while the Arc is still alive.
@@ -5475,7 +5507,18 @@ async fn dispatch_detached_bg_task(
                     drop(pending_project_result.take());
                 }
                 let close = if bg_requires_foldback && !dedicated_disposition {
-                    close_owned_workspace(&bg_state, bg_temp_dir.as_ref(), &bg_thread_id)
+                    match bg_project_authority.terminal_publication() {
+                        Some(publication) => close_terminal_workspace(
+                            &bg_state,
+                            bg_temp_dir.as_ref(),
+                            &bg_thread_id,
+                            publication,
+                            result_project_snapshot_hash.as_deref(),
+                        ),
+                        None => Err(anyhow::anyhow!(
+                            "owned workspace has no terminal publication authority"
+                        )),
+                    }
                 } else {
                     Ok(())
                 };
@@ -6037,13 +6080,15 @@ pub fn execution_params_from_sealed_root_request(
 ) -> Result<ExecutionParams> {
     sealed.validate_current_operator_authority(state)?;
     let provenance = match sealed.candidate_evaluation_authority() {
-        Some(authority) => candidate_evaluation_provenance_from_resume_context(
-            state,
-            resume,
-            authority,
-            provenance_override,
-        )?
-        .0,
+        Some(authority) => {
+            candidate_evaluation_provenance_from_resume_context(
+                state,
+                resume,
+                authority,
+                provenance_override,
+            )?
+            .0
+        }
         None => match provenance_override {
             Some(provenance) => provenance,
             None => execution_provenance_from_resume_context(state, resume)?.0,
@@ -6272,17 +6317,13 @@ pub(crate) fn candidate_evaluation_provenance_from_resume_context(
             || retained.project_authority() != &resume.project_authority
             || retained.original_project_path() != original_project_path.as_path()
         {
-            anyhow::bail!(
-                "retained candidate workspace contradicts its sealed resume authority"
-            );
+            anyhow::bail!("retained candidate workspace contradicts its sealed resume authority");
         }
         let candidate_lifeline = retained.workspace_lifeline().ok_or_else(|| {
             anyhow::anyhow!("retained candidate workspace has no ownership lifeline")
         })?;
-        let candidate_materialization = retained
-            .pinned_materialization()
-            .cloned()
-            .ok_or_else(|| {
+        let candidate_materialization =
+            retained.pinned_materialization().cloned().ok_or_else(|| {
                 anyhow::anyhow!("retained candidate workspace has no materialization proof")
             })?;
         let effective_path = retained.effective_path().to_path_buf();
@@ -6318,9 +6359,9 @@ pub(crate) fn candidate_evaluation_provenance_from_resume_context(
     let candidate_lifeline = candidate.temp_dir.clone().ok_or_else(|| {
         anyhow::anyhow!("candidate operation materialization has no workspace lifeline")
     })?;
-    let candidate_materialization = candidate.pinned_materialization.ok_or_else(|| {
-        anyhow::anyhow!("candidate operation materialization has no CAS proof")
-    })?;
+    let candidate_materialization = candidate
+        .pinned_materialization
+        .ok_or_else(|| anyhow::anyhow!("candidate operation materialization has no CAS proof"))?;
     let effective_path = candidate.effective_path.clone();
     let provenance = ExecutionProvenance::root_pushed_head(
         original_project_path,
@@ -6617,6 +6658,22 @@ async fn run_existing_recovered_thread(
         guard.fail_thread("admitted_protocol_closure_invalid");
         guard.cleanup();
     })?;
+    crate::dispatch::validate_direct_result_retention(
+        &protocol,
+        params
+            .resolved
+            .root_admission
+            .as_ref()
+            .context("recovered output lacks retained root admission")?
+            .resolved_result_policy()
+            .retention,
+        &params.resolved.resolved_item.kind,
+    )
+    .map_err(anyhow::Error::new)
+    .inspect_err(|_| {
+        guard.fail_thread("admitted_output_retention_invalid");
+        guard.cleanup();
+    })?;
     let root_admission = params.resolved.root_admission.as_ref().ok_or_else(|| {
         guard.fail_thread("admitted_program_authority_unavailable");
         guard.cleanup();
@@ -6755,6 +6812,7 @@ async fn run_existing_recovered_thread(
     let bg_chain_root_id = chain_root_id.clone();
     let bg_resolved = params.resolved.clone();
     let bg_prepared_plan = prepared_plan;
+    let bg_stdout_shape = protocol.descriptor.stdout.shape;
     // Per-request engine selected from the sealed project authority.
     let bg_engine = engine;
     let bg_vault = params.vault_bindings.clone();
@@ -6785,6 +6843,7 @@ async fn run_existing_recovered_thread(
         bg_engine,
         bg_vault,
         bg_protocol_env_bindings,
+        bg_stdout_shape,
         bg_acting_principal,
         bg_pre_tree_hash,
         bg_pre_policy_hash,
@@ -6821,11 +6880,11 @@ mod tests {
     use ryeos_engine::contracts::{EffectivePrincipal, ExecutionHints, Principal};
 
     #[test]
-    fn managed_workspace_close_requires_terminal_generation_coherence() {
+    fn terminal_workspace_close_requires_terminal_generation_coherence() {
         use ryeos_state::objects::PinnedTerminalPublication;
 
         assert_eq!(
-            managed_workspace_close_source(
+            terminal_workspace_close_source(
                 &PinnedTerminalPublication::Discard,
                 WorkspaceState::Ready,
                 None,
@@ -6835,7 +6894,7 @@ mod tests {
             WorkspaceState::Ready
         );
         assert_eq!(
-            managed_workspace_close_source(
+            terminal_workspace_close_source(
                 &PinnedTerminalPublication::Discard,
                 WorkspaceState::Active,
                 None,
@@ -6845,7 +6904,7 @@ mod tests {
             WorkspaceState::Active
         );
         assert_eq!(
-            managed_workspace_close_source(
+            terminal_workspace_close_source(
                 &PinnedTerminalPublication::Discard,
                 WorkspaceState::Freezing,
                 Some("ignored"),
@@ -6857,13 +6916,13 @@ mod tests {
 
         let retained = PinnedTerminalPublication::RetainResult;
         assert!(
-            managed_workspace_close_source(&retained, WorkspaceState::Active, None, None,)
+            terminal_workspace_close_source(&retained, WorkspaceState::Active, None, None,)
                 .unwrap_err()
                 .to_string()
                 .contains("not frozen")
         );
         assert!(
-            managed_workspace_close_source(
+            terminal_workspace_close_source(
                 &retained,
                 WorkspaceState::Freezing,
                 Some("frozen"),
@@ -6874,7 +6933,7 @@ mod tests {
             .contains("disagrees")
         );
         assert_eq!(
-            managed_workspace_close_source(
+            terminal_workspace_close_source(
                 &retained,
                 WorkspaceState::Freezing,
                 Some("frozen"),
@@ -6938,7 +6997,7 @@ mod tests {
                     root.clone(),
                     format!("local:{}", root.display()),
                     ryeos_state::objects::LiveProjectAccess::ReadWrite,
-                    ryeos_state::objects::LiveFilesystemConfinement::standard_descriptor_rooted(),
+                    ryeos_state::objects::LiveFilesystemConfinement::standard_fixed_parents(),
                     ryeos_state::objects::EnvironmentAuthority::None,
                     Vec::new(),
                 )

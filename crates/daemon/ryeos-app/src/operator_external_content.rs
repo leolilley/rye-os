@@ -816,7 +816,10 @@ async fn bind_authorized(
         operator_fingerprint,
         authorizer_grant_digest,
     )?;
-    let binding_hash = stage.store_object(&guard, &cas, &binding.to_value()?)?;
+    // The shared CAS guard protects synchronous writes until a complete root
+    // is published. Never root a not-yet-written object, nor duplicate its
+    // transitive closure in the upload receipt: GC already follows typed edges.
+    let binding_hash = cas.store_object(&binding.to_value()?)?;
     let binding_closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
         &cas,
         [binding_hash.clone()],
@@ -828,14 +831,10 @@ async fn bind_authorized(
     if !binding_closure.is_complete() {
         bail!("external-content binding closure is incomplete");
     }
-    stage.protect_cas_closure(
-        &guard,
-        binding_closure.object_hashes.iter().map(String::as_str),
-        binding_closure.blob_hashes.iter().map(String::as_str),
-    )?;
     for hash in &binding_closure.large_object_hashes {
         stage.ensure_protects_large_object(hash)?;
     }
+    stage.protect_cas_closure(&guard, [binding_hash.as_str()], std::iter::empty())?;
     debug_assert!(closure.object_hashes.contains(&request.manifest_hash));
 
     let signer = crate::state_store::NodeIdentitySigner::from_identity(&state.identity);
@@ -1297,7 +1296,7 @@ fn capture_content_import(
     )?;
     let capture_policy =
         ryeos_state::ExternalCapturePolicy::new(request.path.clone(), configured_ignore)?;
-    let mut sink = DurableContentSink { guard, cas, stage };
+    let mut sink = DurableContentSink { _guard: guard, cas };
     let manifest = match request.shape {
         ImportShape::Tree => {
             let target = open_admitted_source_tree(source_root, &request.path, root_device)?;
@@ -1338,15 +1337,14 @@ fn capture_content_import(
             manifest
         }
     };
-    let manifest_hash = sink
-        .stage
-        .store_object(guard, cas, &serde_json::to_value(&manifest)?)?;
+    let manifest_hash = cas.store_object(&serde_json::to_value(&manifest)?)?;
     let verified = ryeos_state::VerifiedExternalContentClosure::load(cas, &manifest_hash)?;
     if verified.manifest() != &manifest {
         bail!("stored content manifest differs from captured value");
     }
+    stage.protect_cas_closure(guard, [manifest_hash.as_str()], std::iter::empty())?;
     Ok(ImportResponse {
-        staging_id: sink.stage.staging_id().to_owned(),
+        staging_id: stage.staging_id().to_owned(),
         request_digest,
         manifest_hash,
         manifest_kind: ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
@@ -1415,12 +1413,14 @@ fn capture_large_import(
             sink.stage.ensure_protects_large_object(file_sha256)?;
         }
     }
-    let manifest_hash = sink.stage.store_object(guard, cas, &manifest.to_value()?)?;
+    let manifest_hash = cas.store_object(&manifest.to_value()?)?;
     let loaded = ryeos_state::objects::load_if_large_content_manifest(cas, &manifest_hash)?
         .ok_or_else(|| anyhow::anyhow!("stored large-content manifest changed kind"))?;
     if loaded != manifest {
         bail!("stored large-content manifest differs from captured value");
     }
+    sink.stage
+        .protect_cas_closure(guard, [manifest_hash.as_str()], std::iter::empty())?;
     Ok(ImportResponse {
         staging_id: sink.stage.staging_id().to_owned(),
         request_digest,
@@ -1481,9 +1481,10 @@ fn open_admitted_source_tree(
 }
 
 struct DurableContentSink<'a> {
-    guard: &'a ryeos_state::CasMutationGuard,
+    // This synchronous capture has no per-file acknowledgement. The guard
+    // excludes GC until the verified completed manifest is durably rooted.
+    _guard: &'a ryeos_state::CasMutationGuard,
     cas: &'a lillux::CasStore,
-    stage: &'a mut ryeos_state::DurableCasUploadStage,
 }
 
 impl ryeos_state::ExternalContentBlobSink for DurableContentSink<'_> {
@@ -1501,11 +1502,6 @@ impl ryeos_state::ExternalContentBlobSink for DurableContentSink<'_> {
         if outcome.size != expected_size {
             bail!("external-content source file changed size during capture");
         }
-        self.stage.protect_cas_closure(
-            self.guard,
-            std::iter::empty(),
-            std::iter::once(outcome.hash.as_str()),
-        )?;
         Ok((outcome.hash, outcome.size))
     }
 }
@@ -1576,25 +1572,11 @@ fn resolve_project_external_content_consumer(
     {
         bail!("project external-content consumer must resolve from the pinned project");
     }
-    let publisher_fingerprint = resolution
-        .root
-        .signer_fingerprint
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("project external-content consumer has no signer"))?;
-    let source_closure = resolution
-        .composed
-        .derived
-        .get(ryeos_state::objects::SOURCE_CLOSURE_DERIVED_KEY)
-        .ok_or_else(|| anyhow::anyhow!("project consumer has no admitted source closure"))
-        .and_then(ryeos_state::objects::EffectiveSourceClosureProjection::from_value)?;
-    let effective_consumer_digest =
-        ryeos_engine::external_content::pre_external_realization_consumer_digest(resolution)?;
-    let consumer = ryeos_state::objects::ExternalContentConsumerAuthority::pinned_project(
-        requested_ref.to_owned(),
-        publisher_fingerprint,
-        project_snapshot_hash.to_owned(),
-        effective_consumer_digest,
-        source_closure,
+    let consumer = crate::external_content_admission::consumer_authority(
+        resolution,
+        &ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+            snapshot_hash: project_snapshot_hash.to_owned(),
+        },
     )?;
     resolve_external_content_consumer_from_resolution(state, resolution, consumer, manifest_hash)
 }
@@ -1684,7 +1666,10 @@ impl ryeos_state::ExternalLargeContentSink for DurableLargeSink<'_> {
         if bytes.len() as u64 != expected_size {
             bail!("large-content file {relative_path} changed size during CAS ingest");
         }
-        let hash = self.stage.store_blob(self.guard, self.cas, &bytes)?;
+        // Like ordinary content capture, the held guard protects these bytes
+        // until the completed manifest is rooted. Explicit large-file roots
+        // remain in the receipt because binding proves their import authority.
+        let hash = self.cas.store_blob(&bytes)?;
         Ok((hash, expected_size))
     }
 }
@@ -1726,6 +1711,118 @@ fn validate_relative_path(value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronous_import_roots_completed_manifest_not_each_blob() {
+        for storage in [ImportStorage::Content, ImportStorage::LargeContent] {
+            let temp = tempfile::tempdir().unwrap();
+            let state_dir = temp.path().join("state");
+            let source = temp.path().join("source");
+            std::fs::create_dir_all(source.join("tree")).unwrap();
+            for n in 0..16 {
+                std::fs::write(source.join(format!("tree/file-{n}")), format!("file {n}")).unwrap();
+            }
+            let recovery = ryeos_state::RecoveryStore::from_runtime_state_dir(&state_dir).unwrap();
+            let guard = ryeos_state::CasMutationGuard::acquire_shared(&state_dir).unwrap();
+            let cas = lillux::CasStore::new(state_dir.join("cas"));
+            let key =
+                ryeos_state::DurableCasPublicationKey::external_content_import(&"a".repeat(64))
+                    .unwrap();
+            let mut stage = recovery
+                .begin_durable_cas_upload_admitted(
+                    &guard,
+                    &"b".repeat(64),
+                    "test-import",
+                    &key,
+                    None,
+                )
+                .unwrap();
+            let root = lillux::PinnedDirectory::open(&source).unwrap().unwrap();
+            let (device, _) = root.device_inode().unwrap();
+            let request = ImportRequest {
+                root: "fixture".into(),
+                path: "tree".into(),
+                shape: ImportShape::Tree,
+                storage,
+                maximum_bytes: 4096,
+                expected_file_sha256: None,
+            };
+            let limits =
+                crate::node_policy::sections::external_content::ExternalContentImportLimits {
+                    max_depth: 8,
+                    max_entries: 32,
+                    max_file_bytes: 4096,
+                    max_total_bytes: 4096,
+                    store_budget_bytes: 8192,
+                    minimum_free_bytes: 0,
+                };
+            let ignore = ryeos_state::ignore::IgnoreMatcher::from_config(
+                &ryeos_state::ignore::IgnoreConfig { patterns: vec![] },
+            )
+            .unwrap();
+            // Before a completed root is published, an interrupted synchronous
+            // write is unacknowledged garbage, not a missing operational root.
+            let orphan = cas.store_blob(b"interrupted capture").unwrap();
+            assert!(
+                recovery
+                    .inspect_staged_cas_root_hashes_read_only()
+                    .unwrap()
+                    .blob_hashes
+                    .is_empty()
+            );
+            let imported = match storage {
+                ImportStorage::Content => capture_content_import(
+                    &request,
+                    &limits,
+                    &root,
+                    device,
+                    &ignore,
+                    &guard,
+                    &cas,
+                    &mut stage,
+                    "a".repeat(64),
+                )
+                .unwrap(),
+                ImportStorage::LargeContent => {
+                    let runtime = lillux::PinnedDirectory::open(&state_dir).unwrap().unwrap();
+                    let large =
+                        ryeos_state::LargeObjectStore::open_or_create_under(&runtime).unwrap();
+                    capture_large_import(
+                        &request,
+                        &limits,
+                        &root,
+                        device,
+                        &ignore,
+                        &guard,
+                        &cas,
+                        &large,
+                        &mut stage,
+                        "a".repeat(64),
+                    )
+                    .unwrap()
+                }
+            };
+            let roots = recovery.inspect_staged_cas_root_hashes_read_only().unwrap();
+            assert_eq!(roots.object_hashes, vec![imported.manifest_hash.clone()]);
+            assert!(roots.blob_hashes.is_empty());
+            let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
+                &cas,
+                roots.object_hashes,
+                ryeos_state::object_closure::ObjectClosureLimits::default(),
+            )
+            .unwrap();
+            assert!(closure.is_complete());
+            assert_eq!(closure.blob_hashes.len(), 16);
+            assert!(!closure.blob_hashes.contains(&orphan));
+            let id = stage.staging_id().to_owned();
+            drop(stage);
+            recovery
+                .open_durable_cas_upload_admitted(&guard, &id, &"b".repeat(64))
+                .unwrap()
+                .ensure_protects_object(&imported.manifest_hash)
+                .unwrap();
+        }
+    }
 
     #[test]
     fn binding_retry_settles_only_its_presented_receipt_for_shared_content() {

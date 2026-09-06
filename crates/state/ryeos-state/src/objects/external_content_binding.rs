@@ -12,9 +12,9 @@ use serde_json::Value;
 use super::EffectiveSourceClosureProjection;
 
 pub const EXTERNAL_CONTENT_BINDING_KIND: &str = "external_content_binding";
-pub const EXTERNAL_CONTENT_BINDING_SCHEMA: &str = "ryeos.external_content_binding.v2";
+pub const EXTERNAL_CONTENT_BINDING_SCHEMA: &str = "ryeos.external_content_binding.v3";
 pub const EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE: &str = "external-content-bindings";
-pub const EXTERNAL_CONTENT_BINDING_SCHEMA_EPOCH: u32 = 3;
+pub const EXTERNAL_CONTENT_BINDING_SCHEMA_EPOCH: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,7 +42,12 @@ pub enum ExternalContentConsumerAuthority {
         publisher_fingerprint: String,
         project_snapshot_hash: String,
         effective_consumer_digest: String,
-        source_closure: EffectiveSourceClosureProjection,
+        // Explicit null means the admitted program has no separately executed
+        // source tree (for example a declarative exact-realization command).
+        // The pinned generation and effective digest still bind its definition.
+        // Missing fields are invalid; this is not a source-admission fallback.
+        #[serde(deserialize_with = "super::deserialize_required_nullable")]
+        source_closure: Option<EffectiveSourceClosureProjection>,
     },
 }
 
@@ -64,7 +69,7 @@ impl ExternalContentConsumerAuthority {
         publisher_fingerprint: String,
         project_snapshot_hash: String,
         effective_consumer_digest: String,
-        source_closure: EffectiveSourceClosureProjection,
+        source_closure: Option<EffectiveSourceClosureProjection>,
     ) -> anyhow::Result<Self> {
         let authority = Self::PinnedProject {
             consumer_ref,
@@ -100,7 +105,7 @@ impl ExternalContentConsumerAuthority {
     pub fn source_closure(&self) -> Option<&EffectiveSourceClosureProjection> {
         match self {
             Self::InstalledBundle { .. } => None,
-            Self::PinnedProject { source_closure, .. } => Some(source_closure),
+            Self::PinnedProject { source_closure, .. } => source_closure.as_ref(),
         }
     }
 
@@ -125,7 +130,9 @@ impl ExternalContentConsumerAuthority {
                 "external-content effective consumer digest",
                 effective_consumer_digest,
             )?;
-            source_closure.validate()?;
+            if let Some(source_closure) = source_closure {
+                source_closure.validate()?;
+            }
         }
         Ok(())
     }
@@ -219,6 +226,9 @@ impl ExternalContentBinding {
     }
 
     pub fn from_value(value: &Value) -> anyhow::Result<Self> {
+        if value.get("schema").and_then(Value::as_str) != Some(EXTERNAL_CONTENT_BINDING_SCHEMA) {
+            anyhow::bail!("unsupported external-content binding schema");
+        }
         let binding: Self = serde_json::from_value(value.clone())?;
         binding.validate()?;
         Ok(binding)
@@ -243,7 +253,7 @@ impl ExternalContentBinding {
             target_node_fingerprint,
         )?;
         let canonical = lillux::canonical_json(&serde_json::json!({
-            "schema": "ryeos.external_content_binding_subject.v2",
+            "schema": "ryeos.external_content_binding_subject.v3",
             "manifest_hash": manifest_hash,
             "manifest_kind": manifest_kind,
             "consumer": consumer,
@@ -353,20 +363,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn declarative_consumer_requires_explicit_absence_and_preserves_exact_identity() {
+        let consumer = ExternalContentConsumerAuthority::pinned_project(
+            "tool:project/build".to_owned(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            None,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&consumer).unwrap();
+        assert!(value.get("source_closure").unwrap().is_null());
+        assert_eq!(
+            serde_json::from_value::<ExternalContentConsumerAuthority>(value.clone()).unwrap(),
+            consumer
+        );
+        value.as_object_mut().unwrap().remove("source_closure");
+        assert!(serde_json::from_value::<ExternalContentConsumerAuthority>(value).is_err());
+
+        let subject = |consumer: &ExternalContentConsumerAuthority| {
+            ExternalContentBinding::derive_binding_subject_id(
+                &"a".repeat(64),
+                super::super::EXTERNAL_CONTENT_MANIFEST_KIND,
+                consumer,
+                &"2".repeat(64),
+            )
+            .unwrap()
+        };
+        let mut source_owning = consumer.clone();
+        let ExternalContentConsumerAuthority::PinnedProject { source_closure, .. } =
+            &mut source_owning
+        else {
+            unreachable!()
+        };
+        *source_closure = Some(EffectiveSourceClosureProjection {
+            schema: super::super::EFFECTIVE_SOURCE_BINDING_SCHEMA,
+            binding_hash: "e".repeat(64),
+            content_manifest_hash: "f".repeat(64),
+            owner_key: "1".repeat(64),
+            file_count: 1,
+            total_bytes: 1,
+        });
+        assert_ne!(subject(&consumer), subject(&source_owning));
+
+        let binding = ExternalContentBinding::active(
+            "a".repeat(64),
+            super::super::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
+            consumer,
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .unwrap();
+        let mut predecessor = binding.to_value().unwrap();
+        predecessor["schema"] = serde_json::json!("ryeos.external_content_binding.v2");
+        assert!(ExternalContentBinding::from_value(&predecessor).is_err());
+    }
+
+    #[test]
     fn project_binding_identity_includes_generation_source_node_and_authorizer() {
         let consumer = ExternalContentConsumerAuthority::pinned_project(
             "tool:project/build".to_owned(),
             "b".repeat(64),
             "c".repeat(64),
             "d".repeat(64),
-            EffectiveSourceClosureProjection {
+            Some(EffectiveSourceClosureProjection {
                 schema: super::super::EFFECTIVE_SOURCE_BINDING_SCHEMA,
                 binding_hash: "e".repeat(64),
                 content_manifest_hash: "f".repeat(64),
                 owner_key: "1".repeat(64),
                 file_count: 1,
                 total_bytes: 1,
-            },
+            }),
         )
         .unwrap();
         let active = ExternalContentBinding::active(

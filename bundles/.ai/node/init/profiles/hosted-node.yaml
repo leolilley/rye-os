@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T00:45:04Z:ca46530a7969b33709ce7ee1b2ca6eeebca58e3f769499b745b45df1ba5dd96e:lCA8Sm4VNEfI09ybE0L+42s/uju/MuRtDGePepygdK3BGviFNR+Yg/A1DfnbPj9NE9dLJPIBHNwv5y7TcP6jDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T04:39:23Z:a4ed7692d75b77fd3a501a60c04286baf2f49eba48da8499cb9f5274ade91ce3:sJ85bL/uPxhb7i+iEPaGrN5w/+EpdhY0pTw4b4O7nyj17sYYYO0UgyT+exVk3EcMt6YYDNmTTbTG2YMqCuMHCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - central-auth
@@ -119,10 +119,16 @@ policies:
   isolation:
     schema: 1
     policy:
-      version: 1
+      version: 3
       mode: disabled
       backend: null
       filesystem:
+        proc_filesystem: empty
+        live_project:
+          mode: fixed_parents
+          limits:
+            max_entries: 2048
+            max_depth: 64
         readable:
           - "{node_public_identity}"
           - "{daemon_socket}"

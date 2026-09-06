@@ -26,7 +26,9 @@ use super::{
 // v23 combines those execution ceilings/mount roots with the daemon-authored
 // scheduled-fire coordinate (invocation-only) and independent candidate
 // purpose/dual-generation authority (executable-program identity).
-pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 23;
+// v24 replaces path-mask claims with explicit fixed-parent live confinement
+// and admitted-execution-namespace symlink semantics; no predecessor aliases.
+pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 24;
 pub const ADMITTED_DIRECT_COMMAND_ROOT: &str = "/ryeos/admitted-direct-command";
 pub const ADMITTED_DIRECT_PROJECT_ROOT: &str = "/ryeos/admitted-project";
 

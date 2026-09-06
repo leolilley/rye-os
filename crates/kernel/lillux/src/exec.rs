@@ -1120,13 +1120,94 @@ enum CapturedStream {
     Stderr,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BoundedCapture {
     bytes: Vec<u8>,
     truncated: bool,
+    closed: bool,
+    read_error: Option<std::io::ErrorKind>,
 }
 
-type SharedCapture = Arc<Mutex<BoundedCapture>>;
+#[derive(Default)]
+struct OutputCapture {
+    state: Mutex<BoundedCapture>,
+    changed: Condvar,
+}
+
+type SharedCapture = Arc<OutputCapture>;
+
+/// One byte-preserving observer of a subprocess's existing bounded stdout
+/// capture. This never takes over its pipe, drainer, or process lifecycle.
+///
+/// Reads wait for captured bytes or capture closure without polling or an extra
+/// output queue. Cleanup may close capture before a descendant closes its pipe.
+/// EOF is not process completion: callers must still settle the
+/// exact [`RunningProcess`] and check its exit/timeout/output-limit result.
+pub struct ProcessStdoutReader {
+    capture: SharedCapture,
+    offset: usize,
+}
+
+/// Observation failure is separate from exact subprocess settlement. The
+/// observer interprets bytes; it never receives process termination authority.
+#[derive(Debug)]
+pub enum ProcessObservationError<E> {
+    AlreadyConsumed,
+    Start(std::io::Error),
+    Panicked,
+    Observation(E),
+}
+
+struct InterruptFailedObservation<'a>(Option<&'a AtomicBool>);
+
+impl Drop for InterruptFailedObservation<'_> {
+    fn drop(&mut self) {
+        if let Some(failed) = self.0 {
+            failed.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Read for ProcessStdoutReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self
+            .capture
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if self.offset < state.bytes.len() {
+                let count = output.len().min(state.bytes.len() - self.offset);
+                output[..count].copy_from_slice(&state.bytes[self.offset..self.offset + count]);
+                self.offset += count;
+                return Ok(count);
+            }
+            if state.truncated {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "subprocess stdout exceeded its capture bound",
+                ));
+            }
+            if let Some(kind) = state.read_error {
+                return Err(std::io::Error::new(
+                    kind,
+                    "subprocess stdout capture failed",
+                ));
+            }
+            if state.closed {
+                return Ok(0);
+            }
+            state = self
+                .capture
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessIdentity {
@@ -1632,6 +1713,7 @@ pub struct RunningProcess {
     status_thread: Option<thread::JoinHandle<()>>,
     stdout_capture: SharedCapture,
     stderr_capture: SharedCapture,
+    stdout_reader_taken: bool,
     drain_stop: Arc<AtomicBool>,
     output_overflow_rx: std::sync::mpsc::Receiver<CapturedStream>,
     start: Instant,
@@ -2041,6 +2123,21 @@ impl Drop for ProcessAwaitingAttachment {
 }
 
 impl RunningProcess {
+    /// Observe raw stdout from its first byte, including bytes already captured
+    /// before this call. Available once, after the attachment/release boundary.
+    /// The process must be waited or aborted concurrently with blocking reads
+    /// so its existing deadline and overflow supervision remain active.
+    pub fn take_stdout_reader(&mut self) -> Option<ProcessStdoutReader> {
+        if self.stdout_reader_taken {
+            return None;
+        }
+        self.stdout_reader_taken = true;
+        Some(ProcessStdoutReader {
+            capture: Arc::clone(&self.stdout_capture),
+            offset: 0,
+        })
+    }
+
     /// Return the bounded tail currently captured from stderr without waiting
     /// for, signalling, or otherwise changing the process lifecycle.
     ///
@@ -2052,6 +2149,7 @@ impl RunningProcess {
 
         let capture = self
             .stderr_capture
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if capture.bytes.is_empty() {
@@ -2111,11 +2209,13 @@ impl RunningProcess {
     fn validate_attachment_release_ready(&mut self) -> Result<(), String> {
         let stdout_truncated = self
             .stdout_capture
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .truncated;
         let stderr_truncated = self
             .stderr_capture
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .truncated;
@@ -2178,7 +2278,62 @@ impl RunningProcess {
     }
 
     /// Wait for the process to finish (or time out) and return the result.
-    pub fn wait(mut self) -> SubprocessResult {
+    pub fn wait(self) -> SubprocessResult {
+        self.wait_interruptible(|| false)
+    }
+
+    /// Observe the existing capture concurrently with the sole wait owner.
+    /// Use one blocking caller, not two jobs in a bounded executor pool: a
+    /// silent observer could otherwise occupy the only slot needed to start
+    /// deadline supervision. OS thread lifetime belongs here, while byte
+    /// interpretation and publication remain in the caller's closure.
+    ///
+    /// The closure must finish after capture closes and must not depend on
+    /// this method returning. Observer failure/panic interrupts the existing
+    /// waiter, which alone terminates, reaps and closes capture before join.
+    pub fn wait_with_stdout<T: Send, E: Send>(
+        mut self,
+        observe: impl FnOnce(ProcessStdoutReader) -> Result<T, E> + Send,
+    ) -> (SubprocessResult, Result<T, ProcessObservationError<E>>) {
+        let Some(reader) = self.take_stdout_reader() else {
+            return (
+                self.wait_interruptible(|| true),
+                Err(ProcessObservationError::AlreadyConsumed),
+            );
+        };
+        let failed = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let failure = &failed;
+            let observer = thread::Builder::new().spawn_scoped(scope, move || {
+                let mut guard = InterruptFailedObservation(Some(failure));
+                let result = observe(reader);
+                if result.is_ok() {
+                    guard.0 = None;
+                }
+                result
+            });
+            match observer {
+                Ok(observer) => {
+                    let completion = self.wait_interruptible(|| failed.load(Ordering::Acquire));
+                    let observed = match observer.join() {
+                        Ok(result) => result.map_err(ProcessObservationError::Observation),
+                        Err(_) => Err(ProcessObservationError::Panicked),
+                    };
+                    (completion, observed)
+                }
+                Err(error) => (
+                    self.wait_interruptible(|| true),
+                    Err(ProcessObservationError::Start(error)),
+                ),
+            }
+        })
+    }
+
+    /// Wait under the same deadline, output and exact-child ownership as
+    /// `wait`, allowing the protocol observer to report a fatal failure.
+    /// The predicate grants no signal handle: this owner alone terminates
+    /// and reaps the supervised process before returning its failed result.
+    pub fn wait_interruptible(mut self, mut interrupted: impl FnMut() -> bool) -> SubprocessResult {
         if self.attachment_release.is_some() {
             self.kill_supervised_processes();
             self.reap_wrapper();
@@ -2226,6 +2381,12 @@ impl RunningProcess {
                     return self.completed_result(status);
                 }
                 Ok(WrapperPoll::Running) => {
+                    if interrupted() {
+                        return self.wait_error_result(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "process observation failed",
+                        ));
+                    }
                     if self.output_overflow_rx.try_recv().is_ok() {
                         self.kill_supervised_processes();
                         self.reap_wrapper();
@@ -2407,6 +2568,11 @@ impl RunningProcess {
         // fixed number of post-stop reads. The latter bound prevents an
         // escaped setsid descendant that keeps writing from hanging cleanup,
         // while preserving ordinary output already present in the pipe.
+        // Consumed JoinHandles already record which captures were settled.
+        // Drop retries process cleanup, but must not clone retained reader
+        // output a second time merely to discard it.
+        let settle_stdout = self.stdout_thread.is_some();
+        let settle_stderr = self.stderr_thread.is_some();
         self.drain_stop.store(true, Ordering::Release);
         if let Some(handle) = self.stdin_thread.take() {
             let _ = handle.join();
@@ -2421,8 +2587,16 @@ impl RunningProcess {
             let _ = handle.join();
         }
         (
-            take_capture(&self.stdout_capture),
-            take_capture(&self.stderr_capture),
+            if settle_stdout {
+                take_capture(&self.stdout_capture)
+            } else {
+                BoundedCapture::default()
+            },
+            if settle_stderr {
+                take_capture(&self.stderr_capture)
+            } else {
+                BoundedCapture::default()
+            },
         )
     }
 
@@ -3277,11 +3451,13 @@ fn lib_spawn_with_stdio(
     #[cfg(not(unix))]
     let wrapper_pgid = -1i64;
 
-    let stdout_capture = Arc::new(Mutex::new(BoundedCapture::default()));
-    let stderr_capture = Arc::new(Mutex::new(BoundedCapture::default()));
+    let stdout_capture = Arc::new(OutputCapture::default());
+    let stderr_capture = Arc::new(OutputCapture::default());
     let drain_stop = Arc::new(AtomicBool::new(false));
     let (output_overflow_tx, output_overflow_rx) = std::sync::mpsc::channel();
     let (stdout_thread, stderr_thread) = if inherit_stdio {
+        stdout_capture.state.lock().unwrap().closed = true;
+        stderr_capture.state.lock().unwrap().closed = true;
         (thread::spawn(|| {}), thread::spawn(|| {}))
     } else {
         let mut stdout_handle = child.stdout.take().expect("stdout configured as piped");
@@ -3503,6 +3679,7 @@ fn lib_spawn_with_stdio(
         status_thread,
         stdout_capture,
         stderr_capture,
+        stdout_reader_taken: false,
         drain_stop,
         output_overflow_rx,
         start,
@@ -3562,8 +3739,10 @@ where
                     match reader.read(&mut probe) {
                         Ok(0) => {}
                         Ok(_) => {
-                            let mut state =
-                                capture.lock().unwrap_or_else(|error| error.into_inner());
+                            let mut state = capture
+                                .state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
                             state.truncated = true;
                             if !overflow_reported {
                                 let _ = overflow_tx.send(stream);
@@ -3582,7 +3761,10 @@ where
                     if let Some(remaining) = post_stop_reads.as_mut() {
                         *remaining -= 1;
                     }
-                    let mut state = capture.lock().unwrap_or_else(|error| error.into_inner());
+                    let mut state = capture
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     let retain = match limit {
                         Some(limit) => limit
                             .saturating_sub(state.bytes.len() as u64)
@@ -3597,6 +3779,8 @@ where
                             let _ = overflow_tx.send(stream);
                         }
                     }
+                    drop(state);
+                    capture.changed.notify_all();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3605,9 +3789,22 @@ where
                     }
                     thread::sleep(CAPTURE_POLL_INTERVAL);
                 }
-                Err(_) => break,
+                Err(error) => {
+                    capture
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .read_error = Some(error.kind());
+                    break;
+                }
             }
         }
+        capture
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed = true;
+        capture.changed.notify_all();
     })
 }
 
@@ -4676,8 +4873,20 @@ fn kill_process_group_if_safe(pgid: i64) {
 fn kill_process_group_if_safe(_pgid: i64) {}
 
 fn take_capture(capture: &SharedCapture) -> BoundedCapture {
-    let mut capture = capture.lock().unwrap_or_else(|error| error.into_inner());
-    std::mem::take(&mut *capture)
+    // Drainers have been joined before settlement. A still-live byte reader
+    // must retain its bounded bytes/EOF even if the process settles first.
+    // Only that case needs a bounded snapshot for the ordinary text result;
+    // no observer queue or additional capture thread is introduced.
+    let has_reader = Arc::strong_count(capture) > 1;
+    let mut state = capture
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if has_reader {
+        state.clone()
+    } else {
+        std::mem::take(&mut *state)
+    }
 }
 
 fn output_limit_exceeded(
@@ -4705,7 +4914,10 @@ fn append_diagnostic(existing: &str, diagnostic: &str) -> String {
 fn append_captured_stderr(reason: String, capture: &SharedCapture) -> String {
     const DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
-    let capture = capture.lock().unwrap_or_else(|error| error.into_inner());
+    let capture = capture
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if capture.bytes.is_empty() {
         return reason;
     }

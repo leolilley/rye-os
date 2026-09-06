@@ -178,6 +178,7 @@ pub const ALL: &[ServiceDescriptor] = &[
     content_pin::DESCRIPTOR,
     credential_profiles::CREATE_DESCRIPTOR,
     credential_profiles::GET_DESCRIPTOR,
+    credential_profiles::LIST_DESCRIPTOR,
     credential_profiles::CONFIRM_DESCRIPTOR,
     credential_profiles::REVOKE_DESCRIPTOR,
     credential_profiles::DELETE_DESCRIPTOR,
