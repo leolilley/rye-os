@@ -15,6 +15,7 @@ use crate::handler_context::HandlerContext;
 use crate::node_policy::sections::object_closure::NodeObjectClosurePolicy;
 use crate::state::AppState;
 
+mod retained_binding;
 mod retained_result;
 
 const BINDING_HEAD_NAMESPACE: &str = ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE;
@@ -82,6 +83,17 @@ pub struct FilesystemImportRequest {
 pub enum ImportRequest {
     Filesystem(FilesystemImportRequest),
     RetainedResult(RetainedResultImportRequest),
+    RetainedBinding(RetainedBindingImportRequest),
+}
+
+/// Reuse the complete exact manifest of a currently active local binding.
+/// The binding owns shape/storage/manifest identity; callers cannot restate
+/// them or use an old import receipt to authorize another consumer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedBindingImportRequest {
+    pub binding_hash: String,
+    pub maximum_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +236,11 @@ pub async fn import(
     match request {
         ImportRequest::Filesystem(request) => import_filesystem(state, context, request).await,
         ImportRequest::RetainedResult(request) => retained_result::import(state, context, request),
+        ImportRequest::RetainedBinding(request) => {
+            tokio::task::spawn_blocking(move || retained_binding::import(state, context, request))
+                .await
+                .context("retained binding import worker stopped")?
+        }
     }
 }
 

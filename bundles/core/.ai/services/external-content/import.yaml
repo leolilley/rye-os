@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T00:22:17Z:7c57180bbea4cb0fcda6fa14c9e1dceff3cda51f6fb94c8d779f747464db9641:Tex6EfryTBrsIxEkTNmeCuri5cviMWbLUoXpdT8otq4UrHWr3SgsvwaZrJPPXnANpI2SbXhzcC5B4JagqA1UCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T22:48:49Z:c4c56900d42f34b435d55df08828199eb4a9e523ba4d5e85bd0d204524d95333:Gy25i2Cppa/1JmKdFOZP910/9CdOSyQ1YIEPczFuqsR78crrjON89RYYyRsdX1vciev7A9AxfIxqba+i4kDzAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 kind: service
 endpoint: external-content.import
 required_caps: ["ryeos.execute.service.external-content/import"]
@@ -8,9 +8,10 @@ schema:
   chain_root_id: string?
   thread_id: string?
   result_project_snapshot_hash: string?
-  path: string
-  shape: string
-  storage: string
+  binding_hash: string?
+  path: string?
+  shape: string?
+  storage: string?
   maximum_bytes: integer
   expected_file_sha256: string?
-description: "Stage bounded content from an admitted filesystem root or an exact owner-authorized retained execution result; source-specific fields are validated by the typed handler"
+description: "Stage bounded content from an admitted filesystem root, exact owner-authorized retained execution result, or exact active operator binding; source-specific fields are validated by the closed typed handler"

@@ -1,9 +1,9 @@
-<!-- ryeos:signed:2026-09-06T07:38:52Z:31e995f3656c73b1f1ee50a8b2c911264edec549b9cd0e5cd3febbd7ccdc763d:3C1YIaB8zudYF1jlLQxgidFwyQ938cf8GRx0AaDobJOrvbUng3h1ipFkJkMvw6DFO91Srnlh0DUuXJXNbYk9Bw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T22:52:09Z:8e0102e3efd6c2fa4b18f5181a480fab8ada1a1f6a446705f989cc17757b373c:2/tty1jYQ6GsPEdMh5DeYGhoJWUmBDAET4DX2sDnKm6NbgUUduCDO8YIhnNx6iEj3K58B6gfzsoZsym+8M56CQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
 tags: [architecture, cas, state, truth, projection, sqlite]
-version: "1.2.0"
+version: "1.3.0"
 description: >
   The three-tier truth model — CAS objects, signed refs, and the
   rebuildable SQLite projection. Content-addressed storage as the
@@ -192,12 +192,30 @@ admission; adding, removing or changing source evidence changes the binding
 subject and cannot reuse a prior grant. Content use still requires the exact
 active target-local binding and current authorizer.
 
-The import service has two explicit sources. `source: filesystem` captures a
+The import service has three explicit sources. `source: filesystem` captures a
 canonical member beneath a node-admitted named root. `source: retained_result`
 selects a file or nonempty regular-file subtree from an exact successfully
 completed execution's retained result snapshot. It requires the configured local
 operator to own the exact chain root and thread; a snapshot hash alone grants
-no access. Both produce the same staging receipt for separate consumer binding.
+no access. `source: retained_binding` reuses the complete unchanged manifest of
+an exact currently active node-signed binding. All three produce the same
+staging receipt for separate consumer binding.
+
+Retained-binding admission requires the configured local operator to be that
+binding's authorizer and its exact authorizer grant to remain current. It
+checks the signed current head, target node, manifest/blob/large-object
+commitments and current import/closure limits under the existing publication
+barrier. Shape, storage and manifest identity come from the binding, not new
+caller fields. It does not reopen a host cache, recapture/exclude files, convert
+storage tiers or rerun an acquisition or producer. Only stage metadata is new.
+This enables new exact project generations to reuse bytes independently of
+the original producer's execution-history retention.
+
+Release serializes with import admission through the same barrier. After an
+import succeeds its durable receipt is independent; later source release does
+not retroactively cancel that receipt or turn it into destination authority.
+The new consumer still needs separate exact declaration and operator admission.
+Released, stale, foreign-node or predecessor bindings cannot mint new receipts.
 
 Retained-result admission uses the lifecycle owner's completed status from the
 verified immutable thread snapshot, with no error and a finished timestamp.
@@ -211,6 +229,7 @@ The CLI exposes these as:
 ```
 ryeos external-content import <named-root> <path> <file|tree> <content|large_content> <maximum-bytes>
 ryeos external-content import-result <chain-root> <thread> <result-snapshot> <path> <file|tree> <content|large_content> <maximum-bytes>
+ryeos external-content import-binding <exact-active-binding-hash> <maximum-bytes>
 ```
 
 Use exact returned execution coordinates, not thread discovery or a mutable
