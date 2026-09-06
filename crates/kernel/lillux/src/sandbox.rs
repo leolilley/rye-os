@@ -817,7 +817,19 @@ mod imp {
                 }
                 continue;
             }
-            sources.insert(descriptor, reanchor_mount_source(fd)?);
+            let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                .map_err(|error| format!("locate inherited request source: {error}"))?;
+            // A recursive directory clone of the construction root (or its
+            // ancestor) would also clone our new private setup mounts. Those
+            // are backend authority, never part of an admitted source. This
+            // kernel locator is rejection evidence only; inode/type equality
+            // below still grants the exact reanchored source authority.
+            if descriptor_kind(descriptor)? == DescriptorKind::Directory
+                && std::path::Path::new(ROOT).starts_with(&path)
+            {
+                return Err("directory source contains the sandbox construction root".to_string());
+            }
+            sources.insert(descriptor, reanchor_mount_source_at(fd, &path)?);
         }
         Ok(sources)
     }
@@ -2824,6 +2836,35 @@ mod imp {
                     .unwrap_err()
                     .contains("cannot grant writable")
             );
+        }
+
+        #[test]
+        fn request_sources_cannot_recursively_capture_private_construction_mounts() {
+            for path in [std::path::Path::new("/"), std::path::Path::new(ROOT)] {
+                let source = crate::secure_fs::pin_canonical_mount_source(path).unwrap();
+                let mut request = super::super::tests::minimal_request();
+                request.mounts.push(LinuxSandboxMount {
+                    source_fd: source.as_raw_fd() as u32,
+                    destination: PathBuf::from("/source"),
+                    access: LinuxSandboxMountAccess::ReadOnly,
+                    layer: 0,
+                });
+                assert!(
+                    reanchor_request_sources(&request)
+                        .unwrap_err()
+                        .contains("contains the sandbox construction root")
+                );
+            }
+            let directory = tempfile::tempdir_in(ROOT).unwrap();
+            let source = crate::secure_fs::pin_canonical_mount_source(directory.path()).unwrap();
+            let mut request = super::super::tests::minimal_request();
+            request.mounts.push(LinuxSandboxMount {
+                source_fd: source.as_raw_fd() as u32,
+                destination: PathBuf::from("/source"),
+                access: LinuxSandboxMountAccess::ReadOnly,
+                layer: 0,
+            });
+            assert!(reanchor_request_sources(&request).is_ok());
         }
 
         #[test]

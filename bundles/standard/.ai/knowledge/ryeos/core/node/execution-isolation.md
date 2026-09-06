@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T04:39:23Z:f1166da4924bdc75ae11d2837cb9128476e52e28f4309eb4406d36636baff069:6bgVxXoSo09V/hvctyyh2qzuEIYluqJyO8iZlZQGejuF+eYnMvL2RS4INUaB83JzVTe7iijd8oJPKksk44vmDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T05:07:58Z:a49dc6870f499913cbff7dbcc5fc64bab907d01eae970455a38691cb5f21a5ed:VzFHYSUqIpuF+gOmg8CBYXDRM6sx8q9mHAKiSTezUgeg0NAotUpNIRxwNr640JHZOVM9FJB8qAl9uOLp/llrBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -107,6 +107,14 @@ removes only its empty underlying mountpoint before any workload starts.
 Materialized files stay linked on the detached filesystem; unlinking them would
 make executable self lookup report a deleted path even through the admitted
 mount. The target retains neither staging paths nor authority descriptors.
+The native backend refuses recursive directory sources equal to or above its
+private construction mountpoint (`/tmp`). Such a source would also clone
+backend-private setup mounts, which are not admitted workload content. Normal
+project directories beneath that mountpoint remain supported. The kernel
+descriptor locator is used only for this refusal; exact inode/type reproof
+still owns source admission. The capability probe temporarily clones its
+ancestor to test inherited descriptor attachment, then retires that probe-only
+alias before exact staging cleanup; production does not suppress cleanup errors.
 Unsealed bytes
 cannot use this materialization path, and sealed sources cannot grant writable
 mounts. These are backend mechanics, not a new realization, host-path fallback,
