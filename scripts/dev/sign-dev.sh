@@ -4,6 +4,11 @@
 # `populate-bundles.sh` uses, but for individual files. Use this after editing a
 # single signed item (e.g. a node/commands or kind-schema YAML) so you don't have
 # to run a full `--populate` rebuild just to make one file's signature valid.
+# Also use this per-item path for the repository-root development bundle.
+# Whole-directory `build`/`bundle-sign` copies and exchanges its input root;
+# it is for detached bundle trees, not this working Git checkout. Project
+# snapshot exclusions are not publisher staging filters. This helper signs
+# bytes only: validate them through the normal resolver/admission separately.
 #
 # Usage: scripts/dev/sign-dev.sh <file> [<file> ...]
 # Env:   RYEOS_DEV_KEY  override the key path (default: .dev-keys/PUBLISHER_DEV.pem)

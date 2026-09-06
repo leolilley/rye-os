@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-06T05:29:33Z:6afbfd086a64beecb106bdd2b5c53a2eaefaf439dfec3117e6d842b82d4542c4:viV/VYAbm3+PWXolkGDOcwoEIi4xmEgDuFBrwtQ6q2etu4yChMRmKqwSWs1BiPJkQtTYr3LYHNpJu3J8kkK9Dw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T06:01:54Z:b5205bc5aa5160d2d39a989b5397e96b1a42455f707e1464e6ce7c894179dbca:tMwnMol3DR7zD1WAB40iz4L+Dymyd8AiheWS7PQrlPoLO9jTU2jTsmRw3dwmCnYQvJ6r3EuJQ4NwhL4s9ruSAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.8.0"
+version: "1.9.0"
 ```
 
 # Source-Local Bundle Development
@@ -135,6 +135,23 @@ public development publisher fixture. That binds reproducible development
 identity only. It grants no operator, node, release, deployment, vault,
 publication, or remote authority.
 
+### Sign project items without exchanging the checkout
+
+Use `scripts/dev/sign-dev.sh <changed-file> ...` for this repository's public
+development publisher. Validate the selected items through normal resolution
+and admission; source-wide `bundle-verify` is read-only. Item signatures and
+the existing project snapshot commit the selected generation. Signing alone
+is not validation or execution authority.
+
+Do not point the whole-directory `build`, `bundle-sign` or binary-manifest
+publication transaction at the working repository. That publisher copies and
+atomically exchanges its complete input directory; project snapshot exclusions
+do not govern its staging. It is appropriate for a detached, exclusively owned
+bundle tree, not a live Git checkout with nested worktrees, caches and ongoing
+edits. A full project-bundle publication check must use such a detached tree
+constructed from an exact admitted source generation. Do not add a second
+ignore list to the publisher or treat its staging as project capture.
+
 ## Locked registry input acquisition
 
 `scripts/release/fetch-development-registry.py` is an explicit operator/publisher
@@ -162,7 +179,13 @@ node-owned filesystem authorities.
 
 Import/bind that input tree through ordinary external-content authority. The
 admitted Stage-0 Cargo then owns final vendoring with isolated networking and
-explicit source replacement. Import its retained output through
+explicit source replacement. The finite `tool:ryeos/development/cargo-vendor`
+selects that exact Cargo and input manifest, an empty executable search path,
+and `--locked --frozen --offline --respect-source-config --versioned-dirs`.
+It has no caller-selected arguments or root-worker grant. Its private Cargo
+home lives under `/tmp`; the useful result is `products/cargo-vendor` in the
+retained project generation. Both the descriptor and resolved project execution
+configuration bound it to 300 seconds. Import its retained output through
 `external-content import-result`. Source checks and successful acquisition
 alone do not prove that the pinned Cargo accepted the format, produced the
 required closure, or that repository build/test qualification passed. No

@@ -1,0 +1,60 @@
+# ryeos:signed:2026-09-06T05:58:18Z:782ac0fe15717294995fe70ef01aa7f4c95feb91d4eb3ff321740d5e6efafaef:kLbgAKWKOTSDyhKkhlko3MCX0XwkMY04uU+Vshuy3nCf99Lm//gLsIb0pgA+pK4RaIUTV0Y6GiOsVPRlLElLCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+category: ryeos/development
+name: cargo-vendor
+version: "1.0.0"
+description: Produce locked vendored sources using admitted Cargo and exact public registry inputs
+executor_id: "@subprocess"
+execution_protocol: protocol:ryeos/core/opaque
+effects: live
+workspace_access: immutable_current_generation
+filesystem_authority: captured_execution
+network_authority: isolated
+external_content:
+  - id: platform
+    kind: tree
+    mode: pinned
+    digest: 98bceddd5b4024d5963eeac8c579e6d4e79c24577980fa9f88bce9ae3151d316
+    mount_root: execution_runtime
+    mount: platform
+  - id: registry-inputs
+    kind: tree
+    mode: pinned
+    digest: 45835b5cf9928ead34e9b8bd0946b05090b8e6eaa652e0052e07fb8aa09d8ac1
+    mount_root: execution_runtime
+    mount: registry-inputs
+env_config:
+  env:
+    PATH: ""
+  env_paths:
+    PATH:
+      prepend: []
+      append: []
+config:
+  command: realization:platform/rust/bin/cargo
+  # Cargo's public local-registry contract, not its private cache format.
+  # Exact archives/index records are immutable inputs. Cargo owns unpacking;
+  # retained result import and consumer binding remain separate RyeOS actions.
+  args:
+    - --config
+    - 'source.crates-io.replace-with="ryeos-locked-inputs"'
+    - --config
+    - 'source.ryeos-locked-inputs.local-registry="/ryeos/realizations/registry-inputs"'
+    - vendor
+    - --manifest-path
+    - Cargo.toml
+    - --locked
+    - --frozen
+    - --offline
+    - --respect-source-config
+    - --versioned-dirs
+    - products/cargo-vendor
+  timeout_secs: 300
+  env:
+    CARGO_HOME: /tmp/cargo
+    CARGO_TARGET_DIR: /tmp/target
+    RUSTC: /ryeos/realizations/platform/rust/bin/rustc
+    RUSTDOC: /ryeos/realizations/platform/rust/bin/rustdoc
+config_schema:
+  type: object
+  properties: {}
+  additionalProperties: false

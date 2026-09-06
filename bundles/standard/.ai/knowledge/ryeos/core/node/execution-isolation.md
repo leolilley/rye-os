@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T05:07:58Z:a49dc6870f499913cbff7dbcc5fc64bab907d01eae970455a38691cb5f21a5ed:VzFHYSUqIpuF+gOmg8CBYXDRM6sx8q9mHAKiSTezUgeg0NAotUpNIRxwNr640JHZOVM9FJB8qAl9uOLp/llrBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T06:05:45Z:ff0e969dfd91ced3a45a9d41898ca5937f851d134fe8b93df092fdb46e92a42f:CAA4FZXVIEyh8dru2QqK6VM6jcLc2S0tXPIAAb56sI1YmvGWgEIubJXDsDNS8aRFyGySM5bSjNK1tj9Eozk9Bg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.15.0"
+version: "1.16.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -46,6 +46,14 @@ are never reinterpreted. Each channel has one exact child descriptor and hidden
 environment binding in both disabled and enforced modes; fd 0 is a deliberate
 full-duplex primary channel, not a sentinel. Parent protocol code retains a
 typed Lillux byte-stream endpoint and never recovers a raw Unix socket.
+
+Argument entries and environment values are exact process data: an empty
+string remains present and empty through plan validation, serialization and
+native launch. It is not replaced with absence, an inherited value, or a
+sentinel. Environment names, argv0, paths and authority identities still
+require nonempty values. Per-string size, collection and NUL restrictions are
+unchanged. This is validation of the existing process contract, not another
+environment policy or an optional compatibility mode.
 
 The native backend's kernel probe includes sources inherited from **before**
 the namespace transition, not just files created inside the sandbox. Linux

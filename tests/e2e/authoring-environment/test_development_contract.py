@@ -55,6 +55,40 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
             self.assertLessEqual(request[bound], policy[bound])
         self.assertLessEqual(len(request["executions"]), policy["max_executions"])
 
+    def test_vendor_uses_exact_inputs_without_network_or_host_cargo(self):
+        tool = load(".ai/tools/ryeos/development/cargo-vendor.yaml")
+        self.assertEqual(tool["config"]["command"], "realization:platform/rust/bin/cargo")
+        self.assertEqual(tool["filesystem_authority"], "captured_execution")
+        self.assertEqual(tool["network_authority"], "isolated")
+        self.assertEqual(tool["workspace_access"], "immutable_current_generation")
+        self.assertFalse(tool["config_schema"]["additionalProperties"])
+        self.assertEqual(tool["config_schema"]["properties"], {})
+        declarations = {entry["id"]: entry for entry in tool["external_content"]}
+        self.assertEqual(set(declarations), {"platform", "registry-inputs"})
+        for declaration in declarations.values():
+            self.assertEqual(declaration["mode"], "pinned")
+            self.assertEqual(declaration["mount_root"], "execution_runtime")
+            self.assertRegex(declaration["digest"], r"^[0-9a-f]{64}$")
+        args = tool["config"]["args"]
+        for required in ("--locked", "--frozen", "--offline", "--respect-source-config", "--versioned-dirs"):
+            self.assertIn(required, args)
+        self.assertEqual(args[-1], "products/cargo-vendor")
+        self.assertEqual(tool["env_config"]["env"]["PATH"], "")
+        self.assertEqual(tool["config"]["env"]["CARGO_HOME"], "/tmp/cargo")
+        execution = load(".ai/config/execution/execution.yaml")
+        self.assertEqual(execution["items"]["tool"]["ryeos/development/cargo-vendor"]["timeout"],
+                         tool["config"]["timeout_secs"])
+        # Provisioning is operator-driven, not silently added to root worker grants.
+        self.assertNotIn("tool:ryeos/development/cargo-vendor",
+                         [route["item_ref"] for route in self.environment["workload_client"]["executions"]])
+
+    def test_producer_timeouts_survive_project_execution_config_precedence(self):
+        execution = load(".ai/config/execution/execution.yaml")["items"]["tool"]
+        runtime = load(".ai/tools/ryeos/development/authoring-environment-production/runtime.yaml")
+        for operation in ("prepare", "assemble", "verify"):
+            self.assertEqual(execution["ryeos/development/authoring-environment-production/" + operation]["timeout"],
+                             runtime["config"]["timeout_secs"])
+
 
 if __name__ == "__main__":
     unittest.main()

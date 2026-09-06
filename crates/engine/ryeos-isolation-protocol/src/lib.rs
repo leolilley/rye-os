@@ -650,11 +650,11 @@ impl IsolationPlan {
         }
         validate_string("argv0", &self.target.argv0)?;
         for argument in &self.target.arguments {
-            validate_string("target argument", argument)?;
+            validate_process_value("target argument", argument)?;
         }
         for (name, value) in &self.environment.values {
             validate_environment_name(name)?;
-            validate_string("environment value", value)?;
+            validate_process_value("environment value", value)?;
         }
 
         let mut authority_ids = BTreeMap::new();
@@ -1340,6 +1340,14 @@ fn validate_string(kind: &str, value: &str) -> Result<(), ProtocolValidationErro
             "{kind} cannot be empty"
         )));
     }
+    validate_process_value(kind, value)
+}
+
+// argv entries and environment values are exact process data, not identifiers.
+// Empty is meaningful (including an explicitly empty PATH) and must not be
+// replaced with absence, an inherited value, or a fabricated sentinel. Names,
+// argv0 and authority coordinates still use the nonempty validator above.
+fn validate_process_value(kind: &str, value: &str) -> Result<(), ProtocolValidationError> {
     if value.len() > MAX_STRING_BYTES {
         return Err(ProtocolValidationError::new(format!(
             "{kind} exceeds {MAX_STRING_BYTES} bytes"
@@ -1509,6 +1517,56 @@ mod tests {
         assert!(IsolationPath::new("/workspace/item").is_ok());
         assert!(IsolationPath::new("workspace/item").is_err());
         assert!(IsolationPath::new("/workspace/../secret").is_err());
+    }
+
+    #[test]
+    fn exact_process_values_allow_empty_without_relaxing_identity_or_byte_bounds() {
+        let (mut plan, authorities) = complete_plan();
+        plan.target.arguments.push(String::new());
+        plan.environment.values.insert("PATH".into(), String::new());
+        plan.environment
+            .values
+            .insert("PYTHONPATH".into(), String::new());
+        plan.validate(&authorities).unwrap();
+        let roundtrip: IsolationPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(roundtrip.target.arguments.last().unwrap(), "");
+        assert_eq!(roundtrip.environment.values.get("PATH").unwrap(), "");
+        roundtrip.validate(&authorities).unwrap();
+
+        let mut unnamed = plan.clone();
+        unnamed
+            .environment
+            .values
+            .insert(String::new(), "value".into());
+        assert!(
+            unnamed
+                .validate(&authorities)
+                .unwrap_err()
+                .to_string()
+                .contains("environment name cannot be empty")
+        );
+        let mut no_argv0 = plan.clone();
+        no_argv0.target.argv0.clear();
+        assert!(
+            no_argv0
+                .validate(&authorities)
+                .unwrap_err()
+                .to_string()
+                .contains("argv0 cannot be empty")
+        );
+
+        for invalid in ["bad\0value".to_owned(), "x".repeat(MAX_STRING_BYTES + 1)] {
+            let mut argument = plan.clone();
+            argument.target.arguments.push(invalid.clone());
+            assert!(argument.validate(&authorities).is_err());
+            let mut environment = plan.clone();
+            environment
+                .environment
+                .values
+                .insert("VALUE".into(), invalid);
+            assert!(environment.validate(&authorities).is_err());
+        }
     }
 
     #[test]
