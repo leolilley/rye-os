@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T03:45:22Z:9941091b316c6e65dd43dbe1b0b514420f87bd8d16c5740be2189b987ac9b7f2:+AlJ1CD0PAqVT9e0c/J0Jge09m6r+UGMi0JytibvSUCFR4RNBr8ah51Hjb8iBFV9g+8/l6xaOu1WFzgMsiseAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T04:58:50Z:c8cdc1d810ad357c08810f9060da394064a4203c6da7138325900cc03d6e496f:RUxTnqu/2MV/ikokDfsdIyjnv1Hoou/oQnf4wYPJ0F1lK8KKAyWoXvpFpq9WY/e4NWIUNr32Ffv2iBap55E7CQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [hosted-execution, environments, authoring, external-content]
-version: "1.0.0"
+version: "1.0.1"
 description: >
   Explicit authoring worker and command environment, separate from child
   project-operation dependencies and restricted client authority.
@@ -71,8 +71,9 @@ Likewise, a finite utility inventory is not a sandbox or a permission grant.
 
 ## Production, import and binding
 
-Source-local finite operations own final assembly and independent verification:
+Source-local finite operations own input preparation, final assembly and independent verification:
 
+- `tool:ryeos/development/authoring-environment-production/prepare`
 - `tool:ryeos/development/authoring-environment-production/assemble`
 - `tool:ryeos/development/authoring-environment-production/verify`
 
@@ -83,10 +84,14 @@ build directory or node store. Corresponding sources and notices accompany the
 environment. Preserve them when redistributing binaries; source collection alone
 is not a comprehensive redistribution-license review.
 
-The source repository's bootstrap helpers acquire/check immutable inputs and
-select upstream payloads. They do not replace RyeOS admission, Tool execution,
-retained-result authority or target-local binding. No managed activation URL
-is authored for an unpublished artifact.
+`prepare` selects already-admitted archives and finite payload members into the
+existing signed input contract; its retained input tree feeds assembly. It has
+no download, Docker, host-PATH, signing or binding path. Input/source selections
+live in signed project configuration, not a parallel release-script workflow.
+Fresh utility compilation remains gated on a real admitted build-support
+artifact alongside the existing Stage0 compiler; the owned build library alone
+is not admission-ready. No managed activation URL is authored for an unpublished
+artifact.
 
 After successful pinned production with retained output, use exact terminal
 coordinates to import without reopening the producer workspace:
@@ -124,7 +129,7 @@ import remains available; retained-result import does not replace it.
 The selected artifact has reproduced independently and passed an offline
 empty-root probe for sed editing, search, diff/patch and scratch Git with
 descriptor-based PATH and no host libraries. The source repository's
-`scripts/release/authoring-baseline/selection.json` records expected manifests
+`tests/e2e/authoring-environment/selection.json` records expected manifests
 and explicit qualification status. Expected hashes are not node receipts.
 
 Before using a model, qualify the combined signed source/binary generation:
