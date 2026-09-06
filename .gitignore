@@ -104,6 +104,9 @@ logs/
 /.ai/tools/ryeos/*
 !/.ai/tools/ryeos/development/
 !/.ai/tools/ryeos/development/**
+# Source-local Tool libraries are authored source, not Python bytecode caches.
+/.ai/tools/ryeos/development/**/__pycache__/
+/.ai/tools/ryeos/development/**/*.pyc
 */.ai/
 !bundles/.ai/
 !bundles/.ai/**
