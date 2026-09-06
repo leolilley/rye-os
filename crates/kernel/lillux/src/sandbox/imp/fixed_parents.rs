@@ -102,7 +102,12 @@ pub(super) fn validate(request: &LinuxSandboxRequest) -> Result<(), String> {
             .map(|mount| mount.source_fd)
             .collect::<BTreeSet<_>>();
         if let Some(overlay) = &request.overlay {
-            other_sources.extend([overlay.lower_fd, overlay.state_fd]);
+            other_sources.insert(
+                overlay
+                    .template
+                    .inherited_authority()
+                    .inherited_descriptor()?,
+            );
         }
         for fd in other_sources {
             let stat = mount_source_stat(raw_fd(fd)?)?;

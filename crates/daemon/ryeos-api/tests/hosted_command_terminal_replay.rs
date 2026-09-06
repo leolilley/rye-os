@@ -2,8 +2,9 @@ mod test_state;
 
 use ryeos_app::process::{ExecutionProcessIdentity, PROCESS_IDENTITY_SCHEMA_VERSION};
 use ryeos_app::runtime_db::{
-    DedicatedCandidateDisposition, NewCredentialProfile, NewDedicatedSession, WorkerProcessRecord,
-    WorkerProcessState, WorkspaceBinding, WorkspaceState,
+    DedicatedCandidateDisposition, NewCredentialProfile, NewDedicatedSession,
+    RuntimeWorkspaceBinding, WorkerProcessRecord, WorkerProcessState, WorkspaceBinding,
+    WorkspaceState,
 };
 use ryeos_app::state_store::{
     FinalizeThreadRecord, NewDedicatedSessionCommand, NewEventRecord, NewThreadRecord,
@@ -305,6 +306,17 @@ fn seed_completed_turn_fixture(
         })
         .unwrap();
     let profile_id = format!("P-{root}");
+    state
+        .state_store
+        .bind_thread_workspace(
+            root,
+            &RuntimeWorkspaceBinding {
+                workspace_id: workspace_id.clone(),
+                view_identity: "test-mount".to_owned(),
+                borrower_launch_owner: launch_claim.owner.clone(),
+            },
+        )
+        .unwrap();
     state
         .state_store
         .create_credential_profile(NewCredentialProfile {
@@ -631,7 +643,12 @@ async fn completed_termination_requires_the_exact_immutable_turn_fence_and_front
     assert_eq!(
         state
             .state_store
-            .prepare_dedicated_session_recovery(recovered_root, 1, &recovered_worker)
+            .prepare_dedicated_session_recovery(
+                recovered_root,
+                1,
+                &recovered_worker,
+                &format!("W-{recovered_root}")
+            )
             .unwrap(),
         2
     );
@@ -776,6 +793,17 @@ async fn terminal_root_replays_only_exact_authoritatively_settled_command() {
             pinned_root_identities: Some("{}"),
             mount_identity: Some("test-mount"),
         })
+        .unwrap();
+    state
+        .state_store
+        .bind_thread_workspace(
+            root,
+            &RuntimeWorkspaceBinding {
+                workspace_id: "W-terminal-hosted-replay".to_owned(),
+                view_identity: "test-mount".to_owned(),
+                borrower_launch_owner: launch_claim.owner.clone(),
+            },
+        )
         .unwrap();
     state
         .state_store

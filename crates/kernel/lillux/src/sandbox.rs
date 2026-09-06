@@ -37,13 +37,11 @@ pub struct LinuxSandboxFixedParentView {
     pub max_depth: usize,
 }
 
-/// Descriptor-backed overlay workspace. The lower, upper, and work
-/// descriptors are all retained by the caller through sandbox creation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Borrow one exact never-attached template into a fresh private sandbox.
+/// A borrower never creates another filesystem over the template's layers.
+#[derive(Debug, Clone)]
 pub struct LinuxSandboxOverlay {
-    pub lower_fd: u32,
-    /// Exact backend-private state directory containing `upper/` and `work/`.
-    pub state_fd: u32,
+    pub template: LinuxOverlayTemplate,
     pub destination: PathBuf,
 }
 
@@ -59,6 +57,17 @@ pub struct LinuxOverlayTemplate {
 }
 
 impl LinuxOverlayTemplate {
+    /// Adopt the exact descriptor assigned this role by the validated launch
+    /// protocol. This protects/registers the inherited owner before namespace
+    /// entry; it never reopens the template through a pathname.
+    ///
+    /// # Safety
+    /// The caller transfers unique descriptor ownership. No owning File or
+    /// other adopted authority may exist for the same numeric descriptor.
+    pub unsafe fn take_inherited_descriptor(fd: u32) -> Result<Self, String> {
+        imp::take_overlay_template(fd)
+    }
+
     /// Retain the exact template in the existing typed subprocess transport.
     pub fn inherited_authority(&self) -> &crate::InheritedDescriptorAuthority {
         &self.authority
@@ -111,7 +120,7 @@ pub struct LinuxSandboxAggregateLimits {
 }
 
 /// Complete low-level request for a private Linux execution view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LinuxSandboxRequest {
     pub executable: PathBuf,
     pub argv0: OsString,
@@ -354,6 +363,10 @@ pub fn exit_with_linux_sandbox_status(status: LinuxSandboxExit) -> ! {
 mod imp {
     use super::*;
 
+    pub fn take_overlay_template(_fd: u32) -> Result<LinuxOverlayTemplate, String> {
+        Err("detached Linux overlay templates are unavailable on this platform".to_string())
+    }
+
     pub fn create_overlay_template(
         _project_fd: u32,
         _state_fd: u32,
@@ -418,7 +431,9 @@ mod imp {
     mod detached_overlay;
     mod fixed_parents;
 
-    pub(super) use detached_overlay::{create_overlay_template, validate_overlay_template};
+    pub(super) use detached_overlay::{
+        create_overlay_template, take_overlay_template, validate_overlay_template,
+    };
 
     const ROOT: &str = "/tmp";
     const OLD_ROOT: &str = "/tmp/.lillux-old-root";
@@ -479,6 +494,11 @@ mod imp {
         if pid == 0 {
             close_fd(report[0]);
             let result = (|| {
+                // The shared-view probe reaps its creator before starting
+                // sibling borrowers. Run before CLONE_NEWPID makes that first
+                // child PID 1 of our pending namespace; its exit would make
+                // subsequent forks fail instead of probing view reuse.
+                probe_overlay()?;
                 enter_namespaces(LinuxSandboxNetwork::Isolated)?;
                 let directory = reanchor_mount_source(inherited_directory.file().as_raw_fd())?;
                 mount_private_root()?;
@@ -493,7 +513,6 @@ mod imp {
                 staging.detach()?;
                 probe_descriptor_mount()?;
                 fixed_parents::probe()?;
-                probe_overlay()?;
                 probe_isolated_pid_child()?;
                 Ok::<(), String>(())
             })();
@@ -567,10 +586,8 @@ mod imp {
         for mount in &mut request.mounts {
             mount.source_fd = sources[&mount.source_fd].inherited_descriptor()?;
         }
-        if let Some(overlay) = &mut request.overlay {
-            overlay.lower_fd = sources[&overlay.lower_fd].inherited_descriptor()?;
-            overlay.state_fd = sources[&overlay.state_fd].inherited_descriptor()?;
-        }
+        // The detached template is NOT an ordinary mount source: reanchoring
+        // it would replace the admitted filesystem with unrelated path bytes.
         if request.minimal_devices {
             create_minimal_devices()?;
         }
@@ -683,14 +700,15 @@ mod imp {
         }
         fixed_parents::validate(request)?;
         if let Some(overlay) = &request.overlay {
-            for fd in [overlay.lower_fd, overlay.state_fd] {
-                validate_inherited_directory(fd, "sandbox overlay")?;
-                if !descriptor_roles.insert(fd) {
-                    return Err(
-                        "descriptor is aliased across mount and overlay authority roles"
-                            .to_string(),
-                    );
-                }
+            let fd = overlay
+                .template
+                .inherited_authority()
+                .inherited_descriptor()?;
+            validate_overlay_template(overlay.template.inherited_authority())?;
+            if !descriptor_roles.insert(fd) {
+                return Err(
+                    "descriptor is aliased across mount and overlay authority roles".to_string(),
+                );
             }
             validate_absolute_path(&overlay.destination, "sandbox overlay destination")?;
             if overlay.destination == PathBuf::from("/")
@@ -867,14 +885,11 @@ mod imp {
     fn reanchor_request_sources(
         request: &LinuxSandboxRequest,
     ) -> Result<BTreeMap<u32, crate::InheritedDescriptorAuthority>, String> {
-        let mut descriptors = request
+        let descriptors = request
             .mounts
             .iter()
             .map(|mount| mount.source_fd)
             .collect::<BTreeSet<_>>();
-        if let Some(overlay) = &request.overlay {
-            descriptors.extend([overlay.lower_fd, overlay.state_fd]);
-        }
         let mut sources = BTreeMap::new();
         for descriptor in descriptors {
             let fd = raw_fd(descriptor)?;
@@ -1219,47 +1234,7 @@ mod imp {
     }
 
     fn probe_overlay() -> Result<(), String> {
-        let probe = format!("{ROOT}/.overlay-probe");
-        for name in ["lower", "state/upper", "state/work", "final"] {
-            mkdir_path(&format!("{probe}/{name}"), 0o700)?;
-        }
-        let lower = crate::PinnedDirectory::open(std::path::Path::new(&format!("{probe}/lower")))
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "overlay probe lower is missing".to_string())?;
-        let state = crate::PinnedDirectory::open(std::path::Path::new(&format!("{probe}/state")))
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "overlay probe state is missing".to_string())?;
-        lower
-            .atomic_write_if_same(OsStr::new("copy-up"), None, b"lower", 0o600)
-            .map_err(|error| error.to_string())?;
-        let lower_fd = lower
-            .try_clone_descriptor()
-            .map_err(|error| error.to_string())?;
-        let state_fd = state
-            .try_clone_descriptor()
-            .map_err(|error| error.to_string())?;
-        // Probe the production construction, including its private staging
-        // point and descriptor move. A parallel hand-written overlay mount
-        // misses setup regressions in the path actual workspaces use.
-        mount_overlay(&LinuxSandboxOverlay {
-            lower_fd: lower_fd.as_raw_fd() as u32,
-            state_fd: state_fd.as_raw_fd() as u32,
-            destination: PathBuf::from("/.overlay-probe/final"),
-        })?;
-        let visible = format!("{probe}/final/copy-up");
-        if std::fs::read(&visible).map_err(|error| error.to_string())? != b"lower" {
-            return Err("overlay probe changed lower content".into());
-        }
-        std::fs::write(&visible, b"upper").map_err(|error| error.to_string())?;
-        if std::fs::read(format!("{probe}/lower/copy-up")).map_err(|error| error.to_string())?
-            != b"lower"
-            || std::fs::read(format!("{probe}/state/upper/copy-up"))
-                .map_err(|error| error.to_string())?
-                != b"upper"
-        {
-            return Err("overlay probe did not preserve private copy-up".into());
-        }
-        unmount_path(&PathBuf::from(format!("{probe}/final")))
+        detached_overlay::probe()
     }
 
     fn probe_inherited_descriptor_mounts(directory: &File, bytes: &File) -> Result<(), String> {
@@ -1335,63 +1310,25 @@ mod imp {
     fn mount_overlay(overlay: &LinuxSandboxOverlay) -> Result<(), String> {
         let target = rooted(&overlay.destination)?;
         ensure_directory_path(&target, "overlay target")?;
-        // Open the final mountpoint after every lower layer is present. The
-        // retained descriptor, not this pathname, is the destination authority
-        // consumed by move_mount below.
         let target_authority = open_mount_target_no_symlinks(&overlay.destination)?;
-        let state = inherited_directory(overlay.state_fd, "overlay state")?;
-        let upper = state
-            .open_child_directory(OsStr::new("upper"))
-            .map_err(|error| format!("open overlay upper directory: {error}"))?
-            .ok_or_else(|| "overlay upper directory is missing".to_string())?;
-        let work = state
-            .open_child_directory(OsStr::new("work"))
-            .map_err(|error| format!("open overlay work directory: {error}"))?
-            .ok_or_else(|| "overlay work directory is missing".to_string())?;
-        let upper_fd = upper
-            .try_clone_descriptor()
-            .map_err(|error| format!("clone overlay upper authority: {error}"))?;
-        let work_fd = work
-            .try_clone_descriptor()
-            .map_err(|error| format!("clone overlay work authority: {error}"))?;
-        let options = format!(
-            "lowerdir=/proc/self/fd/{},upperdir=/proc/self/fd/{},workdir=/proc/self/fd/{},userxattr",
-            overlay.lower_fd,
-            upper_fd.as_raw_fd(),
-            work_fd.as_raw_fd()
-        );
-        // Overlay's legacy string-option ABI cannot consume an O_PATH target
-        // directly. Build it on a trusted private-root staging point, harden
-        // that mount, then move the mount onto the exact no-follow destination
-        // descriptor. No untrusted path is resolved after the proof above.
-        let staging = PathBuf::from(format!("{ROOT}/.lillux-overlay-staging"));
-        // This staging point belongs solely to the fresh private root, never
-        // to a source-backed workspace. Create it here, before ordinary mounts
-        // are installed; refuse an incumbent instead of adopting its identity.
-        mkdir_one(path_string(&staging)?, 0o700)
-            .map_err(|error| format!("create private overlay staging target: {error}"))?;
-        ensure_directory_path(&staging, "overlay staging target")?;
-        mount_raw(
-            Some("overlay"),
-            path_string(&staging)?,
-            Some("overlay"),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            Some(&options),
-        )
-        .map_err(|error| format!("mount descriptor-rooted overlay: {error}"))?;
-        if let Err(error) = set_mount_attributes(&staging, false, true, true) {
-            let _ = unmount_path(&staging);
-            return Err(error);
+        let source = overlay.template.inherited_authority();
+        validate_overlay_template(source)?;
+        // Clone the exact never-attached template in this fresh namespace.
+        // No layer path/state descriptor or new overlay construction enters a
+        // borrower. Per-child mounts are installed only on this private clone.
+        bind_fd_to_mount_target(
+            source.file().as_raw_fd(),
+            target_authority.as_raw_fd(),
+            false,
+            false,
+        )?;
+        let mounted = open_mount_target_no_symlinks(&overlay.destination)?;
+        let expected = mount_source_stat(source.file().as_raw_fd())?;
+        let observed = mount_source_stat(mounted.as_raw_fd())?;
+        if expected.st_dev != observed.st_dev || expected.st_ino != observed.st_ino {
+            return Err("borrower mount differs from its exact admitted template".to_string());
         }
-        if let Err(error) = move_path_mount_to_target(&staging, target_authority.as_raw_fd()) {
-            let _ = unmount_path(&staging);
-            return Err(error);
-        }
-        let staging_path = c_string(staging.as_os_str(), "overlay staging target")?;
-        syscall_zero(
-            unsafe { libc::rmdir(staging_path.as_ptr()) },
-            "remove overlay staging target",
-        )
+        Ok(())
     }
 
     fn bind_descriptor_mount(mount: &LinuxSandboxMount) -> Result<(), String> {

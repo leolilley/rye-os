@@ -64,6 +64,14 @@ pub struct InheritedDescriptorTransferChildAuthority {
 }
 
 impl InheritedDescriptorTransferChildAuthority {
+    /// Trusted Lillux-only fork probes already own this endpoint; moving it
+    /// avoids unsafe raw-fd re-adoption and duplicate registration after fork.
+    pub(crate) fn into_sender(self) -> InheritedDescriptorTransferSender {
+        InheritedDescriptorTransferSender {
+            socket: self.socket,
+        }
+    }
+
     pub fn inherited_descriptor(&self) -> Result<u32, String> {
         self.socket.inherited_descriptor()
     }

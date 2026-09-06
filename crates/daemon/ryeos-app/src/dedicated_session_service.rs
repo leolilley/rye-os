@@ -5,7 +5,6 @@
 //! ledgers, worker-epoch fencing, and cleanup proof consumption.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,12 +19,61 @@ use crate::hosted_operation::{
 };
 use crate::persistent_session::ExclusiveRetirementOutcome;
 use crate::process::{IdentityLiveness, ShutdownAction, execution_group_liveness, kill_by_action};
-use crate::runtime_db::{WorkerProcessRecord, WorkerProcessState, WorkspaceState};
+use crate::runtime_db::{WorkerProcessRecord, WorkerProcessState};
 use crate::state::AppState;
 use crate::state_store::{
     DedicatedSessionRecord, NewDedicatedSessionApproval, NewDedicatedSessionCommand,
     NewEventRecord, ObservationBatchReservation,
 };
+
+/// Readiness for generic workspace capture, under the caller's existing root
+/// operation barrier. Pool absence is not worker death, and a missing journal
+/// PID is not proof that a failed held launch never contacted the workspace.
+/// The returned exact identity still needs quiescence (live capture) or group
+/// death (terminal capture); this function grants no signal or new ownership.
+pub fn workspace_worker_capture_identity(
+    state: &AppState,
+    workspace: &crate::runtime_db::WorkspaceRecord,
+) -> Result<Option<crate::process::ExecutionProcessIdentity>> {
+    let root = workspace
+        .thread_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("workspace capture has no root owner"))?;
+    let worker = state
+        .state_store
+        .workspace_worker_capture_record(workspace)?;
+    let pooled_boot = state
+        .persistent_sessions
+        .exclusive_capture_boot_identity(root)?;
+    let Some(worker) = worker else {
+        if pooled_boot.is_some() {
+            bail!("workspace capture found a pool owner without durable worker authority");
+        }
+        return Ok(None);
+    };
+    if let Some(boot) = pooled_boot.as_deref() {
+        if boot != worker.boot_identity_hash
+            || worker.state != WorkerProcessState::Live
+            || worker.cleanup_state != "owned"
+        {
+            bail!("workspace capture pool and durable worker boot disagree");
+        }
+    } else {
+        crate::process::assert_reaped_process_group_absent(&worker.process_identity)
+            .context("absent pool entry does not prove dedicated worker cleanup")?;
+    }
+    if let Some(raw) = workspace.process_identity.as_deref() {
+        let recorded: crate::process::ExecutionProcessIdentity = serde_json::from_str(raw)?;
+        if recorded != worker.process_identity {
+            bail!("workspace journal and current dedicated worker identities disagree");
+        }
+    } else {
+        // A retained reaped worker need not remain in the journal, but only
+        // exact death—not absence—can permit omitting that live owner.
+        crate::process::assert_reaped_process_group_absent(&worker.process_identity)?;
+    }
+    Ok(Some(worker.process_identity))
+}
 
 pub use ryeos_runtime::callback::{
     DEDICATED_SESSION_AGGREGATE_TERMINALIZATION_RESERVE_MS, DedicatedSessionBoundedOutcome,
@@ -5131,6 +5179,9 @@ pub fn finish_terminal_credential_cleanup(
 
 /// Node-owned owner-drop cancellation path used by the root execution guard.
 /// It does not depend on the cooperative controller still being alive.
+/// This owner retires only session/worker/credential authority. Filesystem
+/// closure belongs to the launch guard holding the ORIGINAL workspace view;
+/// constructing a fresh path guard here would invent physical-close proof.
 pub fn abort_session_for_root_stop(state: &AppState, placement_thread_id: &str) -> Result<()> {
     let Some(session) = state.state_store.dedicated_session(placement_thread_id)? else {
         return Ok(());
@@ -5139,7 +5190,7 @@ pub fn abort_session_for_root_stop(state: &AppState, placement_thread_id: &str) 
         acquire_credential_profile_operation_sync(&session.credential_profile_id);
     if session.state == "terminal" {
         finish_terminal_credential_cleanup(state, &session)?;
-        return close_session_workspace(state, &session);
+        return Ok(());
     }
     if matches!(
         session.state.as_str(),
@@ -5149,7 +5200,7 @@ pub fn abort_session_for_root_stop(state: &AppState, placement_thread_id: &str) 
             .state_store
             .cancel_dedicated_candidate_for_root_stop(&session.placement_thread_id)?;
         finish_terminal_credential_cleanup(state, &session)?;
-        return close_session_workspace(state, &session);
+        return Ok(());
     }
     if session.state == "publishing" {
         bail!("candidate publication is already at a possible irreversible contact boundary");
@@ -5202,89 +5253,7 @@ pub fn abort_session_for_root_stop(state: &AppState, placement_thread_id: &str) 
         (None, None) => bail!("root-owned session has no worker and is not recoverable"),
         _ => bail!("root-owned session has a partial worker identity"),
     }
-    close_session_workspace(state, &session)
-}
-
-fn close_session_workspace(state: &AppState, session: &DedicatedSessionRecord) -> Result<()> {
-    let Some(record) = state
-        .state_store
-        .execution_workspace(&session.workspace_id)?
-    else {
-        return Ok(());
-    };
-    if record.state == WorkspaceState::Closed {
-        return Ok(());
-    }
-    if !matches!(
-        record.state,
-        WorkspaceState::Ready
-            | WorkspaceState::Active
-            | WorkspaceState::Freezing
-            | WorkspaceState::Destroying
-            | WorkspaceState::Closing
-    ) {
-        bail!("session workspace cannot close from state {}", record.state);
-    }
-    let launch_owner = record
-        .launch_owner
-        .as_deref()
-        .ok_or_else(|| anyhow!("session workspace has no launch owner"))?;
-    let mut phase = record.state;
-    if matches!(
-        phase,
-        WorkspaceState::Ready | WorkspaceState::Active | WorkspaceState::Freezing
-    ) {
-        state.state_store.transition_execution_workspace_owned(
-            &record.workspace_id,
-            &session.placement_thread_id,
-            launch_owner,
-            &[phase],
-            WorkspaceState::Destroying,
-            None,
-        )?;
-        phase = WorkspaceState::Destroying;
-    }
-    let root = PathBuf::from(&record.root_path);
-    let layout = ryeos_engine::execution_workspace::WorkspaceLayout::from_root(root.clone());
-    if phase == WorkspaceState::Destroying {
-        let destroyed = state
-            .isolation
-            .workspace_lifecycle(ryeos_engine::isolation::WorkspaceLifecycleInvocation {
-                operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::Destroy,
-                workspace_id: &record.workspace_id,
-                launch_owner,
-                base_snapshot: &record.base_snapshot,
-                project_path: &layout.project,
-            })
-            .map_err(|error| anyhow!(error.to_string()))?;
-        let pinned =
-            lillux::canonical_json(&serde_json::to_value(&destroyed.pinned_root_identities)?)?;
-        if record.backend_id.as_deref() != Some(destroyed.backend_id.as_str())
-            || record.backend_version.as_deref() != Some(destroyed.backend_version.as_str())
-            || record.pinned_root_identities.as_deref() != Some(pinned.as_str())
-            || record.mount_identity.as_deref() != Some(destroyed.mount_identity.as_str())
-        {
-            bail!("session workspace destroy evidence differs from its retained identity");
-        }
-        state.state_store.transition_execution_workspace_owned(
-            &record.workspace_id,
-            &session.placement_thread_id,
-            launch_owner,
-            &[WorkspaceState::Destroying],
-            WorkspaceState::Closing,
-            None,
-        )?;
-    }
-    crate::temp_dir_guard::TempDirGuard::new_workspace(root.clone(), layout.project)?
-        .remove_now()?;
-    state.state_store.transition_execution_workspace_owned(
-        &record.workspace_id,
-        &session.placement_thread_id,
-        launch_owner,
-        &[WorkspaceState::Closing],
-        WorkspaceState::Closed,
-        None,
-    )
+    Ok(())
 }
 
 #[cfg(test)]

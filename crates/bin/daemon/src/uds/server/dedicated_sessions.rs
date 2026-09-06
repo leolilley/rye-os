@@ -6,10 +6,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use ryeos_app::callback_token::CallbackCapability;
 use ryeos_app::accounting_db::{
     ExecutionResourceBudgetSnapshot, ExecutionResourceClaimOutcome, ExecutionResourceDimension,
 };
+use ryeos_app::callback_token::CallbackCapability;
 use ryeos_app::runtime_db::{
     DedicatedCandidateDisposition, NewDedicatedSession, WorkspaceBinding, WorkspaceRecord,
     WorkspaceState,
@@ -97,6 +97,7 @@ fn settle_failed_dedicated_worker_start(
     if let Err(error) = state.state_store.fail_dedicated_session_start(
         placement_thread_id,
         worker_instance_id,
+        boot_epoch,
         reason,
         cleanup_proved,
     ) {
@@ -202,11 +203,7 @@ fn attach_exact_pending_approval(
     placement_thread_id: &str,
 ) -> Result<Value> {
     let mut value = serde_json::to_value(session)?;
-    if value
-        .get("candidate_disposition")
-        .and_then(Value::as_str)
-        != Some("retained_for_review")
-    {
+    if value.get("candidate_disposition").and_then(Value::as_str) != Some("retained_for_review") {
         return Ok(value);
     }
     if let Some(approval) =
@@ -228,7 +225,10 @@ fn attach_exact_pending_approval(
         if !exact {
             bail!("pending approval changed across its session projection read");
         }
-        object.insert("pending_approval".to_owned(), serde_json::to_value(approval)?);
+        object.insert(
+            "pending_approval".to_owned(),
+            serde_json::to_value(approval)?,
+        );
     }
     Ok(value)
 }
@@ -448,15 +448,23 @@ fn scratch_home_id(thread_id: &str) -> String {
 
 fn create_dedicated_runtime_workspace(
     state: &AppState,
+    controller_lifeline: &Arc<ryeos_app::temp_dir_guard::TempDirGuard>,
     workspace_id: &str,
     thread_id: &str,
     launch_owner: &str,
-) -> Result<WorkspaceRecord> {
+) -> Result<(
+    WorkspaceRecord,
+    Arc<ryeos_app::temp_dir_guard::TempDirGuard>,
+)> {
     let base_snapshot = lillux::cas::sha256_hex(&[]);
     let (project, guard) = ryeos_app::temp_dir_guard::create_runtime_workspace(
         &state.config.runtime_root().cache(),
         workspace_id,
     )?;
+    // The controller retains this ORIGINAL owner before any adapter contact.
+    // Do not mount backend-private state beneath its writable scratch root or
+    // replace the guard with a pathname-only owner after creation.
+    controller_lifeline.retain_owned_workspace_lifeline(guard.clone())?;
     let root = project
         .parent()
         .ok_or_else(|| anyhow!("runtime workspace project has no root"))?;
@@ -493,31 +501,81 @@ fn create_dedicated_runtime_workspace(
     )?;
     let created = state
         .isolation
-        .workspace_lifecycle(ryeos_engine::isolation::WorkspaceLifecycleInvocation {
-            operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::Create,
-            workspace_id,
-            launch_owner,
-            base_snapshot: &base_snapshot,
-            project_path: &layout.project,
-        })
+        .create_workspace(
+            ryeos_engine::isolation::WorkspaceLifecycleInvocation {
+                operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::Create,
+                workspace_id,
+                launch_owner,
+                base_snapshot: &base_snapshot,
+                project_path: &layout.project,
+                mount_identity: None,
+            },
+            &|held| {
+                #[cfg(target_os = "linux")]
+                {
+                    let identity =
+                        ryeos_app::process::capture_execution_process_identity_from_pidfd(
+                            i64::from(held.pid()),
+                            Some(i64::from(held.pgid())),
+                            held.pidfd(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    state
+                        .state_store
+                        .attach_workspace_creator(workspace_id, thread_id, launch_owner, &identity)
+                        .map_err(|error| error.to_string())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = held;
+                    Err(
+                        "workspace creator attachment requires exact process identity support"
+                            .to_owned(),
+                    )
+                }
+            },
+        )
         .map_err(|error| anyhow!(error.to_string()))?;
-    let pinned = lillux::canonical_json(&serde_json::to_value(&created.pinned_root_identities)?)?;
+    let evidence = created.evidence;
+    guard.install_workspace_view(
+        &evidence,
+        created
+            .created_view
+            .ok_or_else(|| anyhow!("dedicated workspace Create omitted its retained view"))?,
+    )?;
+    let pinned = lillux::canonical_json(&serde_json::to_value(&evidence.pinned_root_identities)?)?;
+    if state.isolation.is_enforced() {
+        state
+            .state_store
+            .assert_execution_workspace_creator_reaped(workspace_id, thread_id, launch_owner)?;
+    }
     state
         .state_store
         .bind_execution_workspace(WorkspaceBinding {
             workspace_id,
             thread_id,
             launch_owner: Some(launch_owner),
-            backend_id: Some(&created.backend_id),
-            backend_version: Some(&created.backend_version),
+            backend_id: Some(&evidence.backend_id),
+            backend_version: Some(&evidence.backend_version),
             pinned_root_identities: Some(&pinned),
-            mount_identity: Some(&created.mount_identity),
+            mount_identity: evidence.mount_identity.as_deref(),
         })?;
-    guard.disarm();
-    state
+    state.state_store.bind_thread_workspace(
+        thread_id,
+        &ryeos_app::runtime_db::RuntimeWorkspaceBinding {
+            workspace_id: workspace_id.to_owned(),
+            view_identity: evidence
+                .mount_identity
+                .ok_or_else(|| anyhow!("created view identity is absent"))?,
+            borrower_launch_owner: serde_json::from_str(launch_owner)
+                .context("decode dedicated root launch owner")?,
+        },
+    )?;
+    let record = state
         .state_store
         .execution_workspace(workspace_id)?
-        .ok_or_else(|| anyhow!("bound dedicated runtime workspace disappeared"))
+        .ok_or_else(|| anyhow!("bound dedicated runtime workspace disappeared"))?;
+    Ok((record, guard))
 }
 
 pub(super) fn status(params: &Value, state: &AppState, cap: &CallbackCapability) -> Result<Value> {
@@ -759,9 +817,7 @@ pub(super) async fn start(
     let mut aggregate_budget = execution_resource_budget(state, cap)?;
     let (capsule_hash, bounded_turn) =
         admitted_session_capsule(state, &request.thread_id, &request.dependency_ref)?;
-    if bounded_turn
-        != (candidate_disposition == DedicatedCandidateDisposition::RetainedForReview)
-    {
+    if bounded_turn != (candidate_disposition == DedicatedCandidateDisposition::RetainedForReview) {
         bail!("dedicated-session candidate disposition contradicts its admitted worker mode");
     }
     if aggregate_budget
@@ -862,10 +918,7 @@ pub(super) async fn start(
                         "budget_reason":reason,
                         "bounded_outcome":bounded_budget_outcome(&reason)?,
                     });
-                    return attach_execution_resource_budget(
-                        refused,
-                        aggregate_budget.as_ref(),
-                    );
+                    return attach_execution_resource_budget(refused, aggregate_budget.as_ref());
                 }
             }
         }
@@ -874,11 +927,20 @@ pub(super) async fn start(
         &state.config.runtime_state_dir(),
         &profile.home_id,
     )?;
-    let workspace = match state
+    let controller_lifeline = cap
+        .provenance
+        .workspace_lifeline()
+        .ok_or_else(|| anyhow!("dedicated controller has no original workspace lifeline"))?;
+    let (workspace, workspace_lifeline) = match state
         .state_store
         .execution_workspace_for_thread(&request.thread_id)?
     {
-        Some(workspace) => workspace,
+        Some(workspace) => {
+            let lifeline = controller_lifeline
+                .owned_workspace_lifeline()?
+                .ok_or_else(|| anyhow!("dedicated workspace lost its original retained owner"))?;
+            (workspace, lifeline)
+        }
         None if !request.require_pinned_cow && request.required_terminal_publication == "any" => {
             let claim = state
                 .state_store
@@ -888,6 +950,7 @@ pub(super) async fn start(
             let workspace_id = format!("dedicated-{home_id}");
             create_dedicated_runtime_workspace(
                 state,
+                &controller_lifeline,
                 &workspace_id,
                 &request.thread_id,
                 &claim.claimed_by,
@@ -915,6 +978,18 @@ pub(super) async fn start(
         ryeos_executor::execution::workspace::WorkspaceLayout::from_root(workspace_root).project;
     if !workspace_path.is_absolute() {
         bail!("dedicated-session workspace path is not absolute");
+    }
+    if !workspace_lifeline.owns_effective_path(&workspace_path) {
+        bail!("dedicated workspace differs from its original retained owner path");
+    }
+    let view_identity = workspace
+        .mount_identity
+        .as_deref()
+        .ok_or_else(|| anyhow!("dedicated workspace has no bound view incarnation"))?;
+    if workspace_lifeline.workspace_view_identity()?.as_ref()
+        != Some(&(workspace.workspace_id.clone(), view_identity.to_owned()))
+    {
+        bail!("dedicated workspace differs from its original retained view incarnation");
     }
     let worker_instance_id = ryeos_app::thread_lifecycle::new_thread_id();
     let credential_generation = profile.credential_generation;
@@ -1015,6 +1090,7 @@ pub(super) async fn start(
             &request.thread_id,
             credential_generation,
             &worker_instance_id,
+            &workspace.workspace_id,
         )
     } else if let Some(reservation) = handoff_reservation.as_ref() {
         state
@@ -1170,43 +1246,52 @@ pub(super) async fn start(
                 raw,
             )
         });
-    let started = tokio::task::spawn_blocking(move || {
-        ryeos_executor::execution::persistent_session::start_exclusive_capsule(
-            &start_state,
-            &start_capsule,
-            &start_workspace,
-            Some(&start_state_root),
-            &runtime_environment,
-            extra_target_channels,
-            &start_identity,
-            observation_sink,
-        )
-    })
-    .await
-    .context("join dedicated-session worker start")?;
-    if let Err(error) = started {
-        let detail = format!("{error:#}");
-        let reason = bounded_worker_failure_reason("dedicated worker start failed: ", &detail);
-        let cleanup_was_proved_before_attachment = error
-            .downcast_ref::<
-                ryeos_executor::execution::persistent_session::ExclusiveWorkerCleanupUnproved,
-            >()
-            .is_none();
-        let settlement = settle_failed_dedicated_worker_start(
-            state,
-            &request.thread_id,
-            &worker_instance_id,
-            boot_epoch,
-            &reason,
-            cleanup_was_proved_before_attachment,
-        );
-        return match settlement {
-            Ok(()) => Err(anyhow!(reason)),
-            Err(settlement) => Err(anyhow!(
-                "{reason}; explicit failed-start settlement also failed: {settlement:#}"
-            )),
-        };
-    }
+    // A cancelled async caller must not drop admission fences while its
+    // blocking task is still preparing/contacting the exact worker process.
+    let (started, _root_operation, _credential_operation) =
+        tokio::task::spawn_blocking(move || {
+            let started = ryeos_executor::execution::persistent_session::start_exclusive_capsule(
+                &start_state,
+                &start_capsule,
+                &start_workspace,
+                workspace_lifeline,
+                Some(&start_state_root),
+                &runtime_environment,
+                extra_target_channels,
+                &start_identity,
+                observation_sink,
+            )
+            .map_err(|error| {
+                // Failure settlement is part of worker contact, not delivery
+                // of this async response. Cancellation after spawn must not
+                // release the operation fences before recording an unknown
+                // process/credential outcome (including pre-identity failure).
+                let reason = bounded_worker_failure_reason(
+                    "dedicated worker start failed: ",
+                    &format!("{error:#}"),
+                );
+                let cleanup_proved = error
+                    .downcast_ref::<ryeos_executor::execution::persistent_session::ExclusiveWorkerCleanupUnproved>()
+                    .is_none();
+                match settle_failed_dedicated_worker_start(
+                    &start_state,
+                    &start_identity.placement_thread_id,
+                    &start_identity.worker_instance_id,
+                    start_identity.boot_epoch,
+                    &reason,
+                    cleanup_proved,
+                ) {
+                    Ok(()) => error.context(reason),
+                    Err(settlement) => error.context(format!(
+                        "{reason}; explicit failed-start settlement also failed: {settlement:#}"
+                    )),
+                }
+            });
+            (started, _root_operation, _credential_operation)
+        })
+        .await
+        .context("join dedicated-session worker start")?;
+    started?;
     let session = state
         .state_store
         .dedicated_session(&request.thread_id)?

@@ -211,6 +211,9 @@ struct BudgetedSessionFrame {
 
 struct SessionProcess {
     wire: PersistentSessionWireContract,
+    /// The exact identity already validated by exclusive readiness, retained
+    /// so capture can compare the pool owner with its durable worker record.
+    expected_boot_identity: Option<String>,
     writer: Mutex<lillux::InheritedDuplexChannel>,
     reader: Mutex<Option<SessionChannel>>,
     pending: Mutex<HashMap<String, SyncSender<std::result::Result<BudgetedSessionFrame, String>>>>,
@@ -1184,6 +1187,53 @@ impl PersistentSessionPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(state.exclusive_failure_cleanup.remove(session_id))
+    }
+
+    /// Read the existing exclusive owner without consuming any cleanup proof.
+    /// `None` means pool absence only; callers still need durable no-contact or
+    /// exact process-death authority. Pending and uncertain owners always refuse.
+    pub fn exclusive_capture_boot_identity(&self, session_id: &str) -> Result<Option<String>> {
+        validate_exclusive_session_id(session_id)?;
+        let process = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("persistent-session pool poisoned"))?;
+            if state.cleanup_unproved.is_some()
+                || state.exclusive_reservations.contains_key(session_id)
+                || state.exclusive_failure_cleanup.contains_key(session_id)
+            {
+                bail!(
+                    "workspace capture is fenced by pending or unsettled exclusive worker contact"
+                );
+            }
+            let Some(entry) = state.exclusive.get(session_id) else {
+                return Ok(None);
+            };
+            Arc::clone(&entry.process)
+        };
+        // Retirement may hold the process slot during a blocking reap. Never
+        // hold the pool or another process mutex while waiting for that owner;
+        // contended cleanup is not a stable capture point.
+        let cleanup_unknown = process
+            .cleanup_unproved
+            .try_lock()
+            .map_err(|_| anyhow!("session cleanup owner is busy or poisoned"))?
+            .is_some();
+        let running_present = process
+            .running
+            .try_lock()
+            .map_err(|_| anyhow!("session process owner is busy or poisoned"))?
+            .is_some();
+        if process.closed.load(Ordering::Acquire) || cleanup_unknown || !running_present {
+            bail!("workspace capture is fenced by a draining or cleanup-unknown exclusive worker");
+        }
+        let identity = process
+            .expected_boot_identity
+            .as_ref()
+            .ok_or_else(|| anyhow!("exclusive capture owner has no verified boot identity"))?;
+        Ok(Some(identity.clone()))
     }
 
     pub fn retire_exclusive(&self, session_id: &str) -> Result<ExclusiveRetirementOutcome> {
@@ -2589,6 +2639,7 @@ fn ready_process(
     };
     Ok(SessionProcess {
         wire: wire.clone(),
+        expected_boot_identity,
         writer: Mutex::new(writer),
         reader: Mutex::new(Some(SessionChannel { socket, reader })),
         pending: Mutex::new(HashMap::new()),
@@ -3361,6 +3412,7 @@ while True:
             isolation,
             isolation_project_authority:
                 ryeos_engine::isolation::IsolationProjectAuthority::External,
+            isolation_workspace_view: None,
             isolation_filesystem_authority_ceiling:
                 ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
             isolation_network_authority_ceiling:
@@ -3533,6 +3585,30 @@ while True:
         pool.retire_exclusive(&session_id).unwrap();
         pool.reserve_exclusive(&session_id, &lifecycle, &wire)
             .unwrap();
+    }
+
+    #[test]
+    fn exclusive_capture_readiness_refuses_pending_and_preserves_cleanup_proof() {
+        let pool = PersistentSessionPool::new();
+        let id = "c".repeat(64);
+        assert!(pool.exclusive_capture_boot_identity(&id).unwrap().is_none());
+        let reservation = pool
+            .reserve_exclusive(&id, &test_lifecycle(), &test_wire())
+            .unwrap();
+        assert!(pool.exclusive_capture_boot_identity(&id).is_err());
+        drop(reservation);
+        {
+            let mut state = pool.inner.state.lock().unwrap();
+            state.exclusive_failure_cleanup.insert(id.clone(), "reaped");
+        }
+        assert!(pool.exclusive_capture_boot_identity(&id).is_err());
+        assert_eq!(
+            pool.take_exclusive_failure_cleanup_state(&id).unwrap(),
+            Some("reaped")
+        );
+        pool.inner.state.lock().unwrap().cleanup_unproved =
+            Some("fixture unknown process".to_owned());
+        assert!(pool.exclusive_capture_boot_identity(&id).is_err());
     }
 
     #[test]

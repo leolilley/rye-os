@@ -5544,8 +5544,56 @@ async fn run_claimed_thread_row_inner(
             )));
         }
     }
+    // Lineage and borrower admission precede all workspace input contact.
+    // Record operational lineage the instant we commit to launching a child, so a
+    // cancel/kill of the parent can cascade to it. Only a launch carrying a parent
+    // execution context is a child — inline-dispatched and follow children both
+    // flow through here; a fresh root launch and a continuation successor carry no
+    // parent context and are (correctly) not linked. This is fail-closed: the
+    // store atomically inherits an already-durable parent stop onto the child.
+    if let Some(parent_ctx) = parent_execution_context {
+        let inherited_stop = state.state_store.record_child_link(
+            &parent_ctx.parent_thread_id,
+            &thread_id,
+            "dispatch",
+        )?;
+        if inherited_stop.is_some() {
+            super::process_attachment::finalize_requested_stop_if_present(state, &thread_id)?;
+            return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "parent {} was stop-requested before child launch",
+                parent_ctx.parent_thread_id
+            )));
+        }
+    }
+
+    // A local machine-continuation successor continues its predecessor's work
+    // under a fresh thread id and carries no parent execution context, so the
+    // block above does not link it. Link it to its immediate local predecessor
+    // for operational stop propagation. A continuation whose state was restored
+    // by an authority above this runtime has no predecessor runtime row on this
+    // node: its signed cross-site edge already supplies chain authority, and the
+    // current placement is addressed directly for local stop ownership.
+    if let Some(previous) = previous_thread_id
+        && checkpoint_resume_mode != CheckpointResumeMode::ExternallyRestoredContinuation
+    {
+        let inherited_stop =
+            state
+                .state_store
+                .record_child_link(previous, &thread_id, "continuation")?;
+        if inherited_stop.is_some() {
+            super::process_attachment::finalize_requested_stop_if_present(state, &thread_id)?;
+            return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
+                "predecessor {previous} was stop-requested before continuation launch"
+            )));
+        }
+    }
     let owns_workspace = !provenance.is_borrowed_child()
         && provenance.project_authority().requires_project_foldback();
+    if !provenance.is_borrowed_child()
+        && let Some(lifeline) = provenance.workspace_lifeline()
+    {
+        lifecycle_owner.track_owned_workspace_lifeline(lifeline.clone())?;
+    }
     super::runner::bind_owned_workspace_after_thread_birth(
         state,
         provenance,
@@ -5602,49 +5650,6 @@ async fn run_claimed_thread_row_inner(
     drop(pending_executor_blob);
     drop(pending_external_realization);
     drop(pending_session_publications);
-
-    // Record operational lineage the instant we commit to launching a child, so a
-    // cancel/kill of the parent can cascade to it. Only a launch carrying a parent
-    // execution context is a child — inline-dispatched and follow children both
-    // flow through here; a fresh root launch and a continuation successor carry no
-    // parent context and are (correctly) not linked. This is fail-closed: the
-    // store atomically inherits an already-durable parent stop onto the child.
-    if let Some(parent_ctx) = parent_execution_context {
-        let inherited_stop = state.state_store.record_child_link(
-            &parent_ctx.parent_thread_id,
-            &thread_id,
-            "dispatch",
-        )?;
-        if inherited_stop.is_some() {
-            super::process_attachment::finalize_requested_stop_if_present(state, &thread_id)?;
-            return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
-                "parent {} was stop-requested before child launch",
-                parent_ctx.parent_thread_id
-            )));
-        }
-    }
-
-    // A local machine-continuation successor continues its predecessor's work
-    // under a fresh thread id and carries no parent execution context, so the
-    // block above does not link it. Link it to its immediate local predecessor
-    // for operational stop propagation. A continuation whose state was restored
-    // by an authority above this runtime has no predecessor runtime row on this
-    // node: its signed cross-site edge already supplies chain authority, and the
-    // current placement is addressed directly for local stop ownership.
-    if let Some(previous) = previous_thread_id
-        && checkpoint_resume_mode != CheckpointResumeMode::ExternallyRestoredContinuation
-    {
-        let inherited_stop =
-            state
-                .state_store
-                .record_child_link(previous, &thread_id, "continuation")?;
-        if inherited_stop.is_some() {
-            super::process_attachment::finalize_requested_stop_if_present(state, &thread_id)?;
-            return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
-                "predecessor {previous} was stop-requested before continuation launch"
-            )));
-        }
-    }
 
     let root_admission = resolved
         .root_admission
@@ -6578,7 +6583,7 @@ async fn run_claimed_thread_row_inner(
         .map_err(|e| anyhow::anyhow!("runtime wait join error: {e}"))?;
     // The owned wait has completed and compare-cleared the exact attached
     // identity. Revoke callback and thread-auth authority before result handling.
-    lifecycle_owner.disarm();
+    lifecycle_owner.revoke_tokens_after_wait();
 
     // Prune stale capabilities from other completed threads
     let pruned = state.callback_tokens.prune_expired();
@@ -6712,6 +6717,16 @@ async fn run_claimed_thread_row_inner(
                         "runtime requested exact same-thread recovery"
                     );
                     let next_owner = next_claim.canonical_owner()?;
+                    // Rotation transfers durable ownership, not cleanup of
+                    // the original live view. Install the successor guard
+                    // before disarming the predecessor or doing any fallible
+                    // reconstruction. Cancellation must never leave a gap.
+                    let mut next_lifecycle =
+                        super::process_attachment::LifecycleOwnerGuard::new(state, &thread_id);
+                    if let Some(workspace) = provenance.workspace_lifeline() {
+                        next_lifecycle.track_owned_workspace_lifeline(workspace)?;
+                    }
+                    lifecycle_owner.disarm();
                     let current_thread =
                         state.threads.get_thread(&thread_id)?.ok_or_else(|| {
                             BuildAndLaunchError::Internal(anyhow::anyhow!(
@@ -6722,8 +6737,15 @@ async fn run_claimed_thread_row_inner(
                         state,
                         current_thread,
                         &next_owner,
+                        Some(provenance.clone()),
                     ))
                     .await;
+                    if resumed.is_ok() {
+                        next_lifecycle.disarm();
+                    }
+                    // Cleanup requires the exact successor claim to remain
+                    // active; do not release it before the cleanup owner.
+                    drop(next_lifecycle);
                     drop(next_claim);
                     return resumed;
                 }
@@ -6742,6 +6764,7 @@ async fn run_claimed_thread_row_inner(
         if let Some(workspace) = provenance.workspace_lifeline().as_ref() {
             workspace.disarm();
         }
+        lifecycle_owner.disarm();
         return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
             "managed runtime interrupted by daemon shutdown; row preserved for recovery"
         )));
@@ -6809,9 +6832,6 @@ async fn run_claimed_thread_row_inner(
                 terminal_publication,
                 Some(candidate_snapshot_hash),
             ) {
-                if let Some(workspace) = workspace_lifeline.as_ref() {
-                    workspace.disarm();
-                }
                 return Err(BuildAndLaunchError::Internal(error.context(
                     "close managed hosted candidate workspace before binding",
                 )));
@@ -7023,14 +7043,21 @@ async fn run_claimed_thread_row_inner(
             terminal_publication,
             result_project_snapshot_hash.as_deref(),
         ) {
-            if let Some(workspace) = workspace_lifeline.as_ref() {
-                workspace.disarm();
-            }
             return Err(BuildAndLaunchError::Internal(
                 error.context("close managed runtime workspace"),
             ));
         }
     }
+
+    if !owns_workspace && !provenance.is_borrowed_child() {
+        super::runner::close_aborted_owned_workspace(
+            state,
+            provenance.workspace_lifeline().as_ref(),
+            &thread_id,
+        )
+        .map_err(BuildAndLaunchError::Internal)?;
+    }
+    lifecycle_owner.disarm();
 
     // The runtime returns terminal text in `result` (Option<String>) and any
     // non-fatal callback drift in `warnings`. Both must be visible to the
@@ -8603,9 +8630,6 @@ async fn finalize_recovered_hosted_candidate_disposition(
             terminal_publication,
             Some(candidate_snapshot_hash),
         ) {
-            if let Some(workspace) = workspace_lifeline.as_ref() {
-                workspace.disarm();
-            }
             return Err(BuildAndLaunchError::Internal(error.context(
                 "close recovered hosted candidate workspace before disposition",
             )));
@@ -8898,14 +8922,12 @@ fn finalize_recovered_candidate_integration(
         terminal_publication,
         Some(&result_snapshot_hash),
     ) {
-        if let Some(workspace) = workspace_lifeline.as_ref() {
-            workspace.disarm();
-        }
-        tracing::error!(
-            thread_id,
-            %error,
-            "recovered candidate integration finalized but its workspace cleanup remains pending"
-        );
+        // Keep the reconstruction cleanup owner armed. A successful return
+        // would disarm it and discard the only original view lifeline while
+        // same-daemon reconciliation is correctly forbidden to recreate it.
+        return Err(BuildAndLaunchError::Internal(error.context(
+            "recovered candidate integration finalized but workspace closure is unresolved",
+        )));
     }
     kick_launch_window_for_terminal(state, &finalized.chain_root_id);
     kick_follow_resume_if_ready(state, &finalized.chain_root_id);
@@ -8927,6 +8949,39 @@ async fn launch_claimed_native_resume(
     state: &AppState,
     thread: ryeos_app::state_store::ThreadDetail,
     launch_owner: &str,
+    live_provenance: Option<ryeos_app::execution_provenance::ExecutionProvenance>,
+) -> Result<NativeLaunchResult, BuildAndLaunchError> {
+    // Reconstruction itself can create a new view on cold recovery, before
+    // the managed launch installs its ordinary lifecycle guard. Retain the
+    // original owner across that entire fallible interval as well.
+    let mut preparation_owner =
+        super::process_attachment::LifecycleOwnerGuard::new(state, &thread.thread_id);
+    if let Some(provenance) = live_provenance.as_ref()
+        && !provenance.is_borrowed_child()
+        && let Some(workspace) = provenance.workspace_lifeline()
+    {
+        preparation_owner.track_owned_workspace_lifeline(workspace)?;
+    }
+    let result = launch_claimed_native_resume_inner(
+        state,
+        thread,
+        launch_owner,
+        live_provenance,
+        &mut preparation_owner,
+    )
+    .await;
+    if result.is_ok() {
+        preparation_owner.disarm();
+    }
+    result
+}
+
+async fn launch_claimed_native_resume_inner(
+    state: &AppState,
+    thread: ryeos_app::state_store::ThreadDetail,
+    launch_owner: &str,
+    live_provenance: Option<ryeos_app::execution_provenance::ExecutionProvenance>,
+    preparation_owner: &mut super::process_attachment::LifecycleOwnerGuard,
 ) -> Result<NativeLaunchResult, BuildAndLaunchError> {
     let thread_id = thread.thread_id.clone();
     let launch_metadata = state
@@ -8942,6 +8997,14 @@ async fn launch_claimed_native_resume(
         .ok_or_else(|| {
             anyhow::anyhow!("native resume: {thread_id} has no sealed admitted request")
         })?;
+    if let Some(provenance) = live_provenance.as_ref() {
+        super::runner::handoff_live_workspace_for_retry(
+            state,
+            provenance,
+            &thread_id,
+            launch_owner,
+        )?;
+    }
 
     if let Some(authority) = sealed.candidate_evaluation_authority()
         && matches!(
@@ -8984,18 +9047,23 @@ async fn launch_claimed_native_resume(
                 | ryeos_app::runtime_db::WorkspaceState::Freezing,
                 Some(fact),
             ) => {
-                let provenance =
-                    crate::execution::runner::retained_workspace_provenance_for_native_resume(
-                        state,
-                        &thread_id,
-                        launch_owner,
-                        &resume,
-                    )?
-                    .ok_or_else(|| {
-                        BuildAndLaunchError::Internal(anyhow::anyhow!(
-                            "completed candidate integration lost its retained workspace authority"
-                        ))
-                    })?;
+                let provenance = match live_provenance.clone() {
+                    Some(provenance) => Some(provenance),
+                    None => {
+                        crate::execution::runner::retained_workspace_provenance_for_native_resume(
+                            state,
+                            &thread_id,
+                            launch_owner,
+                            &resume,
+                            preparation_owner,
+                        )?
+                    }
+                }
+                .ok_or_else(|| {
+                    BuildAndLaunchError::Internal(anyhow::anyhow!(
+                        "completed candidate integration lost its retained workspace authority"
+                    ))
+                })?;
                 let (provenance, _) =
                     crate::execution::runner::candidate_evaluation_provenance_from_resume_context(
                         state,
@@ -9059,13 +9127,16 @@ async fn launch_claimed_native_resume(
     // happens inside; working dir + runtime registry then follow the
     // provenance so the resumed run resolves against the pinned overlay
     // engine when the original spawn was pushed-head.
-    let retained_provenance =
-        crate::execution::runner::retained_workspace_provenance_for_native_resume(
+    let retained_provenance = match live_provenance {
+        Some(provenance) => Some(provenance),
+        None => crate::execution::runner::retained_workspace_provenance_for_native_resume(
             state,
             &thread_id,
             launch_owner,
             &resume,
-        )?;
+            preparation_owner,
+        )?,
+    };
     if recovered_candidate_workspace_id.is_some()
         && let Some(provenance) = retained_provenance.as_ref()
     {
@@ -9086,6 +9157,12 @@ async fn launch_claimed_native_resume(
         retained_provenance,
     )?;
     let project_path = params.provenance.effective_path().to_path_buf();
+
+    if !params.provenance.is_borrowed_child()
+        && let Some(workspace) = params.provenance.workspace_lifeline()
+    {
+        preparation_owner.track_owned_workspace_lifeline(workspace)?;
+    }
 
     let result = run_claimed_thread_row(
         BuildAndLaunchParams {
@@ -9422,7 +9499,7 @@ async fn launch_existing_native_resume_with_claim(
     // (flipping the awaiting waiter to `ready`) — so the parent must be kicked here
     // too, not left for the next restart.
     let child_chain_root_id = thread.chain_root_id.clone();
-    let result = launch_claimed_native_resume(&state, thread, &launch_owner).await;
+    let result = launch_claimed_native_resume(&state, thread, &launch_owner, None).await;
 
     match result {
         Ok(native) => Ok(SuccessorLaunchOutcome::Launched(native)),

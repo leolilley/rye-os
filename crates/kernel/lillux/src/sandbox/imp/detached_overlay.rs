@@ -13,6 +13,20 @@ const FSCONFIG_SET_FD: libc::c_uint = 5;
 const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
 const OVERLAYFS_SUPER_MAGIC: libc::c_long = 0x794c_7630;
 
+pub(crate) fn take_overlay_template(fd: u32) -> Result<LinuxOverlayTemplate, String> {
+    if fd <= 2 {
+        return Err("overlay template descriptor overlaps stdio".to_string());
+    }
+    let descriptor = raw_fd(fd)?;
+    let lease = crate::retain_fork_sensitive_descriptors();
+    // SAFETY: the outer public adoption contract transfers unique inherited
+    // ownership. Registration/type refusal retains or closes it on every path.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    LinuxOverlayTemplate::from_transferred_authority(
+        crate::InheritedDescriptorAuthority::from_owned_file(file, &lease)?,
+    )
+}
+
 pub(crate) fn create_overlay_template(
     project_fd: u32,
     state_fd: u32,
@@ -165,6 +179,180 @@ pub(crate) fn validate_overlay_template(
     Ok(())
 }
 
+/// Exercise the actual Create/transfer/borrow topology, not a second overlay
+/// mount over the same upper/work. All scratch bytes live in this probe's
+/// private tmpfs; no host-side temporary paths or namespace keepers survive.
+pub(super) fn probe() -> Result<(), String> {
+    bounded_probe_child(|| {
+        enter_mapped_user_namespace()?;
+        syscall_zero(
+            unsafe { libc::unshare(libc::CLONE_NEWNS) },
+            "create template probe namespace",
+        )?;
+        mount_raw(None, "/", None, libc::MS_REC | libc::MS_PRIVATE, None)
+            .map_err(|error| format!("make template probe mounts private: {error}"))?;
+        mount_private_root()?;
+        let root = crate::PinnedDirectory::open(std::path::Path::new(ROOT))
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "template probe root is missing".to_string())?;
+        let lower = root
+            .create_child(OsStr::new("lower"), 0o700)
+            .map_err(|error| error.to_string())?;
+        let state = root
+            .create_child(OsStr::new("state"), 0o700)
+            .map_err(|error| error.to_string())?;
+        state
+            .create_child(OsStr::new("upper"), 0o700)
+            .map_err(|error| error.to_string())?;
+        state
+            .create_child(OsStr::new("work"), 0o700)
+            .map_err(|error| error.to_string())?;
+        lower
+            .atomic_write_if_same(OsStr::new("seed"), None, b"lower", 0o600)
+            .map_err(|error| error.to_string())?;
+        let lower = lower
+            .inherited_descriptor_authority()
+            .map_err(|error| error.to_string())?;
+        let state = state
+            .inherited_descriptor_authority()
+            .map_err(|error| error.to_string())?;
+        let (receiver, sender) =
+            crate::inherited_descriptor_transfer_pair().map_err(|error| error.to_string())?;
+        let parent = unsafe { libc::getpid() };
+        let creator = unsafe { libc::fork() };
+        if creator < 0 {
+            return Err(format!(
+                "fork exact template creator: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if creator == 0 {
+            arm_probe_child(parent);
+            drop(receiver);
+            let result = (|| {
+                let template = create_overlay_template(
+                    lower.inherited_descriptor()?,
+                    state.inherited_descriptor()?,
+                )?;
+                sender
+                    .into_sender()
+                    .send(
+                        b"view",
+                        std::slice::from_ref(template.inherited_authority()),
+                        crate::DescriptorTransferBounds::new(4, 1)
+                            .map_err(|error| error.to_string())?,
+                        crate::time::MonotonicDeadline::after(std::time::Duration::from_secs(10)),
+                    )
+                    .map_err(|error| error.to_string())
+            })();
+            finish_probe_child(result);
+        }
+        drop(sender);
+        let received = receiver.receive(
+            crate::DescriptorTransferBounds::new(4, 1).map_err(|error| error.to_string())?,
+            crate::time::MonotonicDeadline::after(std::time::Duration::from_secs(10)),
+        );
+        // Always reap the exact creator, including malformed/failed receipt.
+        // Its bounded alarm also prevents an inspection wait from hanging.
+        require_probe_exit((LinuxSandboxProcess { pid: creator }).wait()?)?;
+        let (payload, mut descriptors) = received.map_err(|error| error.to_string())?.into_parts();
+        if payload != b"view" || descriptors.len() != 1 {
+            return Err("template probe received an unexpected capability packet".to_string());
+        }
+        let template = LinuxOverlayTemplate::from_transferred_authority(
+            descriptors.pop().unwrap().for_child()?,
+        )?;
+        bounded_probe_child(|| {
+            enter_namespaces(LinuxSandboxNetwork::Isolated)?;
+            mount_private_root()?;
+            create_directory_target(&rooted(&PathBuf::from("/project"))?)?;
+            mount_overlay(&LinuxSandboxOverlay {
+                template: template.clone(),
+                destination: PathBuf::from("/project"),
+            })?;
+            require_probe_bytes("/tmp/project/seed", b"lower")?;
+            std::fs::write("/tmp/project/seed", b"borrower one")
+                .map_err(|error| error.to_string())?;
+            std::fs::create_dir("/tmp/project/private").map_err(|error| error.to_string())?;
+            mount_raw(
+                Some("tmpfs"),
+                "/tmp/project/private",
+                Some("tmpfs"),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some("mode=0700"),
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write("/tmp/project/private/secret", b"private")
+                .map_err(|error| error.to_string())
+        })?;
+        bounded_probe_child(|| {
+            enter_namespaces(LinuxSandboxNetwork::Isolated)?;
+            mount_private_root()?;
+            create_directory_target(&rooted(&PathBuf::from("/project"))?)?;
+            mount_overlay(&LinuxSandboxOverlay {
+                template: template.clone(),
+                destination: PathBuf::from("/project"),
+            })?;
+            require_probe_bytes("/tmp/project/seed", b"borrower one")?;
+            if std::path::Path::new("/tmp/project/private/secret").exists() {
+                return Err("template clone inherited another borrower's private mount".to_string());
+            }
+            std::fs::write("/tmp/project/seed", b"borrower two").map_err(|error| error.to_string())
+        })?;
+        drop(template);
+        require_probe_bytes("/tmp/lower/seed", b"lower")?;
+        require_probe_bytes("/tmp/state/upper/seed", b"borrower two")
+    })
+}
+
+// Only the dedicated single-threaded inspection entry and explicitly isolated
+// kernel tests use this finite fork helper. This is not a workload launcher.
+fn bounded_probe_child(operation: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let parent = unsafe { libc::getpid() };
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!(
+            "fork template probe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if pid == 0 {
+        arm_probe_child(parent);
+        finish_probe_child(operation());
+    }
+    require_probe_exit((LinuxSandboxProcess { pid }).wait()?)
+}
+
+fn arm_probe_child(parent: libc::pid_t) {
+    unsafe {
+        libc::alarm(20);
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent {
+            libc::_exit(125);
+        }
+    }
+}
+
+fn finish_probe_child(result: Result<(), String>) -> ! {
+    if let Err(error) = &result {
+        eprintln!("detached overlay probe: {error}");
+    }
+    unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) }
+}
+
+fn require_probe_exit(outcome: LinuxSandboxExit) -> Result<(), String> {
+    match outcome {
+        LinuxSandboxExit::Code(0) => Ok(()),
+        outcome => Err(format!("detached overlay probe failed: {outcome:?}")),
+    }
+}
+
+fn require_probe_bytes(path: &str, expected: &[u8]) -> Result<(), String> {
+    if std::fs::read(path).map_err(|error| error.to_string())? != expected {
+        return Err(format!("shared-view probe bytes differ at {path}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,59 +492,27 @@ mod tests {
     // Kernel probes run alone in a forked, bounded, single-threaded process.
     // Neither namespace changes nor raw descriptor inspection leave Lillux.
     fn isolated_probe(operation: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-        let parent = unsafe { libc::getpid() };
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return Err(format!(
-                "fork template probe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if pid == 0 {
-            unsafe {
-                libc::alarm(20);
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                if libc::getppid() != parent {
-                    libc::_exit(125);
-                }
-            }
-            let result = operation();
-            if let Err(error) = &result {
-                eprintln!("detached overlay probe: {error}");
-            }
-            unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
-        }
-        match (LinuxSandboxProcess { pid }).wait()? {
-            LinuxSandboxExit::Code(0) => Ok(()),
-            outcome => Err(format!("detached overlay probe failed: {outcome:?}")),
-        }
+        bounded_probe_child(operation)
     }
 
     fn attach_probe_clone(template: &LinuxOverlayTemplate) -> Result<(), String> {
         let destination = PathBuf::from("/project");
         create_directory_target(&rooted(&destination)?)?;
-        let target = open_mount_target_no_symlinks(&destination)?;
-        bind_fd_to_mount_target(
-            template.authority.file().as_raw_fd(),
-            target.as_raw_fd(),
-            false,
-            false,
-        )?;
-        let mounted = File::open(rooted(&destination)?).map_err(|error| error.to_string())?;
-        let expected = mount_source_stat(template.authority.file().as_raw_fd())?;
-        let actual = mount_source_stat(mounted.as_raw_fd())?;
-        if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
-            return Err("borrower did not receive the exact retained merged root".to_string());
-        }
-        Ok(())
+        mount_overlay(&LinuxSandboxOverlay {
+            template: template.clone(),
+            destination,
+        })
     }
 
     fn assert_bytes(path: &str, expected: &[u8]) -> Result<(), String> {
-        let observed = std::fs::read(path).map_err(|error| error.to_string())?;
-        if observed != expected {
-            return Err(format!("shared-view probe bytes differ at {path}"));
-        }
-        Ok(())
+        require_probe_bytes(path, expected)
+    }
+
+    #[test]
+    #[ignore = "requires native sandbox kernel facilities; run alone to exercise the actual production inspector"]
+    fn actual_native_inspection_requires_transferred_shared_view() {
+        let inspection = inspect().unwrap();
+        assert!(inspection.overlay_workspace);
     }
 
     #[test]

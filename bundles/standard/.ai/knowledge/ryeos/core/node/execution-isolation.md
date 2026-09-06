@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T06:05:45Z:ff0e969dfd91ced3a45a9d41898ca5937f851d134fe8b93df092fdb46e92a42f:CAA4FZXVIEyh8dru2QqK6VM6jcLc2S0tXPIAAb56sI1YmvGWgEIubJXDsDNS8aRFyGySM5bSjNK1tj9Eozk9Bg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T11:12:46Z:b74f690f6252caf377369e87c2fd2964224aeaba3ea2607ba3db80b34e7653e7:zlCt5szBuU0ISWaDTl3p3a99uQ8tEOSgoqV2Cw4IkkaGfEIetLgYabTIaTHhgYrZyPNSYcF5eRMpiaJIH1n5Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.16.0"
+version: "1.18.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -24,7 +24,7 @@ compilation. Core ships the self-contained `linux-lillux` implementation as
 available signed data. The explicit development profile selects enforced
 execution; the general installation profiles retain their explicit disabled choice.
 
-Durable execution workspaces use the isolation-adapter v6 contract. RyeOS owns
+Durable execution workspaces use the isolation-adapter v7 contract. RyeOS owns
 one canonical private `project/` generation. Disabled/native execution creates
 no other workspace directory and uses Lillux descriptor-relative filesystem
 mechanics directly. Enforced execution additionally grants the selected signed
@@ -32,6 +32,44 @@ adapter one `backend-state/` directory as an opaque authority. Names and
 representation below that directory—including any platform-specific overlay
 layers—belong exclusively to the adapter and never enter the engine, executor,
 workspace journal, or generic launch plan.
+
+Create runs under the existing held-process attachment boundary. Its exact
+creator identity is recorded before it can touch the workspace. One private
+bounded descriptor-transfer receipt binds the canonical request and response;
+the accepted view descriptor remains in the original workspace lifeline.
+Launches borrow that exact view after durable workspace/launch-owner admission,
+not by reconstructing mounts from path names. The native adapter creates one
+detached overlay template; each borrower independently clones and attaches it
+inside fresh namespaces. It never remounts the same upper/work pair or joins a
+retained creator namespace. The actual backend probe checks these mechanics;
+unsupported kernels refuse, without an alternate backend or ambient fallback.
+
+The runtime journal fences every exact borrower, including nested child
+launches. Exclusive workers additionally retain their existing process/boot
+authority. Live immutable-input capture quiesces writers but retains the view.
+Destroy requires settled borrowers and physical closure of the original view
+owner; root terminal status, absent PID, reference count or a newly opened path
+guard is not that proof. Cold restart verifies old process death before a new
+view incarnation. Live retry transfers the existing original lifeline instead.
+Uncertain pre-attachment contact stays quarantined rather than being silently
+discarded or treated as an unused workspace.
+
+Capture checks both the workspace borrower journal and the existing exclusive
+worker/pool authority. Pending startup, unknown cleanup and extra unsettled
+worker epochs block it. The root-operation drain is acquired before a scarce
+capture permit; otherwise a capture can block the very operations it needs to
+drain. A temporary drain gate does not authorize publication or remain held
+while a candidate awaits its separate disposition.
+
+Errors before a launcher reports its target identity may not carry exact
+cleanup testimony. RyeOS retains their workspace/credential fences as uncertain;
+it does not infer an unused workspace from an absent PID or parse stderr as
+proof of death. This is quarantine, not automatic recovery of that failed start.
+
+A projectless controller retains its separately confined worker workspace
+through its existing scratch lifeline. The worker's private backing directory
+is not placed under the controller's writable scratch mount. This distinction
+does not give either process signing, publication or extra filesystem authority.
 
 On freeze, an adapter may return normalized mutation facts plus a canonical
 relative content-root name below its still-pinned opaque state authority. RyeOS

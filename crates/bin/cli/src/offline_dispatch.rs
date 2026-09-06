@@ -687,6 +687,7 @@ fn exec_tool(
         .apply(
             base_request,
             ryeos_engine::isolation::IsolationLaunchContext {
+                workspace_view: None,
                 project_path: Path::new(project_path),
                 project_authority: project_authority.project,
                 filesystem_authority_ceiling:

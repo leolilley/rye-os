@@ -307,12 +307,22 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
             let capture_parent_thread_id = parent_thread_id.clone();
             let capture_path = cap.provenance.effective_path().to_path_buf();
             let capture_base = base.to_owned();
+            // Root contacts may themselves need a capture permit to finish.
+            // Drain them before taking that permit, retaining the fence in
+            // the blocking closure even if this async caller is cancelled.
+            let root_contact_fence =
+                ryeos_app::hosted_operation::begin_hosted_root_terminalization_async(
+                    &state.state_store,
+                    &parent_thread_id,
+                )
+                .await?;
             let generation = crate::execution::run_bounded_project_capture(move || {
                 crate::execution::seal_callback_workspace_generation(
                     &capture_state,
                     &capture_parent_thread_id,
                     &capture_path,
                     &capture_base,
+                    &root_contact_fence,
                 )
             })
             .await?;

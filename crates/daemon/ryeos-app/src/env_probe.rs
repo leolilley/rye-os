@@ -376,6 +376,7 @@ mod tests {
             envs,
             &isolation,
             IsolationLaunchContext {
+                workspace_view: None,
                 project_path: project,
                 project_authority: IsolationProjectAuthority::ReadOnly,
                 filesystem_authority_ceiling:

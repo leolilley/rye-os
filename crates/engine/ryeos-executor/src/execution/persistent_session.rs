@@ -2103,6 +2103,7 @@ fn start_capsule_process(
         capsule,
         exact,
         &workspace,
+        None,
         &session_protocol,
         None,
         &BTreeMap::new(),
@@ -2198,6 +2199,7 @@ fn spawn_capsule_process_held(
     capsule: &AdmittedPersistentSessionCapsule,
     exact: &PersistentSessionExactProgram,
     workspace: &Path,
+    workspace_view: Option<&lillux::InheritedDescriptorAuthority>,
     session_protocol: &ryeos_engine::protocols::descriptor::PersistentSessionProtocol,
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
@@ -2384,6 +2386,7 @@ fn spawn_capsule_process_held(
     let process = plan.spawn_persistent_session_held(
         state,
         workspace,
+        workspace_view,
         mounts,
         extra_target_channels,
         &capsule.lifecycle,
@@ -2393,6 +2396,12 @@ fn spawn_capsule_process_held(
         &format!("session-{}", &capsule_hash[..24]),
     )?;
     let mut lifelines: Vec<Box<dyn Send + Sync>> = Vec::with_capacity(leases.len());
+    // The pool owns the exact worker epoch/process; retain its alias in the
+    // same lifecycle carrier until that process is retired. A launch plan's
+    // temporary descriptor retention alone ends too early for workspace close.
+    if let Some(view) = workspace_view {
+        lifelines.push(Box::new(view.clone()));
+    }
     lifelines.extend(
         leases
             .into_iter()
@@ -2410,11 +2419,14 @@ fn spawn_capsule_process_held(
 
 /// Start one session-owned process from an already-admitted capsule and
 /// already-ready durable workspace. The exact held identity is committed
-/// before Lillux authorizes child execution.
+/// before Lillux authorizes child execution. The caller holds the existing
+/// hosted-root and credential operation fences through completion; cold
+/// reattach supplies the newly admitted root incarnation's original lifeline.
 pub fn start_exclusive_capsule(
     state: &AppState,
     capsule_hash: &str,
     workspace: &Path,
+    workspace_lifeline: std::sync::Arc<ryeos_app::temp_dir_guard::TempDirGuard>,
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
     extra_target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
@@ -2434,6 +2446,17 @@ pub fn start_exclusive_capsule(
     {
         bail!("persistent-session protocol does not authorize an exclusive runtime workspace");
     }
+    if !workspace_lifeline.owns_effective_path(workspace) {
+        bail!("exclusive session workspace differs from its original owner lifeline");
+    }
+    // Reuse root admission, not a synthetic worker thread or another registry.
+    // Both current LaunchOwner and exact mount incarnation are checked before
+    // any realization preparation or subprocess contact can use this view.
+    let workspace_view = super::runner::borrow_bound_workspace_view(
+        state,
+        Some(&workspace_lifeline),
+        &identity.placement_thread_id,
+    )?;
     let reservation = state.persistent_sessions.reserve_exclusive(
         &identity.placement_thread_id,
         &capsule.lifecycle,
@@ -2460,17 +2483,29 @@ pub fn start_exclusive_capsule(
     } else {
         bail!("exclusive persistent-session protocol requires a readiness identity slot");
     }
-    let held = spawn_capsule_process_held(
+    let mut held = spawn_capsule_process_held(
         state,
         capsule_hash,
         &capsule,
         &exact,
         workspace,
+        workspace_view.as_ref(),
         &session_protocol,
         state_root,
         &runtime_environment,
         extra_target_channels,
-    )?;
+    )
+    .map_err(|error| {
+        if error
+            .downcast_ref::<ryeos_app::persistent_session::PersistentSessionCleanupUnproved>()
+            .is_some()
+        {
+            error.context(ExclusiveWorkerCleanupUnproved)
+        } else {
+            error
+        }
+    })?;
+    held.lifelines.push(Box::new(workspace_lifeline));
     let now = lillux::time::timestamp_millis() as i64;
     let record = WorkerProcessRecord {
         worker_instance_id: identity.worker_instance_id.clone(),

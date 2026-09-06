@@ -170,6 +170,7 @@ fn run_tool_with_hints(
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
+        isolation_workspace_view: None,
         isolation_filesystem_authority_ceiling:
             ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         isolation_network_authority_ceiling:

@@ -8,6 +8,7 @@ use ryeos_engine::canonical_ref::CanonicalRef;
 
 use crate::dispatch_error::DispatchError;
 
+use super::super::process_attachment::AttachedProcessGuard;
 use super::{EnvelopeCallback, LaunchEnvelope, RuntimeResult};
 use ryeos_runtime::envelope::RuntimeResultStatus;
 use ryeos_runtime::process_outcome::RuntimeProcessOutcome;
@@ -92,6 +93,13 @@ impl SpawnedRuntime {
             &result.stderr,
             result.stderr_truncated,
         );
+        // Decode/retry handling runs only after the exact reaped attachment and
+        // its workspace membership settle together. Drop must not erase that
+        // evidence when wait/cleanup or descendant settlement is unproved.
+        self.attached_process
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("waited runtime lost its attached process owner"))?
+            .settle_after_reap()?;
         drop(self.attached_process.take());
         drop(self.workspace_lifeline.take());
         drop(self.external_realizations.take());
@@ -104,37 +112,6 @@ impl SpawnedRuntime {
             )));
         }
         decode_runtime_stdout(&result.stdout)
-    }
-}
-
-struct AttachedProcessGuard {
-    state: ryeos_app::state::AppState,
-    thread_id: String,
-    launch_owner: String,
-    identity: ryeos_app::process::ExecutionProcessIdentity,
-}
-
-impl Drop for AttachedProcessGuard {
-    fn drop(&mut self) {
-        match self
-            .state
-            .state_store
-            .clear_thread_process_if_matches_owned(
-                &self.thread_id,
-                &self.identity,
-                &self.launch_owner,
-            ) {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                thread_id = self.thread_id,
-                "managed runtime identity changed before compare-and-clear"
-            ),
-            Err(error) => tracing::error!(
-                thread_id = self.thread_id,
-                error = %error,
-                "failed to clear managed runtime identity after owned wait"
-            ),
-        }
     }
 }
 
@@ -298,12 +275,27 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
     if let Some(source) = &source_closure {
         admitted_mounts.extend_from_slice(source.mounts());
     }
+    let workspace_view = if project_authority
+        == ryeos_engine::isolation::IsolationProjectAuthority::RuntimeWorkspace
+    {
+        super::super::runner::borrow_bound_workspace_view(
+            state,
+            workspace_lifeline.as_ref(),
+            thread_id,
+        )?
+    } else {
+        // Private immutable/sparse process inputs are not the subject's shared
+        // workspace. Disabled RuntimeWorkspace still checks borrower admission
+        // above; its original owner explicitly returns no template descriptor.
+        None
+    };
     let applied = isolation
         .apply_awaiting_attachment_with_provenance(
             request,
             ryeos_engine::isolation::IsolationLaunchContext {
                 project_path: &spec.project_path,
                 project_authority,
+                workspace_view: workspace_view.as_ref(),
                 filesystem_authority_ceiling,
                 network_authority_ceiling,
                 live_access: live_access.as_ref(),
@@ -322,6 +314,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
             },
         )
         .map_err(|error| anyhow::anyhow!("isolation apply failed: {error}"))?;
+    drop(workspace_view);
     state
         .state_store
         .seed_isolation_provenance(thread_id, applied.provenance)
@@ -415,6 +408,8 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
             None => Err(error),
         };
     }
+    let mut attached_process =
+        AttachedProcessGuard::new(state, thread_id, launch_owner, process_identity.clone())?;
     if let Err(error) = super::super::runner::activate_workspace_after_process_attachment(
         state,
         workspace_lifeline.as_ref(),
@@ -423,34 +418,34 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
         launch_owner,
         &process_identity,
     ) {
-        let cleanup = spawned.abort_and_reap().err();
-        let clear = state
-            .state_store
-            .clear_thread_process_if_matches_owned(thread_id, &process_identity, launch_owner)
+        let cleanup = spawned
+            .abort_and_reap()
+            .map_err(anyhow::Error::from)
+            .and_then(|_| attached_process.settle_after_reap())
             .err();
         drop(workspace_lifeline);
         drop(source_closure);
         let mut error = error.context("activate managed-runtime workspace after attachment");
-        if let Some(clear) = clear {
-            error = error.context(format!("attached-process cleanup failed: {clear:#}"));
-        }
         if let Some(cleanup) = cleanup {
             error = error.context(format!("pending-process cleanup failed: {cleanup}"));
         }
         return Err(error);
     }
-    let attached_process = AttachedProcessGuard {
-        state: state.clone(),
-        thread_id: thread_id.to_string(),
-        launch_owner: launch_owner.to_string(),
-        identity: process_identity.clone(),
-    };
     if let Err(error) =
         state
             .threads
             .authorize_process_release_owned(thread_id, &process_identity, launch_owner)
     {
-        let cleanup = spawned.abort_and_reap().err();
+        let cleanup = spawned
+            .abort_and_reap()
+            .map_err(anyhow::Error::from)
+            .and_then(|_| attached_process.settle_after_reap())
+            .err();
+        if let Some(cleanup) = cleanup {
+            return Err(error.context(format!(
+                "pending-process cleanup failed; retaining authority: {cleanup}"
+            )));
+        }
         let stop_settlement =
             super::super::process_attachment::finalize_requested_stop_if_present(state, thread_id);
         drop(workspace_lifeline);
@@ -463,16 +458,21 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
                 "authorize managed runtime release after durable attachment; stop settlement also failed: {stop_error:#}"
             )),
         };
-        return match cleanup {
-            Some(cleanup) => {
-                Err(error.context(format!("pending-process cleanup failed: {cleanup}")))
-            }
-            None => Err(error),
-        };
+        return Err(error);
     }
-    let spawned = spawned
-        .release_after_attachment()
-        .context("release managed runtime after durable process attachment")?;
+    let spawned = match spawned.release_after_attachment() {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let settlement = attached_process.settle_after_reap();
+            return Err(match settlement {
+                Ok(()) => anyhow::Error::new(error)
+                    .context("release managed runtime after durable process attachment"),
+                Err(settlement) => anyhow::Error::new(error).context(format!(
+                    "release failed; exact attachment retained: {settlement:#}"
+                )),
+            });
+        }
+    };
     Ok(SpawnedRuntime {
         thread_id: thread_id.to_string(),
         runtime_ref: item_ref.to_string(),

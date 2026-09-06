@@ -8,10 +8,13 @@ use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAcc
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v6";
+pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v7";
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+/// One closed digest receipt fits atomically beside exactly one view descriptor.
+/// Full workspace mutation JSON remains on the bounded stdout response channel.
+pub const MAX_WORKSPACE_VIEW_RECEIPT_BYTES: usize = 512;
 pub const MAX_AUTHORITIES: usize = 4096;
 pub const MAX_MOUNTS: usize = 4096;
 pub const MAX_ENVIRONMENT_ENTRIES: usize = 4096;
@@ -148,7 +151,7 @@ impl<'de> Visitor<'de> for StrictJsonValueVisitor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IsolationAdapterProtocolVersion {
-    #[serde(rename = "ryeos.isolation-adapter/v6")]
+    #[serde(rename = "ryeos.isolation-adapter/v7")]
     Current,
 }
 
@@ -349,6 +352,7 @@ pub enum IsolationAuthorityPurpose {
     RuntimeLibraryDirectory,
     WorkspaceProject,
     WorkspaceBackendState,
+    WorkspaceView,
     TargetDuplexChannel,
 }
 
@@ -455,16 +459,17 @@ impl IsolationFixedParentView {
     }
 }
 
-/// One verified writable project view. RyeOS owns the canonical project
-/// generation while the signed adapter exclusively interprets its opaque
-/// backend state. The adapter must compose the view at `destination`;
-/// ordinary writable mounts may not target the same path.
+/// One retained writable project view. Construction already happened once
+/// under its workspace owner. A borrower clones this exact descriptor into
+/// its fresh confinement namespace; it must not construct another filesystem
+/// from lower/state paths. Ordinary mounts may not target the same path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IsolationProjectWorkspace {
     pub workspace_id: String,
-    pub project: IsolationAuthorityId,
-    pub backend_state: IsolationAuthorityId,
+    pub view: IsolationAuthorityId,
+    /// Digest of the exact descriptor's existing opaque directory identity.
+    pub view_descriptor_identity: String,
     pub destination: IsolationPath,
 }
 
@@ -729,23 +734,17 @@ impl IsolationPlan {
         }
         if let Some(workspace) = &self.project_workspace {
             validate_identifier("workspace id", &workspace.workspace_id)?;
-            for (authority, expected) in [
-                (
-                    &workspace.project,
-                    IsolationAuthorityPurpose::WorkspaceProject,
-                ),
-                (
-                    &workspace.backend_state,
-                    IsolationAuthorityPurpose::WorkspaceBackendState,
-                ),
-            ] {
-                if authority_ids.get(authority) != Some(&expected) {
-                    return Err(ProtocolValidationError::new(
-                        "workspace authority is missing or has the wrong purpose",
-                    ));
-                }
-                used_authorities.insert(authority.clone());
+            validate_sha256(
+                "workspace descriptor identity",
+                &workspace.view_descriptor_identity,
+            )?;
+            if authority_ids.get(&workspace.view) != Some(&IsolationAuthorityPurpose::WorkspaceView)
+            {
+                return Err(ProtocolValidationError::new(
+                    "workspace view authority is missing or has the wrong purpose",
+                ));
             }
+            used_authorities.insert(workspace.view.clone());
             if self
                 .mounts
                 .iter()
@@ -809,9 +808,10 @@ impl IsolationPlan {
                 .iter()
                 .any(|mount| mount.source == channel.source)
                 || self.target.executable == channel.source
-                || self.project_workspace.as_ref().is_some_and(|workspace| {
-                    workspace.project == channel.source || workspace.backend_state == channel.source
-                })
+                || self
+                    .project_workspace
+                    .as_ref()
+                    .is_some_and(|workspace| workspace.view == channel.source)
             {
                 return Err(ProtocolValidationError::new(
                     "target channel authority cannot supply filesystem or executable authority",
@@ -1009,6 +1009,13 @@ pub struct AdapterWorkspaceRequest {
     pub launch_owner: String,
     pub base_snapshot: String,
     pub authorities: Vec<IsolationAuthority>,
+    /// Only Create may supply the one-shot descriptor-transfer endpoint.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub transfer_fd: Option<u32>,
+    /// Existing bound incarnation. Null only for Create or separately proved
+    /// cleanup of a construction which never acquired a bound view.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub mount_identity: Option<String>,
 }
 
 impl AdapterWorkspaceRequest {
@@ -1040,7 +1047,64 @@ impl AdapterWorkspaceRequest {
                 ));
             }
         }
+        if let Some(identity) = &self.mount_identity {
+            validate_sha256("workspace mount identity", identity)?;
+        }
+        match self.operation {
+            WorkspaceLifecycleOperation::Create => {
+                if self.mount_identity.is_some()
+                    || self
+                        .transfer_fd
+                        .is_none_or(|fd| fd <= 2 || descriptors.contains(&fd))
+                {
+                    return Err(ProtocolValidationError::new(
+                        "workspace Create requires one distinct transfer endpoint and no prior mount identity",
+                    ));
+                }
+            }
+            WorkspaceLifecycleOperation::FreezeAndDiff => {
+                if self.transfer_fd.is_some() || self.mount_identity.is_none() {
+                    return Err(ProtocolValidationError::new(
+                        "workspace diff requires a bound mount identity and cannot transfer a new view",
+                    ));
+                }
+            }
+            WorkspaceLifecycleOperation::Destroy => {
+                if self.transfer_fd.is_some() {
+                    return Err(ProtocolValidationError::new(
+                        "workspace destruction cannot transfer a new view",
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// Explicit null is part of v7, not a missing-field predecessor fallback.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// The payload in the one-shot Create packet. Both digests are bare lowercase
+/// SHA-256 over Lillux canonical JSON of the respective typed protocol value.
+/// The packet is also canonical JSON and must carry exactly one descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceViewTransferReceipt {
+    pub protocol: IsolationAdapterProtocolVersion,
+    pub request_digest: String,
+    pub response_digest: String,
+}
+
+impl WorkspaceViewTransferReceipt {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_sha256("workspace request digest", &self.request_digest)?;
+        validate_sha256("workspace response digest", &self.response_digest)
     }
 }
 
@@ -1107,7 +1171,11 @@ pub struct AdapterWorkspaceResponse {
     pub backend_id: String,
     pub backend_version: String,
     pub pinned_root_identities: BTreeMap<String, String>,
-    pub mount_identity: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub mount_identity: Option<String>,
+    /// Present only when Create delivers an exact newly constructed view.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub view_descriptor_identity: Option<String>,
     /// Adapter-declared, backend-relative root containing the bytes named by
     /// `mutations`. Present only for `freeze_and_diff`; RyeOS resolves and pins
     /// it below the still-open opaque backend-state authority.
@@ -1118,6 +1186,38 @@ pub struct AdapterWorkspaceResponse {
 }
 
 impl AdapterWorkspaceResponse {
+    /// Sole field-level encoding for the created mount incarnation. Callers
+    /// hash this value with the existing Lillux canonical JSON/SHA-256 owner.
+    /// The mutable directory metadata and the response's own digest are not
+    /// identity inputs. Construction ownership prevents a later directory/
+    /// kernel-coordinate reuse from masquerading as the accepted incarnation.
+    pub fn mount_identity_value(
+        &self,
+        request: &AdapterWorkspaceRequest,
+    ) -> Result<Value, ProtocolValidationError> {
+        if self.operation != WorkspaceLifecycleOperation::Create
+            || request.operation != WorkspaceLifecycleOperation::Create
+        {
+            return Err(ProtocolValidationError::new(
+                "only Create constructs a mount identity",
+            ));
+        }
+        let identity = self.view_descriptor_identity.as_deref().ok_or_else(|| {
+            ProtocolValidationError::new("created view lacks descriptor identity")
+        })?;
+        validate_sha256("workspace descriptor identity", identity)?;
+        Ok(serde_json::json!({
+            "protocol": request.protocol,
+            "workspace_id": request.workspace_id,
+            "launch_owner": request.launch_owner,
+            "base_snapshot": request.base_snapshot,
+            "backend_id": self.backend_id,
+            "backend_version": self.backend_version,
+            "pinned_root_identities": self.pinned_root_identities,
+            "view_descriptor_identity": identity,
+        }))
+    }
+
     pub fn validate_for(
         &self,
         request: &AdapterWorkspaceRequest,
@@ -1133,7 +1233,30 @@ impl AdapterWorkspaceResponse {
         }
         validate_identifier("workspace backend id", &self.backend_id)?;
         validate_string("workspace backend version", &self.backend_version)?;
-        validate_string("workspace mount identity", &self.mount_identity)?;
+        if let Some(identity) = &self.mount_identity {
+            validate_sha256("workspace mount identity", identity)?;
+        }
+        if self.operation == WorkspaceLifecycleOperation::Create {
+            if self.mount_identity.is_none() {
+                return Err(ProtocolValidationError::new(
+                    "created workspace must identify its mount incarnation",
+                ));
+            }
+            validate_sha256(
+                "workspace descriptor identity",
+                self.view_descriptor_identity.as_deref().ok_or_else(|| {
+                    ProtocolValidationError::new(
+                        "created workspace must identify its transferred descriptor",
+                    )
+                })?,
+            )?;
+        } else if self.view_descriptor_identity.is_some()
+            || self.mount_identity != request.mount_identity
+        {
+            return Err(ProtocolValidationError::new(
+                "workspace operation cannot introduce or replace a view identity",
+            ));
+        }
         if self.pinned_root_identities.len() != 2
             || !["project", "backend_state"]
                 .iter()
@@ -1520,6 +1643,35 @@ mod tests {
     }
 
     #[test]
+    fn project_workspace_requires_one_retained_view_role() {
+        let (mut plan, mut authorities) = complete_plan();
+        let view = IsolationAuthorityId::new("workspace-view").unwrap();
+        plan.mounts
+            .retain(|mount| mount.destination.as_str() != "/workspace");
+        authorities.retain(|authority| authority.id.as_str() != "workspace");
+        authorities.push(authority(
+            "workspace-view",
+            5,
+            IsolationAuthorityPurpose::WorkspaceView,
+        ));
+        plan.project_workspace = Some(IsolationProjectWorkspace {
+            workspace_id: "workspace-one".to_string(),
+            view,
+            view_descriptor_identity: "c".repeat(64),
+            destination: IsolationPath::new("/workspace").unwrap(),
+        });
+        plan.validate(&authorities).unwrap();
+        authorities.last_mut().unwrap().purpose = IsolationAuthorityPurpose::WorkspaceProject;
+        assert!(plan.validate(&authorities).is_err());
+        authorities.last_mut().unwrap().purpose = IsolationAuthorityPurpose::WorkspaceView;
+        plan.project_workspace
+            .as_mut()
+            .unwrap()
+            .view_descriptor_identity = "not-a-digest".into();
+        assert!(plan.validate(&authorities).is_err());
+    }
+
+    #[test]
     fn exact_process_values_allow_empty_without_relaxing_identity_or_byte_bounds() {
         let (mut plan, authorities) = complete_plan();
         plan.target.arguments.push(String::new());
@@ -1660,8 +1812,8 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_duplicate_keys_at_every_depth() {
-        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v6","protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
-        let nested = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
+        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v7","protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let nested = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
         for document in [top_level, nested] {
             let error = from_json_str_strict::<AdapterInspectionRequest>(document).unwrap_err();
             assert!(error.to_string().contains("duplicate JSON object key"));
@@ -1670,7 +1822,7 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_unknown_fields_trailing_data_and_excessive_depth() {
-        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
+        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(unknown)
                 .unwrap_err()
@@ -1678,7 +1830,7 @@ mod tests {
                 .contains("unknown field")
         );
 
-        let valid = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let valid = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(&format!("{valid} true"))
                 .unwrap_err()
@@ -1701,7 +1853,7 @@ mod tests {
 
     #[test]
     fn predecessor_adapter_protocol_is_refused() {
-        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v5","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         let error = from_json_str_strict::<AdapterInspectionRequest>(predecessor).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
@@ -2278,6 +2430,9 @@ mod tests {
             workspace_id: "workspace-one".to_string(),
             launch_owner: "{\"attempt\":1}".to_string(),
             base_snapshot: "a".repeat(64),
+            transfer_fd: (operation == WorkspaceLifecycleOperation::Create).then_some(12),
+            mount_identity: (operation != WorkspaceLifecycleOperation::Create)
+                .then(|| "b".repeat(64)),
             authorities: vec![
                 IsolationAuthority {
                     id: IsolationAuthorityId::new("workspace-project").unwrap(),
@@ -2298,7 +2453,7 @@ mod tests {
         let request = workspace_request(WorkspaceLifecycleOperation::Create);
         request.validate().unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v6");
+        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v7");
         let purposes = encoded["authorities"]
             .as_array()
             .unwrap()
@@ -2327,7 +2482,8 @@ mod tests {
                 ("project".to_string(), "dev1-ino2".to_string()),
                 ("backend_state".to_string(), "dev1-ino3".to_string()),
             ]),
-            mount_identity: "example-mount".to_string(),
+            mount_identity: request.mount_identity.clone(),
+            view_descriptor_identity: None,
             mutation_content_root: Some("backend-output".to_string()),
             mutations: Vec::new(),
             destroyed: false,
@@ -2337,5 +2493,138 @@ mod tests {
         assert!(response.validate_for(&request).is_err());
         response.mutation_content_root = None;
         assert!(response.validate_for(&request).is_err());
+    }
+
+    fn workspace_response(request: &AdapterWorkspaceRequest) -> AdapterWorkspaceResponse {
+        AdapterWorkspaceResponse {
+            protocol: request.protocol,
+            operation: request.operation,
+            workspace_id: request.workspace_id.clone(),
+            launch_owner: request.launch_owner.clone(),
+            backend_id: "example-backend".to_string(),
+            backend_version: "1".to_string(),
+            pinned_root_identities: BTreeMap::from([
+                ("project".to_string(), "dev1-ino2".to_string()),
+                ("backend_state".to_string(), "dev1-ino3".to_string()),
+            ]),
+            mount_identity: if request.operation == WorkspaceLifecycleOperation::Create {
+                Some("b".repeat(64))
+            } else {
+                request.mount_identity.clone()
+            },
+            view_descriptor_identity: (request.operation == WorkspaceLifecycleOperation::Create)
+                .then(|| "c".repeat(64)),
+            mutation_content_root: (request.operation
+                == WorkspaceLifecycleOperation::FreezeAndDiff)
+                .then(|| "output".to_string()),
+            mutations: Vec::new(),
+            destroyed: request.operation == WorkspaceLifecycleOperation::Destroy,
+        }
+    }
+
+    #[test]
+    fn workspace_create_requires_exact_transfer_and_no_previous_view() {
+        let original = workspace_request(WorkspaceLifecycleOperation::Create);
+        for descriptor in [None, Some(0), Some(2), Some(10), Some(11)] {
+            let mut request = original.clone();
+            request.transfer_fd = descriptor;
+            assert!(request.validate().is_err());
+        }
+        let mut request = original;
+        request.mount_identity = Some("b".repeat(64));
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn workspace_noncreate_cannot_introduce_a_view() {
+        for operation in [
+            WorkspaceLifecycleOperation::FreezeAndDiff,
+            WorkspaceLifecycleOperation::Destroy,
+        ] {
+            let mut request = workspace_request(operation);
+            request.validate().unwrap();
+            let mut response = workspace_response(&request);
+            response.validate_for(&request).unwrap();
+            request.transfer_fd = Some(12);
+            assert!(request.validate().is_err());
+            request.transfer_fd = None;
+            response.view_descriptor_identity = Some("c".repeat(64));
+            assert!(response.validate_for(&request).is_err());
+            response.view_descriptor_identity = None;
+            response.mount_identity = Some("d".repeat(64));
+            assert!(response.validate_for(&request).is_err());
+        }
+        let mut request = workspace_request(WorkspaceLifecycleOperation::FreezeAndDiff);
+        request.mount_identity = None;
+        assert!(request.validate().is_err());
+        request.operation = WorkspaceLifecycleOperation::Destroy;
+        request.validate().unwrap();
+        let response = workspace_response(&request);
+        assert!(response.mount_identity.is_none());
+        response.validate_for(&request).unwrap();
+    }
+
+    #[test]
+    fn workspace_nullable_identity_fields_must_be_explicit() {
+        let request = workspace_request(WorkspaceLifecycleOperation::Create);
+        for field in ["transfer_fd", "mount_identity"] {
+            let mut encoded = serde_json::to_value(&request).unwrap();
+            encoded.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AdapterWorkspaceRequest>(encoded).is_err(),
+                "{field}"
+            );
+        }
+        let request = workspace_request(WorkspaceLifecycleOperation::Destroy);
+        let response = workspace_response(&request);
+        for field in ["mount_identity", "view_descriptor_identity"] {
+            let mut encoded = serde_json::to_value(&response).unwrap();
+            encoded.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AdapterWorkspaceResponse>(encoded).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_creation_identity_commits_owner_roots_and_actual_view() {
+        let request = workspace_request(WorkspaceLifecycleOperation::Create);
+        let response = workspace_response(&request);
+        response.validate_for(&request).unwrap();
+        let identity = response.mount_identity_value(&request).unwrap();
+        assert_eq!(identity["view_descriptor_identity"], "c".repeat(64));
+        assert_eq!(
+            identity["pinned_root_identities"],
+            serde_json::to_value(&response.pinned_root_identities).unwrap()
+        );
+        let mut changed = request.clone();
+        changed.launch_owner = "{\"attempt\":2}".to_string();
+        assert_ne!(identity, response.mount_identity_value(&changed).unwrap());
+        changed = request.clone();
+        changed.base_snapshot = "d".repeat(64);
+        assert_ne!(identity, response.mount_identity_value(&changed).unwrap());
+        let mut changed = response.clone();
+        changed.view_descriptor_identity = Some("e".repeat(64));
+        assert_ne!(identity, changed.mount_identity_value(&request).unwrap());
+        changed.view_descriptor_identity = None;
+        assert!(changed.validate_for(&request).is_err());
+        assert!(changed.mount_identity_value(&request).is_err());
+    }
+
+    #[test]
+    fn workspace_transfer_receipt_is_closed_and_bounded() {
+        let mut receipt = WorkspaceViewTransferReceipt {
+            protocol: IsolationAdapterProtocolVersion::Current,
+            request_digest: "a".repeat(64),
+            response_digest: "b".repeat(64),
+        };
+        receipt.validate().unwrap();
+        assert!(serde_json::to_vec(&receipt).unwrap().len() < MAX_WORKSPACE_VIEW_RECEIPT_BYTES);
+        let mut value = serde_json::to_value(&receipt).unwrap();
+        value["descriptor"] = serde_json::json!(3);
+        assert!(serde_json::from_value::<WorkspaceViewTransferReceipt>(value).is_err());
+        receipt.response_digest = "B".repeat(64);
+        assert!(receipt.validate().is_err());
     }
 }

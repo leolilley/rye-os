@@ -1197,14 +1197,16 @@ impl PreparedItemPlan {
         )
     }
 
-    /// Spawn a recovered persistent-session plan under projectless scratch
-    /// authority. The daemon pool, rather than thread state, owns the returned
-    /// running process; a daemon restart therefore reopens the capsule and
-    /// starts a fresh matching process.
+    /// Spawn an admitted persistent-session plan with its exact workspace
+    /// view, when its signed protocol requires RuntimeWorkspace. The pool owns
+    /// worker process/epoch retirement; the workspace owner retains the
+    /// original template. Cold restart must admit a new root incarnation,
+    /// never reopen lower/backend-state paths as a substitute for its view.
     pub fn spawn_persistent_session_held(
         self,
         state: &crate::state::AppState,
         workspace: &Path,
+        workspace_view: Option<&lillux::InheritedDescriptorAuthority>,
         external_mounts: Vec<ryeos_engine::isolation::IsolationReadOnlyMountAuthority>,
         target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
         lifecycle: &ryeos_state::objects::PersistentSessionLifecycleContract,
@@ -1246,6 +1248,7 @@ impl PreparedItemPlan {
             app_root: state.config.app_root.clone(),
             isolation: state.isolation.clone(),
             isolation_project_authority: project_authority,
+            isolation_workspace_view: workspace_view.cloned(),
             isolation_filesystem_authority_ceiling: filesystem_authority_ceiling,
             isolation_network_authority_ceiling: network_authority_ceiling,
             isolation_live_access_authority: None,
@@ -1291,7 +1294,23 @@ impl PreparedItemPlan {
         let spawned = state
             .engine
             .spawn_plan(&context, &self.plan)
-            .map_err(|error| anyhow!("spawn persistent session: {error}"))?;
+            .map_err(|error| {
+                // The held-target boundary maps Lillux spawn failures to
+                // ExecutionFailed. That result does not attest to cleanup:
+                // the supervised adapter may already have contacted the view
+                // before failing to report a target identity. Keep uncertainty
+                // fenced; never parse stderr or infer death from a missing PID.
+                let contact_uncertain = matches!(
+                    error,
+                    ryeos_engine::error::EngineError::ExecutionFailed { .. }
+                );
+                let error = anyhow::Error::new(error).context("spawn persistent session");
+                if contact_uncertain {
+                    error.context(crate::persistent_session::PersistentSessionCleanupUnproved)
+                } else {
+                    error
+                }
+            })?;
         #[cfg(target_os = "linux")]
         let identity_result = crate::process::capture_execution_process_identity_from_pidfd(
             spawned.pid() as i64,
@@ -1311,7 +1330,13 @@ impl PreparedItemPlan {
                 let cleanup = spawned.abort_and_reap().err();
                 return Err(match cleanup {
                     Some(cleanup) => {
-                        error.context(format!("held persistent-session cleanup failed: {cleanup}"))
+                        // Failure before identity capture is still process
+                        // contact. Preserve the existing pool cleanup marker
+                        // so an exclusive owner cannot clear its durable
+                        // credential/workspace fence as an uncontacted start.
+                        error
+                            .context(format!("held persistent-session cleanup failed: {cleanup}"))
+                            .context(crate::persistent_session::PersistentSessionCleanupUnproved)
                     }
                     None => error,
                 });
@@ -1790,6 +1815,7 @@ pub struct SpawnItemParams<'a> {
     pub roots: DaemonRootEnv,
     pub isolation: Arc<ryeos_engine::isolation::IsolationRuntime>,
     pub isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
+    pub isolation_workspace_view: Option<lillux::InheritedDescriptorAuthority>,
     pub isolation_live_access_authority:
         Option<ryeos_engine::isolation::IsolationLiveAccessAuthority>,
     pub isolation_external_read_only_mounts:
@@ -1846,6 +1872,7 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
         roots,
         isolation,
         isolation_project_authority,
+        isolation_workspace_view,
         isolation_live_access_authority,
         isolation_external_read_only_mounts,
         isolation_node_trusted_keys_dir,
@@ -2048,6 +2075,7 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
         app_root,
         isolation,
         isolation_project_authority,
+        isolation_workspace_view,
         isolation_filesystem_authority_ceiling:
             ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         isolation_network_authority_ceiling:

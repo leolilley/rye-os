@@ -812,20 +812,22 @@ pub async fn run(
             inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         };
-        let live_access = provenance
-            .isolation_live_access_authority()
-            .map_err(|error| LaunchAugmentationError::Threads(error.to_string()))?;
         let applied = state
             .isolation
             .apply_awaiting_attachment_with_provenance(
                 subprocess_request,
                 ryeos_engine::isolation::IsolationLaunchContext {
+                    // Pre-birth augmentation consumes the already projected
+                    // immutable input payload, not a mutable execution view.
+                    // Its prospective parent has no admitted process/workspace
+                    // owner yet. Never create or borrow a writable overlay here.
+                    workspace_view: None,
                     project_path,
-                    project_authority: provenance.isolation_project_authority(),
+                    project_authority: ryeos_engine::isolation::IsolationProjectAuthority::ReadOnly,
                     filesystem_authority_ceiling:
                         ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
                 network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
-                    live_access: live_access.as_ref(),
+                    live_access: None,
                     state_root: provenance.state_root_override(),
                     checkpoint_dir: None,
                     checkpoint_authority: None,

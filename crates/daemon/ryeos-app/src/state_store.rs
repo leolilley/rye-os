@@ -1203,6 +1203,11 @@ struct Inner {
     signer: Arc<dyn Signer>,
 }
 
+enum WorkspaceProcessSettlementOwner {
+    Live,
+    Abandoned,
+}
+
 fn operational_credential_profile(
     profile: &runtime_db::CredentialProfileRecord,
 ) -> ryeos_state::OperationalCredentialProfileRecord {
@@ -4987,6 +4992,7 @@ impl StateStore {
         &self,
         placement_thread_id: &str,
         worker_instance_id: &str,
+        worker_boot_epoch: u64,
         reason: &str,
         cleanup_proved: bool,
     ) -> Result<()> {
@@ -4994,6 +5000,7 @@ impl StateStore {
         g.runtime_db.fail_dedicated_session_start(
             placement_thread_id,
             worker_instance_id,
+            worker_boot_epoch,
             reason,
             cleanup_proved,
         )
@@ -5050,12 +5057,19 @@ impl StateStore {
         placement_thread_id: &str,
         credential_generation: u64,
         credential_lock_owner: &str,
+        admitted_workspace_id: &str,
     ) -> Result<u64> {
         let g = self.lock()?;
+        self.authorize_dedicated_workspace_contact_locked(
+            &g,
+            placement_thread_id,
+            admitted_workspace_id,
+        )?;
         g.runtime_db.prepare_dedicated_session_recovery(
             placement_thread_id,
             credential_generation,
             credential_lock_owner,
+            admitted_workspace_id,
         )
     }
 
@@ -5868,7 +5882,129 @@ impl StateStore {
         {
             anyhow::bail!("worker process attachment admission is closed for daemon shutdown");
         }
+        let session = g
+            .runtime_db
+            .dedicated_session(&record.placement_thread_id)?
+            .ok_or_else(|| anyhow!("worker attachment has no admitted dedicated session"))?;
+        self.authorize_dedicated_workspace_contact_locked(
+            &g,
+            &record.placement_thread_id,
+            &session.workspace_id,
+        )?;
         g.runtime_db.attach_worker_process(record)
+    }
+
+    /// Existing durable session/worker owners supplement thread membership:
+    /// failed held launches can retain unknown worker contact without writing
+    /// execution_workspace.process_identity. Caller holds the root operation
+    /// barrier and must separately compare the process-local pool owner. This
+    /// proves process identity, not workspace phase admission: capture/close
+    /// own their phase transition and may already have made its no-contact cut.
+    pub fn workspace_worker_capture_record(
+        &self,
+        expected: &runtime_db::WorkspaceRecord,
+    ) -> Result<Option<WorkerProcessRecord>> {
+        let g = self.lock()?;
+        let current = g
+            .runtime_db
+            .workspace(&expected.workspace_id)?
+            .ok_or_else(|| anyhow!("capture workspace journal disappeared"))?;
+        if current.thread_id != expected.thread_id
+            || current.launch_owner != expected.launch_owner
+            || current.mount_identity != expected.mount_identity
+            || current.process_identity != expected.process_identity
+        {
+            bail!("workspace worker capture coordinate changed");
+        }
+        let root = current
+            .thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("capture workspace has no root"))?;
+        let session = g.runtime_db.dedicated_session(root)?;
+        let worker_id = session
+            .as_ref()
+            .and_then(|session| session.worker_instance_id.as_deref());
+        if g.runtime_db
+            .placement_has_unsettled_worker_except(root, worker_id)?
+        {
+            bail!("workspace capture retains another unsettled worker boot");
+        }
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        if session.workspace_id != current.workspace_id {
+            bail!("dedicated session does not name the capture workspace");
+        }
+        let Some(worker_id) = session.worker_instance_id.as_deref() else {
+            let retired_for_recovery = session.state == "recovering"
+                && session.send_boundary == "none"
+                && g.runtime_db
+                    .placement_has_reaped_worker_history(root, &session.admitted_capsule_hash)?;
+            let failed_start_settled =
+                session.state == "terminal" && session.send_boundary != "outcome_unknown";
+            if session.worker_boot_epoch.is_some()
+                || (!retired_for_recovery && !failed_start_settled)
+            {
+                bail!("workspace capture has pending or identity-unknown dedicated worker contact");
+            }
+            // A terminal failed start with no worker row is explicit durable
+            // cleanup testimony. Recovery instead requires indexed old-boot
+            // retirement. Admission reserves each newer ID/epoch before contact,
+            // so an old reaped boot cannot conceal a newer pending attempt.
+            return Ok(None);
+        };
+        let worker = g
+            .runtime_db
+            .worker_process(worker_id)?
+            .ok_or_else(|| anyhow!("capture dedicated worker record is absent"))?;
+        if worker.placement_thread_id != root
+            || Some(worker.boot_epoch) != session.worker_boot_epoch
+            || worker.session_capsule_hash != session.admitted_capsule_hash
+            || !matches!(
+                (worker.state, worker.cleanup_state.as_str()),
+                (runtime_db::WorkerProcessState::Live, "owned")
+                    | (runtime_db::WorkerProcessState::Dead, "reaped")
+            )
+        {
+            bail!("workspace capture worker identity is pending or cleanup is unproved");
+        }
+        Ok(Some(worker))
+    }
+
+    fn authorize_dedicated_workspace_contact_locked(
+        &self,
+        g: &Inner,
+        thread_id: &str,
+        workspace_id: &str,
+    ) -> Result<()> {
+        if !self
+            .process_attachment_admission_open
+            .load(Ordering::Acquire)
+        {
+            bail!("dedicated workspace contact is closed for daemon shutdown");
+        }
+        let binding = g
+            .runtime_db
+            .thread_workspace_binding(thread_id)?
+            .ok_or_else(|| anyhow!("dedicated workspace contact has no retained root binding"))?;
+        if binding.workspace_id != workspace_id {
+            bail!("dedicated session does not name the admitted current workspace");
+        }
+        let workspace = g
+            .runtime_db
+            .workspace(workspace_id)?
+            .ok_or_else(|| anyhow!("dedicated session workspace is absent"))?;
+        if workspace.thread_id.as_deref() != Some(thread_id) {
+            bail!("dedicated workspace contact requires its exact root owner");
+        }
+        let claim = g
+            .runtime_db
+            .get_launch_claim(thread_id)?
+            .ok_or_else(|| anyhow!("dedicated workspace contact has no launch owner"))?;
+        if !self.is_launch_owner_active(&claim.claimed_by) {
+            bail!("dedicated workspace contact requires its active launch owner");
+        }
+        Self::authorize_thread_workspace_contact_locked(g, thread_id)
     }
 
     pub fn fence_unproved_worker_start(
@@ -13102,6 +13238,306 @@ impl StateStore {
         g.runtime_db.set_launch_metadata(thread_id, &metadata)
     }
 
+    /// Bind exact node-local workspace membership before process input
+    /// preparation. Callers establish the existing child link first; no OS or
+    /// view contact may occur between that linkage and this admission.
+    pub fn bind_thread_workspace(
+        &self,
+        thread_id: &str,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+    ) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        if !self
+            .process_attachment_admission_open
+            .load(Ordering::Acquire)
+        {
+            bail!("workspace borrowing is fenced during daemon shutdown");
+        }
+        let thread = g
+            .state_db
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow!("workspace borrower thread is absent"))?;
+        if is_terminal_status(&thread.status) {
+            bail!("terminal thread cannot borrow a workspace");
+        }
+        let _admission = Self::authorize_runtime_pin_for_thread(&g, thread_id)?;
+        if let Some(existing) = g.runtime_db.thread_workspace_binding(thread_id)?
+            && existing != *binding
+        {
+            bail!("thread {thread_id} retains another exact workspace binding");
+        }
+        Self::authorize_workspace_root_lifecycle_locked(&g, binding)?;
+        g.runtime_db.bind_thread_workspace(thread_id, binding)
+    }
+
+    pub fn thread_workspace_binding(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<runtime_db::RuntimeWorkspaceBinding>> {
+        self.lock()?.runtime_db.thread_workspace_binding(thread_id)
+    }
+
+    /// Revalidate an already-bound view immediately before borrowing its
+    /// descriptor. This is contact admission, not another binding: an active
+    /// root may borrow its original view without replaying Ready-only birth.
+    pub fn authorize_thread_workspace_contact(
+        &self,
+        thread_id: &str,
+        expected_binding: &runtime_db::RuntimeWorkspaceBinding,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        if !self
+            .process_attachment_admission_open
+            .load(Ordering::Acquire)
+        {
+            bail!("workspace contact is fenced during daemon shutdown");
+        }
+        if g.runtime_db.thread_workspace_binding(thread_id)?.as_ref() != Some(expected_binding) {
+            bail!("workspace contact does not match the exact retained binding");
+        }
+        let thread = g
+            .state_db
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow!("workspace contact thread is absent"))?;
+        if is_terminal_status(&thread.status) {
+            bail!("terminal thread cannot acquire workspace contact");
+        }
+        let claim = g
+            .runtime_db
+            .get_launch_claim(thread_id)?
+            .ok_or_else(|| anyhow!("workspace contact has no current launch owner"))?;
+        if !self
+            .active_launch_owners
+            .lock()
+            .map_err(|_| anyhow!("active launch-owner registry poisoned"))?
+            .contains(&claim.claimed_by)
+        {
+            bail!("workspace contact requires its active launch owner");
+        }
+        Self::authorize_thread_workspace_contact_locked(&g, thread_id)
+    }
+
+    /// An indexed bounded page of all unsettled members, not just attached
+    /// processes. Pre-attachment ambiguity must remain visible to recovery.
+    pub fn workspace_members_after(
+        &self,
+        workspace_id: &str,
+        view_identity: &str,
+        after_thread_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<runtime_db::RuntimeWorkspaceMember>> {
+        self.lock()?.runtime_db.workspace_members_after(
+            workspace_id,
+            view_identity,
+            after_thread_id,
+            limit,
+        )
+    }
+
+    pub fn workspace_members_for_recovery_after(
+        &self,
+        workspace_id: &str,
+        after_thread_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<runtime_db::RuntimeWorkspaceMember>> {
+        self.lock()?
+            .runtime_db
+            .workspace_members_for_recovery_after(workspace_id, after_thread_id, limit)
+    }
+
+    pub fn execution_workspace_has_members(&self, workspace_id: &str) -> Result<bool> {
+        self.lock()?
+            .runtime_db
+            .execution_workspace_has_members(workspace_id)
+    }
+
+    fn authorize_thread_workspace_contact_locked(g: &Inner, thread_id: &str) -> Result<()> {
+        if let Some(binding) = g.runtime_db.thread_workspace_binding(thread_id)? {
+            Self::authorize_workspace_root_lifecycle_locked(g, &binding)?;
+            g.runtime_db
+                .authorize_workspace_binding(thread_id, &binding, false)?;
+        }
+        // Absence does not manufacture membership. Immutable-input/projectless
+        // launches legitimately have none; enforced view delivery separately
+        // requires its exact binding before selecting a view descriptor.
+        Ok(())
+    }
+
+    fn authorize_workspace_root_lifecycle_locked(
+        g: &Inner,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+    ) -> Result<()> {
+        let workspace = g
+            .runtime_db
+            .workspace(&binding.workspace_id)?
+            .ok_or_else(|| anyhow!("workspace owner is absent"))?;
+        let root = workspace
+            .thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("workspace has no root thread"))?;
+        let root_thread = g
+            .state_db
+            .get_thread(root)?
+            .ok_or_else(|| anyhow!("workspace root thread is absent"))?;
+        if is_terminal_status(&root_thread.status) {
+            bail!("workspace root is terminal and cannot admit process contact");
+        }
+        Ok(())
+    }
+
+    /// Explicit settlement by the still-live exact launch owner. The caller
+    /// MUST already have settled its request/held-launch lifelines and any
+    /// unrecorded pre-attachment process. This method cannot infer that proof
+    /// from a NULL PID, terminal status, or a removed stale claim.
+    ///
+    /// Cold recovery cannot use this API: uncertain old contact remains bound.
+    /// Removing membership also does not prove physical view closure; the
+    /// original workspace slot retains that separate last-owner obligation.
+    pub fn settle_thread_workspace_owned(
+        &self,
+        thread_id: &str,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+    ) -> Result<bool> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        let claim = g
+            .runtime_db
+            .get_launch_claim(thread_id)?
+            .ok_or_else(|| anyhow!("workspace settlement requires its live launch claim"))?;
+        let active = self
+            .active_launch_owners
+            .lock()
+            .map_err(|_| anyhow!("active launch-owner registry poisoned"))?;
+        if claim.owner != binding.borrower_launch_owner || !active.contains(&claim.claimed_by) {
+            bail!("workspace settlement requires the exact active launch owner");
+        }
+        let thread = g
+            .state_db
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow!("workspace settlement thread is absent"))?;
+        if !is_terminal_status(&thread.status) {
+            return Ok(false);
+        }
+        let runtime = g
+            .runtime_db
+            .get_runtime_info(thread_id)?
+            .ok_or_else(|| anyhow!("workspace settlement runtime row is absent"))?;
+        if runtime.process_identity.is_some()
+            || g.runtime_db
+                .in_process_handler_reservation(thread_id)?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        match g.runtime_db.thread_workspace_binding(thread_id)? {
+            None => Ok(true),
+            Some(existing) if existing == *binding => g
+                .runtime_db
+                .clear_thread_workspace_owned(thread_id, binding),
+            Some(_) => bail!("workspace settlement cannot erase another exact binding"),
+        }
+    }
+
+    /// Settle one completed process attempt before its active claim rotates or
+    /// its exact attachment is compare-cleared. The caller MUST have completed
+    /// the owned wait/reap and settled held-launch/request lifelines. Unlike
+    /// terminal cleanup this may run for a nonterminal runtime retry, but only
+    /// with the exact still-attached process identity and active launch owner.
+    /// Never invoke this from an unconditional Drop or after a failed abort.
+    pub fn settle_reaped_thread_workspace_owned(
+        &self,
+        thread_id: &str,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+        identity: &crate::process::ExecutionProcessIdentity,
+    ) -> Result<bool> {
+        self.settle_workspace_process_after_death(
+            thread_id,
+            binding,
+            identity,
+            WorkspaceProcessSettlementOwner::Live,
+        )
+    }
+
+    /// Recovery's explicit exact-identity settlement after existing process
+    /// authority proves group death/reap or a host-boot boundary. Neither a
+    /// vanished PID nor a vanished claim constitutes that proof. The caller
+    /// must retain the exact identity until this atomic mutation succeeds;
+    /// unknown pre-attachment contact remains bound.
+    pub fn settle_dead_thread_workspace_if_matches(
+        &self,
+        thread_id: &str,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+        identity: &crate::process::ExecutionProcessIdentity,
+    ) -> Result<bool> {
+        self.settle_workspace_process_after_death(
+            thread_id,
+            binding,
+            identity,
+            WorkspaceProcessSettlementOwner::Abandoned,
+        )
+    }
+
+    fn settle_workspace_process_after_death(
+        &self,
+        thread_id: &str,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+        identity: &crate::process::ExecutionProcessIdentity,
+        owner: WorkspaceProcessSettlementOwner,
+    ) -> Result<bool> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        let active = self
+            .active_launch_owners
+            .lock()
+            .map_err(|_| anyhow!("active launch-owner registry poisoned"))?;
+        let claim = g.runtime_db.get_launch_claim(thread_id)?;
+        let binding_owner =
+            lillux::canonical_json(&serde_json::to_value(&binding.borrower_launch_owner)?)?;
+        match owner {
+            WorkspaceProcessSettlementOwner::Live => {
+                if !claim.as_ref().is_some_and(|claim| {
+                    claim.owner == binding.borrower_launch_owner
+                        && active.contains(&claim.claimed_by)
+                }) {
+                    return Ok(false);
+                }
+            }
+            WorkspaceProcessSettlementOwner::Abandoned => {
+                if active.contains(&binding_owner)
+                    || claim.as_ref().is_some_and(|claim| {
+                        claim.owner != binding.borrower_launch_owner
+                            || active.contains(&claim.claimed_by)
+                    })
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        if g.state_db.get_thread(thread_id)?.is_none()
+            || g.runtime_db.thread_workspace_binding(thread_id)?.as_ref() != Some(binding)
+        {
+            return Ok(false);
+        }
+        let Some(runtime) = g.runtime_db.get_runtime_info(thread_id)? else {
+            return Ok(false);
+        };
+        if runtime.process_identity.as_ref() != Some(identity)
+            || g.runtime_db
+                .in_process_handler_reservation(thread_id)?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let cleared = g
+            .runtime_db
+            .clear_reaped_workspace_process_if_matches(thread_id, binding, identity)?;
+        if cleared {
+            self.attached_process_registry().remove(thread_id);
+        }
+        Ok(cleared)
+    }
+
     #[tracing::instrument(
         name = "state:attach_thread_process",
         skip(self, launch_metadata),
@@ -13246,6 +13682,7 @@ impl StateStore {
             );
         }
         let _admission = Self::authorize_runtime_pin_for_thread(&g, thread_id)?;
+        Self::authorize_thread_workspace_contact_locked(&g, thread_id)?;
         if mode.requires_empty() {
             if mode.rearms_resume_budget() {
                 g.runtime_db.attach_new_process_rearming_resume_budget(
@@ -13324,6 +13761,7 @@ impl StateStore {
                 "process release identity does not match durable attachment for thread {thread_id}"
             );
         }
+        Self::authorize_thread_workspace_contact_locked(&g, thread_id)?;
         Ok(())
     }
 
@@ -14010,6 +14448,82 @@ impl StateStore {
         g.runtime_db.bind_workspace(binding)
     }
 
+    /// Attach a held workspace creator through the construction journal before
+    /// releasing it. Its PID is never installed as the thread's target PID.
+    pub fn attach_workspace_creator(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+        identity: &crate::process::ExecutionProcessIdentity,
+    ) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        let g = self.lock()?;
+        if !self
+            .process_attachment_admission_open
+            .load(Ordering::Acquire)
+        {
+            bail!("workspace creator attachment is fenced during daemon shutdown");
+        }
+        let _admission = Self::authorize_runtime_pin_for_thread(&g, thread_id)?;
+        let thread = g
+            .state_db
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow!("workspace creator thread is absent"))?;
+        if is_terminal_status(&thread.status) {
+            bail!("terminal thread cannot release a workspace creator");
+        }
+        let runtime = g
+            .runtime_db
+            .get_runtime_info(thread_id)?
+            .ok_or_else(|| anyhow!("workspace creator runtime row is absent"))?;
+        if runtime.stop_intent.is_some() {
+            bail!("workspace creator attachment is fenced by a durable stop");
+        }
+        let claim = g
+            .runtime_db
+            .get_launch_claim(thread_id)?
+            .ok_or_else(|| anyhow!("workspace creator has no current launch claim"))?;
+        if claim.claimed_by != launch_owner {
+            bail!("workspace creator launch owner has changed");
+        }
+        g.runtime_db
+            .attach_workspace_creator(workspace_id, thread_id, launch_owner, identity)
+    }
+
+    /// A successful adapter response is not process-group death evidence.
+    /// Verify the exact held creator retained by this construction before a
+    /// Ready bind clears its identity. Missing identity is not pre-contact proof.
+    pub fn assert_execution_workspace_creator_reaped(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        let workspace = g
+            .runtime_db
+            .workspace(workspace_id)?
+            .ok_or_else(|| anyhow!("workspace creator journal disappeared"))?;
+        let claim = g
+            .runtime_db
+            .get_launch_claim(thread_id)?
+            .ok_or_else(|| anyhow!("workspace creator lost its current launch claim"))?;
+        if workspace.state != runtime_db::WorkspaceState::Constructing
+            || workspace.thread_id.as_deref() != Some(thread_id)
+            || workspace.launch_owner.as_deref() != Some(launch_owner)
+            || claim.claimed_by != launch_owner
+            || !self.is_launch_owner_active(launch_owner)
+        {
+            bail!("workspace creator reap check lost its exact constructing owner");
+        }
+        let identity = workspace
+            .process_identity
+            .as_deref()
+            .ok_or_else(|| anyhow!("workspace construction has no exact held creator identity"))?;
+        crate::process::assert_reaped_process_group_absent(&serde_json::from_str(identity)?)
+    }
+
     pub fn claim_execution_workspace_construction(
         &self,
         workspace_id: &str,
@@ -14099,6 +14613,51 @@ impl StateStore {
         expected_state: runtime_db::WorkspaceState,
         expected_process_identity: Option<&str>,
     ) -> Result<()> {
+        self.handoff_execution_workspace_owner(
+            workspace_id,
+            thread_id,
+            previous_launch_owner,
+            recovery_launch_owner,
+            expected_state,
+            expected_process_identity,
+            None,
+        )
+    }
+
+    /// Same-daemon retry retains the original live view slot. The caller must
+    /// prove that exact slot is still held and all request/process aliases are
+    /// settled; neither an inactive claim nor a filesystem path is that proof.
+    pub fn handoff_execution_workspace_for_live_retry(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        previous_launch_owner: &str,
+        recovery_launch_owner: &str,
+        expected_state: runtime_db::WorkspaceState,
+        expected_process_identity: Option<&str>,
+        view_identity: &str,
+    ) -> Result<()> {
+        self.handoff_execution_workspace_owner(
+            workspace_id,
+            thread_id,
+            previous_launch_owner,
+            recovery_launch_owner,
+            expected_state,
+            expected_process_identity,
+            Some(view_identity),
+        )
+    }
+
+    fn handoff_execution_workspace_owner(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        previous_launch_owner: &str,
+        recovery_launch_owner: &str,
+        expected_state: runtime_db::WorkspaceState,
+        expected_process_identity: Option<&str>,
+        retained_live_view: Option<&str>,
+    ) -> Result<()> {
         let _permit = self.acquire_write_permit()?;
         let g = self.lock()?;
         let _admission = Self::authorize_runtime_pin_for_thread(&g, thread_id)?;
@@ -14109,14 +14668,45 @@ impl StateStore {
         if claim.claimed_by != recovery_launch_owner {
             bail!("stale recovery launch owner for thread {thread_id}");
         }
-        g.runtime_db.rebind_workspace_for_recovery(
-            workspace_id,
-            thread_id,
-            previous_launch_owner,
-            recovery_launch_owner,
-            expected_state,
-            expected_process_identity,
-        )
+        if !self.is_launch_owner_active(recovery_launch_owner)
+            || self.is_launch_owner_active(previous_launch_owner)
+        {
+            bail!("workspace owner transfer requires an active successor and settled predecessor");
+        }
+        let previous: runtime_db::LaunchOwner = serde_json::from_str(previous_launch_owner)?;
+        let recovery: runtime_db::LaunchOwner = serde_json::from_str(recovery_launch_owner)?;
+        if previous.thread_id != thread_id
+            || recovery.thread_id != thread_id
+            || recovery.daemon_generation_id != runtime_db::daemon_generation_id()
+            || (previous.daemon_generation_id == recovery.daemon_generation_id)
+                != retained_live_view.is_some()
+        {
+            bail!("workspace transfer mode does not match its exact daemon-generation owners");
+        }
+        if let Some(raw_identity) = expected_process_identity {
+            let identity: crate::process::ExecutionProcessIdentity =
+                serde_json::from_str(raw_identity)?;
+            crate::process::assert_reaped_process_group_absent(&identity)?;
+        }
+        match retained_live_view {
+            Some(view_identity) => g.runtime_db.handoff_workspace_for_live_retry(
+                workspace_id,
+                thread_id,
+                previous_launch_owner,
+                recovery_launch_owner,
+                expected_state,
+                expected_process_identity,
+                view_identity,
+            ),
+            None => g.runtime_db.rebind_workspace_for_recovery(
+                workspace_id,
+                thread_id,
+                previous_launch_owner,
+                recovery_launch_owner,
+                expected_state,
+                expected_process_identity,
+            ),
+        }
     }
 
     /// Transition an exact dead owner's workspace during reconciliation. A
@@ -14588,8 +15178,35 @@ impl StateStore {
             .bind_runtime_workspace_input_snapshot(operation_id, snapshot_hash)
     }
 
+    fn runtime_workspace_subtree_is_settled_locked(
+        g: &Inner,
+        intent: &runtime_db::RuntimeActionIntent,
+    ) -> Result<bool> {
+        let operation = intent
+            .workspace_operation
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime action has no workspace operation"))?;
+        let workspace = g
+            .runtime_db
+            .workspace(&operation.workspace_id)?
+            .ok_or_else(|| anyhow!("workspace operation lost its workspace owner"))?;
+        if workspace.thread_id.as_deref() != Some(intent.first_caller_thread_id.as_str()) {
+            bail!("workspace operation root owner changed before settlement");
+        }
+        let view_identity = workspace
+            .mount_identity
+            .as_deref()
+            .ok_or_else(|| anyhow!("workspace operation lost its exact view incarnation"))?;
+        Ok(!g.runtime_db.workspace_subtree_has_members(
+            &intent.child_thread_id,
+            &operation.workspace_id,
+            view_identity,
+        )?)
+    }
+
     /// Release an operation only after existing thread/launcher authorities
-    /// prove that its exact child is absent or terminal and process-detached.
+    /// prove that its exact child is absent or terminal and process-detached,
+    /// and every same-view descendant has explicitly settled membership.
     /// Signal delivery or terminal status alone is never reap evidence.
     pub fn begin_runtime_workspace_operation_settlement(&self, operation_id: &str) -> Result<bool> {
         let _permit = self.acquire_write_permit()?;
@@ -14632,7 +15249,7 @@ impl StateStore {
                     && !process_attached
             }
         };
-        if !settled {
+        if !settled || !Self::runtime_workspace_subtree_is_settled_locked(&g, &intent)? {
             return Ok(false);
         }
         g.runtime_db.transition_runtime_workspace_operation(
@@ -14644,7 +15261,8 @@ impl StateStore {
     }
 
     /// Release an operation only after existing thread/launcher authorities
-    /// prove that its exact child is absent or terminal and process-detached.
+    /// prove that its exact child is absent or terminal and process-detached,
+    /// and every same-view descendant has explicitly settled membership.
     /// Signal delivery or terminal status alone is never reap evidence.
     pub fn settle_runtime_workspace_operation(&self, operation_id: &str) -> Result<bool> {
         let _permit = self.acquire_write_permit()?;
@@ -14703,7 +15321,7 @@ impl StateStore {
                     && !process_attached
             }
         };
-        if !settled {
+        if !settled || !Self::runtime_workspace_subtree_is_settled_locked(&g, &intent)? {
             return Ok(false);
         }
         if operation.phase == runtime_db::RuntimeWorkspaceOperationPhase::ChildRunning {
@@ -16587,6 +17205,956 @@ mod tests {
             Arc::new(head_trust),
         )
         .expect("state store")
+    }
+
+    fn workspace_binding_fixture() -> (StateStore, runtime_db::RuntimeWorkspaceBinding) {
+        let store = test_store();
+        let root = "T-workspace-root";
+        store
+            .create_thread_for_test(&thread_record(root, root))
+            .unwrap();
+        let claim = store
+            .claim_thread_launch_active(root, "claim-root", "daemon:workspace-test")
+            .unwrap()
+            .unwrap();
+        let binding = runtime_db::RuntimeWorkspaceBinding {
+            workspace_id: "workspace-parent".to_owned(),
+            view_identity: "exact-created-view-1".to_owned(),
+            borrower_launch_owner: claim.owner,
+        };
+        {
+            let g = store.lock().unwrap();
+            g.runtime_db
+                .reserve_workspace(&binding.workspace_id, &"a".repeat(64), "/workspace-fixture")
+                .unwrap();
+            g.runtime_db
+                .transition_workspace(
+                    &binding.workspace_id,
+                    &[runtime_db::WorkspaceState::Reserved],
+                    runtime_db::WorkspaceState::Constructing,
+                    None,
+                )
+                .unwrap();
+            g.runtime_db
+                .claim_workspace_construction(&binding.workspace_id, root, &claim.claimed_by)
+                .unwrap();
+            g.runtime_db
+                .bind_workspace(runtime_db::WorkspaceBinding {
+                    workspace_id: &binding.workspace_id,
+                    thread_id: root,
+                    launch_owner: Some(&claim.claimed_by),
+                    backend_id: Some("native"),
+                    backend_version: Some("fixture-build"),
+                    pinned_root_identities: Some("fixture-pinned-roots"),
+                    mount_identity: Some(&binding.view_identity),
+                })
+                .unwrap();
+        }
+        store.bind_thread_workspace(root, &binding).unwrap();
+        // A replay while still Ready is exact, not another membership.
+        store.bind_thread_workspace(root, &binding).unwrap();
+        store
+            .transition_execution_workspace(
+                &binding.workspace_id,
+                &[runtime_db::WorkspaceState::Ready],
+                runtime_db::WorkspaceState::Active,
+                None,
+            )
+            .unwrap();
+        (store, binding)
+    }
+
+    fn workspace_child_fixture(
+        store: &StateStore,
+        parent: &str,
+        child: &str,
+        root_binding: &runtime_db::RuntimeWorkspaceBinding,
+    ) -> runtime_db::RuntimeWorkspaceBinding {
+        // Deliberately separate chain roots: membership is not chain equality.
+        store
+            .create_thread_for_test(&thread_record(child, child))
+            .unwrap();
+        let claim = store
+            .claim_thread_launch_active(child, &format!("claim-{child}"), "daemon:workspace-test")
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .record_child_link(parent, child, "dispatch")
+                .unwrap()
+                .is_none()
+        );
+        runtime_db::RuntimeWorkspaceBinding {
+            borrower_launch_owner: claim.owner,
+            ..root_binding.clone()
+        }
+    }
+
+    fn finish_workspace_test_thread(store: &StateStore, thread_id: &str) {
+        store
+            .finalize_thread(
+                thread_id,
+                &FinalizeThreadRecord {
+                    status: ThreadStatus::Completed.as_str().to_owned(),
+                    outcome_code: Some("completed".to_owned()),
+                    result_json: None,
+                    error_json: None,
+                    artifacts: Vec::new(),
+                    final_cost: None,
+                    managed_envelope: None,
+                    result_project_snapshot_hash: None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn attach_workspace_test_process(
+        store: &StateStore,
+        binding: &runtime_db::RuntimeWorkspaceBinding,
+    ) -> crate::process::ExecutionProcessIdentity {
+        let identity = crate::process::ExecutionProcessIdentity {
+            schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            boot_id: "test-boot".to_owned(),
+            target_pid: 12345,
+            target_start_time_ticks: 10,
+            group_leader_pid: 12345,
+            group_leader_start_time_ticks: 10,
+        };
+        let thread_id = &binding.borrower_launch_owner.thread_id;
+        let owner = store
+            .get_launch_claim(thread_id)
+            .unwrap()
+            .unwrap()
+            .claimed_by;
+        store
+            .attach_new_thread_process(
+                thread_id,
+                identity.target_pid,
+                identity.group_leader_pid,
+                &identity,
+                &crate::launch_metadata::RuntimeLaunchMetadata::default(),
+                Some(&owner),
+            )
+            .unwrap();
+        identity
+    }
+
+    #[test]
+    fn workspace_binding_reaped_attempt_clears_exact_attachment_atomically_before_retry() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-reaped-attempt";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let identity = attach_workspace_test_process(&store, &binding);
+        let mut wrong = identity.clone();
+        wrong.target_start_time_ticks += 1;
+        assert!(
+            !store
+                .settle_reaped_thread_workspace_owned(child, &binding, &wrong)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity,
+            Some(identity.clone())
+        );
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding.clone())
+        );
+        // The test supplies the owner's completed-wait proof at this boundary;
+        // a nonterminal attempt may settle without changing thread lifecycle.
+        assert!(!is_terminal_status(
+            &store.get_thread(child).unwrap().unwrap().status
+        ));
+        assert!(
+            store
+                .settle_reaped_thread_workspace_owned(child, &binding, &identity)
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity
+                .is_none()
+        );
+        assert!(store.thread_workspace_binding(child).unwrap().is_none());
+        assert!(
+            !store
+                .list_attached_thread_ids()
+                .unwrap()
+                .iter()
+                .any(|id| id == child)
+        );
+        assert!(
+            !store
+                .settle_reaped_thread_workspace_owned(child, &binding, &identity)
+                .unwrap()
+        );
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        assert!(matches!(
+            store
+                .rotate_active_thread_launch_claim_after_runtime_recovery(
+                    child,
+                    &claim.claimed_by,
+                    "next-attempt",
+                    "daemon:workspace-test",
+                    2,
+                )
+                .unwrap(),
+            runtime_db::RuntimeRecoveryClaimRotation::Rotated { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_binding_dead_settlement_requires_abandoned_exact_attachment() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-dead-attempt";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let identity = attach_workspace_test_process(&store, &binding);
+        assert!(
+            !store
+                .settle_dead_thread_workspace_if_matches(child, &binding, &identity)
+                .unwrap()
+        );
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(child, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        let mut wrong = identity.clone();
+        wrong.target_start_time_ticks += 1;
+        assert!(
+            !store
+                .settle_dead_thread_workspace_if_matches(child, &binding, &wrong)
+                .unwrap()
+        );
+        let mut wrong_binding = binding.clone();
+        wrong_binding.view_identity = "replacement-view".to_owned();
+        assert!(
+            !store
+                .settle_dead_thread_workspace_if_matches(child, &wrong_binding, &identity)
+                .unwrap()
+        );
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding.clone())
+        );
+        assert!(
+            store
+                .settle_dead_thread_workspace_if_matches(child, &binding, &identity)
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity
+                .is_none()
+        );
+        assert!(store.thread_workspace_binding(child).unwrap().is_none());
+    }
+
+    #[test]
+    fn workspace_binding_reaped_settlement_refuses_replacement_claim_and_unattached_contact() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-replaced-attempt";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let identity = attach_workspace_test_process(&store, &binding);
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(child, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        store
+            .claim_thread_launch(child, "replacement", "daemon:replacement")
+            .unwrap();
+        assert!(
+            !store
+                .settle_reaped_thread_workspace_owned(child, &binding, &identity)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .settle_dead_thread_workspace_if_matches(child, &binding, &identity)
+                .unwrap()
+        );
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding.clone())
+        );
+        assert_eq!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity,
+            Some(identity.clone())
+        );
+
+        let unknown = "T-unattached-contact";
+        let unknown_binding =
+            workspace_child_fixture(&store, "T-workspace-root", unknown, &root_binding);
+        store
+            .bind_thread_workspace(unknown, &unknown_binding)
+            .unwrap();
+        assert!(
+            !store
+                .settle_reaped_thread_workspace_owned(unknown, &unknown_binding, &identity)
+                .unwrap()
+        );
+        let unknown_claim = store.get_launch_claim(unknown).unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(
+                unknown,
+                &unknown_claim.claim_id,
+                &unknown_claim.claimed_by,
+            )
+            .unwrap();
+        assert!(
+            !store
+                .settle_dead_thread_workspace_if_matches(unknown, &unknown_binding, &identity)
+                .unwrap()
+        );
+        assert_eq!(
+            store.thread_workspace_binding(unknown).unwrap(),
+            Some(unknown_binding)
+        );
+    }
+
+    #[test]
+    fn workspace_binding_reaped_parent_cannot_hide_unsettled_descendant_contact() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-reaped-parent";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let identity = attach_workspace_test_process(&store, &binding);
+        let nested = workspace_child_fixture(&store, child, "T-live-descendant", &root_binding);
+        store
+            .bind_thread_workspace("T-live-descendant", &nested)
+            .unwrap();
+        assert!(
+            !store
+                .settle_reaped_thread_workspace_owned(child, &binding, &identity)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity,
+            Some(identity.clone())
+        );
+        finish_workspace_test_thread(&store, "T-live-descendant");
+        assert!(
+            store
+                .settle_thread_workspace_owned("T-live-descendant", &nested)
+                .unwrap()
+        );
+        assert!(
+            store
+                .settle_reaped_thread_workspace_owned(child, &binding, &identity)
+                .unwrap()
+        );
+    }
+
+    fn reserve_workspace_test_barrier(
+        store: &StateStore,
+        access: ryeos_engine::kind_registry::WorkspaceAccess,
+        child: &str,
+    ) -> String {
+        let operation_id = "d".repeat(64);
+        let g = store.lock().unwrap();
+        g.runtime_db
+            .reserve_runtime_action_intent_with_workspace(
+                &operation_id,
+                "T-workspace-root",
+                "T-workspace-root",
+                runtime_db::RuntimeActionMode::Inline,
+                &"e".repeat(64),
+                child,
+                None,
+                Some(&runtime_db::NewRuntimeWorkspaceOperation {
+                    workspace_id: "workspace-parent",
+                    access,
+                    worker_instance_id: "test-worker",
+                    worker_boot_epoch: 1,
+                    worker_boot_identity_hash: &"a".repeat(64),
+                    project_authority_digest: &"b".repeat(64),
+                    workload_client_grant_digest: &"c".repeat(64),
+                }),
+            )
+            .unwrap();
+        operation_id
+    }
+
+    #[test]
+    fn workspace_binding_replays_exactly_and_refuses_conflicts_and_stale_owners() {
+        let (store, root_binding) = workspace_binding_fixture();
+        // Contact can use the existing Active root view; it does not repeat
+        // the Ready-only root birth mutation.
+        store
+            .authorize_thread_workspace_contact("T-workspace-root", &root_binding)
+            .unwrap();
+        let mut wrong_root = root_binding.clone();
+        wrong_root.view_identity = "other-created-view".to_owned();
+        assert!(
+            store
+                .authorize_thread_workspace_contact("T-workspace-root", &wrong_root)
+                .is_err()
+        );
+        let child = "T-binding-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let mut conflicting = binding.clone();
+        conflicting.view_identity = "other-created-view".to_owned();
+        assert!(store.bind_thread_workspace(child, &conflicting).is_err());
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(child, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        store
+            .claim_thread_launch_active(child, "replacement-claim", "daemon:replacement")
+            .unwrap()
+            .unwrap();
+        assert!(store.bind_thread_workspace(child, &binding).is_err());
+        assert!(
+            store
+                .authorize_thread_workspace_contact(child, &binding)
+                .is_err()
+        );
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn workspace_binding_freeze_fences_admission_attachment_and_late_release() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-freeze-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let identity = crate::process::ExecutionProcessIdentity {
+            schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            boot_id: "test-boot".to_owned(),
+            target_pid: 12345,
+            target_start_time_ticks: 10,
+            group_leader_pid: 12345,
+            group_leader_start_time_ticks: 10,
+        };
+        let owner = store.get_launch_claim(child).unwrap().unwrap().claimed_by;
+        store
+            .attach_new_thread_process(
+                child,
+                identity.target_pid,
+                identity.group_leader_pid,
+                &identity,
+                &crate::launch_metadata::RuntimeLaunchMetadata::default(),
+                Some(&owner),
+            )
+            .unwrap();
+        store
+            .authorize_attached_process_release(child, &identity, Some(&owner))
+            .unwrap();
+        store
+            .transition_execution_workspace(
+                &binding.workspace_id,
+                &[runtime_db::WorkspaceState::Active],
+                runtime_db::WorkspaceState::Freezing,
+                None,
+            )
+            .unwrap();
+        assert!(store.bind_thread_workspace(child, &binding).is_err());
+        assert!(
+            store
+                .authorize_thread_workspace_contact(child, &binding)
+                .is_err()
+        );
+        assert!(
+            store
+                .authorize_attached_process_release(child, &identity, Some(&owner))
+                .is_err()
+        );
+        assert!(
+            store
+                .attach_thread_process(
+                    child,
+                    identity.target_pid,
+                    identity.group_leader_pid,
+                    &identity,
+                    &crate::launch_metadata::RuntimeLaunchMetadata::default(),
+                    Some(&owner)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn dedicated_workspace_contact_requires_exact_active_root_binding() {
+        let (store, binding) = workspace_binding_fixture();
+        {
+            let g = store.lock().unwrap();
+            store
+                .authorize_dedicated_workspace_contact_locked(
+                    &g,
+                    "T-workspace-root",
+                    &binding.workspace_id,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .authorize_dedicated_workspace_contact_locked(
+                        &g,
+                        "T-workspace-root",
+                        "obsolete-workspace"
+                    )
+                    .is_err()
+            );
+        }
+        let child = "T-not-dedicated-root";
+        let child_binding = workspace_child_fixture(&store, "T-workspace-root", child, &binding);
+        store.bind_thread_workspace(child, &child_binding).unwrap();
+        assert!(
+            store
+                .authorize_dedicated_workspace_contact_locked(
+                    &store.lock().unwrap(),
+                    child,
+                    &binding.workspace_id
+                )
+                .is_err()
+        );
+        let claim = store.get_launch_claim("T-workspace-root").unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(
+                "T-workspace-root",
+                &claim.claim_id,
+                &claim.claimed_by,
+            )
+            .unwrap();
+        assert!(
+            store
+                .authorize_dedicated_workspace_contact_locked(
+                    &store.lock().unwrap(),
+                    "T-workspace-root",
+                    &binding.workspace_id
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_capture_refuses_pending_and_identity_unknown_worker_start() {
+        for (cleanup_proved, recovered_boot) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (store, binding) = workspace_binding_fixture();
+            let root = "T-workspace-root";
+            let workspace = store
+                .execution_workspace(&binding.workspace_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .workspace_worker_capture_record(&workspace)
+                    .unwrap()
+                    .is_none()
+            );
+            store
+                .create_credential_profile(NewCredentialProfile {
+                    profile_id: "P-capture",
+                    owner_principal: "fp:operator",
+                    home_id: "home-capture",
+                })
+                .unwrap();
+            store
+                .acquire_credential_profile("P-capture", "fp:operator", "worker-capture")
+                .unwrap();
+            store
+                .admit_dedicated_session(NewDedicatedSession {
+                    placement_thread_id: root,
+                    chain_root_id: root,
+                    owner_principal: "fp:operator",
+                    admitted_capsule_hash: &"a".repeat(64),
+                    workspace_id: &binding.workspace_id,
+                    candidate_required: false,
+                    candidate_disposition: runtime_db::DedicatedCandidateDisposition::OwnerDecision,
+                    credential_profile_id: "P-capture",
+                    credential_generation: 1,
+                    credential_lock_owner: "worker-capture",
+                })
+                .unwrap();
+            assert!(store.workspace_worker_capture_record(&workspace).is_err());
+            let (worker_id, boot_epoch) = if recovered_boot {
+                // An exact old retirement permits recovery before, but never
+                // after, a new admitted attempt crosses the durable boundary.
+                let identity = attach_workspace_test_process(&store, &binding);
+                store
+                    .transition_execution_workspace_owned(
+                        &binding.workspace_id,
+                        root,
+                        &store.get_launch_claim(root).unwrap().unwrap().claimed_by,
+                        &[runtime_db::WorkspaceState::Active],
+                        runtime_db::WorkspaceState::Active,
+                        Some(&serde_json::to_string(&identity).unwrap()),
+                    )
+                    .unwrap();
+                store
+                    .attach_worker_process(&WorkerProcessRecord {
+                        worker_instance_id: "worker-capture".to_owned(),
+                        boot_identity_hash: "b".repeat(64),
+                        session_capsule_hash: "a".repeat(64),
+                        boot_epoch: 1,
+                        lifecycle_generation: 1,
+                        process_identity: identity,
+                        control_channel_identity: "fixture-channel".to_owned(),
+                        state: runtime_db::WorkerProcessState::Attached,
+                        daemon_generation_id: "daemon:workspace-test".to_owned(),
+                        placement_thread_id: root.to_owned(),
+                        cleanup_state: "owned".to_owned(),
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    })
+                    .unwrap();
+                store
+                    .fence_abandoned_worker_process("worker-capture", root, 1, "reaped")
+                    .unwrap();
+                let retired = store
+                    .execution_workspace(&binding.workspace_id)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    store
+                        .workspace_worker_capture_record(&retired)
+                        .unwrap()
+                        .is_none()
+                );
+                store
+                    .acquire_credential_profile("P-capture", "fp:operator", "worker-next")
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .prepare_dedicated_session_recovery(
+                            root,
+                            1,
+                            "worker-next",
+                            &binding.workspace_id
+                        )
+                        .unwrap(),
+                    2
+                );
+                assert!(store.workspace_worker_capture_record(&retired).is_err());
+                assert!(
+                    store
+                        .fail_dedicated_session_start(
+                            root,
+                            "worker-capture",
+                            1,
+                            "stale cleanup",
+                            true
+                        )
+                        .is_err()
+                );
+                assert!(
+                    store
+                        .fail_dedicated_session_start(root, "worker-next", 1, "wrong epoch", true)
+                        .is_err()
+                );
+                assert_eq!(
+                    store
+                        .reconcile_unattached_credential_profile_locks()
+                        .unwrap(),
+                    (1, 0)
+                );
+                assert!(store.workspace_worker_capture_record(&retired).is_err());
+                assert_eq!(
+                    store
+                        .credential_profile("P-capture")
+                        .unwrap()
+                        .unwrap()
+                        .lock_owner
+                        .as_deref(),
+                    Some("worker-next")
+                );
+                ("worker-next", 2)
+            } else {
+                ("worker-capture", 1)
+            };
+            store
+                .fail_dedicated_session_start(
+                    root,
+                    worker_id,
+                    boot_epoch,
+                    "fixture start failure",
+                    cleanup_proved,
+                )
+                .unwrap();
+            let current = store
+                .execution_workspace(&binding.workspace_id)
+                .unwrap()
+                .unwrap();
+            let observed = store.workspace_worker_capture_record(&current);
+            if cleanup_proved {
+                assert!(observed.unwrap().is_none());
+            } else {
+                assert!(
+                    observed.is_err(),
+                    "missing identity must not hide outcome-unknown contact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_binding_unknown_contact_survives_terminalization_and_claim_removal() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-unknown-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        assert!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity
+                .is_none()
+        );
+        assert!(
+            !store
+                .settle_thread_workspace_owned(child, &binding)
+                .unwrap()
+        );
+        finish_workspace_test_thread(&store, child);
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding.clone())
+        );
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(child, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        assert!(
+            store
+                .settle_thread_workspace_owned(child, &binding)
+                .is_err()
+        );
+        let members = store
+            .workspace_members_after(&binding.workspace_id, &binding.view_identity, None, 10)
+            .unwrap();
+        assert!(
+            members
+                .iter()
+                .any(|member| member.thread_id == child && member.binding == binding)
+        );
+    }
+
+    #[test]
+    fn workspace_binding_live_owner_must_explicitly_settle_after_lifecycle_completion() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-settled-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        finish_workspace_test_thread(&store, child);
+        assert!(store.thread_workspace_binding(child).unwrap().is_some());
+        assert!(
+            store
+                .settle_thread_workspace_owned(child, &binding)
+                .unwrap()
+        );
+        assert!(
+            store
+                .settle_thread_workspace_owned(child, &binding)
+                .unwrap()
+        );
+        assert!(store.thread_workspace_binding(child).unwrap().is_none());
+    }
+
+    #[test]
+    fn workspace_binding_immutable_input_is_not_membership_or_mutable_descendant_authority() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let input = "T-independent-input";
+        workspace_child_fixture(&store, "T-workspace-root", input, &root_binding);
+        // The launch owner selects a separate immutable input and never binds
+        // the subject's mutable view. Its lineage alone cannot add membership.
+        assert!(store.thread_workspace_binding(input).unwrap().is_none());
+        StateStore::authorize_thread_workspace_contact_locked(&store.lock().unwrap(), input)
+            .unwrap();
+        let nested = workspace_child_fixture(&store, input, "T-input-nested", &root_binding);
+        assert!(
+            store
+                .bind_thread_workspace("T-input-nested", &nested)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .workspace_members_after(
+                    &root_binding.workspace_id,
+                    &root_binding.view_identity,
+                    None,
+                    10
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_binding_immutable_capture_blocks_even_previously_bound_writers() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-capture-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        reserve_workspace_test_barrier(
+            &store,
+            ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration,
+            "T-operation-child",
+        );
+        assert!(store.bind_thread_workspace(child, &binding).is_err());
+        assert!(
+            StateStore::authorize_thread_workspace_contact_locked(&store.lock().unwrap(), child)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_binding_exclusive_operation_admits_only_its_same_view_subtree() {
+        use runtime_db::RuntimeWorkspaceOperationPhase as Phase;
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-exclusive-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        let op = reserve_workspace_test_barrier(
+            &store,
+            ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive,
+            child,
+        );
+        assert!(store.bind_thread_workspace(child, &binding).is_err());
+        store
+            .transition_runtime_workspace_operation(&op, &[Phase::Reserved], Phase::Quiescing)
+            .unwrap();
+        store
+            .transition_runtime_workspace_operation(&op, &[Phase::Quiescing], Phase::Quiesced)
+            .unwrap();
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let nested = workspace_child_fixture(&store, child, "T-exclusive-nested", &root_binding);
+        store
+            .bind_thread_workspace("T-exclusive-nested", &nested)
+            .unwrap();
+        let sibling = workspace_child_fixture(
+            &store,
+            "T-workspace-root",
+            "T-exclusive-sibling",
+            &root_binding,
+        );
+        assert!(
+            store
+                .bind_thread_workspace("T-exclusive-sibling", &sibling)
+                .is_err()
+        );
+        store
+            .transition_runtime_workspace_operation(&op, &[Phase::Quiesced], Phase::ChildRunning)
+            .unwrap();
+        finish_workspace_test_thread(&store, child);
+        assert!(
+            !store
+                .settle_thread_workspace_owned(child, &binding)
+                .unwrap()
+        );
+        let intent = store.get_runtime_action_intent(&op).unwrap().unwrap();
+        assert!(
+            !StateStore::runtime_workspace_subtree_is_settled_locked(
+                &store.lock().unwrap(),
+                &intent
+            )
+            .unwrap()
+        );
+        finish_workspace_test_thread(&store, "T-exclusive-nested");
+        assert!(
+            store
+                .settle_thread_workspace_owned("T-exclusive-nested", &nested)
+                .unwrap()
+        );
+        assert!(
+            store
+                .settle_thread_workspace_owned(child, &binding)
+                .unwrap()
+        );
+        assert!(
+            StateStore::runtime_workspace_subtree_is_settled_locked(
+                &store.lock().unwrap(),
+                &intent
+            )
+            .unwrap()
+        );
+        store
+            .transition_runtime_workspace_operation(&op, &[Phase::ChildRunning], Phase::Settling)
+            .unwrap();
+        assert!(
+            StateStore::authorize_thread_workspace_contact_locked(
+                &store.lock().unwrap(),
+                "T-workspace-root"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_binding_member_pages_are_bounded_and_exact() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-page-child";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let first = store
+            .workspace_members_after(&binding.workspace_id, &binding.view_identity, None, 1)
+            .unwrap();
+        let next = store
+            .workspace_members_after(
+                &binding.workspace_id,
+                &binding.view_identity,
+                Some(&first[0].thread_id),
+                1,
+            )
+            .unwrap();
+        assert_ne!(first[0].thread_id, next[0].thread_id);
+        assert!(
+            store
+                .workspace_members_after(&binding.workspace_id, "another-view", None, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .workspace_members_after(&binding.workspace_id, &binding.view_identity, None, 0)
+                .is_err()
+        );
+        assert!(
+            store
+                .workspace_members_after(
+                    &binding.workspace_id,
+                    &binding.view_identity,
+                    None,
+                    runtime_db::WORKSPACE_MEMBER_PAGE_SIZE + 1
+                )
+                .is_err()
+        );
     }
 
     #[test]

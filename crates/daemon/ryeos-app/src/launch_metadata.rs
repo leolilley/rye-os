@@ -90,7 +90,9 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // v29 combines the current adapter protocol's explicit node-owned proc
 // surface with capsule 25/request 18 and retained content-target ceilings.
 // Classify prior launch evidence before decoding its nested authority.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 29;
+// v30 carries the strict isolation-adapter v7 provenance enum. Classify old
+// envelopes before decoding nested protocol authority; never alias v6 to v7.
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 30;
 
 /// Per-thread daemon-owned state directory.
 ///

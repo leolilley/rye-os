@@ -185,6 +185,11 @@ pub struct EngineContext {
     pub app_root: PathBuf,
     pub isolation: Arc<crate::isolation::IsolationRuntime>,
     pub isolation_project_authority: crate::isolation::IsolationProjectAuthority,
+    /// Exact view borrowed from the admitted workspace owner. Unlike
+    /// `isolation_workspace`, this is operational descriptor authority, not a
+    /// path for projectless materialization. Enforced RuntimeWorkspace launch
+    /// refuses absence instead of rebuilding an overlay from filesystem paths.
+    pub isolation_workspace_view: Option<lillux::InheritedDescriptorAuthority>,
     pub isolation_filesystem_authority_ceiling:
         crate::isolation::IsolationFilesystemAuthorityCeiling,
     pub isolation_network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,

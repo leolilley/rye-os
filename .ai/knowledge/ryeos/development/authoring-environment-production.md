@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T08:36:43Z:4ad6b7c623fd1fc247825c8a5c3470f3db429edd67de523b395be779e6d602de:YmLI3M08UpHpIydoQZjovJXzXR5G099zbYTQ0qitg+rha49MwCz4ajVCPJcGV/UqkTJyS9rFq8JihRMj3Z7dBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T11:13:37Z:ea2d39403f788ed4d3ce691738f2b78474e6293407f35d0532bf88edd750507b:ZYM7TUZNX5apx9DMZaOTUJ5yA1iCHMPOoRW54aUup1CN5ujxZLz5Va3rWbe7hgpIou0djkENZWlA7Y9k7ugcAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/development
 tags: [development, authoring, external-content, production]
-version: "1.0.1"
+version: "1.0.2"
 description: Finite production and qualification of the shared command environment.
 ---
 
@@ -108,12 +108,15 @@ complete production output and shell file. Project HEAD remained unchanged.
 capsule, result and import coordinates, separately from the expected pins.
 
 Independent admitted verification, final Worker/Config bindings, restart and
-real hosted candidate qualification remain gates. In particular, the current
-native backend must not qualify an inline assemble/verify graph: its per-launch
-overlay creation would overlap the live parent's upper/work directories.
-The existing generic workspace owner needs one retained merged view and exact
-transitive borrower freeze/cleanup fencing first. A standalone kernel proof
-of detached mount sharing is not runtime integration or worker acceptance.
+real hosted candidate qualification remain gates. The v7 source integration
+replaces per-launch overlay creation with one original retained view and exact
+transitive borrower freeze/cleanup fencing. Each isolated child attaches its
+own clone of that template; the backing workspace is not remounted separately
+for an inline child while its parent is alive. This cut also changes runtime
+epoch 28 and launch metadata 30. The disposable qualification target still
+needs the matching publication and scoped history retirement before an inline
+assemble/verify graph can qualify. A standalone kernel proof or source-level
+ownership test is not installed runtime integration or worker acceptance.
 Direct Python execution is byte-reproduction evidence, not admitted Tool
 execution evidence, and a successful assembly is not independent qualification.
 

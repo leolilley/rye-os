@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-06T04:55:43Z:cdb3a12e7537d39e75912b006e8ae2c6bfbb2c9c2e6dec95750edfab1f6ded04:IaOjsTkskRNtk3FvrJB7E629LAzqKoD5FJTTffWdwAi4eUxiSWMRuX8FIMRfK7FdeCZe+WSkPirDqsbqqbMhBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T22:17:52Z:649163698e13291817e20cd5773fa7ea163c1200f4376db2d5200c91488f79c9:3vtIGr8Dxk5jMu6gfyk+OYP8Na4NRnPwKdA2CMsYKwVZsBwVETwgao0qT2VZiLyqRaxXQkIAMEzGWKxc/7REBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
 title: "Persistence Schema Evolution"
 description: "Rules for immutable CAS wire identities, retained SQLite migrations, rebuildable projections, and explicit history retirement"
 entry_type: reference
-version: "2.2.0"
+version: "2.3.0"
 ```
 
 # Persistence Schema Evolution
@@ -34,9 +34,9 @@ The current clean-cut execution formats include:
 - project snapshot schema 5;
 - admitted launch capsule schema 25;
 - persistent-session capsule schema 8;
-- runtime launch metadata epoch 29;
+- runtime launch metadata epoch 30;
 - the standalone runtime project-authority envelope epoch 4; and
-- the owned runtime SQLite operator schema epoch 27 (encoded in the RyeOS
+- the owned runtime SQLite operator schema epoch 28 (encoded in the RyeOS
   `PRAGMA application_id` family).
 
 The numbers identify independently evolving contracts. A change to a nested
@@ -67,6 +67,24 @@ source/runtime limits and independently enforced receiving-kind content
 ceilings; recovery cannot substitute an ambient kind definition. Launch
 metadata 29 carries both this authority and the proc protocol cut; neither
 standalone v29 shape was installed before the combined generation.
+
+The shared-view workspace cut uses isolation-adapter protocol v7 and launch
+metadata 30, because the nested protocol identity is strict. Runtime epoch 28
+adds exact per-launch workspace/view/launch-owner membership to `thread_runtime`
+and retains creator process identity in the existing construction journal.
+These are local operational authorities, never portable request fields. Cold
+recovery must settle every old incarnation's borrowers before constructing a
+new view; a same-daemon retry transfers its original retained view explicitly.
+Predecessor metadata remains opaque history and predecessor runtime state
+requires the explicit scoped reset. No missing binding is decoded as proof that
+an old worker never contacted a workspace. Sealed request 18, capsule 25 and
+policy v3 are unchanged by this transient protocol/operational membership cut.
+
+Dedicated-worker admission reserves its worker ID and boot epoch before process
+contact, including recovery into the current workspace. An admitted attempt
+without an attached process row remains quarantined after restart; neither
+missing attachment nor an older reaped boot releases its credential fence.
+Only exact failed-start cleanup testimony can settle an unattached attempt.
 
 Authoritative readers must inspect the outer object kind and numeric epoch from
 generic JSON before deserializing nested typed data. Only after that gate may

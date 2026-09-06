@@ -15,12 +15,17 @@ use ryeos_isolation_protocol::{
     IsolationAdapterProtocolVersion, IsolationAuthorityPurpose, IsolationCapability,
     IsolationDiagnostic, IsolationDiagnosticCode, IsolationMountAccess, IsolationNetwork,
     IsolationTargetTriple, LauncherRefusalDocument, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-    MAX_WORKSPACE_MUTATIONS, MAX_WORKSPACE_RESPONSE_BYTES, WorkspaceLifecycleOperation,
-    WorkspaceMutation, WorkspaceMutationKind, from_json_slice_strict,
+    MAX_WORKSPACE_MUTATIONS, MAX_WORKSPACE_RESPONSE_BYTES, MAX_WORKSPACE_VIEW_RECEIPT_BYTES,
+    WorkspaceLifecycleOperation, WorkspaceMutation, WorkspaceMutationKind,
+    WorkspaceViewTransferReceipt, from_json_slice_strict,
 };
 
 const BACKEND_ID: &str = "linux-lillux";
 const ADAPTER_BUILD: &str = env!("CARGO_PKG_VERSION");
+// A dedicated child bounds its local transfer wait. The invoking parent owns
+// the original operation-wide deadline, including launch/reap/settlement.
+const WORKSPACE_TRANSFER_ENTRY_TIMEOUT: lillux::time::Duration =
+    lillux::time::Duration::from_secs(30);
 
 fn main() {
     let mut arguments = std::env::args_os();
@@ -166,15 +171,27 @@ fn translate_launch(request: &AdapterLaunchRequest) -> Result<lillux::LinuxSandb
         .project_workspace
         .as_ref()
         .map(|workspace| {
-            let project = authorities
-                .get(&workspace.project)
-                .ok_or_else(|| "workspace project authority disappeared".to_string())?;
-            let state = authorities
-                .get(&workspace.backend_state)
-                .ok_or_else(|| "workspace state authority disappeared".to_string())?;
+            let view = authorities
+                .get(&workspace.view)
+                .ok_or_else(|| "workspace view authority disappeared".to_string())?;
+            // SAFETY: validated descriptor roles are unique, and this dedicated
+            // adapter consumes each inherited template exactly once.
+            let template = unsafe {
+                lillux::LinuxOverlayTemplate::take_inherited_descriptor(view.inherited_fd)
+            }?;
+            if canonical_digest(
+                &template
+                    .inherited_authority()
+                    .directory_identity()
+                    .map_err(|error| error.to_string())?,
+            )? != workspace.view_descriptor_identity
+            {
+                return Err(
+                    "workspace view descriptor differs from the admitted identity".to_string(),
+                );
+            }
             Ok::<_, String>(lillux::LinuxSandboxOverlay {
-                lower_fd: project.inherited_fd,
-                state_fd: state.inherited_fd,
+                template,
                 destination: PathBuf::from(workspace.destination.as_str()),
             })
         })
@@ -264,6 +281,24 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
     request
         .validate()
         .map_err(|error| format!("invalid workspace request: {error}"))?;
+    if request.transfer_fd == Some(request_fd)
+        || request
+            .authorities
+            .iter()
+            .any(|authority| authority.inherited_fd == request_fd)
+    {
+        return Err("workspace role aliases the sealed request descriptor".to_string());
+    }
+    let deadline = lillux::time::MonotonicDeadline::after(WORKSPACE_TRANSFER_ENTRY_TIMEOUT);
+    let sender = request
+        .transfer_fd
+        .map(|fd| {
+            // SAFETY: the validated sealed request assigns this unique inherited
+            // endpoint solely to this dedicated Create invocation.
+            unsafe { lillux::take_inherited_descriptor_transfer_sender(fd) }
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let descriptor_for = |purpose| {
         request
             .authorities
@@ -285,6 +320,25 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
         operation,
         MAX_WORKSPACE_MUTATIONS,
     )?;
+    let template = if request.operation == WorkspaceLifecycleOperation::Create {
+        Some(lillux::create_linux_overlay_template(
+            descriptor_for(IsolationAuthorityPurpose::WorkspaceProject)?,
+            descriptor_for(IsolationAuthorityPurpose::WorkspaceBackendState)?,
+        )?)
+    } else {
+        None
+    };
+    let view_descriptor_identity = template
+        .as_ref()
+        .map(|template| {
+            canonical_digest(
+                &template
+                    .inherited_authority()
+                    .directory_identity()
+                    .map_err(|error| error.to_string())?,
+            )
+        })
+        .transpose()?;
     let mutations = observation
         .mutations
         .into_iter()
@@ -325,26 +379,88 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
         "backend_state".to_string(),
         observation.state_identity.clone(),
     );
-    let response = AdapterWorkspaceResponse {
+    let mut response = AdapterWorkspaceResponse {
         protocol: IsolationAdapterProtocolVersion::Current,
         operation: request.operation,
         workspace_id: request.workspace_id.clone(),
         launch_owner: request.launch_owner.clone(),
         backend_id: BACKEND_ID.to_string(),
         backend_version: ADAPTER_BUILD.to_string(),
-        mount_identity: format!(
-            "native-overlay:{}:{}",
-            observation.project_identity, observation.state_identity
-        ),
+        mount_identity: request.mount_identity.clone(),
+        view_descriptor_identity,
         pinned_root_identities,
         mutation_content_root: observation.mutation_content_root,
         mutations,
         destroyed: request.operation == WorkspaceLifecycleOperation::Destroy,
     };
+    if request.operation == WorkspaceLifecycleOperation::Create {
+        response.mount_identity = Some(canonical_digest(
+            &response
+                .mount_identity_value(&request)
+                .map_err(|error| error.to_string())?,
+        )?);
+    }
     response
         .validate_for(&request)
         .map_err(|error| format!("invalid workspace response: {error}"))?;
+    if serde_json::to_vec(&response)
+        .map_err(|error| error.to_string())?
+        .len()
+        > MAX_WORKSPACE_RESPONSE_BYTES
+    {
+        return Err("workspace response exceeds its stdout limit".to_string());
+    }
+    match (sender, template) {
+        (Some(sender), Some(template)) => {
+            let bytes = workspace_view_receipt(&request, &response)?;
+            sender
+                .send(
+                    &bytes,
+                    std::slice::from_ref(template.inherited_authority()),
+                    lillux::DescriptorTransferBounds::new(MAX_WORKSPACE_VIEW_RECEIPT_BYTES, 1)
+                        .map_err(|error| error.to_string())?,
+                    deadline,
+                )
+                .map_err(|error| format!("transfer created workspace view: {error}"))?;
+        }
+        (None, None) => {}
+        _ => return Err("workspace transfer and created-view ownership disagree".to_string()),
+    }
     Ok(response)
+}
+
+fn workspace_view_receipt(
+    request: &AdapterWorkspaceRequest,
+    response: &AdapterWorkspaceResponse,
+) -> Result<Vec<u8>, String> {
+    if request.operation != WorkspaceLifecycleOperation::Create {
+        return Err("only Create may deliver a workspace view receipt".to_string());
+    }
+    response
+        .validate_for(request)
+        .map_err(|error| error.to_string())?;
+    let receipt = WorkspaceViewTransferReceipt {
+        protocol: IsolationAdapterProtocolVersion::Current,
+        request_digest: canonical_digest(request)?,
+        response_digest: canonical_digest(response)?,
+    };
+    receipt.validate().map_err(|error| error.to_string())?;
+    let bytes = canonical_bytes(&receipt)?;
+    if bytes.len() > MAX_WORKSPACE_VIEW_RECEIPT_BYTES {
+        return Err("workspace view receipt exceeds the protocol bound".to_string());
+    }
+    Ok(bytes)
+}
+
+fn canonical_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    lillux::canonical_json(&value)
+        .map(String::into_bytes)
+        .map_err(|error| error.to_string())
+}
+
+fn canonical_digest<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    Ok(lillux::sha256_hex(&canonical_bytes(value)?))
 }
 
 fn supported_capabilities(
@@ -487,5 +603,56 @@ mod tests {
         };
         request.validate().unwrap();
         assert!(request.artifacts.is_empty());
+    }
+
+    #[test]
+    fn workspace_receipt_commits_exact_canonical_request_and_full_response() {
+        let request: AdapterWorkspaceRequest = serde_json::from_value(serde_json::json!({
+            "protocol": IsolationAdapterProtocolVersion::Current,
+            "operation": "create", "workspace_id": "workspace-one",
+            "launch_owner": "{\"attempt\":1}", "base_snapshot": "a".repeat(64),
+            "authorities": [
+                {"id":"project", "inherited_fd":10, "purpose":"workspace_project"},
+                {"id":"state", "inherited_fd":11, "purpose":"workspace_backend_state"}
+            ], "transfer_fd":12, "mount_identity":null
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        let mut response = AdapterWorkspaceResponse {
+            protocol: request.protocol,
+            operation: request.operation,
+            workspace_id: request.workspace_id.clone(),
+            launch_owner: request.launch_owner.clone(),
+            backend_id: BACKEND_ID.to_string(),
+            backend_version: ADAPTER_BUILD.to_string(),
+            pinned_root_identities: BTreeMap::from([
+                ("project".to_string(), "dev1-ino2".to_string()),
+                ("backend_state".to_string(), "dev1-ino3".to_string()),
+            ]),
+            mount_identity: None,
+            view_descriptor_identity: Some("b".repeat(64)),
+            mutation_content_root: None,
+            mutations: Vec::new(),
+            destroyed: false,
+        };
+        response.mount_identity =
+            Some(canonical_digest(&response.mount_identity_value(&request).unwrap()).unwrap());
+        let bytes = workspace_view_receipt(&request, &response).unwrap();
+        assert!(bytes.len() <= MAX_WORKSPACE_VIEW_RECEIPT_BYTES);
+        let receipt: WorkspaceViewTransferReceipt = from_json_slice_strict(&bytes).unwrap();
+        assert_eq!(bytes, canonical_bytes(&receipt).unwrap());
+        assert_eq!(receipt.request_digest, canonical_digest(&request).unwrap());
+        assert_eq!(
+            receipt.response_digest,
+            canonical_digest(&response).unwrap()
+        );
+        let mut changed = response.clone();
+        changed.backend_version.push_str("-changed");
+        assert_ne!(canonical_digest(&changed).unwrap(), receipt.response_digest);
+        let mut changed = request.clone();
+        changed.transfer_fd = Some(13);
+        assert_ne!(canonical_digest(&changed).unwrap(), receipt.request_digest);
+        changed.operation = WorkspaceLifecycleOperation::Destroy;
+        assert!(workspace_view_receipt(&changed, &response).is_err());
     }
 }

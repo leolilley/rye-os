@@ -420,6 +420,12 @@ impl IsolationTargetChannelAuthority {
 pub struct IsolationLaunchContext<'a> {
     pub project_path: &'a Path,
     pub project_authority: IsolationProjectAuthority,
+    /// Exact retained view from the admitted workspace owner's bound slot.
+    /// Enforced RuntimeWorkspace launches require it. It is never rebuilt
+    /// from lower/backend-state paths; nonworkspace and disabled launches
+    /// must not carry one. The caller proves workspace/incarnation ownership
+    /// before retrieving this descriptor, not by parsing its path.
+    pub workspace_view: Option<&'a lillux::InheritedDescriptorAuthority>,
     pub filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling,
     pub network_authority_ceiling: IsolationNetworkAuthorityCeiling,
     pub live_access: Option<&'a IsolationLiveAccessAuthority>,

@@ -282,6 +282,7 @@ fn daemon_executes_python_hello_world_end_to_end() {
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
+        isolation_workspace_view: None,
         isolation_filesystem_authority_ceiling:
             ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         isolation_network_authority_ceiling:
@@ -418,6 +419,7 @@ fn python_script_runtime_supports_bundle_local_imports_without_pythonpath() {
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
+        isolation_workspace_view: None,
         isolation_filesystem_authority_ceiling:
             ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         isolation_network_authority_ceiling:
@@ -544,6 +546,7 @@ fn python_function_runtime_supports_bundle_local_imports_without_pythonpath() {
         app_root,
         isolation,
         isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority::External,
+        isolation_workspace_view: None,
         isolation_filesystem_authority_ceiling:
             ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
         isolation_network_authority_ceiling:

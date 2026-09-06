@@ -2189,6 +2189,21 @@ pub(crate) async fn dispatch_method(
         }
     }
 
+    if !request.provenance.is_borrowed_child()
+        && let Some(lifeline) = request.provenance.workspace_lifeline()
+    {
+        lifecycle_owner
+            .track_owned_workspace_lifeline(lifeline)
+            .map_err(DispatchError::Internal)?;
+    }
+    crate::execution::runner::bind_owned_workspace_after_thread_birth(
+        state,
+        &request.provenance,
+        &thread_id,
+        &launch_owner,
+    )
+    .map_err(DispatchError::Internal)?;
+
     // The row is durable and the daemon-owned dispatch task now holds its
     // lifecycle guard. Every remaining preparation/spawn failure passes through
     // the guarded cleanup below and finalizes this exact row, so an accepted
@@ -2542,11 +2557,27 @@ pub(crate) async fn dispatch_method(
                 "method thread {thread_id} was stopped before isolation"
             )));
         }
+        // Retaining a dependent worker lifeline does not grant this method
+        // access to its view. Select only the method's admitted filesystem
+        // authority, as ordinary direct/managed launch already does.
+        let workspace_view = if request.provenance.isolation_project_authority()
+            == ryeos_engine::isolation::IsolationProjectAuthority::RuntimeWorkspace
+        {
+            crate::execution::runner::borrow_bound_workspace_view(
+                state,
+                request.provenance.workspace_lifeline().as_ref(),
+                &thread_id,
+            )
+            .map_err(DispatchError::Internal)?
+        } else {
+            None
+        };
         let applied = state
             .isolation
             .apply_awaiting_attachment_with_provenance(
                 subprocess_request,
                 ryeos_engine::isolation::IsolationLaunchContext {
+                    workspace_view: workspace_view.as_ref(),
                     project_path: request.project_path,
                     project_authority: request.provenance.isolation_project_authority(),
                     filesystem_authority_ceiling,

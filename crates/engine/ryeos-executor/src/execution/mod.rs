@@ -712,21 +712,14 @@ pub(crate) fn fold_back_outputs(
     let policy = closure.policy();
 
     let layout = workspace::WorkspaceLayout::from_root(working_dir.to_path_buf());
-    let lifecycle_operation = if isolation.is_enforced() {
-        ryeos_isolation_protocol::WorkspaceLifecycleOperation::FreezeAndDiff
-    } else {
-        // A disabled node has no mount namespace or overlay adapter. Re-run
-        // the exact native Create check to pin the same private project,
-        // then capture the complete mutable project tree below.
-        ryeos_isolation_protocol::WorkspaceLifecycleOperation::Create
-    };
     let lifecycle = isolation
         .workspace_lifecycle_pinned(ryeos_engine::isolation::WorkspaceLifecycleInvocation {
-            operation: lifecycle_operation,
+            operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::FreezeAndDiff,
             workspace_id,
             launch_owner,
             base_snapshot: base_snapshot_hash,
             project_path: &layout.project,
+            mount_identity: workspace_record.mount_identity.as_deref(),
         })
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let pinned = lillux::canonical_json(&serde_json::to_value(
@@ -739,8 +732,7 @@ pub(crate) fn fold_back_outputs(
         || workspace_record.backend_version.as_deref()
             != Some(lifecycle.evidence.backend_version.as_str())
         || workspace_record.pinned_root_identities.as_deref() != Some(pinned.as_str())
-        || workspace_record.mount_identity.as_deref()
-            != Some(lifecycle.evidence.mount_identity.as_str())
+        || workspace_record.mount_identity != lifecycle.evidence.mount_identity
     {
         anyhow::bail!("workspace freeze evidence does not match the durable creation journal");
     }
@@ -893,7 +885,15 @@ pub(crate) fn seal_callback_workspace_generation(
     thread_id: &str,
     effective_project: &Path,
     base_snapshot_hash: &str,
+    _root_contact_fence: &ryeos_app::hosted_operation::HostedRootTerminalizationGuard,
 ) -> Result<PendingProjectResult> {
+    // The caller acquired this exact placement's existing root gate BEFORE
+    // taking a capture-work permit. Acquiring it here can deadlock all capture
+    // slots while an earlier root operation waits for a slot to finish. A
+    // held worker may already possess the view before attachment, so draining
+    // that gate cannot be replaced by inspecting only attached process rows.
+    // The caller does not commit it: Freezing is the durable contact fence;
+    // a follow/continuation capture does not itself terminalize the root.
     let authority = pinned_state_authority(state)?;
     let guard = authority.acquire_shared_guard()?;
     let cas = authority.cas_store()?;
@@ -936,10 +936,7 @@ pub(crate) fn seal_callback_workspace_generation(
             anyhow::bail!("callback workspace {workspace_id} cannot freeze from state {state}")
         }
     }
-    let process_identity = state
-        .state_store
-        .execution_process_identity_owned(thread_id, launch_owner)?;
-    let quiesced = QuiescedExecutionGroup::stop(process_identity)?;
+    let quiesced = quiesce_bound_workspace(state, &record)?;
     if let Some(snapshot_hash) = record.frozen_snapshot_hash.as_ref() {
         return Ok(PendingProjectResult {
             snapshot_hash: snapshot_hash.clone(),
@@ -1046,15 +1043,12 @@ pub(crate) fn capture_runtime_workspace_input_generation(
     state
         .state_store
         .assert_launch_owner(thread_id, launch_owner)?;
-    let process_identity = state
-        .state_store
-        .execution_process_identity_owned(thread_id, launch_owner)?;
     state.state_store.transition_runtime_workspace_operation(
         operation_id,
         &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved],
         ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing,
     )?;
-    let quiesced = QuiescedExecutionGroup::stop(process_identity)?;
+    let quiesced = quiesce_bound_workspace(state, &record)?;
 
     let capture = (|| -> Result<(String, PendingCasPublication)> {
         let authority = pinned_state_authority(state)?;
@@ -1119,13 +1113,13 @@ pub(crate) fn capture_runtime_workspace_input_generation(
                 Err(error)
             }
             Err(settle_error) => Err(error.context(format!(
-                "workspace-input capture failed and exact root resume/termination was not proved: {settle_error:#}"
+                "workspace-input capture failed and exact borrower resume/termination was not proved: {settle_error:#}"
             ))),
         },
     }
 }
 
-/// Quiesce the exact hosted root while a workload-delegated child receives
+/// Quiesce every exact view borrower while a workload-delegated child receives
 /// exclusive access to its existing mutable CoW workspace.
 ///
 /// The durable barrier and phase live on the existing `RuntimeActionIntent`;
@@ -1180,15 +1174,12 @@ pub(crate) fn quiesce_runtime_workspace_exclusive(
     state
         .state_store
         .assert_launch_owner(thread_id, launch_owner)?;
-    let process_identity = state
-        .state_store
-        .execution_process_identity_owned(thread_id, launch_owner)?;
     state.state_store.transition_runtime_workspace_operation(
         operation_id,
         &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Reserved],
         ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing,
     )?;
-    let quiesced = QuiescedExecutionGroup::stop(process_identity)?;
+    let quiesced = quiesce_bound_workspace(state, &record)?;
     if let Err(error) = state.state_store.transition_runtime_workspace_operation(
         operation_id,
         &[ryeos_app::runtime_db::RuntimeWorkspaceOperationPhase::Quiescing],
@@ -1204,7 +1195,7 @@ pub(crate) fn quiesce_runtime_workspace_exclusive(
                 Err(error.context("record exact exclusive workspace quiescence"))
             }
             Err(settle_error) => Err(error.context(format!(
-                "exclusive quiescence could not be recorded and exact root resume/termination was not proved: {settle_error:#}"
+                "exclusive quiescence could not be recorded and exact borrower resume/termination was not proved: {settle_error:#}"
             ))),
         };
     }
@@ -1262,12 +1253,21 @@ pub async fn prepare_managed_runtime_terminal_project_result(
 
     let capture_state = state.clone();
     let capture_thread_id = thread_id.clone();
+    // Drain root-owned contacts before occupying a scarce capture slot. Move
+    // the guard into the blocking closure so cancellation cannot release the
+    // fence while filesystem capture is still running.
+    let root_contact_fence = ryeos_app::hosted_operation::begin_hosted_root_terminalization_async(
+        &state.state_store,
+        &thread_id,
+    )
+    .await?;
     let pending = run_bounded_project_capture(move || {
         seal_callback_workspace_generation(
             &capture_state,
             &capture_thread_id,
             &effective_path,
             &base_snapshot_hash,
+            &root_contact_fence,
         )
     })
     .await?;
@@ -1325,6 +1325,13 @@ pub(crate) fn prepare_stopped_managed_runtime_terminal_project_result(
     ) {
         return Ok(None);
     }
+    // The later terminal-state commit acquires its own guard. This temporary
+    // disposition fence drains worker starts before any post-exit capture;
+    // missing attachment metadata alone is not a no-contact proof.
+    let _root_contact_fence = ryeos_app::hosted_operation::begin_hosted_root_terminalization(
+        &state.state_store,
+        thread_id,
+    )?;
     state
         .state_store
         .assert_execution_process_detached_owned(thread_id, launch_owner)?;
@@ -1470,6 +1477,7 @@ fn recover_interrupted_workspace_freeze_inner(
         .launch_owner
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("freezing workspace has no launch owner"))?;
+    assert_workspace_capture_processes_settled(state, record)?;
     let authority = pinned_state_authority(state)?;
     let guard = authority.acquire_shared_guard()?;
     let cas = authority.cas_store()?;
@@ -1528,43 +1536,236 @@ fn recover_interrupted_workspace_freeze_inner(
     Ok(snapshot_hash)
 }
 
+/// Stop every current borrower under the caller's existing admission barrier.
+/// RuntimeActionIntent fences transient input/exclusive operations; a callback
+/// first enters Freezing. Neither barrier permits a new same-view admission.
+/// The caller must also drain any already-started worker contact through the
+/// existing root operation owner before a one-way callback/terminal freeze.
+///
+/// This is an invocation-local set of retained Lillux stop authorities, not a
+/// new borrower registry. An indexed member with no attached exact process is
+/// unfinished contact, never an ignorable idle thread. Any refusal drops and
+/// resumes all groups already stopped during this acquisition.
+fn quiesce_bound_workspace(
+    state: &ryeos_app::state::AppState,
+    record: &ryeos_app::runtime_db::WorkspaceRecord,
+) -> Result<QuiescedExecutionGroup> {
+    let view_identity = record
+        .mount_identity
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("workspace capture has no created view identity"))?;
+    let root = record
+        .thread_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("workspace capture has no root owner"))?;
+    let launch_owner = record
+        .launch_owner
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("workspace capture has no exact launch owner"))?;
+    // The existing pool/durable session owners also cover pre-attachment
+    // starts and failed cleanup that cannot be inferred from the journal PID.
+    // Resolve that readiness before stopping any process group.
+    let worker_identity =
+        ryeos_app::dedicated_session_service::workspace_worker_capture_identity(state, record)?;
+    let workspace_identity: Option<ryeos_app::process::ExecutionProcessIdentity> = record
+        .process_identity
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("decode workspace process owner")?;
+    let mut quiesced = QuiescedExecutionGroup {
+        authorities: Vec::new(),
+    };
+    let mut groups = std::collections::BTreeMap::new();
+    let root_identity = state
+        .state_store
+        .execution_process_identity_owned(root, launch_owner)?;
+    quiesced.stop_once(&root_identity, &mut groups)?;
+    let mut after = None;
+    let mut root_seen = false;
+    loop {
+        let members = state.state_store.workspace_members_for_recovery_after(
+            &record.workspace_id,
+            after.as_deref(),
+            ryeos_app::runtime_db::WORKSPACE_MEMBER_PAGE_SIZE,
+        )?;
+        if members.is_empty() {
+            break;
+        }
+        for member in &members {
+            if member.binding.view_identity != view_identity {
+                anyhow::bail!("workspace capture retains an unresolved prior view incarnation");
+            }
+            let owner = lillux::canonical_json(&serde_json::to_value(
+                &member.binding.borrower_launch_owner,
+            )?)?;
+            if member.thread_id == root {
+                if owner != launch_owner {
+                    anyhow::bail!("workspace capture root membership changed launch owner");
+                }
+                root_seen = true;
+            }
+            let identity = state
+                .state_store
+                .execution_process_identity_owned(&member.thread_id, &owner)
+                .with_context(|| {
+                    format!(
+                        "workspace member {} has unresolved process contact",
+                        member.thread_id
+                    )
+                })?;
+            quiesced.stop_once(&identity, &mut groups)?;
+        }
+        after = members.last().map(|member| member.thread_id.clone());
+    }
+    if !root_seen {
+        anyhow::bail!("live workspace capture has no exact root view membership");
+    }
+    // An exclusive worker has its own process owner, while the placement
+    // thread's runtime identity names its controller. Stop both; stopping the
+    // controller alone does not stabilize the shared upper tree.
+    for identity in worker_identity.iter().chain(workspace_identity.iter()) {
+        match ryeos_app::process::execution_liveness(identity) {
+            ryeos_app::process::IdentityLiveness::DeadOrStale => {
+                // A callback may freeze after an exclusive worker has been
+                // retired. Its exact retained identity still requires whole
+                // group absence; a dead leader alone does not stabilize it.
+                ryeos_app::process::assert_reaped_process_group_absent(identity)?;
+            }
+            _ => quiesced.stop_once(identity, &mut groups)?,
+        }
+    }
+    Ok(quiesced)
+}
+
+/// The caller already owns the root contact fence. Empty membership is the
+/// result of exact process/contact settlement, not an inference from a missing
+/// PID. Retained workspace identity separately covers a dedicated worker.
+pub(crate) fn assert_workspace_capture_processes_settled(
+    state: &ryeos_app::state::AppState,
+    record: &ryeos_app::runtime_db::WorkspaceRecord,
+) -> Result<()> {
+    let worker_identity =
+        ryeos_app::dedicated_session_service::workspace_worker_capture_identity(state, record)?;
+    if state
+        .state_store
+        .execution_workspace_has_members(&record.workspace_id)?
+    {
+        anyhow::bail!("terminal workspace capture retains unresolved view members");
+    }
+    let root = record
+        .thread_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("terminal workspace capture has no root owner"))?;
+    let thread = state
+        .state_store
+        .get_thread(root)?
+        .ok_or_else(|| anyhow::anyhow!("terminal workspace capture root disappeared"))?;
+    if let Some(identity) = thread.runtime.process_identity.as_ref() {
+        ryeos_app::process::assert_reaped_process_group_absent(identity)?;
+    } else if thread.runtime.pid.is_some() || thread.runtime.pgid.is_some() {
+        anyhow::bail!("terminal workspace capture root has incomplete process identity");
+    }
+    if let Some(encoded) = record.process_identity.as_deref() {
+        let identity = serde_json::from_str(encoded).context("decode workspace process owner")?;
+        ryeos_app::process::assert_reaped_process_group_absent(&identity)?;
+    }
+    if let Some(identity) = worker_identity.as_ref() {
+        ryeos_app::process::assert_reaped_process_group_absent(identity)?;
+    }
+    Ok(())
+}
+
+/// One capture guard can cover multiple process groups borrowing the same
+/// created view. The individual Lillux guards remain the signal/death owners.
 pub(crate) struct QuiescedExecutionGroup {
-    authority: Option<lillux::QuiescedProcessGroup>,
+    authorities: Vec<lillux::QuiescedProcessGroup>,
+}
+
+/// A group may appear as both root membership and the workspace process. A
+/// numeric PGID alone is never sufficient to deduplicate their authorities.
+fn register_workspace_capture_group(
+    groups: &mut std::collections::BTreeMap<i64, (String, i64)>,
+    identity: &ryeos_app::process::ExecutionProcessIdentity,
+) -> Result<bool> {
+    ryeos_app::process::validate_execution_process_identity_shape(identity)?;
+    let incarnation = (&identity.boot_id, identity.group_leader_start_time_ticks);
+    if let Some((boot, birth)) = groups.get(&identity.group_leader_pid) {
+        if (boot, *birth) != incarnation {
+            anyhow::bail!("workspace members name conflicting process-group incarnations");
+        }
+        return Ok(false);
+    }
+    groups.insert(
+        identity.group_leader_pid,
+        (
+            identity.boot_id.clone(),
+            identity.group_leader_start_time_ticks,
+        ),
+    );
+    Ok(true)
 }
 
 impl QuiescedExecutionGroup {
-    fn stop(identity: ryeos_app::process::ExecutionProcessIdentity) -> Result<Self> {
-        let authority = ryeos_app::process::quiesce_exact_process_group(
-            &identity,
-            lillux::time::Duration::from_secs(2),
-        )?;
-        Ok(Self {
-            authority: Some(authority),
-        })
+    fn stop_once(
+        &mut self,
+        identity: &ryeos_app::process::ExecutionProcessIdentity,
+        groups: &mut std::collections::BTreeMap<i64, (String, i64)>,
+    ) -> Result<()> {
+        let first = register_workspace_capture_group(groups, identity)?;
+        // Even another target in an already-stopped group must still match
+        // its exact recorded incarnation. Never waive stale member evidence
+        // merely because another member happens to share its numeric PGID.
+        if ryeos_app::process::execution_liveness(identity)
+            != ryeos_app::process::IdentityLiveness::Alive
+        {
+            anyhow::bail!("workspace member exact process liveness is not proved");
+        }
+        if first {
+            self.authorities
+                .push(ryeos_app::process::quiesce_exact_process_group(
+                    identity,
+                    lillux::time::Duration::from_secs(2),
+                )?);
+        }
+        Ok(())
     }
 
     pub(crate) fn resume_or_terminate(mut self) -> Result<()> {
-        let authority = self
-            .authority
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("quiesced process-group authority is absent"))?;
-        authority
-            .resume_or_terminate(lillux::time::Duration::from_secs(5))
-            .map_err(anyhow::Error::msg)
+        let mut failures = Vec::new();
+        for authority in self.authorities.drain(..) {
+            if let Err(error) = authority.resume_or_terminate(lillux::time::Duration::from_secs(5))
+            {
+                failures.push(error);
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "workspace group resume/termination failed: {}",
+                failures.join("; ")
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn terminate(mut self) -> Result<()> {
-        let authority = self
-            .authority
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("quiesced process-group authority is absent"))?;
-        authority
-            .terminate(lillux::time::Duration::from_secs(5))
-            .map_err(anyhow::Error::msg)
+        let mut failures = Vec::new();
+        for authority in self.authorities.drain(..) {
+            if let Err(error) = authority.terminate(lillux::time::Duration::from_secs(5)) {
+                failures.push(error);
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "workspace group termination failed: {}",
+                failures.join("; ")
+            );
+        }
+        Ok(())
     }
 }
 
-/// Cancellation-safe ownership of an exclusively quiesced hosted root.
+/// Cancellation-safe ownership of exclusively quiesced workspace borrowers.
 ///
 /// An ordinary capture guard resumes on drop. Exclusive workspace execution
 /// cannot do that: if its async owner is cancelled while the durable intent
@@ -1592,7 +1793,7 @@ impl Drop for ExclusiveWorkspaceQuiescence {
         if let Err(error) = group.terminate() {
             tracing::error!(
                 %error,
-                "failed to terminate an exclusively quiesced hosted execution group"
+                "failed to terminate exclusively quiesced workspace execution groups"
             );
         }
     }
@@ -1600,11 +1801,10 @@ impl Drop for ExclusiveWorkspaceQuiescence {
 
 impl Drop for QuiescedExecutionGroup {
     fn drop(&mut self) {
-        let Some(authority) = self.authority.take() else {
-            return;
-        };
-        if let Err(error) = authority.resume() {
-            tracing::error!(%error, "failed to resume an exact quiesced execution group");
+        for authority in self.authorities.drain(..) {
+            if let Err(error) = authority.resume() {
+                tracing::error!(%error, "failed to resume an exact quiesced execution group");
+            }
         }
     }
 }
@@ -1666,6 +1866,53 @@ mod pinned_child_authority_tests {
         LiveFilesystemConfinement, LiveProjectAccess, PinnedChildProjectRealization, ProjectFile,
         ProjectSnapshot, ProjectSnapshotPolicy, ProjectTree,
     };
+
+    #[test]
+    fn workspace_capture_group_deduplication_requires_exact_group_birth() {
+        let identity = ryeos_app::process::ExecutionProcessIdentity {
+            schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            boot_id: "fixture-boot".to_owned(),
+            target_pid: 40,
+            target_start_time_ticks: 200,
+            group_leader_pid: 39,
+            group_leader_start_time_ticks: 190,
+        };
+        let mut groups = BTreeMap::new();
+        assert!(register_workspace_capture_group(&mut groups, &identity).unwrap());
+        assert!(!register_workspace_capture_group(&mut groups, &identity).unwrap());
+        let mut same_group_target = identity.clone();
+        same_group_target.target_pid = 41;
+        same_group_target.target_start_time_ticks = 201;
+        assert!(!register_workspace_capture_group(&mut groups, &same_group_target).unwrap());
+
+        let mut reused_group = identity.clone();
+        reused_group.group_leader_start_time_ticks += 1;
+        assert!(register_workspace_capture_group(&mut groups, &reused_group).is_err());
+        let mut other_boot = identity.clone();
+        other_boot.boot_id = "another-boot".to_owned();
+        assert!(register_workspace_capture_group(&mut groups, &other_boot).is_err());
+        assert_eq!(groups.len(), 1);
+
+        let mut separate_group = identity;
+        separate_group.group_leader_pid = 49;
+        assert!(register_workspace_capture_group(&mut groups, &separate_group).unwrap());
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn workspace_capture_group_inventory_refuses_incomplete_identity() {
+        let identity = ryeos_app::process::ExecutionProcessIdentity {
+            schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            boot_id: "fixture-boot".to_owned(),
+            target_pid: 40,
+            target_start_time_ticks: 200,
+            group_leader_pid: 39,
+            group_leader_start_time_ticks: 0,
+        };
+        let mut groups = BTreeMap::new();
+        assert!(register_workspace_capture_group(&mut groups, &identity).is_err());
+        assert!(groups.is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

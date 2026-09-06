@@ -393,9 +393,13 @@ impl ExecutionGuard {
     fn cleanup(&mut self) {
         self.revoke_callback_token();
         self.revoke_thread_auth_token();
-        // Drop the Arc<TempDirGuard>. If this is the last holder,
-        // the directory is removed by the TempDirGuard Drop impl.
         self.process_input_dir = None;
+        if let Some(thread_id) = self.thread_id.as_deref()
+            && let Err(error) =
+                close_aborted_owned_workspace(&self.state, self.temp_dir.as_ref(), thread_id)
+        {
+            tracing::warn!(thread_id, %error, "cleanup retains unresolved workspace journal");
+        }
         self.temp_dir = None;
     }
 
@@ -426,8 +430,10 @@ impl Drop for ExecutionGuard {
         self.revoke_callback_token();
         self.revoke_thread_auth_token();
         if self.thread_finalized {
-            self.process_input_dir = None;
-            self.temp_dir = None;
+            // Terminal history alone does not close the retained live view.
+            // Use the same original-owner cleanup, including its shutdown and
+            // unsettled-member refusals, before dropping the last lifeline.
+            self.cleanup();
             return;
         }
         let Some(thread_id) = self.thread_id.clone() else {
@@ -439,6 +445,11 @@ impl Drop for ExecutionGuard {
         match stop_owner_dropped_execution_tree(&self.state, &thread_id) {
             Ok(OwnerDropStopOutcome::Settled) => {
                 self.thread_finalized = true;
+                if let Err(error) =
+                    close_aborted_owned_workspace(&self.state, self.temp_dir.as_ref(), &thread_id)
+                {
+                    tracing::error!(thread_id, %error, "owner-drop preserved unresolved original workspace");
+                }
             }
             Ok(OwnerDropStopOutcome::PreservedForShutdown) => tracing::info!(
                 thread_id,
@@ -555,6 +566,22 @@ pub(crate) fn stop_owner_dropped_execution_tree(
     {
         failures.push(format!("session-bound worker: {error:#}"));
     }
+    if scan_descendants && reached_fixed_point {
+        // The existing lineage query is breadth-first. Settle in reverse so
+        // descendants cannot be hidden by clearing the root's attachment first.
+        // This is one bounded tree pass, not status polling or another registry.
+        let mut order = state.state_store.descendant_thread_ids(root_thread_id)?;
+        order.reverse();
+        order.push(root_thread_id.to_owned());
+        for thread_id in order {
+            if !seen.contains(&thread_id) {
+                continue;
+            }
+            if let Err(error) = settle_stopped_workspace_member(state, &thread_id) {
+                failures.push(format!("workspace member {thread_id}: {error:#}"));
+            }
+        }
+    }
     if state
         .threads
         .get_thread(root_thread_id)?
@@ -610,24 +637,32 @@ fn stop_owner_dropped_thread(state: &AppState, thread_id: &str) -> Result<OwnerD
                 killed.method
             );
         }
-        match state
+        // Shared-view membership and exact attachment must settle atomically,
+        // after descendants stop. Keep both until that child-first pass.
+        if state
             .state_store
-            .clear_thread_process_if_matches(thread_id, identity)
+            .thread_workspace_binding(thread_id)?
+            .is_none()
         {
-            Ok(true) => {}
-            Ok(false) => {
-                let current_identity = state
-                    .threads
-                    .get_thread(thread_id)?
-                    .and_then(|thread| thread.runtime.process_identity);
-                if current_identity.is_some() {
-                    clear_error = Some(anyhow::anyhow!(
-                        "killed process identity changed before compare-and-clear"
-                    ));
+            match state
+                .state_store
+                .clear_thread_process_if_matches(thread_id, identity)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let current_identity = state
+                        .threads
+                        .get_thread(thread_id)?
+                        .and_then(|thread| thread.runtime.process_identity);
+                    if current_identity.is_some() {
+                        clear_error = Some(anyhow::anyhow!(
+                            "killed process identity changed before compare-and-clear"
+                        ));
+                    }
                 }
-            }
-            Err(error) => {
-                clear_error = Some(error.context("compare-clear killed process identity"));
+                Err(error) => {
+                    clear_error = Some(error.context("compare-clear killed process identity"));
+                }
             }
         }
     }
@@ -646,6 +681,34 @@ fn stop_owner_dropped_thread(state: &AppState, thread_id: &str) -> Result<OwnerD
         return Err(error);
     }
     Ok(OwnerDropThreadOutcome::Settled)
+}
+
+fn settle_stopped_workspace_member(state: &AppState, thread_id: &str) -> Result<()> {
+    let Some(binding) = state.state_store.thread_workspace_binding(thread_id)? else {
+        return Ok(());
+    };
+    let identity = state
+        .threads
+        .get_thread(thread_id)?
+        .and_then(|thread| thread.runtime.process_identity)
+        .ok_or_else(|| {
+            anyhow::anyhow!("stopped member retains uncertain pre-attachment contact")
+        })?;
+    ryeos_app::process::assert_reaped_process_group_absent(&identity)?;
+    let owner = lillux::canonical_json(&serde_json::to_value(&binding.borrower_launch_owner)?)?;
+    let settled = if state.state_store.is_launch_owner_active(&owner) {
+        state
+            .state_store
+            .settle_reaped_thread_workspace_owned(thread_id, &binding, &identity)?
+    } else {
+        state
+            .state_store
+            .settle_dead_thread_workspace_if_matches(thread_id, &binding, &identity)?
+    };
+    if !settled {
+        anyhow::bail!("stopped workspace member still has unsettled launch authority");
+    }
+    Ok(())
 }
 
 /// Parts harvested from an `ExecutionGuard` before moving into a
@@ -851,6 +914,30 @@ pub(crate) fn bind_owned_workspace_after_thread_birth(
     thread_id: &str,
     launch_owner: &str,
 ) -> Result<()> {
+    prepare_owned_workspace_after_thread_birth(state, provenance, thread_id, launch_owner)?;
+    if let Some(lifeline) = provenance.workspace_lifeline()
+        && let Some(lifeline) = lifeline.owned_workspace_lifeline()?
+        && let Some((workspace_id, view_identity)) = lifeline.workspace_view_identity()?
+    {
+        state.state_store.bind_thread_workspace(
+            thread_id,
+            &ryeos_app::runtime_db::RuntimeWorkspaceBinding {
+                workspace_id,
+                view_identity,
+                borrower_launch_owner: serde_json::from_str(launch_owner)
+                    .context("decode exact workspace borrower launch owner")?,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn prepare_owned_workspace_after_thread_birth(
+    state: &AppState,
+    provenance: &ExecutionProvenance,
+    thread_id: &str,
+    launch_owner: &str,
+) -> Result<()> {
     if provenance.is_borrowed_child() || !provenance.project_authority().requires_project_foldback()
     {
         return Ok(());
@@ -892,26 +979,87 @@ pub(crate) fn bind_owned_workspace_after_thread_birth(
         )?;
         let created = state
             .isolation
-            .workspace_lifecycle(ryeos_engine::isolation::WorkspaceLifecycleInvocation {
-                operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::Create,
-                workspace_id,
-                launch_owner,
-                base_snapshot: &record.base_snapshot,
-                project_path: &layout.project,
-            })
+            .create_workspace(
+                ryeos_engine::isolation::WorkspaceLifecycleInvocation {
+                    operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::Create,
+                    workspace_id,
+                    launch_owner,
+                    base_snapshot: &record.base_snapshot,
+                    project_path: &layout.project,
+                    mount_identity: None,
+                },
+                &|held| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let identity =
+                            ryeos_app::process::capture_execution_process_identity_from_pidfd(
+                                i64::from(held.pid()),
+                                Some(i64::from(held.pgid())),
+                                held.pidfd(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        state
+                            .state_store
+                            .attach_workspace_creator(
+                                workspace_id,
+                                thread_id,
+                                launch_owner,
+                                &identity,
+                            )
+                            .map_err(|error| error.to_string())
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = held;
+                        Err(
+                            "workspace creator attachment requires exact process identity support"
+                                .to_owned(),
+                        )
+                    }
+                },
+            )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let evidence = created.evidence;
+        lifeline.install_workspace_view(
+            &evidence,
+            created
+                .created_view
+                .ok_or_else(|| anyhow::anyhow!("workspace Create omitted its retained view"))?,
+        )?;
         let pinned_root_identities =
-            lillux::canonical_json(&serde_json::to_value(&created.pinned_root_identities)?)?;
+            lillux::canonical_json(&serde_json::to_value(&evidence.pinned_root_identities)?)?;
+        if record
+            .pinned_root_identities
+            .as_deref()
+            .is_some_and(|expected| expected != pinned_root_identities)
+            || record
+                .backend_id
+                .as_deref()
+                .is_some_and(|expected| expected != evidence.backend_id)
+            || record
+                .backend_version
+                .as_deref()
+                .is_some_and(|expected| expected != evidence.backend_version)
+        {
+            anyhow::bail!(
+                "workspace reconstruction changed its retained backend or pinned backing roots"
+            );
+        }
+        if state.isolation.is_enforced() {
+            state
+                .state_store
+                .assert_execution_workspace_creator_reaped(workspace_id, thread_id, launch_owner)?;
+        }
         state
             .state_store
             .bind_execution_workspace(ryeos_app::runtime_db::WorkspaceBinding {
                 workspace_id,
                 thread_id,
                 launch_owner: Some(launch_owner),
-                backend_id: Some(&created.backend_id),
-                backend_version: Some(&created.backend_version),
+                backend_id: Some(&evidence.backend_id),
+                backend_version: Some(&evidence.backend_version),
                 pinned_root_identities: Some(&pinned_root_identities),
-                mount_identity: Some(&created.mount_identity),
+                mount_identity: evidence.mount_identity.as_deref(),
             })?;
     } else if record.state != WorkspaceState::Ready
         || record.thread_id.as_deref() != Some(thread_id)
@@ -923,6 +1071,53 @@ pub(crate) fn bind_owned_workspace_after_thread_birth(
         );
     }
     Ok(())
+}
+
+/// Retrieve the original retained view only through its already admitted
+/// per-launch membership. A path, chain relationship or absent runtime row
+/// must never manufacture borrow authority. Process attachment repeats the
+/// journal gate before releasing the held target.
+pub(crate) fn borrow_bound_workspace_view(
+    state: &AppState,
+    lifeline: Option<&Arc<TempDirGuard>>,
+    thread_id: &str,
+) -> Result<Option<lillux::InheritedDescriptorAuthority>> {
+    let original = lifeline
+        .map(|lifeline| lifeline.owned_workspace_lifeline())
+        .transpose()?
+        .flatten();
+    let Some(lifeline) = original else {
+        if state
+            .state_store
+            .thread_workspace_binding(thread_id)?
+            .is_some()
+        {
+            anyhow::bail!("workspace borrower lost its original lifeline");
+        }
+        return Ok(None);
+    };
+    let Some((workspace_id, view_identity)) = lifeline.workspace_view_identity()? else {
+        if state
+            .state_store
+            .thread_workspace_binding(thread_id)?
+            .is_some()
+        {
+            anyhow::bail!("ordinary materialization cannot replace a bound workspace view");
+        }
+        return Ok(None);
+    };
+    let binding = state
+        .state_store
+        .thread_workspace_binding(thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace view has no admitted borrower"))?;
+    if binding.workspace_id != workspace_id || binding.view_identity != view_identity {
+        anyhow::bail!("workspace borrower no longer names its original view");
+    }
+    // Exact replay checks the current owner, admission barrier and root state.
+    state
+        .state_store
+        .authorize_thread_workspace_contact(thread_id, &binding)?;
+    lifeline.borrow_workspace_view(&workspace_id, &view_identity)
 }
 
 /// Activate an owner-bound workspace only after the held process identity is
@@ -1011,6 +1206,66 @@ fn close_owned_workspace(
     thread_id: &str,
 ) -> Result<()> {
     close_owned_workspace_from_states(state, lifeline, thread_id, &[WorkspaceState::Freezing])
+}
+
+/// Final/abnormal cleanup through the launch's retained original lifeline.
+/// Projectless controllers can own a separate confined worker workspace; a
+/// borrowed child can never close its parent's journal. Unknown pre-attachment
+/// contact deliberately remains fenced for reconciliation.
+pub(crate) fn close_aborted_owned_workspace(
+    state: &AppState,
+    lifeline: Option<&Arc<TempDirGuard>>,
+    thread_id: &str,
+) -> Result<()> {
+    if !state.state_store.process_attachment_admission_is_open() {
+        // Shutdown explicitly transfers recovery to the durable journal;
+        // a request Drop must not race the coordinator's process teardown.
+        return Ok(());
+    }
+    let original = lifeline
+        .map(|guard| guard.owned_workspace_lifeline())
+        .transpose()?
+        .flatten();
+    let Some(guard) = original else {
+        return Ok(());
+    };
+    let Some(root) = guard.path() else {
+        return Ok(());
+    };
+    let id = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("owned workspace ID is not UTF-8"))?;
+    let Some(record) = state.state_store.execution_workspace(id)? else {
+        return Ok(());
+    };
+    if record.thread_id.as_deref() != Some(thread_id) || record.state == WorkspaceState::Closed {
+        return Ok(());
+    }
+    let thread = state
+        .threads
+        .get_thread(thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace cleanup root disappeared"))?;
+    if !ryeos_state::objects::ThreadStatus::from_str_lossy(&thread.status)
+        .is_some_and(|status| status.is_terminal())
+    {
+        anyhow::bail!("workspace cleanup requires settled terminal root authority");
+    }
+    if thread.runtime.process_identity.is_some() {
+        anyhow::bail!("workspace cleanup still has an attached root process");
+    }
+    close_owned_workspace_from_states(
+        state,
+        Some(&guard),
+        thread_id,
+        &[
+            WorkspaceState::Ready,
+            WorkspaceState::Active,
+            WorkspaceState::Freezing,
+            WorkspaceState::Destroying,
+            WorkspaceState::Closing,
+        ],
+    )
 }
 
 /// Destroy an execution's owned workspace only after its process has
@@ -1109,14 +1364,58 @@ fn close_owned_workspace_from_states(
         .launch_owner
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("execution workspace has no launch owner"))?;
-    transition_owned_workspace(
-        state,
-        Some(guard),
-        thread_id,
-        expected_states,
-        WorkspaceState::Destroying,
-        None,
+    if record.state == WorkspaceState::Closed {
+        return Ok(());
+    }
+    if !expected_states.contains(&record.state) {
+        anyhow::bail!(
+            "workspace close encountered unexpected state {}",
+            record.state
+        );
+    }
+    if !matches!(
+        record.state,
+        WorkspaceState::Destroying | WorkspaceState::Closing
+    ) {
+        transition_owned_workspace(
+            state,
+            Some(guard),
+            thread_id,
+            expected_states,
+            WorkspaceState::Destroying,
+            None,
+        )?;
+    }
+    // The no-new-contact cut precedes the complete existing-owner check.
+    // Refresh the exact journal coordinate after the state transition so the
+    // worker/pool owner can detect any concurrent change without using stale
+    // state as evidence. Root membership alone cannot cover a failed worker
+    // start whose target identity was never reported.
+    let record = state
+        .state_store
+        .execution_workspace(workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace disappeared during close"))?;
+    let view_identity = record
+        .mount_identity
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("workspace close has no created view identity"))?;
+    super::assert_workspace_capture_processes_settled(state, &record)?;
+    guard.close_workspace_view(
+        workspace_id,
+        view_identity,
+        lillux::time::MonotonicDeadline::after(lillux::time::Duration::from_secs(30)),
     )?;
+    if record.state == WorkspaceState::Closing {
+        guard.remove_now()?;
+        return state.state_store.transition_execution_workspace_owned(
+            workspace_id,
+            thread_id,
+            launch_owner,
+            &[WorkspaceState::Closing],
+            WorkspaceState::Closed,
+            None,
+        );
+    }
     let destroyed = state
         .isolation
         .workspace_lifecycle(ryeos_engine::isolation::WorkspaceLifecycleInvocation {
@@ -1125,13 +1424,14 @@ fn close_owned_workspace_from_states(
             launch_owner,
             base_snapshot: &record.base_snapshot,
             project_path: &layout.project,
+            mount_identity: record.mount_identity.as_deref(),
         })
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let pinned = lillux::canonical_json(&serde_json::to_value(&destroyed.pinned_root_identities)?)?;
     if record.backend_id.as_deref() != Some(destroyed.backend_id.as_str())
         || record.backend_version.as_deref() != Some(destroyed.backend_version.as_str())
         || record.pinned_root_identities.as_deref() != Some(pinned.as_str())
-        || record.mount_identity.as_deref() != Some(destroyed.mount_identity.as_str())
+        || record.mount_identity != destroyed.mount_identity
     {
         anyhow::bail!("workspace destroy evidence does not match the durable journal");
     }
@@ -1225,6 +1525,7 @@ fn record_candidate_integration_process_completion(
 
 struct PostExecutionFoldbackParams<'a> {
     pub state: &'a AppState,
+    pub contact_fence: &'a ryeos_app::hosted_operation::HostedRootTerminalizationGuard,
     pub thread_id: &'a str,
     pub acting_principal: &'a str,
     pub pre_tree_hash: &'a str,
@@ -1241,6 +1542,7 @@ fn post_execution_foldback(
 ) -> Result<crate::execution::PendingProjectResult> {
     let PostExecutionFoldbackParams {
         state,
+        contact_fence: _contact_fence,
         thread_id,
         acting_principal,
         pre_tree_hash,
@@ -1281,6 +1583,7 @@ fn post_execution_foldback(
         .state_store
         .assert_launch_owner(thread_id, launch_owner)
         .context("fence authoritative fold-back to current launch owner")?;
+    super::assert_workspace_capture_processes_settled(state, &workspace_record)?;
 
     // The shared CAS guard is the outer mutation lock. Keep it live from the
     // first fold-back object write through the signed HEAD publication so GC
@@ -1585,22 +1888,29 @@ fn clear_finished_process(
     thread_id: &str,
     process_identity: &ryeos_app::process::ExecutionProcessIdentity,
     launch_owner: &str,
-) {
-    match state.state_store.clear_thread_process_if_matches_owned(
-        thread_id,
-        process_identity,
-        launch_owner,
-    ) {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(
-            thread_id,
-            "finished process identity was no longer attached during compare-and-clear"
+) -> Result<()> {
+    let settled = (|| -> Result<bool> {
+        ryeos_app::process::assert_reaped_process_group_absent(process_identity)?;
+        if let Some(binding) = state.state_store.thread_workspace_binding(thread_id)? {
+            state.state_store.settle_reaped_thread_workspace_owned(
+                thread_id,
+                &binding,
+                process_identity,
+            )
+        } else {
+            state.state_store.clear_thread_process_if_matches_owned(
+                thread_id,
+                process_identity,
+                launch_owner,
+            )
+        }
+    })();
+    match settled {
+        Ok(true) => Ok(()),
+        Ok(false) => anyhow::bail!(
+            "finished process retains changed identity or unsettled workspace descendants"
         ),
-        Err(error) => tracing::error!(
-            thread_id,
-            error = %error,
-            "failed to clear finished process identity"
-        ),
+        Err(error) => Err(error.context("settle exact finished process and workspace membership")),
     }
 }
 
@@ -2248,7 +2558,7 @@ fn build_protocol_launch_env(
         cmd: PathBuf::new(),
         args: Vec::new(),
         cwd: project_path.to_path_buf(),
-        timeout: std::time::Duration::from_secs(0),
+        timeout: lillux::time::Duration::from_secs(0),
         item_ref,
         thread_id: thread_id.to_string(),
         project_path: project_path.to_path_buf(),
@@ -3387,12 +3697,6 @@ pub async fn run_and_wait(
             guard.cleanup();
         })?;
     guard.track_thread(&created.thread_id);
-    bind_owned_workspace_after_thread_birth(
-        &state,
-        &params.provenance,
-        &created.thread_id,
-        &wait_launch_owner,
-    )?;
     drop(wait_cas_guard);
     // The row and its capsule are durable, so realization roots are
     // capsule-reachable; retire the staging lease. Failure before this point
@@ -3401,24 +3705,6 @@ pub async fn run_and_wait(
         publication.publish().map_err(|error| {
             anyhow::anyhow!("publish direct external realization roots: {error:#}")
         })?;
-    }
-    let PreparedProcessInputs {
-        path: process_path,
-        lifeline: process_input_lifeline,
-        isolation_project_authority: wait_isolation_project_authority,
-        isolation_live_access_authority: wait_isolation_live_access_authority,
-        external: wait_bound_external,
-        source: wait_bound_source,
-    } = prepare_process_inputs(
-        &state,
-        &params.provenance,
-        &created.thread_id,
-        &wait_external.retained_resolution,
-        &effective_path,
-    )?;
-    effective_path = process_path;
-    if let Some(lifeline) = process_input_lifeline {
-        guard.track_process_input_dir(lifeline);
     }
     if let Some(parent_thread_id) = params.parent_thread_id.as_deref() {
         let inherited_stop = match state.state_store.record_child_link(
@@ -3462,6 +3748,30 @@ pub async fn run_and_wait(
             guard.cleanup();
             anyhow::bail!("parent {parent_thread_id} was stop-requested before tool launch");
         }
+    }
+    bind_owned_workspace_after_thread_birth(
+        &state,
+        &params.provenance,
+        &created.thread_id,
+        &wait_launch_owner,
+    )?;
+    let PreparedProcessInputs {
+        path: process_path,
+        lifeline: process_input_lifeline,
+        isolation_project_authority: wait_isolation_project_authority,
+        isolation_live_access_authority: wait_isolation_live_access_authority,
+        external: wait_bound_external,
+        source: wait_bound_source,
+    } = prepare_process_inputs(
+        &state,
+        &params.provenance,
+        &created.thread_id,
+        &wait_external.retained_resolution,
+        &effective_path,
+    )?;
+    effective_path = process_path;
+    if let Some(lifeline) = process_input_lifeline {
+        guard.track_process_input_dir(lifeline);
     }
     tracing::Span::current().record("thread_id", created.thread_id.as_str());
 
@@ -3604,6 +3914,13 @@ pub async fn run_and_wait(
     let mut wait_external_mounts = wait_external_mounts;
     wait_external_mounts.append(&mut wait_source_mounts);
     let spawn_workspace_lifeline = guard.process_workspace_lifeline();
+    let wait_workspace_view = if wait_isolation_project_authority
+        == ryeos_engine::isolation::IsolationProjectAuthority::RuntimeWorkspace
+    {
+        borrow_bound_workspace_view(&state, guard.temp_dir.as_ref(), &created.thread_id)?
+    } else {
+        None
+    };
     let wait_node_trusted_keys_dir = state.config.runtime_root().trusted_keys_dir();
     let spawn_handle = task::spawn_blocking(move || {
         let _spawn_workspace_lifeline = spawn_workspace_lifeline;
@@ -3618,6 +3935,7 @@ pub async fn run_and_wait(
             roots: wait_roots,
             isolation: wait_isolation,
             isolation_project_authority: wait_isolation_project_authority,
+            isolation_workspace_view: wait_workspace_view,
             isolation_live_access_authority: wait_isolation_live_access_authority,
             isolation_external_read_only_mounts: wait_external_mounts,
             isolation_node_trusted_keys_dir: wait_node_trusted_keys_dir,
@@ -3745,12 +4063,12 @@ pub async fn run_and_wait(
         Err(error) => {
             let failed_identity = spawned.process_identity.clone();
             let pending_cleanup = spawned.abort_and_reap();
-            clear_finished_process(
+            let _ = clear_finished_process(
                 &state,
                 &created.thread_id,
                 &failed_identity,
                 &wait_launch_owner,
-            );
+            ).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
             let cleanup = fail_thread_static_owned(
                 &state,
                 &created.thread_id,
@@ -3785,11 +4103,14 @@ pub async fn run_and_wait(
     ) {
         let failed_identity = spawned.process_identity.clone();
         let pending_cleanup = spawned.abort_and_reap();
-        clear_finished_process(
+        let _ = clear_finished_process(
             &state,
             &created.thread_id,
             &failed_identity,
             &wait_launch_owner,
+        )
+        .inspect_err(
+            |error| tracing::error!(%error, "failed launch retains unresolved process authority"),
         );
         let lifecycle_cleanup = fail_thread_static_owned(
             &state,
@@ -3812,12 +4133,12 @@ pub async fn run_and_wait(
     let spawned = match spawned.release_after_attachment() {
         Ok(running) => running,
         Err(error) => {
-            clear_finished_process(
+            let _ = clear_finished_process(
                 &state,
                 &created.thread_id,
                 &release_identity,
                 &wait_launch_owner,
-            );
+            ).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
             let cleanup = fail_thread_static_owned(
                 &state,
                 &created.thread_id,
@@ -3862,16 +4183,16 @@ pub async fn run_and_wait(
                 &running.thread_id,
                 &waited_identity,
                 &wait_launch_owner,
-            );
+            )?;
             c
         }
         Err(join_err) => {
-            clear_finished_process(
+            let _ = clear_finished_process(
                 &state,
                 &running.thread_id,
                 &waited_identity,
                 &wait_launch_owner,
-            );
+            ).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
             tracing::error!(error = %join_err, "failed to observe waiting execution");
             guard.fail_thread("process_observation_failed");
             guard.cleanup();
@@ -3925,6 +4246,11 @@ pub async fn run_and_wait(
     } else if !wait_requires_foldback || !wait_records_terminal_generation {
         None
     } else {
+        let contact_fence = ryeos_app::hosted_operation::begin_hosted_root_terminalization_async(
+            &state.state_store,
+            &running.thread_id,
+        )
+        .await?;
         transition_owned_workspace(
             &state,
             guard.temp_dir.as_ref(),
@@ -3950,6 +4276,7 @@ pub async fn run_and_wait(
             ) => {
                 let pending = post_execution_foldback(PostExecutionFoldbackParams {
                     state: &state,
+                    contact_fence: &contact_fence,
                     thread_id: &running.thread_id,
                     acting_principal: &params.acting_principal,
                     pre_tree_hash,
@@ -4052,7 +4379,7 @@ pub async fn run_and_wait(
                     &state,
                     &running.thread_id,
                     session.updated_at_ms,
-                    std::time::Duration::from_secs(24 * 60 * 60),
+                    lillux::time::Duration::from_secs(24 * 60 * 60),
                 ) => {
                     result?;
                 }
@@ -4297,12 +4624,6 @@ pub async fn run_detached(
             guard.cleanup();
         })?;
     guard.track_thread(&created.thread_id);
-    bind_owned_workspace_after_thread_birth(
-        &state,
-        &params.provenance,
-        &created.thread_id,
-        &detached_launch_owner,
-    )?;
     drop(bg_cas_guard);
     // Row and capsule are durable: realization roots are capsule-reachable,
     // so retire the staging lease before scheduling the detached task.
@@ -4310,24 +4631,6 @@ pub async fn run_detached(
         publication.publish().map_err(|error| {
             anyhow::anyhow!("publish direct external realization roots: {error:#}")
         })?;
-    }
-    let PreparedProcessInputs {
-        path: process_path,
-        lifeline: process_input_lifeline,
-        isolation_project_authority: bg_isolation_project_authority,
-        isolation_live_access_authority: bg_isolation_live_access_authority,
-        external: bg_bound_external,
-        source: bg_bound_source,
-    } = prepare_process_inputs(
-        &state,
-        &params.provenance,
-        &created.thread_id,
-        &bg_fresh_external.retained_resolution,
-        &effective_path,
-    )?;
-    effective_path = process_path;
-    if let Some(lifeline) = process_input_lifeline {
-        guard.track_process_input_dir(lifeline);
     }
     if let Some(parent_thread_id) = params.parent_thread_id.as_deref() {
         let inherited_stop = match state.state_store.record_child_link(
@@ -4371,6 +4674,30 @@ pub async fn run_detached(
             guard.cleanup();
             anyhow::bail!("parent {parent_thread_id} was stop-requested before tool launch");
         }
+    }
+    bind_owned_workspace_after_thread_birth(
+        &state,
+        &params.provenance,
+        &created.thread_id,
+        &detached_launch_owner,
+    )?;
+    let PreparedProcessInputs {
+        path: process_path,
+        lifeline: process_input_lifeline,
+        isolation_project_authority: bg_isolation_project_authority,
+        isolation_live_access_authority: bg_isolation_live_access_authority,
+        external: bg_bound_external,
+        source: bg_bound_source,
+    } = prepare_process_inputs(
+        &state,
+        &params.provenance,
+        &created.thread_id,
+        &bg_fresh_external.retained_resolution,
+        &effective_path,
+    )?;
+    effective_path = process_path;
+    if let Some(lifeline) = process_input_lifeline {
+        guard.track_process_input_dir(lifeline);
     }
     tracing::Span::current().record("thread_id", created.thread_id.as_str());
 
@@ -4782,6 +5109,25 @@ async fn dispatch_detached_bg_task(
     }
 
     let bg_node_trusted_keys_dir = bg_state.config.runtime_root().trusted_keys_dir();
+    let bg_workspace_view = if bg_isolation_project_authority
+        == ryeos_engine::isolation::IsolationProjectAuthority::RuntimeWorkspace
+    {
+        match borrow_bound_workspace_view(&bg_state, bg_temp_dir.as_ref(), &bg_thread_id) {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(thread_id = %bg_thread_id, %error, "workspace borrow refused before detached spawn");
+                let _ = fail_thread_static_owned(
+                    &bg_state,
+                    &bg_thread_id,
+                    "workspace_borrow_refused",
+                    &launch_owner,
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let spawn_result = task::spawn_blocking(move || {
         let _spawn_workspace_lifeline = spawn_workspace_lifeline;
         let project_root = match &res_for_spawn.plan_context.project_context {
@@ -4803,6 +5149,7 @@ async fn dispatch_detached_bg_task(
             roots,
             isolation: isolation_for_spawn,
             isolation_project_authority: bg_isolation_project_authority,
+            isolation_workspace_view: bg_workspace_view,
             isolation_live_access_authority: bg_isolation_live_access_authority,
             isolation_external_read_only_mounts: bg_external_mounts,
             isolation_node_trusted_keys_dir: bg_node_trusted_keys_dir,
@@ -5043,7 +5390,7 @@ async fn dispatch_detached_bg_task(
                 "failed to reap attachment-pending process after running-transition refusal"
             );
         }
-        clear_finished_process(&bg_state, &bg_thread_id, &failed_identity, &launch_owner);
+        let _ = clear_finished_process(&bg_state, &bg_thread_id, &failed_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
         if let Err(cleanup_error) = fail_thread_static_owned(
             &bg_state,
             &bg_thread_id,
@@ -5081,7 +5428,7 @@ async fn dispatch_detached_bg_task(
                 "failed to reap attachment-pending process after release refusal"
             );
         }
-        clear_finished_process(&bg_state, &bg_thread_id, &failed_identity, &launch_owner);
+        let _ = clear_finished_process(&bg_state, &bg_thread_id, &failed_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
         if let Err(cleanup_error) = fail_thread_static_owned(
             &bg_state,
             &bg_thread_id,
@@ -5109,7 +5456,7 @@ async fn dispatch_detached_bg_task(
                 %error,
                 "failed to release detached execution after durable attachment"
             );
-            clear_finished_process(&bg_state, &bg_thread_id, &release_identity, &launch_owner);
+            let _ = clear_finished_process(&bg_state, &bg_thread_id, &release_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
             if let Err(cleanup_error) = fail_thread_static_owned(
                 &bg_state,
                 &bg_thread_id,
@@ -5140,7 +5487,18 @@ async fn dispatch_detached_bg_task(
         wait_workspace_lifeline,
     )
     .await;
-    clear_finished_process(&bg_state, &bg_thread_id, &waited_identity, &launch_owner);
+    if let Err(error) =
+        clear_finished_process(&bg_state, &bg_thread_id, &waited_identity, &launch_owner)
+    {
+        tracing::error!(thread_id = %bg_thread_id, %error, "detached process settlement refused; no capture or publication");
+        let _ = fail_thread_static_owned(
+            &bg_state,
+            &bg_thread_id,
+            "process_settlement_unproved",
+            &launch_owner,
+        );
+        return;
+    }
     // Extract the execution dir path while the Arc is still alive.
     let bg_exec_dir_path = bg_temp_dir.as_ref().and_then(|g| g.path());
     match wait_result {
@@ -5209,6 +5567,33 @@ async fn dispatch_detached_bg_task(
                 drop(bg_temp_dir.take());
                 return;
             }
+            // Acquire before any synchronous capture/CAS permit, so draining
+            // operations cannot be starved of the resources they need to exit.
+            let contact_fence = if callback_sealed_result.is_none()
+                && bg_requires_foldback
+                && bg_records_terminal_generation
+            {
+                match ryeos_app::hosted_operation::begin_hosted_root_terminalization_async(
+                    &bg_state.state_store,
+                    &bg_thread_id,
+                )
+                .await
+                {
+                    Ok(fence) => Some(fence),
+                    Err(error) => {
+                        tracing::error!(thread_id = %bg_thread_id, %error, "terminal capture contact fence failed");
+                        let _ = fail_thread_static_owned(
+                            &bg_state,
+                            &bg_thread_id,
+                            "workspace_capture_fence_failed",
+                            &launch_owner,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             if callback_sealed_result.is_none()
                 && bg_requires_foldback
                 && let Err(error) = transition_owned_workspace(
@@ -5272,6 +5657,9 @@ async fn dispatch_detached_bg_task(
                         Some(workspace),
                     ) => match post_execution_foldback(PostExecutionFoldbackParams {
                         state: &bg_state,
+                        contact_fence: contact_fence
+                            .as_ref()
+                            .expect("terminal foldback acquired its contact fence"),
                         thread_id: &bg_thread_id,
                         acting_principal: &bg_acting_principal,
                         pre_tree_hash,
@@ -5345,6 +5733,10 @@ async fn dispatch_detached_bg_task(
                     }
                 }
             };
+            // Freezing now durably rejects new workspace contact. Candidate
+            // disposition has its own operations; do not retain this temporary
+            // drain gate through review/publication or reacquire it on failure.
+            drop(contact_fence);
             if let Some(fact) = candidate_integration_completion.as_ref() {
                 let Some(result_snapshot_hash) = result_project_snapshot_hash.as_deref() else {
                     tracing::error!(
@@ -5432,7 +5824,7 @@ async fn dispatch_detached_bg_task(
                                 &bg_state,
                                 &bg_thread_id,
                                 session.updated_at_ms,
-                                std::time::Duration::from_secs(24 * 60 * 60),
+                                lillux::time::Duration::from_secs(24 * 60 * 60),
                             ) => {
                                 result?;
                             }
@@ -5898,20 +6290,72 @@ fn execution_provenance_from_resume_context(
     }
 }
 
-/// Recover the exact unpublished CoW workspace owned by a same-thread native
-/// resume. This is generic execution infrastructure: the admitted runtime and
-/// worker data decide whether the resumed program reattaches any remote
-/// session.
-///
-/// Reconciliation first proves the previous process owner dead and preserves
-/// this row. Here the new launch claim re-verifies the backend/root journal,
-/// rebuilds immutable resolution authority from the admitted CAS snapshot,
-/// and atomically transfers only the operational workspace owner.
-pub fn retained_workspace_provenance_for_native_resume(
+/// Transfer the original live view to a same-daemon retry claim after all
+/// predecessor contacts settle. This is not cold recreation: the original
+/// descriptor and its creation identity remain unchanged.
+pub(crate) fn handoff_live_workspace_for_retry(
+    state: &AppState,
+    provenance: &ExecutionProvenance,
+    thread_id: &str,
+    recovery_launch_owner: &str,
+) -> Result<()> {
+    let Some(root_lifeline) = provenance.workspace_lifeline() else {
+        return Ok(());
+    };
+    let Some(lifeline) = root_lifeline.owned_workspace_lifeline()? else {
+        return Ok(());
+    };
+    let (workspace_id, view_identity) = lifeline
+        .workspace_view_identity()?
+        .ok_or_else(|| anyhow::anyhow!("live retry lost its original created workspace view"))?;
+    let workspace = state
+        .state_store
+        .execution_workspace(&workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("live retry workspace journal disappeared"))?;
+    if workspace.thread_id.as_deref() != Some(thread_id)
+        || workspace.mount_identity.as_deref() != Some(view_identity.as_str())
+    {
+        anyhow::bail!("live retry cannot substitute another workspace or view");
+    }
+    if let Some(identity) =
+        ryeos_app::dedicated_session_service::workspace_worker_capture_identity(state, &workspace)?
+    {
+        ryeos_app::process::assert_reaped_process_group_absent(&identity)?;
+    }
+    if let Some(identity) = workspace.process_identity.as_deref() {
+        ryeos_app::process::assert_reaped_process_group_absent(&serde_json::from_str(identity)?)?;
+    }
+    let previous_owner = workspace
+        .launch_owner
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("live retry workspace has no previous owner"))?;
+    state
+        .state_store
+        .handoff_execution_workspace_for_live_retry(
+            &workspace_id,
+            thread_id,
+            previous_owner,
+            recovery_launch_owner,
+            workspace.state,
+            workspace.process_identity.as_deref(),
+            &view_identity,
+        )?;
+    // Transfer only the original view owner. A recovered frozen disposition
+    // launches no process and must not acquire an unattachable borrower row.
+    // Any actual resumed launch binds at its ordinary before-contact boundary.
+    Ok(())
+}
+
+/// Cold recovery creates a new operational view over the exact retained
+/// backing state only after predecessor-daemon/process settlement. The
+/// caller's existing lifecycle owner must cover construction and every
+/// fallible reconstruction step before the resumed launcher takes over.
+pub(crate) fn retained_workspace_provenance_for_native_resume(
     state: &AppState,
     thread_id: &str,
     recovery_launch_owner: &str,
     resume: &ResumeContext,
+    preparation_owner: &mut super::process_attachment::LifecycleOwnerGuard,
 ) -> Result<Option<ExecutionProvenance>> {
     let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
         snapshot_hash,
@@ -5958,6 +6402,14 @@ pub fn retained_workspace_provenance_for_native_resume(
     {
         anyhow::bail!("retained execution workspace journal is incomplete or contradictory");
     }
+    // Cold recreation must also settle the existing worker owner. A failed
+    // start may have no root member or workspace PID while retaining unknown
+    // process contact in its dedicated-session/credential authority.
+    if let Some(identity) =
+        ryeos_app::dedicated_session_service::workspace_worker_capture_identity(state, &workspace)?
+    {
+        ryeos_app::process::assert_reaped_process_group_absent(&identity)?;
+    }
     let previous_launch_owner = workspace
         .launch_owner
         .as_deref()
@@ -5985,25 +6437,6 @@ pub fn retained_workspace_provenance_for_native_resume(
         anyhow::bail!("retained execution workspace root does not encode its journal identity");
     }
     let layout = super::workspace::WorkspaceLayout::from_root(root.clone());
-    let observed = state
-        .isolation
-        .workspace_lifecycle(ryeos_engine::isolation::WorkspaceLifecycleInvocation {
-            operation: ryeos_isolation_protocol::WorkspaceLifecycleOperation::Create,
-            workspace_id: &workspace.workspace_id,
-            launch_owner: previous_launch_owner,
-            base_snapshot: snapshot_hash,
-            project_path: &layout.project,
-        })
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let observed_roots =
-        lillux::canonical_json(&serde_json::to_value(&observed.pinned_root_identities)?)?;
-    if workspace.backend_id.as_deref() != Some(observed.backend_id.as_str())
-        || workspace.backend_version.as_deref() != Some(observed.backend_version.as_str())
-        || workspace.pinned_root_identities.as_deref() != Some(observed_roots.as_str())
-        || workspace.mount_identity.as_deref() != Some(observed.mount_identity.as_str())
-    {
-        anyhow::bail!("retained execution workspace no longer matches its backend/root journal");
-    }
     let pinned_roots: BTreeMap<String, String> = serde_json::from_str(
         workspace
             .pinned_root_identities
@@ -6048,6 +6481,7 @@ pub fn retained_workspace_provenance_for_native_resume(
         workspace.process_identity.as_deref(),
     )?;
     let lifeline = Arc::new(TempDirGuard::new_workspace(root, layout.project)?);
+    preparation_owner.track_owned_workspace_lifeline(lifeline.clone())?;
     let provenance = ExecutionProvenance::root_pushed_head(
         original_project_path,
         resolved.request_engine,
@@ -6055,6 +6489,41 @@ pub fn retained_workspace_provenance_for_native_resume(
         materialization,
         resume.project_authority.clone(),
     )?;
+    // Cold rebind owns a NEW construction incarnation. Old root identities
+    // are retained only to verify the exact backing state, never as evidence
+    // that a vanished daemon descriptor survived restart. Construction is not
+    // borrower admission: recovered disposition may only finish a previously
+    // frozen result and never launch a target. The resumed launch binds its
+    // member separately at the ordinary before-contact boundary.
+    prepare_owned_workspace_after_thread_birth(
+        state,
+        &provenance,
+        thread_id,
+        recovery_launch_owner,
+    )?;
+    if workspace.state == WorkspaceState::Freezing {
+        let frozen = workspace.frozen_snapshot_hash.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("retained frozen disposition has no committed result generation")
+        })?;
+        let reconstructed = state
+            .state_store
+            .execution_workspace(&workspace.workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("reconstructed frozen workspace disappeared"))?;
+        if reconstructed.frozen_snapshot_hash.as_deref() != Some(frozen) {
+            anyhow::bail!("workspace reconstruction changed its committed frozen generation");
+        }
+        // Create/Ready proves the NEW view exists; restoring the exact prior
+        // frozen phase does not admit a writer or infer a freeze from a stale
+        // hash on an otherwise Active/Ready workspace.
+        state.state_store.transition_execution_workspace_owned(
+            &workspace.workspace_id,
+            thread_id,
+            recovery_launch_owner,
+            &[WorkspaceState::Ready],
+            WorkspaceState::Freezing,
+            None,
+        )?;
+    }
     tracing::info!(
         thread_id,
         workspace_id = %workspace.workspace_id,

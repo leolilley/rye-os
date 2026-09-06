@@ -670,6 +670,20 @@ pub fn execution_liveness(identity: &ExecutionProcessIdentity) -> IdentityLivene
     }
 }
 
+/// Assert exact post-wait cleanup using this module's retained process
+/// authority. A dead/reused leader alone is insufficient: the target must be
+/// gone and either the host boot ended or the whole numeric group is absent.
+/// Unavailable evidence never authorizes clearing a durable attachment.
+pub fn assert_reaped_process_group_absent(identity: &ExecutionProcessIdentity) -> Result<()> {
+    if execution_liveness(identity) != IdentityLiveness::DeadOrStale
+        || (execution_identity_is_current_boot(identity)?
+            && process_group_presence(identity.pgid()) != IdentityLiveness::DeadOrStale)
+    {
+        anyhow::bail!("owned subprocess wait did not prove exact target and group absence");
+    }
+    Ok(())
+}
+
 /// Whether the retained wrapper still names the exact live group identity.
 ///
 /// This is stronger than target liveness for duplicate-launch guards: the

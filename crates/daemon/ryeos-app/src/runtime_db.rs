@@ -692,6 +692,70 @@ pub struct LaunchOwner {
     pub daemon_generation_id: String,
 }
 
+/// Node-local membership in one exact created workspace view. This is process
+/// lifetime authority, not portable project or launch-metadata authority.
+/// A retained binding is conservatively live even without a PID or claim:
+/// adapter setup may have contacted the view before target attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkspaceBinding {
+    pub workspace_id: String,
+    pub view_identity: String,
+    pub borrower_launch_owner: LaunchOwner,
+}
+
+impl RuntimeWorkspaceBinding {
+    fn validate_for(&self, thread_id: &str) -> Result<()> {
+        if self.workspace_id.is_empty()
+            || self.view_identity.is_empty()
+            || self.workspace_id.contains('\0')
+            || self.view_identity.contains('\0')
+            || self.borrower_launch_owner.thread_id != thread_id
+            || self.borrower_launch_owner.monotonic_launch_epoch == 0
+            || self.borrower_launch_owner.unpredictable_nonce.is_empty()
+            || self.borrower_launch_owner.daemon_generation_id.is_empty()
+        {
+            bail!("invalid exact workspace binding for thread {thread_id}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkspaceMember {
+    pub thread_id: String,
+    pub binding: RuntimeWorkspaceBinding,
+}
+
+/// A bounded operational query page, not a node's concurrency policy.
+pub const WORKSPACE_MEMBER_PAGE_SIZE: usize = 512;
+
+fn decode_workspace_binding(
+    thread_id: &str,
+    workspace_id: Option<String>,
+    view_identity: Option<String>,
+    owner: Option<String>,
+) -> Result<Option<RuntimeWorkspaceBinding>> {
+    match (workspace_id, view_identity, owner) {
+        (None, None, None) => Ok(None),
+        (Some(workspace_id), Some(view_identity), Some(owner)) => {
+            let binding = RuntimeWorkspaceBinding {
+                workspace_id,
+                view_identity,
+                borrower_launch_owner: serde_json::from_str(&owner)
+                    .context("decode workspace borrower launch owner")?,
+            };
+            binding.validate_for(thread_id)?;
+            if lillux::canonical_json(&serde_json::to_value(&binding.borrower_launch_owner)?)?
+                != owner
+            {
+                bail!("workspace borrower launch owner is not canonical");
+            }
+            Ok(Some(binding))
+        }
+        _ => bail!("thread {thread_id} has a partial workspace binding"),
+    }
+}
+
 pub fn daemon_generation_id() -> &'static str {
     static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GENERATION.get_or_init(|| {
@@ -954,11 +1018,23 @@ CREATE TABLE IF NOT EXISTS thread_runtime (
     process_identity TEXT,
     process_dead_observed_at_ms INTEGER,
     stop_requested_at_ms INTEGER,
-    stop_intent TEXT
+    stop_intent TEXT,
+    workspace_id TEXT,
+    workspace_view_identity TEXT,
+    workspace_borrower_launch_owner TEXT,
+    CHECK (
+        (workspace_id IS NULL AND workspace_view_identity IS NULL
+            AND workspace_borrower_launch_owner IS NULL)
+        OR (workspace_id IS NOT NULL AND workspace_view_identity IS NOT NULL
+            AND workspace_borrower_launch_owner IS NOT NULL)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_thread_runtime_chain_root
     ON thread_runtime(chain_root_id);
+
+CREATE INDEX IF NOT EXISTS idx_thread_runtime_workspace_view
+    ON thread_runtime(workspace_id, workspace_view_identity, thread_id);
 
 CREATE TABLE IF NOT EXISTS in_process_handler_reservation (
     thread_id TEXT PRIMARY KEY,
@@ -1508,7 +1584,9 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // Epoch 27 requires retained prepared-content target contracts in request 18,
 // capsule 25, and launch metadata 29. Epoch 26 is already allocated to the
 // coordinating fixed-parent confinement cut. No ambient-kind recovery substitution.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 27;
+// Epoch 28 records exact per-launch shared-view membership and creator
+// attachment. No predecessor row can imply borrower absence or mount ownership.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 28;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -1586,6 +1664,24 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                     },
                     sqlite_schema::ColumnSpec {
                         name: "stop_intent",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_id",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_view_identity",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workspace_borrower_launch_owner",
                         col_type: "TEXT",
                         pk: false,
                         not_null: false,
@@ -3143,6 +3239,12 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                 name: "idx_thread_runtime_chain_root",
                 table: "thread_runtime",
                 columns: &["chain_root_id"],
+                unique: false,
+            },
+            sqlite_schema::IndexSpec {
+                name: "idx_thread_runtime_workspace_view",
+                table: "thread_runtime",
+                columns: &["workspace_id", "workspace_view_identity", "thread_id"],
                 unique: false,
             },
             sqlite_schema::IndexSpec {
@@ -4977,6 +5079,7 @@ impl RuntimeDb {
             ("dedicated owner principal", session.owner_principal),
             ("dedicated admitted capsule", session.admitted_capsule_hash),
             ("dedicated workspace id", session.workspace_id),
+            ("dedicated pending worker id", session.credential_lock_owner),
             (
                 "dedicated credential profile id",
                 session.credential_profile_id,
@@ -5053,7 +5156,7 @@ impl RuntimeDb {
                 completion_request_digest, completion_turn_id, completion_operation_id,
                 bounded_outcome_json, terminal_reason,
                 created_at_ms, updated_at_ms
-             ) SELECT ?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8, ?9, ?12, NULL,
+             ) SELECT ?1, ?2, ?3, ?4, ?10, 1, ?5, ?6, ?7, ?8, ?9, ?12, NULL,
                        'admitted', 'none', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                        NULL, ?11, ?11
                WHERE EXISTS(SELECT 1 FROM credential_profile
@@ -5100,22 +5203,21 @@ impl RuntimeDb {
         Ok(())
     }
 
-    /// Recover only profile reservations that provably never crossed the
-    /// durable worker-attachment boundary. `attach_worker_process` writes the
-    /// worker row and placement identity atomically before releasing the held
-    /// child, so an owner absent from both tables has no process authority.
-    /// Any retained identity—including cleanup-unproved evidence—keeps the
-    /// credential profile fenced.
+    /// Preserve admitted attempts even when process attachment was interrupted.
+    /// Admission reserves the exact worker ID/epoch before possible contact;
+    /// absence of a worker row does not prove that the held launcher was reaped.
+    /// Only reservations with no admitted attempt may release their profile lock.
     pub fn reconcile_unattached_credential_profile_locks(&self) -> Result<(usize, usize)> {
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
-        let sessions_recovered = tx.execute(
+        let sessions_quarantined = tx.execute(
             "UPDATE dedicated_session
-                SET state='recovering', send_boundary='none', updated_at_ms=?1
+                SET state='outcome_unknown', send_boundary='outcome_unknown', updated_at_ms=?1
               WHERE state='admitted'
-                AND worker_instance_id IS NULL AND worker_boot_epoch IS NULL
                 AND NOT EXISTS(SELECT 1 FROM worker_process
-                      WHERE worker_process.placement_thread_id=dedicated_session.placement_thread_id)",
+                      WHERE worker_process.worker_instance_id=dedicated_session.worker_instance_id
+                        AND worker_process.placement_thread_id=dedicated_session.placement_thread_id
+                        AND worker_process.boot_epoch=dedicated_session.worker_boot_epoch)",
             [now],
         )?;
         let locks_released = tx.execute(
@@ -5126,13 +5228,16 @@ impl RuntimeDb {
                       WHERE worker_process.worker_instance_id=credential_profile.lock_owner)
                 AND NOT EXISTS(SELECT 1 FROM dedicated_session
                       WHERE dedicated_session.worker_instance_id=credential_profile.lock_owner)
+                AND NOT EXISTS(SELECT 1 FROM dedicated_session
+                      WHERE dedicated_session.credential_profile_id=credential_profile.profile_id
+                        AND dedicated_session.state IN ('admitted','binding','outcome_unknown'))
                 AND NOT EXISTS(SELECT 1 FROM credential_profile_reservation
                       WHERE credential_profile_reservation.reservation_id=credential_profile.lock_owner
                         AND credential_profile_reservation.state='reserved')",
             [now],
         )?;
         tx.commit()?;
-        Ok((sessions_recovered, locks_released))
+        Ok((sessions_quarantined, locks_released))
     }
 
     pub fn dedicated_session(
@@ -5398,14 +5503,34 @@ impl RuntimeDb {
         &self,
         placement_thread_id: &str,
         worker_instance_id: &str,
+        worker_boot_epoch: u64,
         reason: &str,
         cleanup_proved: bool,
     ) -> Result<()> {
         validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
         validate_bounded_runtime_text("worker instance id", worker_instance_id, 256)?;
         validate_bounded_runtime_text("dedicated terminal reason", reason, 4096)?;
+        if worker_boot_epoch == 0 {
+            bail!("dedicated failed-start epoch must be positive");
+        }
+        let epoch = i64::try_from(worker_boot_epoch)?;
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
+        // `cleanup_proved` is the caller's exact held-launch/reap testimony.
+        // A missing row is never that proof; a retained row must independently
+        // agree with the same attempt and its settled cleanup state.
+        if cleanup_proved {
+            let unsettled: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_process WHERE worker_instance_id=?1
+                  AND (placement_thread_id!=?2 OR boot_epoch!=?3
+                       OR state!='dead' OR cleanup_state!='reaped'))",
+                params![worker_instance_id, placement_thread_id, epoch],
+                |row| row.get(0),
+            )?;
+            if unsettled {
+                bail!("dedicated failed-start cleanup contradicts retained worker authority");
+            }
+        }
         let next_state = if cleanup_proved {
             "terminal"
         } else {
@@ -5414,10 +5539,17 @@ impl RuntimeDb {
         let changed = tx.execute(
             "UPDATE dedicated_session
                 SET state=?5, terminal_reason=?3,
-                    send_boundary=CASE WHEN ?5='outcome_unknown' THEN 'outcome_unknown' ELSE send_boundary END,
+                    worker_instance_id=CASE WHEN ?5='terminal' AND NOT EXISTS(
+                      SELECT 1 FROM worker_process WHERE worker_instance_id=?2)
+                      THEN NULL ELSE worker_instance_id END,
+                    worker_boot_epoch=CASE WHEN ?5='terminal' AND NOT EXISTS(
+                      SELECT 1 FROM worker_process WHERE worker_instance_id=?2)
+                      THEN NULL ELSE worker_boot_epoch END,
+                    send_boundary=CASE WHEN ?5='outcome_unknown' THEN 'outcome_unknown' ELSE 'none' END,
                     updated_at_ms=?4
-              WHERE placement_thread_id=?1 AND state IN ('admitted','binding','recovering')",
-            params![placement_thread_id, worker_instance_id, reason, now, next_state],
+              WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?6
+                AND state IN ('admitted','binding','recovering','outcome_unknown')",
+            params![placement_thread_id, worker_instance_id, reason, now, next_state, epoch],
         )?;
         if changed != 1 {
             bail!("dedicated start failure lost its session-state CAS");
@@ -5562,15 +5694,19 @@ impl RuntimeDb {
         placement_thread_id: &str,
         credential_generation: u64,
         credential_lock_owner: &str,
+        admitted_workspace_id: &str,
     ) -> Result<u64> {
-        let next_epoch: i64 = self.conn.query_row(
+        validate_bounded_runtime_text("dedicated pending worker id", credential_lock_owner, 256)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let next_epoch: i64 = tx.query_row(
             "SELECT COALESCE(MAX(boot_epoch), 0) + 1 FROM worker_process WHERE placement_thread_id=?1",
             [placement_thread_id],
             |row| row.get(0),
         )?;
-        let changed = self.conn.execute(
+        let changed = tx.execute(
             "UPDATE dedicated_session
-                SET state='admitted', credential_generation=?2, updated_at_ms=?3
+                SET state='admitted', credential_generation=?2, updated_at_ms=?3,
+                    workspace_id=?5, worker_instance_id=?4, worker_boot_epoch=?6
               WHERE placement_thread_id=?1 AND state='recovering'
                 AND worker_instance_id IS NULL AND worker_boot_epoch IS NULL
                 AND send_boundary='none'
@@ -5583,12 +5719,15 @@ impl RuntimeDb {
                 placement_thread_id,
                 i64::try_from(credential_generation)?,
                 lillux::time::timestamp_millis() as i64,
-                credential_lock_owner
+                credential_lock_owner,
+                admitted_workspace_id,
+                next_epoch
             ],
         )?;
         if changed != 1 {
             bail!("dedicated recovery preparation lost its session CAS");
         }
+        tx.commit()?;
         u64::try_from(next_epoch).context("negative dedicated recovery epoch")
     }
 
@@ -8699,7 +8838,7 @@ impl RuntimeDb {
                         thread_runtime.process_identity
                    FROM execution_workspace
                    LEFT JOIN thread_runtime ON thread_runtime.thread_id = ?2
-                  WHERE workspace_id = ?1 AND execution_workspace.thread_id = ?2",
+                  WHERE execution_workspace.workspace_id = ?1 AND execution_workspace.thread_id = ?2",
                 params![workspace_id, record.placement_thread_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -8768,7 +8907,8 @@ impl RuntimeDb {
             "UPDATE dedicated_session
              SET worker_instance_id = ?2, worker_boot_epoch = ?3,
                  state = 'binding', updated_at_ms = ?4
-             WHERE placement_thread_id = ?1 AND state = 'admitted' AND worker_instance_id IS NULL",
+             WHERE placement_thread_id = ?1 AND state = 'admitted'
+               AND worker_instance_id = ?2 AND worker_boot_epoch = ?3",
             params![
                 record.placement_thread_id,
                 record.worker_instance_id,
@@ -8840,8 +8980,7 @@ impl RuntimeDb {
                     state='outcome_unknown', send_boundary='outcome_unknown',
                     terminal_reason=?4, updated_at_ms=?5
               WHERE placement_thread_id=?1
-                AND (worker_instance_id IS NULL OR worker_instance_id=?2)
-                AND (worker_boot_epoch IS NULL OR worker_boot_epoch=?3)
+                AND worker_instance_id=?2 AND worker_boot_epoch=?3
                 AND state IN ('admitted','binding','recovering','outcome_unknown')",
             params![
                 record.placement_thread_id,
@@ -8942,6 +9081,44 @@ impl RuntimeDb {
                     .ok_or_else(|| anyhow!("listed worker process disappeared"))
             })
             .collect()
+    }
+
+    /// Existing placement/epoch index bounds capture readiness to this owner;
+    /// old ambiguous boots cannot be hidden by an empty current-worker slot.
+    pub(crate) fn placement_has_unsettled_worker_except(
+        &self,
+        placement_thread_id: &str,
+        expected_worker: Option<&str>,
+    ) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_process
+                WHERE placement_thread_id=?1
+                  AND (?2 IS NULL OR worker_instance_id != ?2)
+                  AND (state!='dead' OR cleanup_state!='reaped'))",
+                params![placement_thread_id, expected_worker],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Indexed historical cleanup testimony, never proof that a newer pending
+    /// attempt is absent. Callers must first check the session's attempt fields
+    /// and refuse any other unsettled boot under the same store lock.
+    pub(crate) fn placement_has_reaped_worker_history(
+        &self,
+        placement_thread_id: &str,
+        capsule_hash: &str,
+    ) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_process
+                  WHERE placement_thread_id=?1 AND session_capsule_hash=?2
+                    AND state='dead' AND cleanup_state='reaped')",
+                params![placement_thread_id, capsule_hash],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Fence a previous daemon generation before any replacement worker can
@@ -11630,6 +11807,367 @@ impl RuntimeDb {
         Ok(())
     }
 
+    /// Bind only after the existing launch/lineage owners have admitted this
+    /// thread and before input preparation or any descriptor contact. Replays
+    /// still pass current admission; a prior reservation is not a freeze bypass.
+    pub(crate) fn bind_thread_workspace(
+        &self,
+        thread_id: &str,
+        binding: &RuntimeWorkspaceBinding,
+    ) -> Result<()> {
+        binding.validate_for(thread_id)?;
+        self.authorize_workspace_binding(thread_id, binding, true)?;
+        let owner = lillux::canonical_json(&serde_json::to_value(&binding.borrower_launch_owner)?)?;
+        let changed = self.conn.execute(
+            "UPDATE thread_runtime
+                SET workspace_id=?2, workspace_view_identity=?3, workspace_borrower_launch_owner=?4
+              WHERE thread_id=?1
+                AND workspace_id IS NULL AND workspace_view_identity IS NULL
+                AND workspace_borrower_launch_owner IS NULL",
+            params![
+                thread_id,
+                binding.workspace_id,
+                binding.view_identity,
+                owner
+            ],
+        )?;
+        if changed == 0 && self.thread_workspace_binding(thread_id)?.as_ref() != Some(binding) {
+            bail!("thread {thread_id} has an absent runtime row or conflicting workspace binding");
+        }
+        Ok(())
+    }
+
+    pub fn thread_workspace_binding(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<RuntimeWorkspaceBinding>> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT workspace_id, workspace_view_identity, workspace_borrower_launch_owner
+               FROM thread_runtime WHERE thread_id=?1",
+                params![thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        match raw {
+            None => Ok(None),
+            Some((workspace_id, view_identity, owner)) => {
+                decode_workspace_binding(thread_id, workspace_id, view_identity, owner)
+            }
+        }
+    }
+
+    /// Enumerate retained membership, including unknown pre-attachment contact.
+    /// Neither terminal status, a missing PID, nor stale-claim deletion filters
+    /// a member out. Cleanup must explicitly settle the exact binding.
+    pub fn workspace_members_after(
+        &self,
+        workspace_id: &str,
+        view_identity: &str,
+        after_thread_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeWorkspaceMember>> {
+        self.workspace_members_page(workspace_id, Some(view_identity), after_thread_id, limit)
+    }
+
+    /// Recovery must inspect all retained incarnations: a stale view binding
+    /// cannot disappear merely because the journal names a newer view.
+    pub fn workspace_members_for_recovery_after(
+        &self,
+        workspace_id: &str,
+        after_thread_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeWorkspaceMember>> {
+        self.workspace_members_page(workspace_id, None, after_thread_id, limit)
+    }
+
+    pub fn execution_workspace_has_members(&self, workspace_id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_runtime WHERE workspace_id=?1)",
+                [workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn workspace_members_page(
+        &self,
+        workspace_id: &str,
+        view_identity: Option<&str>,
+        after_thread_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeWorkspaceMember>> {
+        if limit == 0 || limit > WORKSPACE_MEMBER_PAGE_SIZE {
+            bail!("workspace member page size must be 1..={WORKSPACE_MEMBER_PAGE_SIZE}");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT thread_id, workspace_id, workspace_view_identity, workspace_borrower_launch_owner
+               FROM thread_runtime
+              WHERE workspace_id=?1 AND (?2 IS NULL OR workspace_view_identity=?2)
+                AND (?3 IS NULL OR thread_id>?3)
+              ORDER BY thread_id LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![workspace_id, view_identity, after_thread_id, limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                },
+            )?
+            .map(|row| {
+                let (thread_id, workspace_id, view_identity, owner) = row?;
+                let binding =
+                    decode_workspace_binding(&thread_id, workspace_id, view_identity, owner)?
+                        .ok_or_else(|| anyhow!("indexed workspace member lost its binding"))?;
+                Ok(RuntimeWorkspaceMember { thread_id, binding })
+            })
+            .collect()
+    }
+
+    /// Resolve the existing operation barrier by its unique workspace index.
+    /// This consults the hosted operation owner; it does not create a hosted
+    /// identity or another lease for ordinary callback/hook borrowers.
+    fn workspace_operation_barrier(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<RuntimeActionIntent>> {
+        let operation_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT operation_id FROM runtime_action_intent
+              WHERE workspace_id=?1 AND (
+                workspace_operation_phase IN ('reserved', 'quiescing', 'quiesced')
+                OR (workspace_access='shared_exclusive'
+                    AND workspace_operation_phase IN ('child_running', 'settling')))",
+                params![workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        operation_id
+            .map(|id| {
+                self.get_runtime_action_intent(&id)?
+                    .ok_or_else(|| anyhow!("workspace operation barrier disappeared"))
+            })
+            .transpose()
+    }
+
+    /// Every intermediate parent must itself borrow this view. An immutable
+    /// input's subject lineage cannot grant its descendants the mutable view.
+    fn has_workspace_ancestor(
+        &self,
+        thread_id: &str,
+        ancestor: &str,
+        binding: &RuntimeWorkspaceBinding,
+    ) -> Result<bool> {
+        self.conn
+            .query_row(
+                "WITH RECURSIVE parents(thread_id) AS (
+                SELECT ?1
+                UNION
+                SELECT link.parent_thread_id FROM parents
+                  JOIN thread_child_link AS link ON link.child_thread_id=parents.thread_id
+                  JOIN thread_runtime AS parent ON parent.thread_id=link.parent_thread_id
+                 WHERE parent.workspace_id=?3 AND parent.workspace_view_identity=?4
+             ) SELECT EXISTS(SELECT 1 FROM parents WHERE thread_id=?2)",
+                params![
+                    thread_id,
+                    ancestor,
+                    binding.workspace_id,
+                    binding.view_identity
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn authorize_workspace_binding(
+        &self,
+        thread_id: &str,
+        binding: &RuntimeWorkspaceBinding,
+        binding_admission: bool,
+    ) -> Result<()> {
+        binding.validate_for(thread_id)?;
+        let claim = self
+            .get_launch_claim(thread_id)?
+            .ok_or_else(|| anyhow!("workspace borrower has no current launch claim"))?;
+        if claim.owner != binding.borrower_launch_owner {
+            bail!("stale workspace borrower launch owner for thread {thread_id}");
+        }
+        let runtime = self
+            .get_runtime_info(thread_id)?
+            .ok_or_else(|| anyhow!("workspace borrower runtime row is absent"))?;
+        if runtime.stop_intent.is_some() {
+            bail!("workspace borrower has a durable stop request");
+        }
+        let workspace = self
+            .workspace(&binding.workspace_id)?
+            .ok_or_else(|| anyhow!("bound workspace is absent"))?;
+        if workspace.mount_identity.as_deref() != Some(binding.view_identity.as_str()) {
+            bail!("workspace view incarnation does not match its retained owner");
+        }
+        let root = workspace
+            .thread_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("bound workspace has no root owner"))?;
+        let root_claim = self
+            .get_launch_claim(root)?
+            .ok_or_else(|| anyhow!("workspace root has no current launch claim"))?;
+        if workspace.launch_owner.as_deref() != Some(root_claim.claimed_by.as_str()) {
+            bail!("workspace root launch owner has changed");
+        }
+        if self
+            .get_runtime_info(root)?
+            .is_none_or(|runtime| runtime.stop_intent.is_some())
+        {
+            bail!("workspace root is absent or has a durable stop request");
+        }
+        let root_launch = thread_id == root;
+        let allowed_state = if root_launch {
+            workspace.state == WorkspaceState::Ready
+                || (!binding_admission && workspace.state == WorkspaceState::Active)
+        } else {
+            workspace.state == WorkspaceState::Active
+        };
+        if !allowed_state {
+            bail!(
+                "workspace {} is not admitting this launch from {}",
+                workspace.workspace_id,
+                workspace.state
+            );
+        }
+        if !root_launch && !self.has_workspace_ancestor(thread_id, root, binding)? {
+            bail!("workspace borrower has no exact same-view root lineage");
+        }
+        if let Some(intent) = self.workspace_operation_barrier(&binding.workspace_id)? {
+            let operation = intent
+                .workspace_operation
+                .as_ref()
+                .ok_or_else(|| anyhow!("workspace barrier has no operation"))?;
+            let exclusive_child = operation.access
+                == ryeos_engine::kind_registry::WorkspaceAccess::SharedExclusive
+                && matches!(
+                    operation.phase,
+                    RuntimeWorkspaceOperationPhase::Quiesced
+                        | RuntimeWorkspaceOperationPhase::ChildRunning
+                )
+                && self.has_workspace_ancestor(thread_id, &intent.child_thread_id, binding)?;
+            if !exclusive_child {
+                bail!(
+                    "workspace contact is fenced by operation {}",
+                    intent.operation_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A subtree retains contact while any exact-view member remains bound,
+    /// even if its immediate child already terminalized or lost its claim.
+    pub(crate) fn workspace_subtree_has_members(
+        &self,
+        child_thread_id: &str,
+        workspace_id: &str,
+        view_identity: &str,
+    ) -> Result<bool> {
+        self.conn
+            .query_row(
+                "WITH RECURSIVE descendants(thread_id) AS (
+                SELECT ?1
+                UNION
+                SELECT link.child_thread_id FROM descendants
+                  JOIN thread_child_link AS link ON link.parent_thread_id=descendants.thread_id
+             ) SELECT EXISTS(
+                SELECT 1 FROM thread_runtime AS runtime JOIN descendants USING(thread_id)
+                 WHERE runtime.workspace_id=?2 AND runtime.workspace_view_identity=?3)",
+                params![child_thread_id, workspace_id, view_identity],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn workspace_descendants_have_members(
+        &self,
+        thread_id: &str,
+        binding: &RuntimeWorkspaceBinding,
+    ) -> Result<bool> {
+        self.conn
+            .query_row(
+                "WITH RECURSIVE descendants(thread_id) AS (
+                SELECT child_thread_id FROM thread_child_link WHERE parent_thread_id=?1
+                UNION
+                SELECT link.child_thread_id FROM descendants
+                  JOIN thread_child_link AS link ON link.parent_thread_id=descendants.thread_id
+             ) SELECT EXISTS(
+                SELECT 1 FROM thread_runtime AS runtime JOIN descendants USING(thread_id)
+                 WHERE runtime.workspace_id=?2 AND runtime.workspace_view_identity=?3)",
+                params![thread_id, binding.workspace_id, binding.view_identity],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Only StateStore's live launch owner may call this after proving lifecycle
+    /// settlement. Missing process identity alone never reaches this mutation.
+    pub(crate) fn clear_thread_workspace_owned(
+        &self,
+        thread_id: &str,
+        binding: &RuntimeWorkspaceBinding,
+    ) -> Result<bool> {
+        let owner = lillux::canonical_json(&serde_json::to_value(&binding.borrower_launch_owner)?)?;
+        if self.workspace_descendants_have_members(thread_id, binding)? {
+            return Ok(false);
+        }
+        Ok(self.conn.execute(
+            "UPDATE thread_runtime SET workspace_id=NULL, workspace_view_identity=NULL,
+                    workspace_borrower_launch_owner=NULL
+              WHERE thread_id=?1 AND workspace_id=?2 AND workspace_view_identity=?3
+                AND workspace_borrower_launch_owner=?4
+                AND pid IS NULL AND pgid IS NULL AND process_identity IS NULL
+                AND EXISTS(SELECT 1 FROM thread_launch_claim WHERE thread_id=?1 AND claimed_by=?4)
+                AND NOT EXISTS(SELECT 1 FROM in_process_handler_reservation WHERE thread_id=?1)",
+            params![
+                thread_id,
+                binding.workspace_id,
+                binding.view_identity,
+                owner
+            ],
+        )? == 1)
+    }
+
+    /// The StateStore caller has already proved exact owner disposition and
+    /// process death/reap. Clear both retained coordinates in one statement;
+    /// a missing or replaced attachment can never settle membership here.
+    pub(crate) fn clear_reaped_workspace_process_if_matches(
+        &self,
+        thread_id: &str,
+        binding: &RuntimeWorkspaceBinding,
+        identity: &ExecutionProcessIdentity,
+    ) -> Result<bool> {
+        binding.validate_for(thread_id)?;
+        validate_execution_process_identity_shape(identity)?;
+        if self.workspace_descendants_have_members(thread_id, binding)? {
+            return Ok(false);
+        }
+        let owner = lillux::canonical_json(&serde_json::to_value(&binding.borrower_launch_owner)?)?;
+        let identity = serde_json::to_string(identity)?;
+        Ok(self.conn.execute(
+            "UPDATE thread_runtime
+                SET pid=NULL, pgid=NULL, process_identity=NULL, process_dead_observed_at_ms=NULL,
+                    workspace_id=NULL, workspace_view_identity=NULL, workspace_borrower_launch_owner=NULL
+              WHERE thread_id=?1 AND workspace_id=?2 AND workspace_view_identity=?3
+                AND workspace_borrower_launch_owner=?4 AND process_identity=?5
+                AND NOT EXISTS(SELECT 1 FROM in_process_handler_reservation WHERE thread_id=?1)",
+            params![thread_id, binding.workspace_id, binding.view_identity, owner, identity],
+        )? == 1)
+    }
+
     pub fn insert_thread_runtime(&self, thread_id: &str, chain_root_id: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO thread_runtime (thread_id, chain_root_id, pid, pgid, metadata, launch_metadata)
@@ -13187,21 +13725,23 @@ impl RuntimeDb {
                 .as_ref()
                 .map(|owner| owner.daemon_generation_id.clone())
                 .unwrap_or_else(|| "<malformed owner>".to_string());
-            // A process identity is written only after the claim owner has
-            // spawned and durably attached the exact held process. All three
-            // attachment columns being empty is therefore positive proof that
-            // a well-formed dead-generation claim died before that boundary.
-            // Malformed owners and partial attachment residue fail closed and
-            // retain the consumed retry budget.
+            // Do not mistake missing target attachment for no workspace
+            // contact. A borrower may already be in adapter setup, and a
+            // constructing workspace may retain its separately attached creator.
+            // Those exact operational owners preserve the consumed budget.
             let proved_unattached = if parsed_owner.is_some() {
                 tx.query_row(
-                    "SELECT pid, pgid, process_identity
+                    "SELECT pid, pgid, process_identity, workspace_id,
+                            NOT EXISTS(SELECT 1 FROM execution_workspace
+                                WHERE thread_id=?1 AND process_identity IS NOT NULL)
                        FROM thread_runtime WHERE thread_id = ?1",
                     params![thread_id],
                     |row| {
                         Ok(row.get::<_, Option<i64>>(0)?.is_none()
                             && row.get::<_, Option<i64>>(1)?.is_none()
-                            && row.get::<_, Option<String>>(2)?.is_none())
+                            && row.get::<_, Option<String>>(2)?.is_none()
+                            && row.get::<_, Option<String>>(3)?.is_none()
+                            && row.get::<_, bool>(4)?)
                     },
                 )
                 .optional()?
@@ -13515,6 +14055,40 @@ impl RuntimeDb {
         Ok(())
     }
 
+    /// Persist the exact held creator before it can contact workspace layers.
+    /// It is a lifecycle control process, not the thread's execution target.
+    pub(crate) fn attach_workspace_creator(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        launch_owner: &str,
+        identity: &ExecutionProcessIdentity,
+    ) -> Result<()> {
+        validate_execution_process_identity_shape(identity)?;
+        let encoded = serde_json::to_string(identity)?;
+        let changed = self.conn.execute(
+            "UPDATE execution_workspace SET process_identity=?4, updated_at_ms=?5
+              WHERE workspace_id=?1 AND thread_id=?2 AND launch_owner=?3
+                AND state='constructing'
+                AND (process_identity IS NULL OR process_identity=?4)
+                AND EXISTS(SELECT 1 FROM thread_launch_claim WHERE thread_id=?2 AND claimed_by=?3)",
+            params![
+                workspace_id,
+                thread_id,
+                launch_owner,
+                encoded,
+                lillux::time::timestamp_millis()
+            ],
+        )?;
+        if changed != 1 {
+            bail!("workspace creator attachment lost its exact construction owner or identity");
+        }
+        Ok(())
+    }
+
+    /// The caller has reaped the creator and validated its complete result and
+    /// transferred view before publishing Ready. Clearing its control-process
+    /// identity here must never be used as evidence that reaping occurred.
     pub fn bind_workspace(&self, binding: WorkspaceBinding<'_>) -> Result<()> {
         let WorkspaceBinding {
             workspace_id,
@@ -13529,7 +14103,7 @@ impl RuntimeDb {
             "UPDATE execution_workspace
                 SET backend_id=?4,
                     backend_version=?5, pinned_root_identities=?6, mount_identity=?7,
-                    state=?8, updated_at_ms=?9
+                    state=?8, updated_at_ms=?9, process_identity=NULL
               WHERE workspace_id=?1 AND thread_id=?2 AND launch_owner=?3
                 AND state=?10",
             params![
@@ -13651,9 +14225,9 @@ impl RuntimeDb {
     }
 
     /// Transfer a retained workspace from one proved-dead launch owner to the
-    /// current same-thread recovery claim. Backend/root evidence is verified
-    /// by the caller before this transaction; this boundary makes the owner
-    /// replacement and removal of the stale process attachment indivisible.
+    /// current same-thread recovery claim for a NEW backend Create. The old
+    /// mount descriptor died with its owner; only pinned roots/backend survive
+    /// as comparison evidence. Every exact old borrower must already be settled.
     pub fn rebind_workspace_for_recovery(
         &self,
         workspace_id: &str,
@@ -13663,17 +14237,54 @@ impl RuntimeDb {
         expected_state: WorkspaceState,
         expected_process_identity: Option<&str>,
     ) -> Result<()> {
+        self.transfer_workspace_owner(
+            workspace_id,
+            thread_id,
+            previous_launch_owner,
+            recovery_launch_owner,
+            expected_state,
+            expected_process_identity,
+            None,
+        )
+    }
+
+    pub(crate) fn handoff_workspace_for_live_retry(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        previous_launch_owner: &str,
+        recovery_launch_owner: &str,
+        expected_state: WorkspaceState,
+        expected_process_identity: Option<&str>,
+        view_identity: &str,
+    ) -> Result<()> {
+        self.transfer_workspace_owner(
+            workspace_id,
+            thread_id,
+            previous_launch_owner,
+            recovery_launch_owner,
+            expected_state,
+            expected_process_identity,
+            Some(view_identity),
+        )
+    }
+
+    fn transfer_workspace_owner(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        previous_launch_owner: &str,
+        recovery_launch_owner: &str,
+        expected_state: WorkspaceState,
+        expected_process_identity: Option<&str>,
+        retained_live_view: Option<&str>,
+    ) -> Result<()> {
         if !matches!(
             expected_state,
             WorkspaceState::Ready | WorkspaceState::Active | WorkspaceState::Freezing
         ) {
             bail!("retained workspace recovery requires ready, active, or freezing state");
         }
-        let recovery_state = if expected_state == WorkspaceState::Freezing {
-            WorkspaceState::Freezing
-        } else {
-            WorkspaceState::Ready
-        };
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("begin retained workspace owner transfer")?;
         let claim_owner: Option<String> = tx
@@ -13685,6 +14296,35 @@ impl RuntimeDb {
             .optional()?;
         if claim_owner.as_deref() != Some(recovery_launch_owner) {
             bail!("retained workspace recovery lost its current launch claim");
+        }
+        let unresolved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thread_runtime WHERE workspace_id=?1)
+                 OR EXISTS(SELECT 1 FROM thread_runtime WHERE thread_id=?2
+                   AND (process_identity IS NOT NULL OR pid IS NOT NULL OR pgid IS NOT NULL))",
+            params![workspace_id, thread_id],
+            |row| row.get(0),
+        )?;
+        if unresolved {
+            bail!("retained workspace recovery has unsettled exact borrowers or root process");
+        }
+        if let Some(view_identity) = retained_live_view {
+            let matches: bool = tx.query_row(
+                "SELECT mount_identity=?2 FROM execution_workspace WHERE workspace_id=?1",
+                params![workspace_id, view_identity],
+                |row| row.get(0),
+            )?;
+            if !matches {
+                bail!("live retry lost its original exact workspace view");
+            }
+        }
+        if expected_state == WorkspaceState::Freezing {
+            let captured: bool = tx.query_row(
+                "SELECT frozen_snapshot_hash IS NOT NULL FROM execution_workspace WHERE workspace_id=?1",
+                [workspace_id], |row| row.get(0),
+            )?;
+            if !captured {
+                bail!("uncommitted workspace freeze remains quarantined during cold recovery");
+            }
         }
         let existing: Option<(
             Option<String>,
@@ -13711,7 +14351,8 @@ impl RuntimeDb {
         }
         let changed = tx.execute(
             "UPDATE execution_workspace
-                SET launch_owner=?4, state=?5, process_identity=NULL, updated_at_ms=?6
+                SET launch_owner=?4, state=?5, process_identity=NULL,
+                    mount_identity=?9, updated_at_ms=?6
               WHERE workspace_id=?1 AND thread_id=?2 AND launch_owner=?3
                 AND state=?7
                 AND ((?8 IS NULL AND process_identity IS NULL) OR process_identity=?8)",
@@ -13720,10 +14361,19 @@ impl RuntimeDb {
                 thread_id,
                 previous_launch_owner,
                 recovery_launch_owner,
-                recovery_state.as_str(),
+                if retained_live_view.is_some() {
+                    if expected_state == WorkspaceState::Freezing {
+                        WorkspaceState::Freezing.as_str()
+                    } else {
+                        WorkspaceState::Ready.as_str()
+                    }
+                } else {
+                    WorkspaceState::Constructing.as_str()
+                },
                 lillux::time::timestamp_millis(),
                 expected_state.as_str(),
                 expected_process_identity,
+                retained_live_view,
             ],
         )?;
         if changed != 1 {
@@ -16145,7 +16795,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_releases_only_pre_attachment_credential_reservations() {
+    fn startup_quarantines_unattached_attempts_and_releases_only_unadmitted_reservations() {
         let (_tmp, db) = fresh_db();
         create_locked_profile(&db, "P-orphan", "worker-orphan");
         create_locked_profile(&db, "P-admitted", "worker-admitted");
@@ -16165,18 +16815,18 @@ mod tests {
 
         assert_eq!(
             db.reconcile_unattached_credential_profile_locks().unwrap(),
-            (1, 2)
+            (1, 1)
         );
         assert_eq!(
             db.dedicated_session("T-admitted").unwrap().unwrap().state,
-            "recovering"
+            "outcome_unknown"
         );
         assert_eq!(
             db.credential_profile("P-admitted")
                 .unwrap()
                 .unwrap()
                 .lock_owner,
-            None
+            Some("worker-admitted".to_owned())
         );
         assert_eq!(
             db.credential_profile("P-orphan")
@@ -16184,6 +16834,46 @@ mod tests {
                 .unwrap()
                 .lock_owner,
             None
+        );
+        let session = db.dedicated_session("T-admitted").unwrap().unwrap();
+        assert_eq!(
+            session.worker_instance_id.as_deref(),
+            Some("worker-admitted")
+        );
+        assert_eq!(session.worker_boot_epoch, Some(1));
+        assert_eq!(session.send_boundary, "outcome_unknown");
+        assert_eq!(
+            db.reconcile_unattached_credential_profile_locks().unwrap(),
+            (0, 0)
+        );
+        assert!(
+            db.terminalize_unattached_dedicated_session("T-admitted", "cancelled")
+                .is_err()
+        );
+        assert!(
+            db.prepare_dedicated_session_recovery("T-admitted", 1, "worker-next", "W-admitted")
+                .is_err()
+        );
+        for (worker, epoch) in [("worker-other", 1), ("worker-admitted", 2)] {
+            assert!(
+                db.fail_dedicated_session_start("T-admitted", worker, epoch, "stale cleanup", true)
+                    .is_err()
+            );
+        }
+        // Only the exact launch owner can settle the retained attempt, with
+        // explicit cleanup testimony; startup itself never manufactures it.
+        db.fail_dedicated_session_start("T-admitted", "worker-admitted", 1, "proved cleanup", true)
+            .unwrap();
+        assert_eq!(
+            db.dedicated_session("T-admitted").unwrap().unwrap().state,
+            "terminal"
+        );
+        assert!(
+            db.credential_profile("P-admitted")
+                .unwrap()
+                .unwrap()
+                .lock_owner
+                .is_none()
         );
     }
 
@@ -16391,10 +17081,32 @@ mod tests {
 
         db.acquire_credential_profile("P-recover", "fp:operator", "worker-recover-2")
             .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO execution_workspace (
+                workspace_id, thread_id, launch_owner, backend_id,
+                base_snapshot, root_path, state, created_at_ms, updated_at_ms
+             ) VALUES ('W-recover-next', 'T-recover', 'owner-next', 'backend',
+                       'a', '/tmp/workspace-recover-next', 'ready', 1, 1)",
+                [],
+            )
+            .unwrap();
         assert_eq!(
-            db.prepare_dedicated_session_recovery("T-recover", 1, "worker-recover-2")
-                .unwrap(),
+            db.prepare_dedicated_session_recovery(
+                "T-recover",
+                1,
+                "worker-recover-2",
+                "W-recover-next"
+            )
+            .unwrap(),
             2
+        );
+        assert_eq!(
+            db.dedicated_session("T-recover")
+                .unwrap()
+                .unwrap()
+                .workspace_id,
+            "W-recover-next"
         );
         let second = WorkerProcessRecord {
             worker_instance_id: "worker-recover-2".to_owned(),
@@ -16655,6 +17367,40 @@ mod tests {
             )
             .is_err()
         );
+        let borrower_owner = lillux::canonical_json(
+            &serde_json::to_value(&db.get_launch_claim("T-retained").unwrap().unwrap().owner)
+                .unwrap(),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO thread_runtime(thread_id, chain_root_id, workspace_id,
+                workspace_view_identity, workspace_borrower_launch_owner)
+             VALUES ('T-retained','T-retained','W-retained','different-old-view',?1)",
+                [&borrower_owner],
+            )
+            .unwrap();
+        assert!(db.execution_workspace_has_members("W-retained").unwrap());
+        assert_eq!(
+            db.workspace_members_for_recovery_after("W-retained", None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            db.rebind_workspace_for_recovery(
+                "W-retained",
+                "T-retained",
+                "old-owner",
+                &recovery_owner,
+                WorkspaceState::Ready,
+                None
+            )
+            .is_err(),
+            "any old incarnation must fence cold recreation, including NULL-PID contact"
+        );
+        db.conn.execute("UPDATE thread_runtime SET workspace_id=NULL,
+            workspace_view_identity=NULL, workspace_borrower_launch_owner=NULL WHERE thread_id='T-retained'", []).unwrap();
         db.rebind_workspace_for_recovery(
             "W-retained",
             "T-retained",
@@ -16665,7 +17411,10 @@ mod tests {
         )
         .unwrap();
         let retained = db.workspace("W-retained").unwrap().unwrap();
-        assert_eq!(retained.state, WorkspaceState::Ready);
+        assert_eq!(retained.state, WorkspaceState::Constructing);
+        assert!(retained.mount_identity.is_none());
+        assert_eq!(retained.pinned_root_identities.as_deref(), Some("{}"));
+        assert_eq!(retained.backend_id.as_deref(), Some("backend"));
         assert_eq!(
             retained.launch_owner.as_deref(),
             Some(recovery_owner.as_str())
@@ -16699,7 +17448,8 @@ mod tests {
         )
         .unwrap();
         let frozen = db.workspace("W-frozen").unwrap().unwrap();
-        assert_eq!(frozen.state, WorkspaceState::Freezing);
+        assert_eq!(frozen.state, WorkspaceState::Constructing);
+        assert!(frozen.mount_identity.is_none());
         assert_eq!(
             frozen.frozen_snapshot_hash.as_deref(),
             Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
@@ -16708,6 +17458,32 @@ mod tests {
             frozen.launch_owner.as_deref(),
             Some(frozen_recovery_owner.as_str())
         );
+        // Cold recovery proves a new view before restoring the already
+        // committed frozen disposition. Neither step reserves a process.
+        db.bind_workspace(WorkspaceBinding {
+            workspace_id: "W-frozen",
+            thread_id: "T-frozen",
+            launch_owner: Some(&frozen_recovery_owner),
+            backend_id: Some("backend"),
+            backend_version: Some("v1"),
+            pinned_root_identities: Some("{}"),
+            mount_identity: Some("new-frozen-view"),
+        })
+        .unwrap();
+        db.transition_workspace_owned(
+            "W-frozen",
+            "T-frozen",
+            &frozen_recovery_owner,
+            &[WorkspaceState::Ready],
+            WorkspaceState::Freezing,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.workspace("W-frozen").unwrap().unwrap().state,
+            WorkspaceState::Freezing
+        );
+        assert!(db.thread_workspace_binding("T-frozen").unwrap().is_none());
     }
 
     #[test]
@@ -16788,6 +17564,136 @@ mod tests {
             process_identity,
             serde_json::to_string(&record.process_identity).unwrap()
         );
+    }
+
+    #[test]
+    fn live_workspace_retry_retains_only_exact_view_after_process_settlement() {
+        let (_tmp, db) = fresh_db();
+        db.conn
+            .execute(
+                "INSERT INTO execution_workspace (
+                workspace_id, thread_id, launch_owner, backend_id, backend_version,
+                pinned_root_identities, mount_identity, base_snapshot, root_path,
+                state, created_at_ms, updated_at_ms
+             ) VALUES ('W-live-retry','T-live-retry','old-owner','backend','v1',
+                '{}','retained-view','base','/tmp/W-live-retry','active',1,1)",
+                [],
+            )
+            .unwrap();
+        db.claim_thread_launch("T-live-retry", "new-claim", "daemon-test")
+            .unwrap();
+        let owner = db
+            .get_launch_claim("T-live-retry")
+            .unwrap()
+            .unwrap()
+            .claimed_by;
+        assert!(
+            db.handoff_workspace_for_live_retry(
+                "W-live-retry",
+                "T-live-retry",
+                "old-owner",
+                &owner,
+                WorkspaceState::Active,
+                None,
+                "different-view",
+            )
+            .is_err()
+        );
+        db.conn
+            .execute(
+                "INSERT INTO thread_runtime(thread_id, chain_root_id, pid, pgid)
+            VALUES ('T-live-retry','T-live-retry',123,123)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.handoff_workspace_for_live_retry(
+                "W-live-retry",
+                "T-live-retry",
+                "old-owner",
+                &owner,
+                WorkspaceState::Active,
+                None,
+                "retained-view",
+            )
+            .is_err(),
+            "unsettled root process must fence an otherwise exact live view"
+        );
+        db.conn
+            .execute(
+                "UPDATE thread_runtime SET pid=NULL, pgid=NULL WHERE thread_id='T-live-retry'",
+                [],
+            )
+            .unwrap();
+        db.handoff_workspace_for_live_retry(
+            "W-live-retry",
+            "T-live-retry",
+            "old-owner",
+            &owner,
+            WorkspaceState::Active,
+            None,
+            "retained-view",
+        )
+        .unwrap();
+        let view = db.workspace("W-live-retry").unwrap().unwrap();
+        assert_eq!(view.state, WorkspaceState::Ready);
+        assert_eq!(view.launch_owner.as_deref(), Some(owner.as_str()));
+        assert_eq!(view.mount_identity.as_deref(), Some("retained-view"));
+        assert_eq!(view.pinned_root_identities.as_deref(), Some("{}"));
+        assert_eq!(view.backend_version.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn live_workspace_transfer_preserves_only_committed_exact_frozen_phase() {
+        for (phase, frozen, expected_phase) in [
+            (WorkspaceState::Freezing, None, None),
+            (
+                WorkspaceState::Freezing,
+                Some("frozen-generation"),
+                Some(WorkspaceState::Freezing),
+            ),
+            (
+                WorkspaceState::Active,
+                Some("earlier-generation"),
+                Some(WorkspaceState::Ready),
+            ),
+        ] {
+            let (_tmp, db) = fresh_db();
+            db.conn
+                .execute(
+                    "INSERT INTO execution_workspace(
+                workspace_id, thread_id, launch_owner, backend_id, backend_version,
+                pinned_root_identities, mount_identity, base_snapshot, root_path,
+                state, frozen_snapshot_hash, created_at_ms, updated_at_ms)
+                VALUES('W-phase','T-phase','old-owner','backend','v1','{}','same-view',
+                    'base','/tmp/W-phase',?1,?2,1,1)",
+                    params![phase.as_str(), frozen],
+                )
+                .unwrap();
+            db.claim_thread_launch("T-phase", "next-claim", "daemon-test")
+                .unwrap();
+            let owner = db.get_launch_claim("T-phase").unwrap().unwrap().claimed_by;
+            let result = db.handoff_workspace_for_live_retry(
+                "W-phase",
+                "T-phase",
+                "old-owner",
+                &owner,
+                phase,
+                None,
+                "same-view",
+            );
+            match expected_phase {
+                None => assert!(result.is_err()),
+                Some(expected_phase) => {
+                    result.unwrap();
+                    let workspace = db.workspace("W-phase").unwrap().unwrap();
+                    assert_eq!(workspace.state, expected_phase);
+                    assert_eq!(workspace.frozen_snapshot_hash.as_deref(), frozen);
+                    assert_eq!(workspace.mount_identity.as_deref(), Some("same-view"));
+                    assert!(!db.execution_workspace_has_members("W-phase").unwrap());
+                }
+            }
+        }
     }
 
     #[test]
@@ -17151,6 +18057,7 @@ mod tests {
         db.fail_dedicated_session_start(
             "T-ready-fail",
             "worker-ready-fail",
+            1,
             "readiness failed",
             true,
         )
@@ -17483,7 +18390,7 @@ mod tests {
             worker_instance_id: "worker-ledger".to_owned(),
             boot_identity_hash: "b".repeat(64),
             session_capsule_hash: "c".repeat(64),
-            boot_epoch: 4,
+            boot_epoch: 1,
             lifecycle_generation: 1,
             process_identity: fake_process_identity(124, 124),
             control_channel_identity: "fd:10".to_owned(),
@@ -17495,7 +18402,7 @@ mod tests {
             updated_at_ms: now,
         })
         .unwrap();
-        db.complete_worker_binding("worker-ledger", "T-ledger", 4)
+        db.complete_worker_binding("worker-ledger", "T-ledger", 1)
             .unwrap();
 
         let payload = serde_json::json!({"operation": "fixture_turn"});
@@ -17503,7 +18410,7 @@ mod tests {
             .reserve_dedicated_session_command(NewDedicatedSessionCommand {
                 placement_thread_id: "T-ledger",
                 idempotency_key: "request-one",
-                worker_boot_epoch: 4,
+                worker_boot_epoch: 1,
                 command_kind: "request",
                 request_digest: &"d".repeat(64),
                 payload: &payload,
@@ -17513,18 +18420,18 @@ mod tests {
             .reserve_dedicated_session_command(NewDedicatedSessionCommand {
                 placement_thread_id: "T-ledger",
                 idempotency_key: "request-one",
-                worker_boot_epoch: 4,
+                worker_boot_epoch: 1,
                 command_kind: "request",
                 request_digest: &"d".repeat(64),
                 payload: &payload,
             })
             .unwrap();
         assert_eq!(command, replay);
-        db.mark_dedicated_command_contacted("T-ledger", command.command_sequence, 4)
+        db.mark_dedicated_command_contacted("T-ledger", command.command_sequence, 1)
             .unwrap();
         db.observe_dedicated_session_state(
             "T-ledger",
-            4,
+            1,
             "idle",
             "turn_running",
             None,
@@ -17535,7 +18442,7 @@ mod tests {
             placement_thread_id: "T-ledger",
             approval_id: "approval-one",
             worker_instance_id: "worker-ledger",
-            worker_boot_epoch: 4,
+            worker_boot_epoch: 1,
             request_digest: &"e".repeat(64),
             operation_class: "fixture",
             requested_authority: &serde_json::json!({}),
@@ -17548,7 +18455,7 @@ mod tests {
         db.reserve_dedicated_session_approval_decision(
             "T-ledger",
             "approval-one",
-            4,
+            1,
             &"e".repeat(64),
             "fp:operator",
             &approval_decision,
@@ -17560,7 +18467,7 @@ mod tests {
             db.reserve_dedicated_session_approval_decision(
                 "T-ledger",
                 "approval-one",
-                4,
+                1,
                 &"e".repeat(64),
                 "fp:operator",
                 &approval_decision,
@@ -17572,7 +18479,7 @@ mod tests {
         db.mark_dedicated_approval_delivery_contacting(
             "T-ledger",
             "approval-one",
-            4,
+            1,
             "reservation-one",
             &approval_decision_digest,
         )
@@ -17580,7 +18487,7 @@ mod tests {
         db.settle_dedicated_approval_delivery(
             "T-ledger",
             "approval-one",
-            4,
+            1,
             "reservation-one",
             &approval_decision_digest,
         )
@@ -17593,7 +18500,7 @@ mod tests {
                     decision_principal, decision_json, decision_digest, reservation_token,
                     expires_at_ms, created_at_ms, resolved_at_ms,
                     delivery_contacted_at_ms, delivery_settled_at_ms
-                 ) VALUES ('T-ledger', 'approval-recovered', 'worker-ledger', 4,
+                 ) VALUES ('T-ledger', 'approval-recovered', 'worker-ledger', 1,
                            ?1, 'fixture', '{}', 'delivery_unknown', 'fp:operator',
                            ?2, ?3, 'reservation-recovered', ?4, 1, 1, 1, NULL)",
                 params![
@@ -17607,7 +18514,7 @@ mod tests {
         db.settle_recovered_dedicated_approval_delivery(
             "T-ledger",
             "approval-recovered",
-            4,
+            1,
             "reservation-recovered",
             &approval_decision_digest,
         )
@@ -17617,7 +18524,7 @@ mod tests {
         db.settle_recovered_dedicated_approval_delivery(
             "T-ledger",
             "approval-recovered",
-            4,
+            1,
             "reservation-recovered",
             &approval_decision_digest,
         )
@@ -17637,7 +18544,7 @@ mod tests {
             placement_thread_id: "T-ledger",
             approval_id: "approval-uncontacted",
             worker_instance_id: "worker-ledger",
-            worker_boot_epoch: 4,
+            worker_boot_epoch: 1,
             request_digest: &"8".repeat(64),
             operation_class: "fixture",
             requested_authority: &serde_json::json!({}),
@@ -17647,7 +18554,7 @@ mod tests {
         db.reserve_dedicated_session_approval_decision(
             "T-ledger",
             "approval-uncontacted",
-            4,
+            1,
             &"8".repeat(64),
             "fp:operator",
             &approval_decision,
@@ -17655,9 +18562,9 @@ mod tests {
             "reservation-uncontacted",
         )
         .unwrap();
-        db.reconcile_dedicated_approval_stale_epoch("T-ledger", "approval-uncontacted", 4)
+        db.reconcile_dedicated_approval_stale_epoch("T-ledger", "approval-uncontacted", 1)
             .unwrap();
-        db.reconcile_dedicated_approval_stale_epoch("T-ledger", "approval-uncontacted", 4)
+        db.reconcile_dedicated_approval_stale_epoch("T-ledger", "approval-uncontacted", 1)
             .unwrap();
         assert_eq!(
             db.conn
@@ -17673,14 +18580,14 @@ mod tests {
         db.settle_dedicated_command(
             "T-ledger",
             command.command_sequence,
-            4,
+            1,
             true,
             &serde_json::json!({"ok": true}),
         )
         .unwrap();
         db.observe_dedicated_session_state(
             "T-ledger",
-            4,
+            1,
             "turn_running",
             "idle",
             Some("turn-fixture"),
@@ -17695,24 +18602,24 @@ mod tests {
             .reserve_dedicated_session_command(NewDedicatedSessionCommand {
                 placement_thread_id: "T-ledger",
                 idempotency_key: "request-recovered",
-                worker_boot_epoch: 4,
+                worker_boot_epoch: 1,
                 command_kind: "request",
                 request_digest: &"c".repeat(64),
                 payload: &payload,
             })
             .unwrap();
-        db.mark_dedicated_command_contacted("T-ledger", recovered_command.command_sequence, 4)
+        db.mark_dedicated_command_contacted("T-ledger", recovered_command.command_sequence, 1)
             .unwrap();
         db.mark_dedicated_command_outcome_unknown(
             "T-ledger",
             recovered_command.command_sequence,
-            4,
+            1,
         )
         .unwrap();
         db.settle_recovered_dedicated_command(
             "T-ledger",
             recovered_command.command_sequence,
-            4,
+            1,
             &serde_json::json!({"redacted":true,"response_digest":"c".repeat(64)}),
         )
         .unwrap();
@@ -17720,7 +18627,7 @@ mod tests {
             .reserve_dedicated_session_command(NewDedicatedSessionCommand {
                 placement_thread_id: "T-ledger",
                 idempotency_key: "request-recovered",
-                worker_boot_epoch: 4,
+                worker_boot_epoch: 1,
                 command_kind: "request",
                 request_digest: &"c".repeat(64),
                 payload: &payload,
@@ -17734,17 +18641,17 @@ mod tests {
             .reserve_dedicated_session_command(NewDedicatedSessionCommand {
                 placement_thread_id: "T-ledger",
                 idempotency_key: "request-expiry",
-                worker_boot_epoch: 4,
+                worker_boot_epoch: 1,
                 command_kind: "events",
                 request_digest: &"a".repeat(64),
                 payload: &payload,
             })
             .unwrap();
-        db.mark_dedicated_command_contacted("T-ledger", expiry_command.command_sequence, 4)
+        db.mark_dedicated_command_contacted("T-ledger", expiry_command.command_sequence, 1)
             .unwrap();
         db.observe_dedicated_session_state(
             "T-ledger",
-            4,
+            1,
             "idle",
             "turn_running",
             None,
@@ -17755,7 +18662,7 @@ mod tests {
             placement_thread_id: "T-ledger",
             approval_id: "approval-expiry",
             worker_instance_id: "worker-ledger",
-            worker_boot_epoch: 4,
+            worker_boot_epoch: 1,
             request_digest: &"b".repeat(64),
             operation_class: "fixture",
             requested_authority: &serde_json::json!({}),
@@ -17765,7 +18672,7 @@ mod tests {
         db.observe_dedicated_session_approval_expiry(
             "T-ledger",
             "approval-expiry",
-            4,
+            1,
             &"b".repeat(64),
         )
         .unwrap();
@@ -17773,7 +18680,7 @@ mod tests {
             placement_thread_id: "T-ledger",
             approval_id: "approval-expiry-contacting",
             worker_instance_id: "worker-ledger",
-            worker_boot_epoch: 4,
+            worker_boot_epoch: 1,
             request_digest: &"d".repeat(64),
             operation_class: "fixture",
             requested_authority: &serde_json::json!({}),
@@ -17783,7 +18690,7 @@ mod tests {
         db.reserve_dedicated_session_approval_decision(
             "T-ledger",
             "approval-expiry-contacting",
-            4,
+            1,
             &"d".repeat(64),
             "fp:operator",
             &approval_decision,
@@ -17794,7 +18701,7 @@ mod tests {
         db.mark_dedicated_approval_delivery_contacting(
             "T-ledger",
             "approval-expiry-contacting",
-            4,
+            1,
             "reservation-expiry-contacting",
             &approval_decision_digest,
         )
@@ -17802,14 +18709,14 @@ mod tests {
         db.observe_dedicated_session_approval_expiry(
             "T-ledger",
             "approval-expiry-contacting",
-            4,
+            1,
             &"d".repeat(64),
         )
         .unwrap();
         db.mark_dedicated_approval_delivery_unknown(
             "T-ledger",
             "approval-expiry-contacting",
-            4,
+            1,
             "reservation-expiry-contacting",
             &approval_decision_digest,
         )
@@ -17818,7 +18725,7 @@ mod tests {
             db.settle_dedicated_approval_delivery(
                 "T-ledger",
                 "approval-expiry-contacting",
-                4,
+                1,
                 "reservation-expiry-contacting",
                 &approval_decision_digest,
             )
@@ -17844,14 +18751,14 @@ mod tests {
         db.settle_dedicated_command(
             "T-ledger",
             expiry_command.command_sequence,
-            4,
+            1,
             true,
             &serde_json::json!({"expired":true}),
         )
         .unwrap();
         db.observe_dedicated_session_state(
             "T-ledger",
-            4,
+            1,
             "turn_running",
             "idle",
             Some("turn-expiry"),
@@ -17867,7 +18774,7 @@ mod tests {
             db.reserve_dedicated_session_command(NewDedicatedSessionCommand {
                 placement_thread_id: "T-ledger",
                 idempotency_key: "request-after-revocation",
-                worker_boot_epoch: 4,
+                worker_boot_epoch: 1,
                 command_kind: "request",
                 request_digest: &"f".repeat(64),
                 payload: &payload,
@@ -21492,6 +22399,165 @@ mod tests {
             db.claim_thread_launch("t-junk", "c-new", "daemon-current")
                 .unwrap(),
             LaunchClaimOutcome::Claimed
+        );
+    }
+
+    #[test]
+    fn workspace_binding_columns_are_all_or_none_and_stale_claims_do_not_erase_membership() {
+        let (_tmp, db) = fresh_db();
+        db.insert_thread_runtime("T-borrower", "T-borrower")
+            .unwrap();
+        db.claim_thread_launch("T-borrower", "claim-old", "daemon-old")
+            .unwrap();
+        let claim = db.get_launch_claim("T-borrower").unwrap().unwrap();
+        assert!(db.conn.execute(
+            "UPDATE thread_runtime SET workspace_id='workspace' WHERE thread_id='T-borrower'", [],
+        ).is_err());
+        db.conn.execute(
+            "UPDATE thread_runtime SET workspace_id='workspace', workspace_view_identity='view',
+                    workspace_borrower_launch_owner=?1 WHERE thread_id='T-borrower'",
+            params![claim.claimed_by],
+        ).unwrap();
+        let before = db.thread_workspace_binding("T-borrower").unwrap().unwrap();
+        db.bump_resume_attempts("T-borrower").unwrap();
+        let cleared = db.clear_stale_launch_claims("daemon-current").unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].resume_budget_rearmed);
+        assert_eq!(db.get_resume_attempts("T-borrower").unwrap(), 1);
+        assert_eq!(
+            db.thread_workspace_binding("T-borrower").unwrap(),
+            Some(before)
+        );
+        assert_eq!(
+            db.workspace_members_after("workspace", "view", None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_binding_creator_uses_constructing_journal_until_ready() {
+        let (_tmp, db) = fresh_db();
+        db.insert_thread_runtime("T-creator", "T-creator").unwrap();
+        db.claim_thread_launch("T-creator", "claim-creator", "daemon-old")
+            .unwrap();
+        let claim = db.get_launch_claim("T-creator").unwrap().unwrap();
+        db.reserve_workspace("workspace", &"a".repeat(64), "/fixture-workspace")
+            .unwrap();
+        db.transition_workspace(
+            "workspace",
+            &[WorkspaceState::Reserved],
+            WorkspaceState::Constructing,
+            None,
+        )
+        .unwrap();
+        db.claim_workspace_construction("workspace", "T-creator", &claim.claimed_by)
+            .unwrap();
+        let identity = ExecutionProcessIdentity {
+            schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+            boot_id: "test-boot".to_owned(),
+            target_pid: 12345,
+            target_start_time_ticks: 10,
+            group_leader_pid: 12345,
+            group_leader_start_time_ticks: 10,
+        };
+        db.attach_workspace_creator("workspace", "T-creator", &claim.claimed_by, &identity)
+            .unwrap();
+        db.attach_workspace_creator("workspace", "T-creator", &claim.claimed_by, &identity)
+            .unwrap();
+        let mut wrong = identity.clone();
+        wrong.target_start_time_ticks += 1;
+        wrong.group_leader_start_time_ticks += 1;
+        assert!(
+            db.attach_workspace_creator("workspace", "T-creator", &claim.claimed_by, &wrong)
+                .is_err()
+        );
+        assert!(
+            db.attach_workspace_creator("workspace", "T-creator", "wrong-owner", &identity)
+                .is_err()
+        );
+        assert!(
+            db.get_runtime_info("T-creator")
+                .unwrap()
+                .unwrap()
+                .process_identity
+                .is_none()
+        );
+        assert!(
+            db.workspace("workspace")
+                .unwrap()
+                .unwrap()
+                .process_identity
+                .is_some()
+        );
+        // This call represents successful creator reap/transfer, not a reap
+        // inference from the returned Ready state.
+        db.bind_workspace(WorkspaceBinding {
+            workspace_id: "workspace",
+            thread_id: "T-creator",
+            launch_owner: Some(&claim.claimed_by),
+            backend_id: Some("native"),
+            backend_version: Some("test-build"),
+            pinned_root_identities: Some("test-pins"),
+            mount_identity: Some("created-view"),
+        })
+        .unwrap();
+        assert!(
+            db.workspace("workspace")
+                .unwrap()
+                .unwrap()
+                .process_identity
+                .is_none()
+        );
+        assert!(
+            db.attach_workspace_creator("workspace", "T-creator", &claim.claimed_by, &identity)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_binding_unsettled_creator_does_not_rearm_unattached_target_budget() {
+        let (_tmp, db) = fresh_db();
+        db.insert_thread_runtime("T-creator", "T-creator").unwrap();
+        db.claim_thread_launch("T-creator", "claim-creator", "daemon-old")
+            .unwrap();
+        let claim = db.get_launch_claim("T-creator").unwrap().unwrap();
+        db.reserve_workspace("workspace", &"a".repeat(64), "/fixture-workspace")
+            .unwrap();
+        db.transition_workspace(
+            "workspace",
+            &[WorkspaceState::Reserved],
+            WorkspaceState::Constructing,
+            None,
+        )
+        .unwrap();
+        db.claim_workspace_construction("workspace", "T-creator", &claim.claimed_by)
+            .unwrap();
+        db.attach_workspace_creator(
+            "workspace",
+            "T-creator",
+            &claim.claimed_by,
+            &ExecutionProcessIdentity {
+                schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+                boot_id: "test-boot".to_owned(),
+                target_pid: 12345,
+                target_start_time_ticks: 10,
+                group_leader_pid: 12345,
+                group_leader_start_time_ticks: 10,
+            },
+        )
+        .unwrap();
+        db.bump_resume_attempts("T-creator").unwrap();
+        let cleared = db.clear_stale_launch_claims("daemon-current").unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].resume_budget_rearmed);
+        assert!(
+            db.workspace("workspace")
+                .unwrap()
+                .unwrap()
+                .process_identity
+                .is_some()
         );
     }
 

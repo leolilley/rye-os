@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-06T08:36:43Z:405f092d629d82d8753f7529a2a12c2d24083247f0cc622d2fc812bbc7f4c55a:dse3HnAOCeeoqA4qTLO0oWf2RajuLuO0nfRCCxT+7u4ghtqahbQFuo4l62u9v/PLRiCGrKKavNKF1tf1rtpgCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T22:17:52Z:cf3bada1f6c3e18d3cb050def79ac3d944b5655df2550412ffc54facae8e7adb:b7X1pM0OeoJExI3WMyWFTOcOlGQ34rqeI1ffOOP8CC2sAxMOXclDYQin6xUM5I3ndTH7C+FdoMBYniFjAXlcBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.9.0"
+version: "1.10.0"
 ```
 
 # Source-Local Bundle Development
@@ -243,7 +243,7 @@ need implementation and isolated qualification. Do not grant nonexistent
 operations or substitute placeholder manifests to advertise them early.
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
-clean-cut isolation-adapter v6 protocol. The backend is available signed data,
+clean-cut isolation-adapter v7 protocol. The backend is available signed data,
 not ambient host setup: bundle membership does not activate it and every
 ordinary init profile remains explicitly disabled. The separately selectable
 `development` init profile maps to the existing `full` bundle set and enables
@@ -262,7 +262,7 @@ for the exact supported filesystem and symlink boundaries. Policy or runtime
 history from the prior authority contract requires explicit scoped retirement,
 not a decoder fallback or automatic install-time reset.
 
-The v6 plan carries bounded fixed-parent views, a sorted collection of
+The v7 plan carries bounded fixed-parent views, a sorted collection of
 daemon-created target channels and explicit PID-namespace and proc-filesystem
 choices. The development profile selects fresh PID-local, read-only procfs for
 ordinary compiler/executable self lookup, never the host proc mount. Lillux owns namespace, mount,
@@ -273,6 +273,16 @@ release script, project tool, Python bootstrap, or compiler-specific wrapper.
 The same source-to-target descriptor mapping is enforced when isolation is
 disabled, and the daemon side remains a typed Lillux byte-stream endpoint.
 There is no raw Unix-socket conversion escape hatch.
+
+Writable runtime workspaces use one detached view created and transferred by
+the trusted backend before its creator exits. Each child attaches a clone of
+that same view in its own isolation namespace; it does not construct another
+overlay over the parent's backing directories. The original workspace lifeline
+owns the descriptor, and the existing per-launch runtime rows retain exact
+borrower membership. Capture quiesces every writer; close/recreation require
+proved settlement, including pending dedicated-worker starts. Missing process
+attachment is not proof of no contact. This v7 source cut still requires the
+combined installed graph and worker-to-child acceptance before remote use.
 
 Per-child filesystem and network denial are data driven. The signed Tool kind
 projects composed `filesystem_authority` and `network_authority` into the
@@ -296,7 +306,7 @@ Every external-content declaration and realized entry names a mandatory
 `mount_root` and canonical relative `mount`. `project` targets the admitted
 workspace; `execution_runtime` targets a strict child of the shared sandbox
 namespace `/ryeos/realizations`. Allowed roots are signed kind/runtime data.
-The Tool contract permits both; Worker, Config, Graph and launch-content
+Tool, Worker and Config contracts permit both; Graph and launch-content
 dependency contracts currently permit project roots only. Runtime mounts use
 the existing descriptor-pinned read-only realization authority, reject mount
 and workspace overlaps, and require enforced isolation. They never use the

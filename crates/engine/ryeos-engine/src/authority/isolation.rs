@@ -55,6 +55,7 @@ pub use provenance::{
 const VERIFIED_CODE_ISOLATION_ROOT: &str = "/run/ryeos/verified-code";
 const DAEMON_PRIVATE_WORKSPACE_BACKEND_ID: &str = "ryeos-daemon-private-workspace";
 const DAEMON_PRIVATE_WORKSPACE_BACKEND_VERSION: &str = "1";
+const WORKSPACE_LIFECYCLE_TIMEOUT: lillux::time::Duration = lillux::time::Duration::from_secs(30);
 /// Engine-owned handoff from sealed descriptor paths to their verified logical
 /// identities. Runtime loaders may use the logical path for import layout and
 /// diagnostics, but must read executable bytes only from the descriptor path.
@@ -130,7 +131,7 @@ pub struct WorkspaceLifecycleEvidence {
     pub backend_id: String,
     pub backend_version: String,
     pub pinned_root_identities: BTreeMap<String, String>,
-    pub mount_identity: String,
+    pub mount_identity: Option<String>,
     pub mutations: Vec<ryeos_isolation_protocol::WorkspaceMutation>,
     pub destroyed: bool,
 }
@@ -141,6 +142,18 @@ pub struct WorkspaceLifecycleEvidence {
 pub struct PinnedWorkspaceLifecycleResult {
     pub evidence: WorkspaceLifecycleEvidence,
     pub mutation_content: Option<lillux::PinnedDirectory>,
+    /// Present exactly for Create. The explicit disabled mode is not a missing
+    /// enforced view; callers must install this outcome before publishing Ready.
+    pub created_view: Option<CreatedWorkspaceView>,
+}
+
+/// Operational result of the selected workspace backend. Only the explicitly
+/// disabled isolation runtime may produce Disabled; every enforced adapter
+/// must transfer its exact directory authority. This is not portable content.
+#[derive(Debug)]
+pub enum CreatedWorkspaceView {
+    Disabled,
+    Descriptor(lillux::InheritedDescriptorAuthority),
 }
 
 /// One descriptor-relative workspace adapter invocation. Keeping the durable
@@ -153,6 +166,9 @@ pub struct WorkspaceLifecycleInvocation<'a> {
     pub launch_owner: &'a str,
     pub base_snapshot: &'a str,
     pub project_path: &'a Path,
+    /// Exact accepted creation identity. Absent for Create or proved cleanup
+    /// of a construction which never reached a bound view; required for freeze.
+    pub mount_identity: Option<&'a str>,
 }
 
 impl std::fmt::Debug for IsolationRuntime {
@@ -629,8 +645,25 @@ struct WritableMountValidation<'a> {
 
 struct PreparedProjectWorkspace {
     workspace_id: String,
-    project: lillux::InheritedDescriptorAuthority,
-    backend_state: lillux::InheritedDescriptorAuthority,
+    view: lillux::InheritedDescriptorAuthority,
+}
+
+fn validate_workspace_view_context(
+    state: IsolationRuntimeState,
+    project: IsolationProjectAuthority,
+    view: Option<&lillux::InheritedDescriptorAuthority>,
+) -> Result<(), EngineError> {
+    let requires_view = state == IsolationRuntimeState::Enforced
+        && project == IsolationProjectAuthority::RuntimeWorkspace;
+    if requires_view != view.is_some() {
+        return Err(refused(if requires_view {
+            "enforced runtime workspace launch requires its exact retained view; lower/state reconstruction is not launch authority".to_string()
+        } else {
+            "nonworkspace or explicitly disabled launch cannot carry a retained workspace view"
+                .to_string()
+        }));
+    }
+    Ok(())
 }
 
 fn open_backend_relative_directory(
@@ -770,13 +803,54 @@ impl IsolationRuntime {
         &self,
         invocation: WorkspaceLifecycleInvocation<'_>,
     ) -> Result<PinnedWorkspaceLifecycleResult, EngineError> {
+        if invocation.operation == WorkspaceLifecycleOperation::Create {
+            return Err(refused(
+                "workspace creation requires retained view and durable creator attachment"
+                    .to_string(),
+            ));
+        }
+        self.workspace_lifecycle_pinned_with_creator(invocation, None)
+    }
+
+    /// Construct the selected backend's view using the existing held-process
+    /// owner. The callback must durably bind the exact creator's pidfd-derived
+    /// identity to the constructing workspace before allowing release. A failed
+    /// callback aborts/reaps the held creator; a later failure preserves that
+    /// recorded identity for reconciliation. No process-global view registry.
+    pub fn create_workspace(
+        &self,
+        invocation: WorkspaceLifecycleInvocation<'_>,
+        attach_creator: &dyn Fn(&lillux::ProcessAwaitingAttachment) -> Result<(), String>,
+    ) -> Result<PinnedWorkspaceLifecycleResult, EngineError> {
+        if invocation.operation != WorkspaceLifecycleOperation::Create {
+            return Err(refused(
+                "workspace creation received another operation".to_string(),
+            ));
+        }
+        self.workspace_lifecycle_pinned_with_creator(invocation, Some(attach_creator))
+    }
+
+    fn workspace_lifecycle_pinned_with_creator(
+        &self,
+        invocation: WorkspaceLifecycleInvocation<'_>,
+        attach_creator: Option<&dyn Fn(&lillux::ProcessAwaitingAttachment) -> Result<(), String>>,
+    ) -> Result<PinnedWorkspaceLifecycleResult, EngineError> {
+        let deadline = lillux::time::MonotonicDeadline::after(WORKSPACE_LIFECYCLE_TIMEOUT);
         let WorkspaceLifecycleInvocation {
             operation,
             workspace_id,
             launch_owner,
             base_snapshot,
             project_path,
+            mount_identity,
         } = invocation;
+        if (operation == WorkspaceLifecycleOperation::Create && mount_identity.is_some())
+            || (operation == WorkspaceLifecycleOperation::FreezeAndDiff && mount_identity.is_none())
+        {
+            return Err(refused(
+                "workspace lifecycle received an invalid view identity coordinate".to_string(),
+            ));
+        }
         #[cfg(not(unix))]
         {
             let _ = (
@@ -785,6 +859,9 @@ impl IsolationRuntime {
                 launch_owner,
                 base_snapshot,
                 project_path,
+                mount_identity,
+                attach_creator,
+                deadline,
             );
             return Err(refused(
                 "workspace lifecycle requires inherited Unix descriptors".to_string(),
@@ -793,12 +870,10 @@ impl IsolationRuntime {
         #[cfg(unix)]
         {
             if self.state == IsolationRuntimeState::Disabled {
-                if operation == WorkspaceLifecycleOperation::FreezeAndDiff {
-                    return Err(refused(
-                        "daemon-private workspaces use complete project recapture, not adapter delta evidence"
-                            .to_string(),
-                    ));
-                }
+                // Explicit disabled isolation uses complete project recapture
+                // at the caller. Freeze verifies its retained roots/identity;
+                // it does not manufacture a second Create incarnation or claim
+                // adapter delta evidence.
                 let project_root = lillux::PinnedDirectory::open(project_path)
                     .map_err(|error| refused(format!("pin workspace project: {error}")))?
                     .ok_or_else(|| refused("workspace project is missing".to_string()))?;
@@ -814,10 +889,21 @@ impl IsolationRuntime {
                     "project".to_string(),
                     root_identity("project", &project_root)?,
                 )]);
-                let mount_identity = format!(
-                    "daemon-private-project:{}",
-                    pinned_root_identities["project"]
-                );
+                let mount_identity = match operation {
+                    WorkspaceLifecycleOperation::Create => Some(lillux::sha256_hex(
+                        lillux::canonical_json(&serde_json::json!({
+                            "workspace_id": workspace_id,
+                            "launch_owner": launch_owner,
+                            "base_snapshot": base_snapshot,
+                            "backend_id": DAEMON_PRIVATE_WORKSPACE_BACKEND_ID,
+                            "backend_version": DAEMON_PRIVATE_WORKSPACE_BACKEND_VERSION,
+                            "pinned_root_identities": pinned_root_identities,
+                        }))
+                        .map_err(|error| refused(format!("encode workspace identity: {error}")))?
+                        .as_bytes(),
+                    )),
+                    _ => mount_identity.map(str::to_owned),
+                };
                 let evidence = WorkspaceLifecycleEvidence {
                     operation,
                     workspace_id: workspace_id.to_string(),
@@ -832,6 +918,8 @@ impl IsolationRuntime {
                 return Ok(PinnedWorkspaceLifecycleResult {
                     evidence,
                     mutation_content: None,
+                    created_view: (operation == WorkspaceLifecycleOperation::Create)
+                        .then_some(CreatedWorkspaceView::Disabled),
                 });
             }
 
@@ -910,6 +998,15 @@ impl IsolationRuntime {
                     purpose: IsolationAuthorityPurpose::WorkspaceBackendState,
                 },
             ];
+            let (mut transfer_receiver, mut transfer_child) = if operation
+                == WorkspaceLifecycleOperation::Create
+            {
+                let (receiver, child) = lillux::inherited_descriptor_transfer_pair()
+                    .map_err(|error| refused(format!("create workspace view channel: {error}")))?;
+                (Some(receiver), Some(child))
+            } else {
+                (None, None)
+            };
             let request = AdapterWorkspaceRequest {
                 protocol: IsolationAdapterProtocolVersion::Current,
                 operation,
@@ -917,6 +1014,12 @@ impl IsolationRuntime {
                 launch_owner: launch_owner.to_string(),
                 base_snapshot: base_snapshot.to_string(),
                 authorities,
+                transfer_fd: transfer_child
+                    .as_ref()
+                    .map(|child| child.inherited_descriptor())
+                    .transpose()
+                    .map_err(|error| refused(format!("inspect workspace view channel: {error}")))?,
+                mount_identity: mount_identity.map(str::to_owned),
             };
             request
                 .validate()
@@ -931,110 +1034,210 @@ impl IsolationRuntime {
             let request_handle =
                 lillux::sealed_memfd(c"ryeos-workspace-request", &request_bytes)
                     .map_err(|error| refused(format!("seal workspace request: {error}")))?;
-            let result = lillux::run(lillux::SubprocessRequest {
-                cmd: backend.adapter_handle.path().to_string_lossy().into_owned(),
-                argv0: None,
-                args: vec![
-                    "workspace".to_string(),
-                    request_handle
-                        .inherited_descriptor()
-                        .map_err(|error| {
-                            refused(format!("inspect workspace request descriptor: {error}"))
-                        })?
-                        .to_string(),
-                ],
-                cwd: Some("/".to_string()),
-                envs: Vec::new(),
-                stdin_data: None,
-                timeout: 30.0,
-                limits: Some(lillux::SubprocessLimits {
-                    max_open_files: Some(32),
-                    max_stdout_bytes: Some(
-                        ryeos_isolation_protocol::MAX_WORKSPACE_RESPONSE_BYTES as u64,
-                    ),
-                    max_stderr_bytes: Some(64 * 1024),
-                    ..lillux::SubprocessLimits::default()
-                }),
-                inherited_fds: vec![
-                    backend.adapter_handle.clone(),
-                    project,
-                    backend_state,
-                    request_handle,
-                ],
-                inherited_fd_mappings: Vec::new(),
-                supervised_status: None,
-            });
-            if !result.success {
-                return Err(refused(format!(
-                    "workspace lifecycle adapter failed: {}",
-                    result.stderr.trim()
-                )));
-            }
-            let response: AdapterWorkspaceResponse =
-                ryeos_isolation_protocol::from_json_str_strict(&result.stdout)
-                    .map_err(|error| refused(format!("decode workspace response: {error}")))?;
-            response
-                .validate_for(&request)
-                .map_err(|error| refused(format!("validate workspace response: {error}")))?;
-            if response.backend_id != backend.declaration.id
-                || response.backend_version != backend.adapter_build
-            {
-                return Err(refused(
-                    "workspace lifecycle response changed the captured backend identity"
-                        .to_string(),
-                ));
-            }
-            let root_identity =
-                |label: &str, root: &lillux::PinnedDirectory| -> Result<String, EngineError> {
-                    let (device, inode) = root.device_inode().map_err(|error| {
-                        refused(format!("inspect workspace {label} identity: {error}"))
-                    })?;
-                    Ok(format!("dev{device}-ino{inode}"))
+            let operation_result = (|| {
+                let mut launch_request = lillux::SubprocessRequest {
+                    cmd: backend.adapter_handle.path().to_string_lossy().into_owned(),
+                    argv0: None,
+                    args: vec![
+                        "workspace".to_string(),
+                        request_handle
+                            .inherited_descriptor()
+                            .map_err(|error| {
+                                refused(format!("inspect workspace request descriptor: {error}"))
+                            })?
+                            .to_string(),
+                    ],
+                    cwd: Some("/".to_string()),
+                    envs: Vec::new(),
+                    stdin_data: None,
+                    timeout: deadline.remaining().as_secs_f64(),
+                    limits: Some(lillux::SubprocessLimits {
+                        max_open_files: Some(32),
+                        max_stdout_bytes: Some(
+                            ryeos_isolation_protocol::MAX_WORKSPACE_RESPONSE_BYTES as u64,
+                        ),
+                        max_stderr_bytes: Some(64 * 1024),
+                        ..lillux::SubprocessLimits::default()
+                    }),
+                    inherited_fds: vec![
+                        backend.adapter_handle.clone(),
+                        project,
+                        backend_state,
+                        request_handle,
+                    ],
+                    inherited_fd_mappings: Vec::new(),
+                    supervised_status: None,
                 };
-            let observed_roots = BTreeMap::from([
-                (
-                    "project".to_string(),
-                    root_identity("project", &project_root)?,
-                ),
-                (
-                    "backend_state".to_string(),
-                    root_identity("backend state", &backend_state_root)?,
-                ),
-            ]);
-            if response.pinned_root_identities != observed_roots {
-                return Err(refused(
-                    "workspace adapter changed or misstated its pinned root identities".to_string(),
-                ));
-            }
-            let mutation_content = response
-                .mutation_content_root
-                .as_deref()
-                .map(|relative| {
-                    open_backend_relative_directory(&backend_state_root, relative).map_err(
-                        |error| {
-                            refused(format!(
-                                "pin adapter-declared mutation content root: {error}"
-                            ))
-                        },
+                // Zero disables the generic subprocess timeout. Expiry must refuse
+                // instead of accidentally turning this bounded control call into
+                // an unbounded adapter process.
+                if deadline.has_elapsed() || launch_request.timeout <= 0.0 {
+                    return Err(refused(
+                        "workspace lifecycle deadline expired before launch".to_string(),
+                    ));
+                }
+                if let Some(child) = &transfer_child {
+                    child.retain_for_child(&mut launch_request.inherited_fds);
+                }
+                let result = if let Some(attach_creator) = attach_creator {
+                    let held =
+                        lillux::spawn_awaiting_attachment(launch_request).map_err(|error| {
+                            refused(format!("hold workspace creator: {}", error.stderr))
+                        })?;
+                    // On callback failure the linear held owner synchronously
+                    // aborts/reaps. Before release its exact identity is durable;
+                    // a daemon crash cannot leave an untracked filesystem creator.
+                    attach_creator(&held)
+                        .map_err(|error| refused(format!("attach workspace creator: {error}")))?;
+                    held.release_after_attachment()
+                        .map_err(|error| refused(format!("release workspace creator: {error}")))?
+                        .wait()
+                } else {
+                    lillux::run(launch_request)
+                };
+                // Do not keep the peer artificially alive while receiving. The
+                // caller's original deadline covers both creator wait and receive.
+                drop(transfer_child.take());
+                if !result.success {
+                    return Err(refused(format!(
+                        "workspace lifecycle adapter failed: {}",
+                        result.stderr.trim()
+                    )));
+                }
+                let response: AdapterWorkspaceResponse =
+                    ryeos_isolation_protocol::from_json_str_strict(&result.stdout)
+                        .map_err(|error| refused(format!("decode workspace response: {error}")))?;
+                response
+                    .validate_for(&request)
+                    .map_err(|error| refused(format!("validate workspace response: {error}")))?;
+                if response.backend_id != backend.declaration.id
+                    || response.backend_version != backend.adapter_build
+                {
+                    return Err(refused(
+                        "workspace lifecycle response changed the captured backend identity"
+                            .to_string(),
+                    ));
+                }
+                let root_identity =
+                    |label: &str, root: &lillux::PinnedDirectory| -> Result<String, EngineError> {
+                        let (device, inode) = root.device_inode().map_err(|error| {
+                            refused(format!("inspect workspace {label} identity: {error}"))
+                        })?;
+                        Ok(format!("dev{device}-ino{inode}"))
+                    };
+                let observed_roots = BTreeMap::from([
+                    (
+                        "project".to_string(),
+                        root_identity("project", &project_root)?,
+                    ),
+                    (
+                        "backend_state".to_string(),
+                        root_identity("backend state", &backend_state_root)?,
+                    ),
+                ]);
+                if response.pinned_root_identities != observed_roots {
+                    return Err(refused(
+                        "workspace adapter changed or misstated its pinned root identities"
+                            .to_string(),
+                    ));
+                }
+                let created_view = if let Some(receiver) = transfer_receiver.take() {
+                    let bounds = lillux::DescriptorTransferBounds::new(
+                        ryeos_isolation_protocol::MAX_WORKSPACE_VIEW_RECEIPT_BYTES,
+                        1,
                     )
+                    .map_err(|error| refused(format!("bound workspace view receipt: {error}")))?;
+                    let packet = receiver
+                        .receive(bounds, deadline)
+                        .map_err(|error| refused(format!("receive workspace view: {error}")))?;
+                    let (bytes, mut descriptors) = packet.into_parts();
+                    validate_workspace_view_receipt(
+                        &bytes,
+                        descriptors.len(),
+                        &request,
+                        &response,
+                    )?;
+                    let view = descriptors
+                        .pop()
+                        .ok_or_else(|| refused("workspace view descriptor is missing".to_string()))?
+                        .for_child()
+                        .map_err(|error| refused(format!("retain workspace view: {error}")))?;
+                    let observed_view = view.directory_identity().map_err(|error| {
+                        refused(format!("inspect workspace view directory: {error}"))
+                    })?;
+                    let observed_digest = workspace_transfer_value_digest(
+                        serde_json::to_value(observed_view).map_err(|error| {
+                            refused(format!("encode workspace descriptor identity: {error}"))
+                        })?,
+                    )?;
+                    if response.view_descriptor_identity.as_deref()
+                        != Some(observed_digest.as_str())
+                    {
+                        return Err(refused(
+                            "workspace view differs from its received descriptor".to_string(),
+                        ));
+                    }
+                    let mount_digest = workspace_transfer_value_digest(
+                        response.mount_identity_value(&request).map_err(|error| {
+                            refused(format!("compile workspace view identity: {error}"))
+                        })?,
+                    )?;
+                    if response.mount_identity.as_deref() != Some(mount_digest.as_str()) {
+                        return Err(refused(
+                            "workspace view changed its construction incarnation".to_string(),
+                        ));
+                    }
+                    Some(CreatedWorkspaceView::Descriptor(view))
+                } else {
+                    None
+                };
+                let mutation_content = response
+                    .mutation_content_root
+                    .as_deref()
+                    .map(|relative| {
+                        open_backend_relative_directory(&backend_state_root, relative).map_err(
+                            |error| {
+                                refused(format!(
+                                    "pin adapter-declared mutation content root: {error}"
+                                ))
+                            },
+                        )
+                    })
+                    .transpose()?;
+                let evidence = WorkspaceLifecycleEvidence {
+                    operation: response.operation,
+                    workspace_id: response.workspace_id,
+                    launch_owner: response.launch_owner,
+                    backend_id: response.backend_id,
+                    backend_version: response.backend_version,
+                    pinned_root_identities: response.pinned_root_identities,
+                    mount_identity: response.mount_identity,
+                    mutations: response.mutations,
+                    destroyed: response.destroyed,
+                };
+                drop(project_root);
+                Ok(PinnedWorkspaceLifecycleResult {
+                    evidence,
+                    mutation_content,
+                    created_view,
                 })
-                .transpose()?;
-            let evidence = WorkspaceLifecycleEvidence {
-                operation: response.operation,
-                workspace_id: response.workspace_id,
-                launch_owner: response.launch_owner,
-                backend_id: response.backend_id,
-                backend_version: response.backend_version,
-                pinned_root_identities: response.pinned_root_identities,
-                mount_identity: response.mount_identity,
-                mutations: response.mutations,
-                destroyed: response.destroyed,
-            };
-            drop(project_root);
-            Ok(PinnedWorkspaceLifecycleResult {
-                evidence,
-                mutation_content,
-            })
+            })();
+            drop(transfer_child);
+            drop(transfer_receiver);
+            if operation_result.is_err() && operation == WorkspaceLifecycleOperation::Create {
+                // Completed drops may have queued SCM_RIGHTS or received-view
+                // closes behind an unrelated fork. Settle those on the EXISTING
+                // barrier, not with a new registry or an empty-slot assumption.
+                // Even successful settlement is not durable creation evidence;
+                // callers retain construction ownership on every error.
+                if let Err(error) = lillux::retain_fork_sensitive_descriptors_until(deadline) {
+                    return Err(refused(format!(
+                        "workspace creation failed and transport closure remains unproved: {error}; {}",
+                        operation_result.err().expect("checked creation failure")
+                    )));
+                }
+            }
+            operation_result
         }
     }
 
@@ -1800,6 +2003,11 @@ impl IsolationRuntime {
         // carriers. Namespace, mount, descriptor, process, and host-path
         // mechanics belong to Lillux; never add a backend-specific branch or
         // an ambient-path fallback here.
+        validate_workspace_view_context(
+            self.state,
+            context.project_authority,
+            context.workspace_view,
+        )?;
         let verified_command_authority = context
             .verified_command
             .map(|authority| authority.authority());
@@ -2373,18 +2581,6 @@ impl IsolationRuntime {
                     "runtime workspace authority cannot be cloned: {error}"
                 ))
             })?;
-            let backend_state = expected_root
-                .open_child_directory(std::ffi::OsStr::new(
-                    crate::execution_workspace::BACKEND_STATE_DIR,
-                ))
-                .map_err(|error| {
-                    refused(format!(
-                        "runtime workspace backend state cannot be opened: {error}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    refused("runtime workspace backend state disappeared".to_string())
-                })?;
             let workspace_id = workspace_name
                 .to_str()
                 .ok_or_else(|| refused("runtime workspace id is not UTF-8".to_string()))?
@@ -2394,14 +2590,12 @@ impl IsolationRuntime {
                 Some(handle.clone()),
                 Some(PreparedProjectWorkspace {
                     workspace_id,
-                    project: handle,
-                    backend_state: backend_state.inherited_descriptor_authority().map_err(
-                        |error| {
-                            refused(format!(
-                                "runtime workspace backend state cannot be cloned: {error}"
-                            ))
-                        },
-                    )?,
+                    view: context
+                        .workspace_view
+                        .ok_or_else(|| {
+                            refused("enforced workspace lacks its retained view".to_string())
+                        })?
+                        .clone(),
                 }),
             )
         } else if context.project_authority == IsolationProjectAuthority::EphemeralScratch {
@@ -3298,34 +3492,34 @@ impl IsolationRuntime {
         };
 
         let project_workspace_plan = if let Some(workspace) = project_workspace {
-            let project = IsolationAuthorityId::new("workspace-project")
+            let view = IsolationAuthorityId::new("workspace-view")
                 .map_err(|error| refused(error.to_string()))?;
-            let backend_state = IsolationAuthorityId::new("workspace-backend-state")
-                .map_err(|error| refused(error.to_string()))?;
-            for (id, handle, purpose) in [
-                (
-                    project.clone(),
-                    workspace.project,
-                    IsolationAuthorityPurpose::WorkspaceProject,
-                ),
-                (
-                    backend_state.clone(),
-                    workspace.backend_state,
-                    IsolationAuthorityPurpose::WorkspaceBackendState,
-                ),
-            ] {
-                let inherited_fd = inherited_fd(&handle)?;
-                authorities.push(IsolationAuthority {
-                    id,
-                    inherited_fd,
-                    purpose,
-                });
-                authority_handles.push(handle);
-            }
+            let descriptor_identity = workspace
+                .view
+                .directory_identity()
+                .map_err(|error| refused(format!("identify exact workspace view: {error}")))?;
+            let identity_value = serde_json::to_value(descriptor_identity).map_err(|error| {
+                refused(format!("encode workspace descriptor identity: {error}"))
+            })?;
+            let view_descriptor_identity = lillux::sha256_hex(
+                lillux::canonical_json(&identity_value)
+                    .map_err(|error| {
+                        refused(format!(
+                            "canonicalize workspace descriptor identity: {error}"
+                        ))
+                    })?
+                    .as_bytes(),
+            );
+            authorities.push(IsolationAuthority {
+                id: view.clone(),
+                inherited_fd: inherited_fd(&workspace.view)?,
+                purpose: IsolationAuthorityPurpose::WorkspaceView,
+            });
+            authority_handles.push(workspace.view);
             Some(IsolationProjectWorkspace {
                 workspace_id: workspace.workspace_id,
-                project,
-                backend_state,
+                view,
+                view_descriptor_identity,
                 destination: IsolationPath::new(project_destination.to_string_lossy().into_owned())
                     .map_err(|error| refused(error.to_string()))?,
             })
@@ -5091,6 +5285,59 @@ fn load_policy_source(app_root: &Path) -> Result<LoadedIsolationPolicy, EngineEr
     })
 }
 
+fn workspace_transfer_value_digest(value: serde_json::Value) -> Result<String, EngineError> {
+    Ok(lillux::sha256_hex(
+        lillux::canonical_json(&value)
+            .map_err(|error| refused(format!("encode workspace view identity: {error}")))?
+            .as_bytes(),
+    ))
+}
+
+/// Pure correlation check shared by the real bounded packet receive path and
+/// its tests. This is not descriptor adoption or mount identity proof: the
+/// caller must still retain and inspect the actual received authority.
+fn validate_workspace_view_receipt(
+    bytes: &[u8],
+    descriptor_count: usize,
+    request: &AdapterWorkspaceRequest,
+    response: &AdapterWorkspaceResponse,
+) -> Result<(), EngineError> {
+    let receipt: ryeos_isolation_protocol::WorkspaceViewTransferReceipt =
+        ryeos_isolation_protocol::from_json_slice_strict(bytes)
+            .map_err(|error| refused(format!("decode workspace view receipt: {error}")))?;
+    receipt
+        .validate()
+        .map_err(|error| refused(format!("validate workspace view receipt: {error}")))?;
+    let canonical_receipt = lillux::canonical_json(
+        &serde_json::to_value(&receipt)
+            .map_err(|error| refused(format!("encode view receipt: {error}")))?,
+    )
+    .map_err(|error| refused(format!("canonicalize view receipt: {error}")))?;
+    if canonical_receipt.as_bytes() != bytes {
+        return Err(refused(
+            "workspace view receipt is not canonical".to_string(),
+        ));
+    }
+    let request_digest = workspace_transfer_value_digest(
+        serde_json::to_value(request)
+            .map_err(|error| refused(format!("encode workspace request: {error}")))?,
+    )?;
+    let response_digest = workspace_transfer_value_digest(
+        serde_json::to_value(response)
+            .map_err(|error| refused(format!("encode workspace response: {error}")))?,
+    )?;
+    if receipt.protocol != request.protocol
+        || receipt.request_digest != request_digest
+        || receipt.response_digest != response_digest
+        || descriptor_count != 1
+    {
+        return Err(refused(
+            "workspace view receipt changed its exact invocation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn refused(reason: String) -> EngineError {
     EngineError::IsolationPolicyRefused { reason }
 }
@@ -5103,6 +5350,131 @@ mod tests {
         IsolationBackendSelection, IsolationCapability,
     };
     use std::collections::BTreeSet;
+
+    fn workspace_receipt_fixture() -> (
+        AdapterWorkspaceRequest,
+        AdapterWorkspaceResponse,
+        ryeos_isolation_protocol::WorkspaceViewTransferReceipt,
+    ) {
+        let request = AdapterWorkspaceRequest {
+            protocol: IsolationAdapterProtocolVersion::Current,
+            operation: WorkspaceLifecycleOperation::Create,
+            workspace_id: "receipt-fixture".to_owned(),
+            launch_owner: "{\"attempt\":1}".to_owned(),
+            base_snapshot: "a".repeat(64),
+            authorities: vec![
+                IsolationAuthority {
+                    id: IsolationAuthorityId::new("project").unwrap(),
+                    inherited_fd: 10,
+                    purpose: IsolationAuthorityPurpose::WorkspaceProject,
+                },
+                IsolationAuthority {
+                    id: IsolationAuthorityId::new("backend").unwrap(),
+                    inherited_fd: 11,
+                    purpose: IsolationAuthorityPurpose::WorkspaceBackendState,
+                },
+            ],
+            transfer_fd: Some(12),
+            mount_identity: None,
+        };
+        let mut response = AdapterWorkspaceResponse {
+            protocol: request.protocol,
+            operation: request.operation,
+            workspace_id: request.workspace_id.clone(),
+            launch_owner: request.launch_owner.clone(),
+            backend_id: "fixture".to_owned(),
+            backend_version: "1".to_owned(),
+            pinned_root_identities: BTreeMap::from([
+                ("project".to_owned(), "dev1-ino10".to_owned()),
+                ("backend_state".to_owned(), "dev1-ino11".to_owned()),
+            ]),
+            mount_identity: None,
+            view_descriptor_identity: Some("b".repeat(64)),
+            mutation_content_root: None,
+            mutations: Vec::new(),
+            destroyed: false,
+        };
+        response.mount_identity = Some(
+            workspace_transfer_value_digest(response.mount_identity_value(&request).unwrap())
+                .unwrap(),
+        );
+        request.validate().unwrap();
+        response.validate_for(&request).unwrap();
+        let receipt = ryeos_isolation_protocol::WorkspaceViewTransferReceipt {
+            protocol: request.protocol,
+            request_digest: workspace_transfer_value_digest(
+                serde_json::to_value(&request).unwrap(),
+            )
+            .unwrap(),
+            response_digest: workspace_transfer_value_digest(
+                serde_json::to_value(&response).unwrap(),
+            )
+            .unwrap(),
+        };
+        (request, response, receipt)
+    }
+
+    #[test]
+    fn workspace_receipt_accepts_only_the_unchanged_exact_invocation() {
+        let (request, response, receipt) = workspace_receipt_fixture();
+        let bytes = lillux::canonical_json(&serde_json::to_value(receipt).unwrap()).unwrap();
+        validate_workspace_view_receipt(bytes.as_bytes(), 1, &request, &response).unwrap();
+        let mut changed_request = request.clone();
+        changed_request.transfer_fd = Some(13);
+        assert!(
+            validate_workspace_view_receipt(bytes.as_bytes(), 1, &changed_request, &response)
+                .is_err()
+        );
+        let mut changed_response = response.clone();
+        changed_response.view_descriptor_identity = Some("c".repeat(64));
+        assert!(
+            validate_workspace_view_receipt(bytes.as_bytes(), 1, &request, &changed_response)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_receipt_refuses_wrong_digests_or_descriptor_count() {
+        let (request, response, receipt) = workspace_receipt_fixture();
+        let value = serde_json::to_value(receipt).unwrap();
+        let bytes = lillux::canonical_json(&value).unwrap();
+        for count in [0, 2] {
+            assert!(
+                validate_workspace_view_receipt(bytes.as_bytes(), count, &request, &response)
+                    .is_err()
+            );
+        }
+        for field in ["request_digest", "response_digest"] {
+            let mut changed = value.clone();
+            changed[field] = serde_json::Value::String("d".repeat(64));
+            let changed = lillux::canonical_json(&changed).unwrap();
+            assert!(
+                validate_workspace_view_receipt(changed.as_bytes(), 1, &request, &response)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_receipt_refuses_noncanonical_or_unknown_fields() {
+        let (request, response, receipt) = workspace_receipt_fixture();
+        let mut value = serde_json::to_value(receipt).unwrap();
+        let pretty = serde_json::to_vec_pretty(&value).unwrap();
+        assert!(
+            validate_workspace_view_receipt(&pretty, 1, &request, &response)
+                .unwrap_err()
+                .to_string()
+                .contains("not canonical")
+        );
+        value["unexpected"] = serde_json::Value::Bool(true);
+        let unknown = lillux::canonical_json(&value).unwrap();
+        assert!(
+            validate_workspace_view_receipt(unknown.as_bytes(), 1, &request, &response)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+    }
 
     #[cfg(unix)]
     fn resolved_backend() -> ResolvedIsolationBackend {
@@ -5502,6 +5874,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: app_root.path(),
                     project_authority: IsolationProjectAuthority::ReadOnly,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -5584,6 +5957,7 @@ mod tests {
             .apply_with_provenance(
                 request,
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: app_root.path(),
                     project_authority: IsolationProjectAuthority::ReadOnly,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -5648,6 +6022,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::ReadOnly,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -5750,6 +6125,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::External,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -5867,6 +6243,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::EphemeralScratch,
                     filesystem_authority_ceiling:
@@ -5952,6 +6329,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::External,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6069,6 +6447,7 @@ mod tests {
         let error = match runtime.apply(
             request,
             IsolationLaunchContext {
+                workspace_view: None,
                 project_path: app_root.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
                 filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6122,6 +6501,7 @@ mod tests {
         let error = match runtime.apply(
             request,
             IsolationLaunchContext {
+                workspace_view: None,
                 project_path: app_root.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
                 filesystem_authority_ceiling:
@@ -6175,6 +6555,7 @@ mod tests {
         let error = match runtime.apply(
             request,
             IsolationLaunchContext {
+                workspace_view: None,
                 project_path: app_root.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
                 filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6220,16 +6601,28 @@ mod tests {
             .path()
             .join(crate::execution_workspace::PROJECT_DIR);
         let base_snapshot = "a".repeat(64);
-        let invocation = |operation| WorkspaceLifecycleInvocation {
+        let invocation = |operation, mount_identity| WorkspaceLifecycleInvocation {
             operation,
             workspace_id: "native-cow",
             launch_owner: "{\"attempt\":1}",
             base_snapshot: &base_snapshot,
             project_path: &project,
+            mount_identity,
         };
+        assert!(
+            runtime
+                .workspace_lifecycle(invocation(WorkspaceLifecycleOperation::Create, None))
+                .unwrap_err()
+                .to_string()
+                .contains("workspace creation requires retained view")
+        );
         let created = runtime
-            .workspace_lifecycle(invocation(WorkspaceLifecycleOperation::Create))
-            .unwrap();
+            .create_workspace(
+                invocation(WorkspaceLifecycleOperation::Create, None),
+                &|_| panic!("explicit disabled isolation must not spawn a creator"),
+            )
+            .unwrap()
+            .evidence;
         assert_eq!(created.backend_id, DAEMON_PRIVATE_WORKSPACE_BACKEND_ID);
         assert_eq!(
             created
@@ -6241,13 +6634,14 @@ mod tests {
         );
         assert!(!workspace.path().join("backend-state").exists());
         assert!(!created.destroyed);
-        assert!(
-            runtime
-                .workspace_lifecycle(invocation(WorkspaceLifecycleOperation::FreezeAndDiff))
-                .unwrap_err()
-                .to_string()
-                .contains("complete project recapture")
-        );
+        let frozen = runtime
+            .workspace_lifecycle(invocation(
+                WorkspaceLifecycleOperation::FreezeAndDiff,
+                created.mount_identity.as_deref(),
+            ))
+            .unwrap();
+        assert_eq!(frozen.mount_identity, created.mount_identity);
+        assert!(frozen.mutations.is_empty());
 
         let compiled = runtime
             .apply(
@@ -6265,6 +6659,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: &project,
                     project_authority: IsolationProjectAuthority::RuntimeWorkspace,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6292,7 +6687,10 @@ mod tests {
         assert!(lillux::run(compiled).success);
 
         let destroyed = runtime
-            .workspace_lifecycle(invocation(WorkspaceLifecycleOperation::Destroy))
+            .workspace_lifecycle(invocation(
+                WorkspaceLifecycleOperation::Destroy,
+                created.mount_identity.as_deref(),
+            ))
             .unwrap();
         assert!(destroyed.destroyed);
         assert_eq!(destroyed.mount_identity, created.mount_identity);
@@ -6307,6 +6705,7 @@ mod tests {
             authorized_write_namespaces: vec!["project".to_string()],
         };
         let context = IsolationLaunchContext {
+            workspace_view: None,
             project_path: app_root.path(),
             project_authority: IsolationProjectAuthority::External,
             filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6363,6 +6762,7 @@ mod tests {
             supervised_status: Some(status.reader),
         };
         let context = IsolationLaunchContext {
+            workspace_view: None,
             project_path: app_root.path(),
             project_authority: IsolationProjectAuthority::External,
             filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6410,6 +6810,7 @@ mod tests {
             authorized_write_namespaces: vec!["project".to_string()],
         };
         let context = |live_access| IsolationLaunchContext {
+            workspace_view: None,
             project_path: app_root.path(),
             project_authority: IsolationProjectAuthority::External,
             filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6465,7 +6866,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_runtime_still_rejects_runtime_workspace_authority() {
+    fn disabled_runtime_rejects_an_ambient_path_claimed_as_a_runtime_workspace() {
         let app_root = tempfile::tempdir().unwrap();
         write_policy(app_root.path(), &IsolationPolicy::disabled_for_authoring());
         let runtime = IsolationRuntime::load(app_root.path()).unwrap();
@@ -6485,6 +6886,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    workspace_view: None,
                     project_path: app_root.path(),
                     project_authority: IsolationProjectAuthority::RuntimeWorkspace,
                     filesystem_authority_ceiling: IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -6505,12 +6907,45 @@ mod tests {
                 },
             )
             .err()
-            .expect("runtime workspace must be rejected when isolation is disabled");
+            .expect("an ambient app root is not a daemon-owned runtime workspace");
         assert!(
             error
                 .to_string()
-                .contains("durable project execution requires an enforced isolation backend")
+                .contains("runtime workspace project is not the canonical project child"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn only_enforced_runtime_workspace_requires_exact_retained_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let view = lillux::PinnedDirectory::open(directory.path())
+            .unwrap()
+            .unwrap()
+            .inherited_descriptor_authority()
+            .unwrap();
+        for state in [
+            IsolationRuntimeState::Disabled,
+            IsolationRuntimeState::Enforced,
+        ] {
+            for project in [
+                IsolationProjectAuthority::External,
+                IsolationProjectAuthority::RuntimeWorkspace,
+                IsolationProjectAuthority::EphemeralScratch,
+                IsolationProjectAuthority::ReadOnly,
+            ] {
+                let requires_view = state == IsolationRuntimeState::Enforced
+                    && project == IsolationProjectAuthority::RuntimeWorkspace;
+                assert_eq!(
+                    validate_workspace_view_context(state, project, None).is_err(),
+                    requires_view
+                );
+                assert_eq!(
+                    validate_workspace_view_context(state, project, Some(&view)).is_ok(),
+                    requires_view
+                );
+            }
+        }
     }
 
     #[test]
