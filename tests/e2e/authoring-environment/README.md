@@ -34,11 +34,20 @@ sed editing, search, diff/patch and scratch Git in private tmpfs with no network
 or host libraries. The exact edited-file hash is required, not just exit zero.
 Docker belongs to this independent probe only; no production Tool contacts it.
 
-`selection.json` preserves the independently reproduced artifact selection and
-empty-root evidence. Expected manifests are computed from the selected bytes
-using the existing manifest recipe; they are **not** node import/binding receipts.
-Its false production/import/binding/hosted-turn/restart gates remain false until
-those operations actually pass through RyeOS on a coherent signed generation.
+`selection.json` preserves the independently reproduced artifact selection,
+empty-root evidence and separately identified admitted-production observations.
+Expected manifests are computed from selected bytes; observed imports instead
+come from exact completed-thread retained results through the normal CLI.
+Admitted preparation, single-root assembly and all four manifest imports passed
+on 2026-09-06. These are not independent admitted verification, final consumer
+binding, a hosted turn or restart qualification. The cumulative `ryeos_production`
+gate remains false until admitted verification passes as well.
+
+Do not qualify inline assembly/verification against the current native backend:
+the live parent and inline child would mount separate overlays over the same
+upper/work directories. The generic workspace owner must first provide one
+retained merged view and transitive borrower freeze/cleanup fencing. A passing
+standalone kernel-mechanics probe does not establish those runtime contracts.
 
 The complete source/input trees require large-content authority. The original
 utility binary and corresponding-source archives remain exact historical inputs;

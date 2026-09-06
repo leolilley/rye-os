@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T07:07:52Z:d0523f0f0491400d9b1b4e1befae6dbb0b3c1354f55135a2fa19c46acbc6c879:bU+R2Av//sK29pE0JLv9HnHlHvrVgX0L9XCiaIbVWEX/fXZMPXJ4rpCwV8pjVVOqc6fUkTsiqfKSbE8CY1qQCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T08:36:43Z:4ad6b7c623fd1fc247825c8a5c3470f3db429edd67de523b395be779e6d602de:YmLI3M08UpHpIydoQZjovJXzXR5G099zbYTQ0qitg+rha49MwCz4ajVCPJcGV/UqkTJyS9rFq8JihRMj3Z7dBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/development
 tags: [development, authoring, external-content, production]
@@ -100,11 +100,22 @@ is introduced. The existing content manifest and target-local binding remain
 the materialization/authority owners.
 
 Artifact-only reproduction and an offline empty-root probe have passed.
-`tests/e2e/authoring-environment/selection.json` records their exact selection
-and distinguishes expected manifests from actual node receipts. Full admitted
-production, import/bind/restart and real hosted candidate qualification must
-still pass on a coherent signed generation. Direct Python execution of the
-same source is a byte-reproduction check, not admitted Tool execution evidence.
+Admitted preparation and single-root assembly also passed on 2026-09-06, with
+no operator vault or network access. Exact completed-thread result imports
+matched all four selected manifests: prepared inputs, runtime environment,
+complete production output and shell file. Project HEAD remained unchanged.
+`tests/e2e/authoring-environment/selection.json` retains the exact thread,
+capsule, result and import coordinates, separately from the expected pins.
+
+Independent admitted verification, final Worker/Config bindings, restart and
+real hosted candidate qualification remain gates. In particular, the current
+native backend must not qualify an inline assemble/verify graph: its per-launch
+overlay creation would overlap the live parent's upper/work directories.
+The existing generic workspace owner needs one retained merged view and exact
+transitive borrower freeze/cleanup fencing first. A standalone kernel proof
+of detached mount sharing is not runtime integration or worker acceptance.
+Direct Python execution is byte-reproduction evidence, not admitted Tool
+execution evidence, and a successful assembly is not independent qualification.
 
 ## Utility-build dependency gate
 

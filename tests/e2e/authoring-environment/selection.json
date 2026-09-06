@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "artifact": "ryeos-authoring-environment-v1-x86_64-linux",
-  "identity_basis": "source-level assembly and independent reproduction; expected manifests are not node receipts",
+  "identity_basis": "source-level independent reproduction plus admitted prepare/assemble and exact retained-result imports; expected pins and observed node receipts remain distinct",
   "input_contract_sha256": "88e99105df613be12870b3ff6283af77c36d78075d741595a4d028c048a5f946",
   "input_files": 107,
   "input_bytes": 139930117,
@@ -18,11 +18,58 @@
   "qualification": {
     "independent_reproduction": true,
     "offline_empty_root": true,
+    "admitted_prepare": true,
+    "admitted_assemble": true,
+    "admitted_verify": false,
     "ryeos_production": false,
-    "retained_result_import": false,
+    "retained_result_import": true,
     "consumer_binding": false,
     "hosted_turn": false,
     "restart": false
+  },
+  "admitted_production_evidence": {
+    "date": "2026-09-06",
+    "node_fingerprint": "0db14ae10fa3e060d175a9ebdd975f4041b0a3a271c99078436a4a4b0e533f60",
+    "source_snapshot_hash": "c6a82ca90f7dbefcd515498e92c564cb7d616505c75cc2f32b02d44d58d7daba",
+    "source_head_advanced": false,
+    "prepare": {
+      "thread_id": "T-b3f99e91-889c-3385-a7f2-c2afc89189bb",
+      "capsule_hash": "d28d3498f380693b78407b02b33a658e3a44c7653943703540d3e66d1ea150d6",
+      "result_snapshot_hash": "d7c239c4f9ad14a256eceda7e87d61370418c52261d8a48883e6a35dffc0cea1",
+      "outcome_code": "exit:0"
+    },
+    "assemble": {
+      "thread_id": "T-f552714a-8e0f-6108-c77b-cd60d5735a4a",
+      "capsule_hash": "79ed2f0be57e8c9bc14f10db4548fc29b5653b5160bdbe82dc096032beb55ed7",
+      "result_snapshot_hash": "bea84a8bd2f3a134fa74afe309a413db235acb86407c430fa14ad5de094fc50d",
+      "outcome_code": "exit:0"
+    },
+    "observed_imports": {
+      "assembly_inputs": {
+        "manifest_hash": "cc090b3d53dd41c0351dcd5ea7a18bfd4e37957ae5738569039b9b88ffd9ff80",
+        "request_digest": "03d1b7f64e72ebff01bd711c47163ae2c349a13d307d83ccbaf7bce2477fdcf6",
+        "entry_count": 133,
+        "total_bytes": 139930117
+      },
+      "environment": {
+        "manifest_hash": "1ca7a7fe9ecc1d19c38c986ba9df435ff7bbe6d4ba020f2643564b8bba0c84e6",
+        "request_digest": "a8dbe3e83aabe5bbe82838c980a2a5229048dd8fefbce1ac9dee190d9af86e78",
+        "entry_count": 108,
+        "total_bytes": 19851979
+      },
+      "production": {
+        "manifest_hash": "31852861af3ec0384240611b8675ea600ae7d93b76cf6c5c1451276e0f7bd49c",
+        "request_digest": "fcdcea4f3ade2e2b938f80dd3b5d2e0076463c443a57f7b3fb2cfda8d828bafc",
+        "entry_count": 124,
+        "total_bytes": 135151248
+      },
+      "shell_file": {
+        "manifest_hash": "f609633ef39f5458263e6150590d889c044d590b702333fca82584057b1fc7c4",
+        "request_digest": "6bf1fd2a27d4646c4d44883fb6bed6dc46ad09092c9a875fd4d56a43ea29eb7f",
+        "entry_count": 1,
+        "total_bytes": 927249
+      }
+    }
   },
   "empty_root_probe": {
     "image_id": "sha256:37df3db95c2b91caf72c28f029ebfa79c7f70ca030d49af6935188c4b032bbbf",

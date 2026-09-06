@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T07:07:52Z:95bd70c7483071b099ff7376d959bace4ee4266197c7b1c92c5207a7e9ca0503:rzLrU9dmIgulwn7xeV6pkk1arv09dG5Q/x3GLxjC+iQVGOyaLlY4qPN1QnJeH1hUSx6qWWg6hNIOhPekZETPBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T08:36:43Z:405f092d629d82d8753f7529a2a12c2d24083247f0cc622d2fc812bbc7f4c55a:dse3HnAOCeeoqA4qTLO0oWf2RajuLuO0nfRCCxT+7u4ghtqahbQFuo4l62u9v/PLRiCGrKKavNKF1tf1rtpgCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -210,6 +210,15 @@ alone do not prove that the pinned Cargo accepted the format, produced the
 required closure, or that repository build/test qualification passed. No
 dependency manifest or build/test grant is invented before those gates.
 
+Admitted isolated vendoring and exact retained-result import passed on
+2026-09-06. Thread `T-137fee28-f0e1-afe6-5baf-e0acd428e682` completed with
+`exit:0`; result snapshot
+`8af6287a6eb131a36ef6b59f22aa1d4926dcac71f0b4ef137a7c36e26923907f`
+retains `products/cargo-vendor`. Its observed large-content manifest is
+`8dac785a06faad238b3210c79ba3ca7bee37dc211fe0e95acf80dff6500a75ac`
+(25,804 entries / 575,879,606 bytes). This is a real input-production receipt,
+not evidence that repository check/build/test operations have passed.
+
 The upstream contracts are [Cargo source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)
 and [cargo vendor](https://doc.rust-lang.org/cargo/commands/cargo-vendor.html).
 
@@ -228,9 +237,10 @@ The client digest names the measured local development artifact from revision
 `e0fd43c89`, not a published release. It must be replaced with the exact released
 artifact when release qualification reaches that gate. Source composition
 checks are not evidence of target-local bindings or a successful worker call.
-Cargo dependency production and check/build/test routes are still pending real
-input production; do not grant nonexistent operations or substitute placeholder
-manifest hashes to advertise them early.
+Cargo dependency production now has an observed manifest. Finite check/build/
+test Tools, their exact target-local bindings and workload-client grants still
+need implementation and isolated qualification. Do not grant nonexistent
+operations or substitute placeholder manifests to advertise them early.
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
 clean-cut isolation-adapter v6 protocol. The backend is available signed data,
