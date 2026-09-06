@@ -15,6 +15,8 @@ use crate::handler_context::HandlerContext;
 use crate::node_policy::sections::object_closure::NodeObjectClosurePolicy;
 use crate::state::AppState;
 
+mod retained_result;
+
 const BINDING_HEAD_NAMESPACE: &str = ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE;
 
 /// Retire every predecessor external-content binding head while the node is
@@ -44,7 +46,7 @@ pub fn discard_binding_heads_offline(
     state.discard_external_content_binding_heads(&guard, dry_run)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportShape {
     File,
@@ -63,8 +65,31 @@ pub enum ImportStorage {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImportRequest {
+pub struct FilesystemImportRequest {
     pub root: String,
+    pub path: String,
+    pub shape: ImportShape,
+    pub storage: ImportStorage,
+    pub maximum_bytes: u64,
+    #[serde(default)]
+    pub expected_file_sha256: Option<String>,
+}
+
+/// Source selection is explicit and closed. Neither a snapshot hash nor a
+/// named root can be substituted for the other source's authorization.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImportRequest {
+    Filesystem(FilesystemImportRequest),
+    RetainedResult(RetainedResultImportRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedResultImportRequest {
+    pub chain_root_id: String,
+    pub thread_id: String,
+    pub result_project_snapshot_hash: String,
     pub path: String,
     pub shape: ImportShape,
     pub storage: ImportStorage,
@@ -195,6 +220,17 @@ pub async fn import(
     state: Arc<AppState>,
     context: HandlerContext,
     request: ImportRequest,
+) -> anyhow::Result<ImportResponse> {
+    match request {
+        ImportRequest::Filesystem(request) => import_filesystem(state, context, request).await,
+        ImportRequest::RetainedResult(request) => retained_result::import(state, context, request),
+    }
+}
+
+async fn import_filesystem(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    request: FilesystemImportRequest,
 ) -> anyhow::Result<ImportResponse> {
     let operator_fingerprint =
         crate::operator_authority::require_local_configured_operator(&state, &context)?;
@@ -351,7 +387,7 @@ pub fn import_managed_activation_component(
     >()?;
     let policy = import_policy.managed_activation.require_enabled()?;
     activation.document.validate_portable()?;
-    let request = ImportRequest {
+    let request = FilesystemImportRequest {
         root: "managed-activation-staging".to_owned(),
         path: staged_name.to_owned(),
         shape: match component.declaration_kind {
@@ -816,7 +852,10 @@ async fn bind_authorized(
         operator_fingerprint,
         authorizer_grant_digest,
     )?;
-    let binding_hash = stage.store_object(&guard, &cas, &binding.to_value()?)?;
+    // The shared CAS guard protects synchronous writes until a complete root
+    // is published. Never root a not-yet-written object, nor duplicate its
+    // transitive closure in the upload receipt: GC already follows typed edges.
+    let binding_hash = cas.store_object(&binding.to_value()?)?;
     let binding_closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
         &cas,
         [binding_hash.clone()],
@@ -828,14 +867,10 @@ async fn bind_authorized(
     if !binding_closure.is_complete() {
         bail!("external-content binding closure is incomplete");
     }
-    stage.protect_cas_closure(
-        &guard,
-        binding_closure.object_hashes.iter().map(String::as_str),
-        binding_closure.blob_hashes.iter().map(String::as_str),
-    )?;
     for hash in &binding_closure.large_object_hashes {
         stage.ensure_protects_large_object(hash)?;
     }
+    stage.protect_cas_closure(&guard, [binding_hash.as_str()], std::iter::empty())?;
     debug_assert!(closure.object_hashes.contains(&request.manifest_hash));
 
     let signer = crate::state_store::NodeIdentitySigner::from_identity(&state.identity);
@@ -1276,7 +1311,7 @@ struct ResolvedConsumer {
 
 #[allow(clippy::too_many_arguments)]
 fn capture_content_import(
-    request: &ImportRequest,
+    request: &FilesystemImportRequest,
     limits: &crate::node_policy::sections::external_content::ExternalContentImportLimits,
     source_root: &lillux::PinnedDirectory,
     root_device: u64,
@@ -1297,7 +1332,7 @@ fn capture_content_import(
     )?;
     let capture_policy =
         ryeos_state::ExternalCapturePolicy::new(request.path.clone(), configured_ignore)?;
-    let mut sink = DurableContentSink { guard, cas, stage };
+    let mut sink = DurableContentSink { _guard: guard, cas };
     let manifest = match request.shape {
         ImportShape::Tree => {
             let target = open_admitted_source_tree(source_root, &request.path, root_device)?;
@@ -1338,15 +1373,14 @@ fn capture_content_import(
             manifest
         }
     };
-    let manifest_hash = sink
-        .stage
-        .store_object(guard, cas, &serde_json::to_value(&manifest)?)?;
+    let manifest_hash = cas.store_object(&serde_json::to_value(&manifest)?)?;
     let verified = ryeos_state::VerifiedExternalContentClosure::load(cas, &manifest_hash)?;
     if verified.manifest() != &manifest {
         bail!("stored content manifest differs from captured value");
     }
+    stage.protect_cas_closure(guard, [manifest_hash.as_str()], std::iter::empty())?;
     Ok(ImportResponse {
-        staging_id: sink.stage.staging_id().to_owned(),
+        staging_id: stage.staging_id().to_owned(),
         request_digest,
         manifest_hash,
         manifest_kind: ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND.to_owned(),
@@ -1357,7 +1391,7 @@ fn capture_content_import(
 
 #[allow(clippy::too_many_arguments)]
 fn capture_large_import(
-    request: &ImportRequest,
+    request: &FilesystemImportRequest,
     limits: &crate::node_policy::sections::external_content::ExternalContentImportLimits,
     source_root: &lillux::PinnedDirectory,
     root_device: u64,
@@ -1415,12 +1449,14 @@ fn capture_large_import(
             sink.stage.ensure_protects_large_object(file_sha256)?;
         }
     }
-    let manifest_hash = sink.stage.store_object(guard, cas, &manifest.to_value()?)?;
+    let manifest_hash = cas.store_object(&manifest.to_value()?)?;
     let loaded = ryeos_state::objects::load_if_large_content_manifest(cas, &manifest_hash)?
         .ok_or_else(|| anyhow::anyhow!("stored large-content manifest changed kind"))?;
     if loaded != manifest {
         bail!("stored large-content manifest differs from captured value");
     }
+    sink.stage
+        .protect_cas_closure(guard, [manifest_hash.as_str()], std::iter::empty())?;
     Ok(ImportResponse {
         staging_id: sink.stage.staging_id().to_owned(),
         request_digest,
@@ -1481,9 +1517,10 @@ fn open_admitted_source_tree(
 }
 
 struct DurableContentSink<'a> {
-    guard: &'a ryeos_state::CasMutationGuard,
+    // This synchronous capture has no per-file acknowledgement. The guard
+    // excludes GC until the verified completed manifest is durably rooted.
+    _guard: &'a ryeos_state::CasMutationGuard,
     cas: &'a lillux::CasStore,
-    stage: &'a mut ryeos_state::DurableCasUploadStage,
 }
 
 impl ryeos_state::ExternalContentBlobSink for DurableContentSink<'_> {
@@ -1501,11 +1538,6 @@ impl ryeos_state::ExternalContentBlobSink for DurableContentSink<'_> {
         if outcome.size != expected_size {
             bail!("external-content source file changed size during capture");
         }
-        self.stage.protect_cas_closure(
-            self.guard,
-            std::iter::empty(),
-            std::iter::once(outcome.hash.as_str()),
-        )?;
         Ok((outcome.hash, outcome.size))
     }
 }
@@ -1684,13 +1716,16 @@ impl ryeos_state::ExternalLargeContentSink for DurableLargeSink<'_> {
         if bytes.len() as u64 != expected_size {
             bail!("large-content file {relative_path} changed size during CAS ingest");
         }
-        let hash = self.stage.store_blob(self.guard, self.cas, &bytes)?;
+        // Like ordinary content capture, the held guard protects these bytes
+        // until the completed manifest is rooted. Explicit large-file roots
+        // remain in the receipt because binding proves their import authority.
+        let hash = self.cas.store_blob(&bytes)?;
         Ok((hash, expected_size))
     }
 }
 
 fn import_request_digest(
-    request: &ImportRequest,
+    request: &FilesystemImportRequest,
     limits: &crate::node_policy::sections::external_content::ExternalContentImportLimits,
     root_device: u64,
     root_inode: u64,
@@ -1809,7 +1844,7 @@ mod tests {
 
     #[test]
     fn import_identity_is_path_free_and_commits_the_open_root_identity() {
-        let request = ImportRequest {
+        let request = FilesystemImportRequest {
             root: "models".to_owned(),
             path: "qwen".to_owned(),
             shape: ImportShape::Tree,
