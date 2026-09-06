@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T03:29:24Z:5d834e19dc8d828ba39a6d7d6c237791586a97c8b379deda4cc8429402bb6d86:oB2Srg/06AiOQCAeRLhNFQ5O03ZlZ8ryLZjGmCAxknFhLY+JxHzZXEp/YNj800qqaewou2yUeRoeuF0dZ4E2BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T04:55:43Z:52669f3919dc10972575e0ca06cf0d0aa321e44842db0f71a82e9755a9a521f5:otbS0ilk93CfGuOkXVCHxthB0QNT8WRjRrr+3lExXOtl5v06XjVgO1cKPrC/Zn1LDsEYx3Ln4I6l944dfAM+Dg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
@@ -191,6 +191,38 @@ invalid. Binding and launch use the same authority projection after source
 admission; adding, removing or changing source evidence changes the binding
 subject and cannot reuse a prior grant. Content use still requires the exact
 active target-local binding and current authorizer.
+
+The import service has two explicit sources. `source: filesystem` captures a
+canonical member beneath a node-admitted named root. `source: retained_result`
+selects a file or nonempty regular-file subtree from an exact successfully
+completed execution's retained result snapshot. It requires the configured local
+operator to own the exact chain root and thread; a snapshot hash alone grants
+no access. Both produce the same staging receipt for separate consumer binding.
+
+The CLI exposes these as:
+
+```
+ryeos external-content import <named-root> <path> <file|tree> <content|large_content> <maximum-bytes>
+ryeos external-content import-result <chain-root> <thread> <result-snapshot> <path> <file|tree> <content|large_content> <maximum-bytes>
+```
+
+Use exact returned execution coordinates, not thread discovery or a mutable
+workspace path. Retained import shares verified CAS file blobs and derives the
+ordinary content manifest; files above the small-content ceiling use the existing
+verified large-store ingest and chunk commitments. Producer/snapshot provenance
+changes acquisition identity, not the resulting payload manifest. Current node
+capture exclusions and all selected-tier limits still apply.
+
+Project snapshots retain regular files and normalized executable modes, not
+symlinks or empty directories. Retained tree import derives only directories
+needed by retained files. It is not a lossless exporter of arbitrary filesystem
+trees; use filesystem capture for richer trees, or a retained archive file when
+the consumer explicitly handles that format. No source is silently substituted.
+
+The staged manifest is a typed transitive GC root for both content stores. Binding
+verifies that exact manifest and its complete closure, then stages the binding
+root. Receipts need not enumerate every descendant. Import never publishes a
+consumer binding or modifies the original workspace.
 
 A binding retry validates its exact current signed binding and settles only
 the presented principal-bound upload receipt. A fresh retry protects that

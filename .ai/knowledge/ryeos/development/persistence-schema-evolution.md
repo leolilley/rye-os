@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T04:39:23Z:64b7dc212cf46f3034ee9d5a95e0c112d42c291d9ccec8494e2f78d2fb71a468:C73Y7nx/pMtHGBzvYf7p7E9qJXni/swYj3z1iKP2bIgYJ8aFSi2dS1JmPKKWfZ+oQDz7nehQo/gtXuE+9HNgDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T04:55:43Z:cdb3a12e7537d39e75912b006e8ae2c6bfbb2c9c2e6dec95750edfab1f6ded04:IaOjsTkskRNtk3FvrJB7E629LAzqKoD5FJTTffWdwAi4eUxiSWMRuX8FIMRfK7FdeCZe+WSkPirDqsbqqbMhBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -29,14 +29,14 @@ occupied. Removing old readers does not make the number reusable.
 
 The current clean-cut execution formats include:
 
-- sealed root execution request schema 17;
+- sealed root execution request schema 18;
 - thread snapshot schema 12;
 - project snapshot schema 5;
-- admitted launch capsule schema 24;
+- admitted launch capsule schema 25;
 - persistent-session capsule schema 8;
 - runtime launch metadata epoch 29;
 - the standalone runtime project-authority envelope epoch 4; and
-- the owned runtime SQLite operator schema epoch 26 (encoded in the RyeOS
+- the owned runtime SQLite operator schema epoch 27 (encoded in the RyeOS
   `PRAGMA application_id` family).
 
 The numbers identify independently evolving contracts. A change to a nested
@@ -60,6 +60,13 @@ decoding that enum. Compiled isolation plans are transient and are not embedded
 in sealed requests or launch capsules, so this change alone does not advance
 their epochs or runtime SQLite epoch 26. Installed policy generations require
 explicit replacement; no missing-field defaults or predecessor adapters exist.
+
+The combined shared-authoring/content admission cut advances sealed request
+18, capsule 25 and runtime epoch 27. Prepared launches now retain intersected
+source/runtime limits and independently enforced receiving-kind content
+ceilings; recovery cannot substitute an ambient kind definition. Launch
+metadata 29 carries both this authority and the proc protocol cut; neither
+standalone v29 shape was installed before the combined generation.
 
 Authoritative readers must inspect the outer object kind and numeric epoch from
 generic JSON before deserializing nested typed data. Only after that gate may
@@ -215,9 +222,10 @@ store. The exact appended-column intermediate produced by the original v6
 migrator is also recognized and repaired; no unknown layout is modified.
 
 Replay indexes inside that stable database have their own clean-cut epoch,
-currently epoch 9. Epoch 9 binds dispatch-effect replay to admitted launch
-capsule schema 24, including explicit fixed-parent live filesystem authority.
-An epoch-8 record cannot prove that authority and
+currently epoch 10. Epoch 10 binds dispatch-effect replay to admitted launch
+capsule schema 25, including retained receiving-kind content ceilings and
+explicit fixed-parent live filesystem authority.
+An epoch-9 record cannot prove that authority and
 is therefore retired rather than reinterpreted.
 They are not authority-compatible merely because the surrounding SQLite schema
 is current: a dispatch-effect record retains its complete admitted execution

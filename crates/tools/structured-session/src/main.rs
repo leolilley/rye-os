@@ -1177,7 +1177,6 @@ fn resolve_pinned_executable(
         bail!("workload realization id is ambiguous");
     }
     if realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
-        || realization.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
         || !lillux::valid_hash(&realization.manifest_hash)
         || realization.entry_count == 0
         || realization.total_bytes == 0
@@ -1193,15 +1192,20 @@ fn resolve_pinned_executable(
     {
         bail!("workload realization mount is not a safe relative path");
     }
+    let external_root = realization.mount_root.root(Some(external_root))?;
+    // The executable and its argv[0] resource path must share one pinned root,
+    // even if the pathname is renamed while the workload is being prepared.
+    let root = lillux::PinnedDirectory::open(external_root)?
+        .ok_or_else(|| anyhow!("external realization root is unavailable"))?;
     let pinned = match realization.kind {
         ryeos_state::objects::ExternalContentKind::File => {
             if mount.file_name() != executable_name.file_name() {
                 bail!("file realization mount does not match the workload executable");
             }
-            open_pinned_regular_file(external_root, mount)?
+            open_pinned_regular_file_under(&root, mount)?
         }
         ryeos_state::objects::ExternalContentKind::Tree => {
-            let directory = open_pinned_directory(external_root, mount)?;
+            let directory = open_pinned_directory_under(&root, mount)?;
             match directory.open_pinned_regular(executable_name.as_os_str(), false)? {
                 Some(file) => file,
                 None => bail!("pinned structured-session workload executable is absent"),
@@ -1211,8 +1215,6 @@ fn resolve_pinned_executable(
     pinned.require_executable()?;
     let executable_handle = pinned.into_inherited_descriptor_path()?;
     let executable = executable_handle.path().to_path_buf();
-    let root = lillux::PinnedDirectory::open(external_root)?
-        .ok_or_else(|| anyhow!("external realization root is unavailable"))?;
     let root_handle = root.into_inherited_descriptor_path()?;
     let descriptor_root = root_handle.path();
     let argv0 = match realization.kind {
@@ -1259,7 +1261,6 @@ fn resolve_pinned_executable_search(
             .ok_or_else(|| anyhow!("executable search names an absent realization"))?;
         if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
             || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
-            || realization.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
         {
             bail!("executable search requires a pinned tree realization");
         }
@@ -1267,7 +1268,8 @@ fn resolve_pinned_executable_search(
         if entry.relative_directory != "." {
             relative.push(&entry.relative_directory);
         }
-        let directory = open_pinned_directory(external_root, &relative)?;
+        let directory =
+            open_pinned_directory(realization.mount_root.root(Some(external_root))?, &relative)?;
         let handle = directory.into_inherited_descriptor_path()?;
         let path = handle
             .path()
@@ -1351,8 +1353,6 @@ fn resolve_session_process_environment(
                     })?;
                 if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
                     || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
-                    || realization.mount_root
-                        != ryeos_state::objects::ExternalContentMountRoot::Project
                 {
                     bail!("session process environment requires a pinned tree realization");
                 }
@@ -1360,6 +1360,7 @@ fn resolve_session_process_environment(
                 if relative_path != "." {
                     relative.push(&relative_path);
                 }
+                let external_root = realization.mount_root.root(Some(external_root))?;
                 let handle = match path_kind {
                     ryeos_state::objects::SessionProcessEnvironmentPathKind::Directory => {
                         open_pinned_directory(external_root, &relative)?
@@ -1388,6 +1389,15 @@ fn open_pinned_directory(
     root: &std::path::Path,
     relative: &std::path::Path,
 ) -> Result<lillux::PinnedDirectory> {
+    let root = lillux::PinnedDirectory::open(root)?
+        .ok_or_else(|| anyhow!("external realization root is unavailable"))?;
+    open_pinned_directory_under(&root, relative)
+}
+
+fn open_pinned_directory_under(
+    root: &lillux::PinnedDirectory,
+    relative: &std::path::Path,
+) -> Result<lillux::PinnedDirectory> {
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || relative
@@ -1396,8 +1406,7 @@ fn open_pinned_directory(
     {
         bail!("pinned realization directory is not a safe relative path");
     }
-    let mut directory = lillux::PinnedDirectory::open(root)?
-        .ok_or_else(|| anyhow!("external realization root is unavailable"))?;
+    let mut directory = root.try_clone()?;
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             unreachable!("relative path was validated");
@@ -1413,6 +1422,15 @@ fn open_pinned_regular_file(
     root: &std::path::Path,
     relative: &std::path::Path,
 ) -> Result<lillux::PinnedRegularFile> {
+    let root = lillux::PinnedDirectory::open(root)?
+        .ok_or_else(|| anyhow!("external realization root is unavailable"))?;
+    open_pinned_regular_file_under(&root, relative)
+}
+
+fn open_pinned_regular_file_under(
+    root: &lillux::PinnedDirectory,
+    relative: &std::path::Path,
+) -> Result<lillux::PinnedRegularFile> {
     let name = relative
         .file_name()
         .ok_or_else(|| anyhow!("pinned realization file has no name"))?;
@@ -1420,9 +1438,8 @@ fn open_pinned_regular_file(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     let directory = match parent {
-        Some(parent) => open_pinned_directory(root, parent)?,
-        None => lillux::PinnedDirectory::open(root)?
-            .ok_or_else(|| anyhow!("external realization root is unavailable"))?,
+        Some(parent) => open_pinned_directory_under(root, parent)?,
+        None => root.try_clone()?,
     };
     directory
         .open_pinned_regular(name, false)?
@@ -3072,6 +3089,183 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn pinned_content_fixture(mount: &str, mount_root: &str) -> Value {
+        json!([{
+            "id":"fixture", "kind":"tree", "mode":"pinned",
+            "manifest_hash":"a".repeat(64), "entry_count":4, "total_bytes":16,
+            "mount_root":mount_root, "mount":mount
+        }])
+    }
+
+    #[test]
+    fn pinned_content_paths_preserve_search_order_and_retain_resource_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let mount = project.join("runtime");
+        std::fs::create_dir_all(mount.join("bin")).unwrap();
+        std::fs::create_dir(mount.join("helpers")).unwrap();
+        std::fs::write(mount.join("worker"), b"worker").unwrap();
+        std::fs::set_permissions(mount.join("worker"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        std::fs::write(mount.join("resource"), b"retained").unwrap();
+        let sealed = pinned_content_fixture("runtime", "project").to_string();
+        let (executable, argv0, workload_handles) =
+            resolve_pinned_executable(&project, &sealed, "fixture", std::path::Path::new("worker"))
+                .unwrap();
+        let search = json!([
+            {"realization_id":"fixture", "relative_directory":"helpers"},
+            {"realization_id":"fixture", "relative_directory":"bin"}
+        ])
+        .to_string();
+        let (path, search_handles) =
+            resolve_pinned_executable_search(&project, &sealed, Some(&search)).unwrap();
+        let bindings = json!({
+            "FIXTURE_RESOURCE":{
+                "kind":"realization_path", "realization_id":"fixture",
+                "relative_path":"resource", "path_kind":"file"
+            }
+        })
+        .to_string();
+        let (environment, environment_handles) =
+            resolve_session_process_environment(&project, &project, &sealed, Some(&bindings))
+                .unwrap();
+        // All returned paths remain tied to the original admitted handles,
+        // including argv[0]'s adjacent resources, not a replacement pathname.
+        std::fs::rename(&project, root.path().join("retained")).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        assert_eq!(std::fs::read(executable).unwrap(), b"worker");
+        assert_eq!(
+            std::fs::read(argv0.parent().unwrap().join("resource")).unwrap(),
+            b"retained"
+        );
+        assert_eq!(
+            std::fs::read(&environment["FIXTURE_RESOURCE"]).unwrap(),
+            b"retained"
+        );
+        let directories = path
+            .as_ref()
+            .unwrap()
+            .split(':')
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect::<Vec<_>>();
+        assert!(directories[0].ends_with("runtime/helpers"));
+        assert!(directories[1].ends_with("runtime/bin"));
+        assert_eq!(
+            (
+                workload_handles.len(),
+                search_handles.len(),
+                environment_handles.len()
+            ),
+            (2, 2, 1)
+        );
+    }
+
+    #[test]
+    fn pinned_content_paths_never_substitute_project_content_for_runtime_mounts() {
+        let project = tempfile::tempdir().unwrap();
+        // A unique mount avoids relying on whether the machine already has a
+        // runtime root. This fixture deliberately exists only in the project.
+        let mount = project.path().file_name().unwrap().to_str().unwrap();
+        std::fs::create_dir(project.path().join(mount)).unwrap();
+        std::fs::write(project.path().join(mount).join("worker"), b"worker").unwrap();
+        std::fs::set_permissions(
+            project.path().join(mount).join("worker"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        let sealed = pinned_content_fixture(mount, "execution_runtime").to_string();
+        let search = json!([{"realization_id":"fixture", "relative_directory":"."}]).to_string();
+        let bindings = json!({"FIXTURE_RESOURCE":{
+            "kind":"realization_path", "realization_id":"fixture",
+            "relative_path":"worker", "path_kind":"file"
+        }})
+        .to_string();
+        assert!(
+            resolve_pinned_executable(
+                project.path(),
+                &sealed,
+                "fixture",
+                std::path::Path::new("worker")
+            )
+            .is_err()
+        );
+        assert!(resolve_pinned_executable_search(project.path(), &sealed, Some(&search)).is_err());
+        assert!(
+            resolve_session_process_environment(
+                project.path(),
+                project.path(),
+                &sealed,
+                Some(&bindings)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pinned_content_paths_refuse_unsafe_search_and_environment_endpoints() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("runtime")).unwrap();
+        std::fs::write(project.path().join("runtime/file"), b"file").unwrap();
+        std::os::unix::fs::symlink("file", project.path().join("runtime/link")).unwrap();
+        let sealed = pinned_content_fixture("runtime", "project");
+        for relative in ["../runtime", "/runtime", "file", "link"] {
+            let search =
+                json!([{"realization_id":"fixture", "relative_directory":relative}]).to_string();
+            assert!(
+                resolve_pinned_executable_search(
+                    project.path(),
+                    &sealed.to_string(),
+                    Some(&search)
+                )
+                .is_err(),
+                "{relative}"
+            );
+        }
+        let search = json!([{"realization_id":"fixture", "relative_directory":"."}]);
+        let duplicates = json!([search[0], search[0]]).to_string();
+        assert!(
+            resolve_pinned_executable_search(
+                project.path(),
+                &sealed.to_string(),
+                Some(&duplicates)
+            )
+            .is_err()
+        );
+        for (field, value) in [("kind", "file"), ("mode", "captured"), ("id", "absent")] {
+            let mut changed = sealed.clone();
+            changed[0][field] = json!(value);
+            assert!(
+                resolve_pinned_executable_search(
+                    project.path(),
+                    &changed.to_string(),
+                    Some(&search.to_string())
+                )
+                .is_err()
+            );
+        }
+        for (relative, kind) in [
+            ("link", "file"),
+            ("file", "directory"),
+            (".", "file"),
+            ("../file", "file"),
+        ] {
+            let bindings = json!({"FIXTURE_RESOURCE":{
+                "kind":"realization_path", "realization_id":"fixture",
+                "relative_path":relative, "path_kind":kind
+            }})
+            .to_string();
+            assert!(
+                resolve_session_process_environment(
+                    project.path(),
+                    project.path(),
+                    &sealed.to_string(),
+                    Some(&bindings)
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

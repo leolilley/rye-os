@@ -87,8 +87,9 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // independent candidate evaluation/integration in capsule 23/request 16.
 // v28 carries explicit fixed-parent live confinement and namespace-scoped
 // symlink semantics in capsule v24. Older live authority stays opaque history.
-// v29 requires the current adapter protocol's explicit node-owned proc
-// surface. Classify prior launch evidence before decoding its protocol enum.
+// v29 combines the current adapter protocol's explicit node-owned proc
+// surface with capsule 25/request 18 and retained content-target ceilings.
+// Classify prior launch evidence before decoding its nested authority.
 pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 29;
 
 /// Per-thread daemon-owned state directory.

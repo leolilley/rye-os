@@ -28,7 +28,10 @@ use super::{
 // purpose/dual-generation authority (executable-program identity).
 // v24 replaces path-mask claims with explicit fixed-parent live confinement
 // and admitted-execution-namespace symlink semantics; no predecessor aliases.
-pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 24;
+// v25 retains independently enforced receiving-kind content contracts in the
+// prepared launch, alongside the intersected source/runtime content policy.
+// v24 is already allocated to the coordinating fixed-parent confinement cut.
+pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 25;
 pub const ADMITTED_DIRECT_COMMAND_ROOT: &str = "/ryeos/admitted-direct-command";
 pub const ADMITTED_DIRECT_PROJECT_ROOT: &str = "/ryeos/admitted-project";
 

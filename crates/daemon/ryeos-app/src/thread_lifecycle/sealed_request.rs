@@ -135,7 +135,10 @@ where
 /// filesystem/network and realization-root execution contract.
 /// v17 seals fixed-parent live confinement and explicit namespace symlink
 /// semantics. Old path-mask claims cannot be decoded as this authority.
-pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 17;
+/// v18 requires retained source/runtime and receiving-kind content ceilings in
+/// prepared launches; predecessor preparation cannot authorize this boundary.
+/// v17 is already allocated to the coordinating fixed-parent confinement cut.
+pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

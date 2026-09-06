@@ -15,6 +15,8 @@ use crate::handler_context::HandlerContext;
 use crate::node_policy::sections::object_closure::NodeObjectClosurePolicy;
 use crate::state::AppState;
 
+mod retained_result;
+
 const BINDING_HEAD_NAMESPACE: &str = ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE;
 
 /// Retire every predecessor external-content binding head while the node is
@@ -44,7 +46,7 @@ pub fn discard_binding_heads_offline(
     state.discard_external_content_binding_heads(&guard, dry_run)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportShape {
     File,
@@ -63,8 +65,31 @@ pub enum ImportStorage {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImportRequest {
+pub struct FilesystemImportRequest {
     pub root: String,
+    pub path: String,
+    pub shape: ImportShape,
+    pub storage: ImportStorage,
+    pub maximum_bytes: u64,
+    #[serde(default)]
+    pub expected_file_sha256: Option<String>,
+}
+
+/// Source selection is explicit and closed. Neither a snapshot hash nor a
+/// named root can be substituted for the other source's authorization.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImportRequest {
+    Filesystem(FilesystemImportRequest),
+    RetainedResult(RetainedResultImportRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedResultImportRequest {
+    pub chain_root_id: String,
+    pub thread_id: String,
+    pub result_project_snapshot_hash: String,
     pub path: String,
     pub shape: ImportShape,
     pub storage: ImportStorage,
@@ -195,6 +220,17 @@ pub async fn import(
     state: Arc<AppState>,
     context: HandlerContext,
     request: ImportRequest,
+) -> anyhow::Result<ImportResponse> {
+    match request {
+        ImportRequest::Filesystem(request) => import_filesystem(state, context, request).await,
+        ImportRequest::RetainedResult(request) => retained_result::import(state, context, request),
+    }
+}
+
+async fn import_filesystem(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    request: FilesystemImportRequest,
 ) -> anyhow::Result<ImportResponse> {
     let operator_fingerprint =
         crate::operator_authority::require_local_configured_operator(&state, &context)?;
@@ -351,7 +387,7 @@ pub fn import_managed_activation_component(
     >()?;
     let policy = import_policy.managed_activation.require_enabled()?;
     activation.document.validate_portable()?;
-    let request = ImportRequest {
+    let request = FilesystemImportRequest {
         root: "managed-activation-staging".to_owned(),
         path: staged_name.to_owned(),
         shape: match component.declaration_kind {
@@ -1275,7 +1311,7 @@ struct ResolvedConsumer {
 
 #[allow(clippy::too_many_arguments)]
 fn capture_content_import(
-    request: &ImportRequest,
+    request: &FilesystemImportRequest,
     limits: &crate::node_policy::sections::external_content::ExternalContentImportLimits,
     source_root: &lillux::PinnedDirectory,
     root_device: u64,
@@ -1355,7 +1391,7 @@ fn capture_content_import(
 
 #[allow(clippy::too_many_arguments)]
 fn capture_large_import(
-    request: &ImportRequest,
+    request: &FilesystemImportRequest,
     limits: &crate::node_policy::sections::external_content::ExternalContentImportLimits,
     source_root: &lillux::PinnedDirectory,
     root_device: u64,
@@ -1675,7 +1711,7 @@ impl ryeos_state::ExternalLargeContentSink for DurableLargeSink<'_> {
 }
 
 fn import_request_digest(
-    request: &ImportRequest,
+    request: &FilesystemImportRequest,
     limits: &crate::node_policy::sections::external_content::ExternalContentImportLimits,
     root_device: u64,
     root_inode: u64,
@@ -1739,7 +1775,7 @@ mod tests {
                 .unwrap();
             let root = lillux::PinnedDirectory::open(&source).unwrap().unwrap();
             let (device, _) = root.device_inode().unwrap();
-            let request = ImportRequest {
+            let request = FilesystemImportRequest {
                 root: "fixture".into(),
                 path: "tree".into(),
                 shape: ImportShape::Tree,
@@ -1906,7 +1942,7 @@ mod tests {
 
     #[test]
     fn import_identity_is_path_free_and_commits_the_open_root_identity() {
-        let request = ImportRequest {
+        let request = FilesystemImportRequest {
             root: "models".to_owned(),
             path: "qwen".to_owned(),
             shape: ImportShape::Tree,

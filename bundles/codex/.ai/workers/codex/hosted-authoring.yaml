@@ -1,9 +1,10 @@
-# ryeos:signed:2026-09-06T03:45:22Z:7178f446a41b7a8fff80f64554d51db4f3d613b6e57def54982f29e9290b55cc:R1zAzkVhHlX1CIziBGktkgRMNsQFDb2iont1MWCPjnyHKEiv/vkd6j6nVWuXTBSIJzHbVG+Hna5TgY6HCvUlBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T03:45:22Z:9edaeb925ecc271a1db23664d75f1803998aa341ee3c8870c712acc9b5888021:zRpeoHGp0S72kJvlTLANpr+JTPdEjqvGwyyjdE/dBOGtEmrgiP+Ajhs1xgcSaWzYAMPK4dEvQjRhRsAN+7AUAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "codex"
-version: "1.0.1"
+version: "1.0.0"
 executor_id: "@subprocess"
-description: "Codex App Server profile for one RyeOS session-bound worker execution."
+description: "Codex authoring profile; select through config:codex/environments/authoring."
 execution_protocol: protocol:ryeos/core/structured_session
+filesystem_authority: captured_execution
 supported_target:
   os: linux
   arch: x86_64
@@ -16,7 +17,7 @@ session_resources:
 
 source:
   root: "lib/hosted"
-  entry: "structured-session.profile.json"
+  entry: "authoring.profile.json"
   digest: "eb79967f7d95958574d5c40063617fdeb770b87c949971895e8b4707e224d708"
 
 external_content:
@@ -44,8 +45,8 @@ external_content:
   - id: codex-zsh
     kind: file
     mode: pinned
-    digest: "bda40827700404df0317f0e83951a4f6b6fb0933b3eec3af29c1a903c39aa008"
-    metadata_hint: "openai-codex-zsh-v0.147.0-x86_64-unknown-linux-musl"
+    digest: "f609633ef39f5458263e6150590d889c044d590b702333fca82584057b1fc7c4"
+    metadata_hint: "ryeos-codex-zsh-v0.147.0-authoring-runtime-v1"
     mount_root: project
     mount: codex-resources/zsh/bin/zsh
   - id: codex-rg

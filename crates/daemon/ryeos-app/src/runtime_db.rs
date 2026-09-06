@@ -1505,7 +1505,10 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // Epoch 26 admits fixed-parent live authority in project envelope 4, sealed
 // request 17, thread snapshot 12, launch metadata 28 and launch capsule 24.
 // Previous live-path-mask authority is never reinterpreted on open.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 26;
+// Epoch 27 requires retained prepared-content target contracts in request 18,
+// capsule 25, and launch metadata 29. Epoch 26 is already allocated to the
+// coordinating fixed-parent confinement cut. No ambient-kind recovery substitution.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 27;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK

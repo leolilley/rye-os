@@ -5,6 +5,8 @@ use std::ffi::OsStr;
 
 use anyhow::Context as _;
 
+pub mod retained_project;
+
 use crate::objects::{
     ExternalContentManifestEntryKind, ExternalContentManifestObject,
     MAX_EXTERNAL_CONTENT_FILE_BYTES, MAX_EXTERNAL_CONTENT_MANIFEST_BYTES,
