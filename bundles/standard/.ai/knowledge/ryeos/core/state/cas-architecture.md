@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T04:55:43Z:52669f3919dc10972575e0ca06cf0d0aa321e44842db0f71a82e9755a9a521f5:otbS0ilk93CfGuOkXVCHxthB0QNT8WRjRrr+3lExXOtl5v06XjVgO1cKPrC/Zn1LDsEYx3Ln4I6l944dfAM+Dg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T07:06:10Z:22a30404a933a906c5a21481f5bfa4481bd0c2192793ee016916848d16d62960:8aSb6WoyIswHA/9UH3aB0WtiHCD+PVVfig1PIQPO7RIKv1yc508FjnmJATGyc4tGIv50+nqrkmmMuFw8kY9cAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
@@ -251,6 +251,16 @@ Deterministic capacity refusal leaves the handle unchanged. A publication I/O
 failure fences the handle, retaining its lock until drop, because rename may
 have succeeded before sync failed. Normal reopen determines the actual durable
 state; the old handle cannot continue using stale roots or undo settlement.
+
+Execution workspace capture validates the complete bounded mutation set, then
+protects its expected project-file objects and blobs in one update to the
+existing staging lease before opening the first changed file. Those roots are
+capture expectations, not testimony that missing bytes exist. Pinned reads
+and bounded CAS streams must still agree on size, hash and portable executable
+mode before a resulting tree can be published. The shared CAS guard and the
+same lease retain crash/GC protection; neither per-file journal rewrites nor a
+second capture journal is needed. Descendant replacement uses the project
+tree's sorted path range rather than scanning unrelated files on every upsert.
 
 ## Event Durability Tiers
 
