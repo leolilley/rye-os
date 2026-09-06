@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T05:12:11Z:27f8cfbe5129c8280914280e142357f47a0ce85fc56f7611cfb96435a3aff252:msyES+/zUaE6rutqfyfFN+AkoLAaKdfzF7yoPfS9jsTFVcZ3lvhBh2fznLC4yon3uB8gaTeuoKqjyhGA9IN/Bw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T05:29:33Z:6afbfd086a64beecb106bdd2b5c53a2eaefaf439dfec3117e6d842b82d4542c4:viV/VYAbm3+PWXolkGDOcwoEIi4xmEgDuFBrwtQ6q2etu4yChMRmKqwSWs1BiPJkQtTYr3LYHNpJu3J8kkK9Dw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -134,6 +134,42 @@ The generated manifest and executable development items are signed by the
 public development publisher fixture. That binds reproducible development
 identity only. It grants no operator, node, release, deployment, vault,
 publication, or remote authority.
+
+## Locked registry input acquisition
+
+`scripts/release/fetch-development-registry.py` is an explicit operator/publisher
+bootstrap helper, not a worker operation. It consumes the selected
+`config:development/ryeos/registry-acquisition` and `Cargo.lock`, and obtains
+only the locked public registry coordinates. It verifies archive checksums
+against both the lock and selected index entries; it never executes Cargo,
+unpacks crates, reads host Cargo credentials, or writes node state.
+
+URLs, host selection and byte/time budgets are project-owned acquisition data,
+not node egress permissions. The helper consumes operator-selected input files;
+it does not verify their RyeOS signatures or turn them into node authority.
+Host Python/PyYAML and curl are bootstrap dependencies only. Curl must support
+streaming download bounds (version 8.4 or later, checked before acquisition).
+User curl configuration, proxies and redirects are disabled. Each request is
+independently process-supervised within both request and total time budgets.
+
+The output uses Cargo's documented local-registry format: unchanged verified
+crate archives plus plain index entries for selected locked versions. It does
+not synthesize Cargo's private sparse-cache encoding. A sibling staging
+directory prevents failed downloads from publishing a partial registry. The
+operator must exclusively own the destination during acquisition; this helper
+is not a concurrent no-replace transaction or a replacement for Lillux's
+node-owned filesystem authorities.
+
+Import/bind that input tree through ordinary external-content authority. The
+admitted Stage-0 Cargo then owns final vendoring with isolated networking and
+explicit source replacement. Import its retained output through
+`external-content import-result`. Source checks and successful acquisition
+alone do not prove that the pinned Cargo accepted the format, produced the
+required closure, or that repository build/test qualification passed. No
+dependency manifest or build/test grant is invented before those gates.
+
+The upstream contracts are [Cargo source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)
+and [cargo vendor](https://doc.rust-lang.org/cargo/commands/cargo-vendor.html).
 
 ## Development execution confinement
 
