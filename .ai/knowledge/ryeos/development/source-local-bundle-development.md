@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T06:01:54Z:b5205bc5aa5160d2d39a989b5397e96b1a42455f707e1464e6ce7c894179dbca:tMwnMol3DR7zD1WAB40iz4L+Dymyd8AiheWS7PQrlPoLO9jTU2jTsmRw3dwmCnYQvJ6r3EuJQ4NwhL4s9ruSAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T06:51:53Z:5a71b42773108719719b9448509b86d6c5e5f49e7ea3ece066f7ed72ab2dac18:BJBE1UPEFLl7m9kevoo9oEONA9SsG5B2aT83s6jyq0RuFPozEYRhoKfEFo8P6nmckNcvTWlSv8KHtPUsSd59Cw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -151,6 +151,25 @@ bundle tree, not a live Git checkout with nested worktrees, caches and ongoing
 edits. A full project-bundle publication check must use such a detached tree
 constructed from an exact admitted source generation. Do not add a second
 ignore list to the publisher or treat its staging as project capture.
+
+### Node-owned bundle verification
+
+Run "ryeos bundle verify /absolute/source" as the configured local operator.
+The CLI uses the live daemon, or the same service through normal standalone
+dispatch when that node is stopped. Source and explicit registry-root paths
+must be absolute; the daemon never interprets them relative to its own cwd.
+
+Verification retains the installed generation through preflight and executes
+parser handlers under its existing isolation runtime. It is not an offline
+Tool that receives node registrations, policies or private keys to bootstrap
+another privileged engine. The registry_root and registry_roots parameters are
+alternative selectors and cannot both be supplied. The direct
+"ryeos-core-tools bundle-verify" maintainer/CI entry remains available in its
+explicit host composition context; it is not a workload sandbox escape hatch.
+
+Verification neither signs nor publishes the candidate and its report is not
+an installation/admission receipt. For an immutable publication check use an
+exact detached source generation.
 
 ## Locked registry input acquisition
 

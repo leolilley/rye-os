@@ -290,20 +290,36 @@ mod tests {
 
     #[test]
     fn snapshot_commands_target_core_authority_items_and_bind_project_authority() {
-        for file in [
-            "snapshot-create.yaml",
-            "snapshot-log.yaml",
-            "snapshot-show.yaml",
-            "snapshot-status.yaml",
+        for (file, expected_ref, expected_availability) in [
+            (
+                "snapshot-create.yaml",
+                "tool:core/snapshot-create",
+                ryeos_runtime::CommandAvailability::Daemon,
+            ),
+            (
+                "snapshot-log.yaml",
+                "tool:core/snapshot-log",
+                ryeos_runtime::CommandAvailability::Daemon,
+            ),
+            (
+                "snapshot-show.yaml",
+                "tool:core/snapshot-show",
+                ryeos_runtime::CommandAvailability::Daemon,
+            ),
+            (
+                "snapshot-status.yaml",
+                "service:project/snapshot-status",
+                ryeos_runtime::CommandAvailability::Both,
+            ),
         ] {
             let command = source_command("core", file);
             assert!(
                 matches!(
                     &command.dispatch,
-                    CommandDispatch::ExecuteRef { execute, .. }
-                        if execute.starts_with("tool:core/snapshot-")
+                    CommandDispatch::ExecuteRef { execute, availability }
+                        if execute == expected_ref && *availability == expected_availability
                 ),
-                "snapshot command {file} must target an authority-bearing item in the core bundle namespace",
+                "snapshot command {file} must select its existing node/callback authority owner",
             );
             let project = command
                 .project
@@ -321,7 +337,7 @@ mod tests {
             assert_eq!(
                 project.bind_parameter.as_deref(),
                 Some("project_path"),
-                "snapshot command {file} must satisfy the target tool's required project_path",
+                "snapshot command {file} must satisfy the target item's required project_path",
             );
         }
     }

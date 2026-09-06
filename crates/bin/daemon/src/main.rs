@@ -2942,6 +2942,21 @@ fn ensure_runtime_paths(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Establish ingress authority from the configured operator key loaded by
+/// stopped-node bootstrap. A principal string alone is not authentication;
+/// keep this proof here, never infer it in the generic service executor.
+fn standalone_operator_handler_context(
+    operator: &NodeIdentity,
+) -> ryeos_app::handler_context::HandlerContext {
+    ryeos_app::handler_context::HandlerContext::new_with_authority(
+        operator.principal_id(),
+        vec![], // Existing standalone filesystem authority does not mint live scopes.
+        true,
+        Some(ryeos_app::identity::AuthorizedKeyPrincipalClass::LocalClient),
+        None,
+    )
+}
+
 /// Run a service in standalone mode (daemon is not running).
 ///
 /// Performs bootstrap: load config, build engine + trust store,
@@ -2993,6 +3008,7 @@ async fn run_service_standalone(
     let standalone_operator = NodeIdentity::load(&config.operator_signing_key_path)
         .context("load configured local operator identity for standalone service")?;
     let standalone_principal = standalone_operator.principal_id();
+    let standalone_handler_context = standalone_operator_handler_context(&standalone_operator);
     let standalone_plan_ctx = ryeos_engine::contracts::PlanContext {
         requested_by: ryeos_engine::contracts::EffectivePrincipal::Local(
             ryeos_engine::contracts::Principal {
@@ -3011,6 +3027,18 @@ async fn run_service_standalone(
     };
     let service_canonical = ryeos_engine::canonical_ref::CanonicalRef::parse(service_ref)
         .with_context(|| format!("invalid standalone service ref {service_ref}"))?;
+    // Preserve registry admission when dispatching the already verified item
+    // below. Discover this from the signed kind contract, never a kind name.
+    anyhow::ensure!(
+        engine
+            .kinds
+            .kinds_for_in_process_registry(
+                ryeos_engine::kind_registry::InProcessRegistryKind::Services,
+            )
+            .any(|(kind, _)| kind == service_canonical.kind),
+        "kind `{}` is not admitted to the Services in-process registry",
+        service_canonical.kind,
+    );
     let service_resolved = engine
         .resolve(&standalone_plan_ctx, &service_canonical)
         .with_context(|| format!("resolve standalone service {service_ref}"))?;
@@ -3192,7 +3220,8 @@ async fn run_service_standalone(
         requested_call: None,
     };
 
-    let result = service_executor::execute_service(
+    let result = service_executor::execute_service_verified(
+        service_verified,
         service_ref,
         params,
         ExecutionMode::Standalone,
@@ -3204,6 +3233,9 @@ async fn run_service_standalone(
             usage_subject: None,
             usage_subject_asserted_by: None,
         },
+        None,
+        None,
+        Some(standalone_handler_context),
     )
     .await?;
 
@@ -3231,6 +3263,25 @@ mod shutdown_mapping_tests {
     use ryeos_app::process::{ShutdownAction, resolve_shutdown_action};
     use ryeos_engine::contracts::CancellationMode;
     use std::time::Duration;
+
+    #[test]
+    fn standalone_ingress_carries_only_the_loaded_local_operator_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let operator =
+            ryeos_app::identity::NodeIdentity::create(&root.path().join("operator.pem")).unwrap();
+        let context = super::standalone_operator_handler_context(&operator);
+        assert!(context.verified);
+        assert_eq!(context.fingerprint, operator.principal_id());
+        assert!(context.scopes.is_empty());
+        assert_eq!(
+            context.authorized_key_class,
+            Some(ryeos_app::identity::AuthorizedKeyPrincipalClass::LocalClient)
+        );
+        assert!(context.authenticated_origin_site_id.is_none());
+        context
+            .validate_execution_authority(&operator.principal_id(), &[], "site:local", "site:local")
+            .unwrap();
+    }
 
     #[test]
     fn composed_service_registry_has_unique_refs_and_endpoints() {

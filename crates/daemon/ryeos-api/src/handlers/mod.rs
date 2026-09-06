@@ -23,6 +23,7 @@ pub mod bundle_install;
 pub mod bundle_list;
 pub mod bundle_remove;
 pub mod bundle_smoke;
+pub mod bundle_verify;
 pub mod commands_dispatch;
 pub mod commands_get;
 pub mod commands_list;
@@ -57,6 +58,7 @@ pub mod objects_has;
 pub mod objects_put;
 pub mod project_apply_snapshot;
 pub mod project_status;
+pub mod project_snapshot_status;
 pub mod push_head;
 pub mod rebuild;
 pub mod remote_admit;
@@ -142,6 +144,7 @@ pub const ALL: &[ServiceDescriptor] = &[
     push_head::DESCRIPTOR,
     project_apply_snapshot::DESCRIPTOR,
     project_status::DESCRIPTOR,
+    project_snapshot_status::DESCRIPTOR,
     launch_cancel::DESCRIPTOR,
     launch_status::DESCRIPTOR,
     threads_list::DESCRIPTOR,
@@ -208,6 +211,7 @@ pub const ALL: &[ServiceDescriptor] = &[
     bundle_list::DESCRIPTOR,
     bundle_remove::DESCRIPTOR,
     bundle_smoke::DESCRIPTOR,
+    bundle_verify::DESCRIPTOR,
     maintenance_gc::DESCRIPTOR,
     rebuild::VERIFY_DESCRIPTOR,
     rebuild::REBUILD_DESCRIPTOR,

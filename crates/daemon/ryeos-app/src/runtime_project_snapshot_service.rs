@@ -1,4 +1,4 @@
-//! Daemon-authoritative project snapshot reads and mutation.
+//! Node-authoritative project snapshot reads and mutation.
 //!
 //! The terminal tool is only a callback client. It never loads the node key,
 //! invents a trust store, reads authoritative refs, or publishes HEAD itself.
@@ -60,18 +60,13 @@ struct ProjectParams {
 }
 
 struct SnapshotContext<'a> {
-    state: SnapshotState<'a>,
+    state: &'a AppState,
     ignore_matcher: &'a crate::ignore::IgnoreMatcher,
     project_path: PathBuf,
     project_hash: String,
     principal_key: String,
     authority: ryeos_state::PinnedStateAuthority,
     cas: CasStore,
-}
-
-enum SnapshotState<'a> {
-    Live(&'a AppState),
-    Offline(&'a ryeos_state::StateDb),
 }
 
 pub struct RuntimeProjectSnapshotService;
@@ -168,7 +163,7 @@ impl RuntimeProjectSnapshotService {
         let authority = state.state_store.pinned_state_authority()?;
         let cas = authority.cas_store()?;
         let ctx = SnapshotContext {
-            state: SnapshotState::Live(state),
+            state,
             ignore_matcher: state.ignore_matcher.as_ref(),
             project_hash: ryeos_state::refs::deployed_project_key(canonical),
             principal_key: ryeos_state::refs::principal_storage_key(&thread_auth.acting_principal)?
@@ -192,70 +187,43 @@ impl RuntimeProjectSnapshotService {
     }
 }
 
-/// Read snapshot status without a daemon thread. This uses the fail-only,
-/// non-repairing projection opener and the same shared CAS guard as the live
-/// service, preserving signed-head verification without requiring callback
-/// authority for a read-only command.
-pub fn offline_status(
-    app_root: &Path,
+/// Configured-local-operator status using the node's existing state owner.
+///
+/// The Both-mode service supplies live AppState or its normal
+/// read_only_existing standalone equivalent. Never recreate configuration,
+/// private identities, policy, or projection state in a terminal Tool merely
+/// to make offline status work. Runtime callers continue through execute()
+/// and its sealed project plus manifest-backed callback authority.
+pub fn local_operator_status(
+    state: &AppState,
+    caller: &crate::handler_context::HandlerContext,
     project_path: &Path,
     include_unchanged: bool,
     time_budget_ms: u64,
 ) -> Result<Value> {
-    let config = crate::config::Config::load(&crate::config::ConfigSources {
-        app_root: Some(app_root.to_path_buf()),
-        ..crate::config::ConfigSources::default()
-    })
-    .context("load local node configuration for snapshot status")?;
-    let identity = crate::identity::NodeIdentity::load(&config.node_signing_key_path)
-        .context("load node identity for signed-head verification")?;
-    let mut head_trust = ryeos_state::refs::TrustStore::new();
-    head_trust.insert(
-        identity.fingerprint().to_string(),
-        *identity.verifying_key(),
-    );
-    let state_db = ryeos_state::StateDb::open_for_projection_verification(
-        &config.runtime_state_dir(),
-        std::sync::Arc::new(head_trust),
-    )
-    .context("open local snapshot projection for verification")?;
-    let authority = state_db.pinned_authority()?;
-    let cas = authority.cas_store()?;
-    let operator_key = lillux::crypto::load_signing_key(&config.operator_signing_key_path)
-        .context("load operator identity for principal snapshot head")?;
-    let principal = format!(
-        "fp:{}",
-        lillux::signature::compute_fingerprint(&operator_key.verifying_key())
-    );
+    crate::operator_authority::require_local_configured_operator(state, caller)
+        .context("snapshot status requires the configured local operator")?;
+    // Authenticate before canonicalization or any other path observation.
+    if !project_path.is_absolute() {
+        bail!("snapshot status project_path must be an absolute path");
+    }
     let project_path = canonical_project_path(project_path)?;
     let canonical = project_path
         .to_str()
         .ok_or_else(|| anyhow!("canonical project_path is not valid UTF-8"))?;
-    let project_hash = ryeos_state::refs::deployed_project_key(canonical);
-    let node_trust_store = ryeos_engine::trust::TrustStore::load(
-        None,
-        &ryeos_engine::roots::RuntimeRoot::new(config.app_root.clone()).config(),
-    )
-    .context("load node trust for exact ingest-ignore policy")?;
-    let node_policy = crate::node_policy::load_snapshot(
-        &config.app_root,
-        &node_trust_store,
-        &crate::node_policy::NodePolicyTable::new(),
-    )
-    .context("compile exact node policy generation for snapshot status")?;
-    let ignore_matcher = node_policy
-        .require::<crate::node_policy::sections::ingest_ignore::CompiledIngestIgnorePolicy>()?
-        .matcher
-        .clone();
+    let authority = state.state_store.pinned_state_authority()?;
+    let cas = authority.cas_store()?;
     let ctx = SnapshotContext {
-        state: SnapshotState::Offline(&state_db),
-        ignore_matcher: &ignore_matcher,
+        state,
+        ignore_matcher: state.ignore_matcher.as_ref(),
+        project_hash: ryeos_state::refs::deployed_project_key(canonical),
+        principal_key: ryeos_state::refs::principal_storage_key(&caller.fingerprint)?.to_owned(),
         project_path,
-        project_hash,
-        principal_key: ryeos_state::refs::principal_storage_key(&principal)?.to_owned(),
         authority,
         cas,
     };
+    // Only the comparison is shared. This local-operator entry does not
+    // synthesize callback authority or expose snapshot mutation.
     status(
         &ctx,
         &ProjectParams {
@@ -278,10 +246,7 @@ fn heads(ctx: &SnapshotContext<'_>) -> Result<(Option<String>, Option<String>)> 
                 .map(|head| head.target_hash),
         ))
     };
-    match ctx.state {
-        SnapshotState::Live(state) => state.state_store.with_state_db(read),
-        SnapshotState::Offline(db) => read(db),
-    }
+    ctx.state.state_store.with_state_db(read)
 }
 
 fn status(ctx: &SnapshotContext<'_>, params: &ProjectParams) -> Result<Value> {
@@ -405,9 +370,7 @@ fn log(ctx: &SnapshotContext<'_>, limit: usize) -> Result<Value> {
 }
 
 fn create(ctx: &SnapshotContext<'_>, message: Option<String>, allow_empty: bool) -> Result<Value> {
-    let SnapshotState::Live(state) = ctx.state else {
-        bail!("snapshot creation requires live daemon authority");
-    };
+    let state = ctx.state;
     let guard = ctx.authority.acquire_shared_guard()?;
     let _permit = state
         .write_barrier
@@ -960,6 +923,36 @@ mod tests {
             missing_runtime.contains("ryeos.create.project-snapshots.live"),
             "got: {missing_runtime}"
         );
+    }
+
+    #[test]
+    fn snapshot_status_callback_keeps_both_existing_authority_requirements() {
+        let authorizer = Authorizer::new();
+        let read_project = vec![LIVE_PROJECT_READ_CAPABILITY.to_owned()];
+        let status_runtime = vec![project_snapshot_cap(&ProjectSnapshotOperation::Status)];
+        assert!(
+            authorize_snapshot_operation(
+                &authorizer,
+                &read_project,
+                &status_runtime,
+                &ProjectSnapshotOperation::Status,
+            )
+            .is_ok()
+        );
+        for (project, runtime) in [
+            (Vec::new(), status_runtime.clone()),
+            (read_project.clone(), Vec::new()),
+        ] {
+            assert!(
+                authorize_snapshot_operation(
+                    &authorizer,
+                    &project,
+                    &runtime,
+                    &ProjectSnapshotOperation::Status,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
