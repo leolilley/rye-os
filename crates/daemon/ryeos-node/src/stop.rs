@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd};
 
 use crate::status::LifecycleStatus;
 use crate::{LifecycleProgressObserver, LocalLifecycleEnv};
@@ -136,7 +136,7 @@ fn observe(observer: &mut Option<&mut dyn LifecycleProgressObserver>, status: &L
 struct LiveDaemonTarget {
     pid: u32,
     #[cfg(target_os = "linux")]
-    pidfd: OwnedFd,
+    peer: lillux::local_ipc::AuthenticatedUnixPeer,
 }
 
 impl LiveDaemonTarget {
@@ -146,7 +146,7 @@ impl LiveDaemonTarget {
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
-                    self.pidfd.as_raw_fd(),
+                    self.peer.pidfd().as_raw_fd(),
                     signal,
                     std::ptr::null::<libc::siginfo_t>(),
                     0u32,
@@ -170,7 +170,7 @@ impl LiveDaemonTarget {
         #[cfg(target_os = "linux")]
         {
             let mut pollfd = libc::pollfd {
-                fd: self.pidfd.as_raw_fd(),
+                fd: self.peer.pidfd().as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -199,14 +199,7 @@ async fn pin_live_daemon(env: &LocalLifecycleEnv) -> Result<LiveDaemonTarget> {
             Ok(Ok(stream)) => stream,
             _ => continue,
         };
-        let Some(pid) = stream
-            .peer_cred()
-            .context("read daemon socket peer credentials")?
-            .pid()
-        else {
-            continue;
-        };
-        let pinned = pin_verified_ryeosd_peer(&stream, pid as u32);
+        let pinned = pin_verified_ryeosd_peer(&stream);
         if let Ok(target) = pinned {
             return Ok(target);
         }
@@ -216,36 +209,18 @@ async fn pin_live_daemon(env: &LocalLifecycleEnv) -> Result<LiveDaemonTarget> {
     ))
 }
 
-fn pin_verified_ryeosd_peer(stream: &tokio::net::UnixStream, pid: u32) -> Result<LiveDaemonTarget> {
+fn pin_verified_ryeosd_peer(stream: &tokio::net::UnixStream) -> Result<LiveDaemonTarget> {
     #[cfg(target_os = "linux")]
     {
-        let mut raw_pidfd: libc::c_int = -1;
-        let mut value_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERPIDFD,
-                (&mut raw_pidfd as *mut libc::c_int).cast(),
-                &mut value_len,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("capture daemon socket peer with SO_PEERPIDFD");
-        }
-        if value_len as usize != std::mem::size_of::<libc::c_int>() || raw_pidfd < 0 {
-            bail!("SO_PEERPIDFD returned an invalid daemon descriptor");
-        }
-        // SAFETY: successful SO_PEERPIDFD installed a new owned descriptor.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+        let peer = lillux::local_ipc::AuthenticatedUnixPeer::capture(stream.as_fd())?;
+        let pid = u32::try_from(peer.pid()).context("invalid daemon peer PID")?;
         verify_expected_ryeosd_pid(pid)?;
-        Ok(LiveDaemonTarget { pid, pidfd })
+        Ok(LiveDaemonTarget { pid, peer })
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (stream, pid);
+        let _ = stream;
         bail!("pidfd lifecycle stop is not supported on this platform")
     }
 }

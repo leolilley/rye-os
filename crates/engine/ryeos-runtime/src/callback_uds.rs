@@ -167,8 +167,8 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
         }
     }
 
-    async fn attach_process(&self, thread_id: &str, pid: u32) -> Result<Value, CallbackError> {
-        let mut params = json!({"thread_id": thread_id, "pid": pid});
+    async fn attach_process(&self, thread_id: &str) -> Result<Value, CallbackError> {
+        let mut params = json!({"thread_id": thread_id});
         self.inject_callback_token(&mut params);
         self.rpc
             .request("runtime.attach_process", params)
@@ -761,6 +761,39 @@ impl RuntimeCallbackAPI for UdsRuntimeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attachment_wire_has_thread_authority_and_no_process_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("callback.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let frame = crate::framing::recv_frame(&mut stream).await.unwrap();
+            let request: Value = rmp_serde::from_slice(&frame).unwrap();
+            assert_eq!(request["method"], "runtime.attach_process");
+            assert_eq!(
+                request["params"],
+                json!({
+                    "thread_id":"T-runtime", "callback_token":"callback-test",
+                    "thread_auth_token":"thread-test",
+                })
+            );
+            let response = rmp_serde::to_vec_named(&json!({
+                "request_id":request["request_id"], "result":{"attached":true},
+            }))
+            .unwrap();
+            crate::framing::send_frame(&mut stream, &response)
+                .await
+                .unwrap();
+        });
+        let client = UdsRuntimeClient::new(socket, "callback-test".into(), "thread-test".into());
+        assert_eq!(
+            client.attach_process("T-runtime").await.unwrap(),
+            json!({"attached":true})
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn from_env_returns_error_without_token() {

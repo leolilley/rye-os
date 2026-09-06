@@ -330,28 +330,8 @@ pub fn validate_durable_process_control_support() -> Result<()> {
             );
         }
 
-        let (peer, _other) = std::os::unix::net::UnixStream::pair()
-            .context("create Unix socket pair for SO_PEERPIDFD probe")?;
-        let mut peer_pidfd: libc::c_int = -1;
-        let mut value_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                peer.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERPIDFD,
-                (&mut peer_pidfd as *mut libc::c_int).cast(),
-                &mut value_len,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("SO_PEERPIDFD is unavailable; RyeOS requires Linux 6.9 or newer");
-        }
-        if value_len as usize != std::mem::size_of::<libc::c_int>() || peer_pidfd < 0 {
-            anyhow::bail!("SO_PEERPIDFD returned an invalid descriptor");
-        }
-        // SAFETY: successful SO_PEERPIDFD installed a new descriptor.
-        drop(unsafe { OwnedFd::from_raw_fd(peer_pidfd) });
+        lillux::local_ipc::validate_peer_process_control_support()
+            .context("SO_PEERPIDFD is unavailable; RyeOS requires Linux 6.9 or newer")?;
         Ok(())
     }
 }

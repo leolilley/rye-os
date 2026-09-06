@@ -13305,7 +13305,7 @@ impl RuntimeDb {
         }
 
         // Preserve seeded launch metadata. A self-attach over UDS sends only
-        // thread/pid, so its `launch_metadata` is the serde default (empty); do
+        // thread identity, so its internal `launch_metadata` stays empty; do
         // NOT let that clobber metadata already seeded on the row at spawn
         // (resume context / continuation spec). Update only pid/pgid in that case.
         let Some(merged_launch_metadata) = merged_launch_metadata else {
@@ -21133,8 +21133,8 @@ mod tests {
 
     #[test]
     fn empty_attach_preserves_seeded_launch_metadata() {
-        // Spawn seeds real metadata; a later UDS self-attach sends only pid/pgid
-        // (empty metadata) and must NOT clobber it.
+        // Spawn seeds real metadata; a later authenticated self-attach repeats
+        // the kernel-observed identity with empty metadata and must not clobber it.
         let (_tmp, db) = fresh_db();
         db.insert_thread_runtime("t1", "c1").unwrap();
         let seeded = RuntimeLaunchMetadata {

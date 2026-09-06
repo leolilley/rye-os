@@ -539,9 +539,12 @@ impl CallbackClient {
         call(client, self.thread_id.clone(), value).await
     }
 
-    /// Report this process's pid so the daemon records the runtime's process
-    /// group. Resume-critical: hard-fails when the callback channel is
-    /// unavailable. A live runtime that cannot register its pgid must exit
+    /// Acknowledge this runtime through its kernel-authenticated Unix peer so
+    /// the daemon revalidates the exact attached process and group identity.
+    /// Never report a caller-local PID: an isolated runtime sees PID 1, while
+    /// the daemon observes its own PID namespace. Resume-critical: fails when
+    /// the callback channel is unavailable. A runtime that cannot acknowledge
+    /// its exact process attachment must exit
     /// rather than keep doing untracked work — otherwise, after a daemon
     /// restart, reconcile cannot tell it from a crashed thread and would
     /// resume a duplicate alongside the still-running original.
@@ -553,7 +556,7 @@ impl CallbackClient {
             )
         })?;
         client
-            .attach_process(&self.thread_id, std::process::id())
+            .attach_process(&self.thread_id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
@@ -1414,11 +1417,7 @@ mod tests {
         ) -> Result<Value, CallbackError> {
             Ok(json!({}))
         }
-        async fn attach_process(
-            &self,
-            _thread_id: &str,
-            _pid: u32,
-        ) -> Result<Value, CallbackError> {
+        async fn attach_process(&self, _thread_id: &str) -> Result<Value, CallbackError> {
             Ok(json!({}))
         }
         async fn mark_running(&self, _thread_id: &str) -> Result<Value, CallbackError> {
@@ -2115,7 +2114,7 @@ mod tests {
         async fn dispatch_action(&self, _: DispatchActionRequest) -> Result<Value, CallbackError> {
             Ok(json!({}))
         }
-        async fn attach_process(&self, _: &str, _: u32) -> Result<Value, CallbackError> {
+        async fn attach_process(&self, _: &str) -> Result<Value, CallbackError> {
             Ok(json!({}))
         }
         async fn mark_running(&self, _: &str) -> Result<Value, CallbackError> {

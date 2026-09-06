@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use lillux::local_ipc::AuthenticatedUnixPeer;
 
 use anyhow::{Context, Result, anyhow};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -221,26 +220,6 @@ fn ready_lifecycle_response(state: &AppState) -> ryeos_node::LifecycleResponse {
     response.thread_projection =
         serde_json::to_value(state.state_store.projection_health_snapshot()).ok();
     response
-}
-
-/// Kernel-authenticated identity of the process that opened this Unix stream.
-/// The pidfd, not the reusable numeric PID, remains authoritative for the
-/// connection lifetime.
-pub(crate) struct AuthenticatedUnixPeer {
-    pid: i64,
-    #[cfg(target_os = "linux")]
-    pidfd: OwnedFd,
-}
-
-impl AuthenticatedUnixPeer {
-    fn pid(&self) -> i64 {
-        self.pid
-    }
-
-    #[cfg(target_os = "linux")]
-    fn pidfd(&self) -> BorrowedFd<'_> {
-        self.pidfd.as_fd()
-    }
 }
 
 const MAX_UDS_CONNECTIONS: usize = 32;
@@ -865,7 +844,6 @@ fn handle_mark_running(params: &serde_json::Value, state: &AppState) -> Result<s
 #[serde(deny_unknown_fields)]
 struct RuntimeAttachProcessParams {
     thread_id: String,
-    pid: i64,
 }
 
 async fn handle_attach_process(
@@ -876,16 +854,16 @@ async fn handle_attach_process(
 ) -> Result<serde_json::Value> {
     let wire: RuntimeAttachProcessParams =
         serde_json::from_value(params.clone()).context("invalid runtime.attach_process params")?;
-    let peer = verify_attaching_peer_pid(wire.pid, peer)?;
-    // The runtime reports its own PID, which must match the accepted stream's
-    // kernel credential above. Derive and pin both the target and group leader
-    // daemon-side; never trust a runtime-supplied PGID or identity. The durable
-    // boot/start-time tuple is required for every later signal.
+    let peer = require_attaching_peer(peer)?;
+    // Peer PID is in the daemon's namespace; runtime-local PID 1 is not the
+    // host PID. The exact callback launch owner and existing immutable process
+    // attachment remain authoritative. Do not add a namespace translation,
+    // claimed PID, or runtime/kind-specific exception here.
     let process_identity = {
         #[cfg(target_os = "linux")]
         {
             ryeos_app::process::capture_execution_process_identity_from_pidfd(
-                wire.pid,
+                peer.pid(),
                 None,
                 peer.pidfd(),
             )
@@ -898,7 +876,7 @@ async fn handle_attach_process(
     };
     let params = ThreadAttachProcessParams {
         thread_id: wire.thread_id,
-        pid: wire.pid,
+        pid: peer.pid(),
         pgid: process_identity.pgid(),
         process_identity: Some(process_identity),
         metadata: None,
@@ -950,20 +928,10 @@ async fn handle_attach_process(
     serde_json::to_value(attached).context("failed to encode runtime.attach_process result")
 }
 
-fn verify_attaching_peer_pid(
-    reported_pid: i64,
-    peer: Option<&AuthenticatedUnixPeer>,
-) -> Result<&AuthenticatedUnixPeer> {
-    let peer = peer.ok_or_else(|| {
+fn require_attaching_peer(peer: Option<&AuthenticatedUnixPeer>) -> Result<&AuthenticatedUnixPeer> {
+    peer.ok_or_else(|| {
         anyhow!("runtime.attach_process requires a kernel-authenticated Unix peer pidfd")
-    })?;
-    let peer_pid = peer.pid();
-    if reported_pid != peer_pid {
-        anyhow::bail!(
-            "runtime.attach_process PID mismatch: reported {reported_pid}, Unix peer {peer_pid}"
-        );
-    }
-    Ok(peer)
+    })
 }
 
 /// Runtime-supplied terminal completion received on `runtime.finalize_thread`.
@@ -1796,30 +1764,19 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn runtime_attach_requires_matching_unix_peer_pid() {
-        fn peer(pid: i64) -> AuthenticatedUnixPeer {
-            AuthenticatedUnixPeer {
-                pid,
-                #[cfg(target_os = "linux")]
-                pidfd: std::fs::File::open("/dev/null").unwrap().into(),
-            }
+    fn runtime_attach_has_no_caller_selected_process_identity() {
+        let request: RuntimeAttachProcessParams =
+            serde_json::from_value(json!({"thread_id":"T-runtime"})).unwrap();
+        assert_eq!(request.thread_id, "T-runtime");
+        for injected in [
+            json!({"thread_id":"T-runtime","pid":1}),
+            json!({"thread_id":"T-runtime","pgid":42}),
+            json!({"thread_id":"T-runtime","process_identity":{}}),
+        ] {
+            assert!(serde_json::from_value::<RuntimeAttachProcessParams>(injected).is_err());
         }
-
-        let matching = peer(42);
-        verify_attaching_peer_pid(42, Some(&matching)).unwrap();
-
-        let missing = verify_attaching_peer_pid(42, None)
-            .err()
-            .expect("missing authenticated Unix peer should be rejected");
+        let missing = require_attaching_peer(None).unwrap_err();
         assert!(format!("{missing:#}").contains("kernel-authenticated Unix peer pidfd"));
-
-        let other = peer(43);
-        let mismatched = verify_attaching_peer_pid(42, Some(&other))
-            .err()
-            .expect("mismatched authenticated Unix peer should be rejected");
-        let message = format!("{mismatched:#}");
-        assert!(message.contains("reported 42"), "got: {message}");
-        assert!(message.contains("Unix peer 43"), "got: {message}");
     }
 
     type TestProvenance = ryeos_app::execution_provenance::ExecutionProvenance;

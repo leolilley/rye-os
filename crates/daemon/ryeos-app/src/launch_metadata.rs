@@ -1037,7 +1037,7 @@ impl RuntimeLaunchMetadata {
     }
 
     /// True when this carries no spawn-time metadata — i.e. a wire caller (a UDS
-    /// `runtime.attach_process` self-attach, which sends only thread/pid) let the
+    /// `runtime.attach_process` self-attach, which sends only thread identity) let the
     /// fields default. `attach_process` uses this to avoid clobbering metadata
     /// already seeded on the row at spawn (resume context).
     pub fn is_empty(&self) -> bool {

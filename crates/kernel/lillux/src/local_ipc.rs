@@ -17,6 +17,94 @@ use crate::{PinnedDirectory, protect_descriptor_from_exec};
 // within that platform boundary before asking the OS to bind or connect it.
 const MAX_ENDPOINT_PATH_BYTES: usize = 103;
 
+/// Kernel-authenticated process that connected one Unix stream. Its PID is
+/// expressed in the receiver's namespace, not in the peer's namespace. The
+/// retained pidfd pins the incarnation; a caller's numeric PID is never proof.
+/// Higher layers still authorize the thread/launch and validate birth/group
+/// identity against their existing durable process owner.
+#[derive(Debug)]
+pub struct AuthenticatedUnixPeer {
+    pid: i64,
+    #[cfg(target_os = "linux")]
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl AuthenticatedUnixPeer {
+    #[cfg(unix)]
+    pub fn capture(stream: std::os::fd::BorrowedFd<'_>) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stream;
+            bail!("authenticated Unix process identity requires Linux SO_PEERPIDFD")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+            let credentials = peer_credentials(&stream)?;
+            if credentials.pid <= 0 {
+                bail!("Unix peer process is not visible in the receiver's PID namespace");
+            }
+            let mut raw_pidfd: libc::c_int = -1;
+            let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: the borrowed connected stream and output storage stay
+            // live throughout the call. Linux installs a new CLOEXEC pidfd.
+            if unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERPIDFD,
+                    (&mut raw_pidfd as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("capture Unix peer pidfd with SO_PEERPIDFD");
+            }
+            if raw_pidfd < 0 {
+                bail!("SO_PEERPIDFD returned an invalid descriptor");
+            }
+            // Own immediately so any subsequent validation error closes it.
+            // SAFETY: successful SO_PEERPIDFD installed this new descriptor.
+            let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_pidfd) };
+            if length as usize != std::mem::size_of::<libc::c_int>() {
+                bail!("SO_PEERPIDFD returned an invalid descriptor length");
+            }
+            protect_descriptor_from_exec(&pidfd).map_err(anyhow::Error::msg)?;
+            Ok(Self {
+                pid: i64::from(credentials.pid),
+                pidfd,
+            })
+        }
+    }
+
+    pub fn pid(&self) -> i64 {
+        self.pid
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn pidfd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.pidfd.as_fd()
+    }
+}
+
+/// Probe the same peer-identity mechanism used by runtime attachment. No
+/// synthetic descriptor or numeric-PID fallback may qualify this capability.
+pub fn validate_peer_process_control_support() -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    bail!("authenticated Unix process control requires Linux SO_PEERPIDFD");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsFd as _;
+        let (stream, _other) = std::os::unix::net::UnixStream::pair()
+            .context("create Unix socket pair for SO_PEERPIDFD probe")?;
+        AuthenticatedUnixPeer::capture(stream.as_fd())?;
+        Ok(())
+    }
+}
+
 /// One connected local byte stream whose descriptor cannot leak across exec.
 pub struct LocalDuplexStream {
     #[cfg(unix)]
@@ -241,7 +329,7 @@ impl OwnerPrivateLocalDuplexListener {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_credentials(stream: &std::os::unix::net::UnixStream) -> Result<libc::ucred> {
+fn peer_credentials(stream: &impl std::os::fd::AsFd) -> Result<libc::ucred> {
     use std::os::fd::AsRawFd as _;
 
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
@@ -250,7 +338,7 @@ fn peer_credentials(stream: &std::os::unix::net::UnixStream) -> Result<libc::ucr
     // buffer/length pointers remain writable for the complete call.
     if unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            stream.as_fd().as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             credentials.as_mut_ptr().cast(),
@@ -365,4 +453,41 @@ fn validate_endpoint_path(endpoint: &Path) -> Result<()> {
 fn os_name_cstring(name: &OsStr) -> Result<CString> {
     use std::os::unix::ffi::OsStrExt as _;
     CString::new(name.as_bytes()).context("local endpoint name contains NUL")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod peer_process_tests {
+    use super::*;
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    #[test]
+    fn unix_peer_retains_kernel_pidfd_and_receiver_namespace_coordinate() {
+        let (stream, other) = std::os::unix::net::UnixStream::pair().unwrap();
+        let peer = AuthenticatedUnixPeer::capture(stream.as_fd()).unwrap();
+        assert_eq!(peer.pid(), i64::from(std::process::id()));
+        drop(stream);
+        drop(other);
+        // Socket closure does not release the independently pinned process.
+        let flags = unsafe { libc::fcntl(peer.pidfd().as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    peer.pidfd().as_raw_fd(),
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn unix_peer_refuses_non_socket_descriptors() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(AuthenticatedUnixPeer::capture(file.as_fd()).is_err());
+    }
 }

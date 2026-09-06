@@ -753,7 +753,9 @@ pub trait RuntimeCallbackAPI: Send + Sync {
     async fn dispatch_action(&self, request: DispatchActionRequest)
     -> Result<Value, CallbackError>;
 
-    async fn attach_process(&self, thread_id: &str, pid: u32) -> Result<Value, CallbackError>;
+    /// Acknowledge this runtime through the authenticated connection. PID and
+    /// group identity are daemon-observed facts, not namespace-local inputs.
+    async fn attach_process(&self, thread_id: &str) -> Result<Value, CallbackError>;
 
     /// Feature-gated daemon crash-qualification seam.
     ///

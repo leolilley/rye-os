@@ -141,14 +141,13 @@ pub struct ThreadMarkRunningParams {
 pub struct ThreadAttachProcessParams {
     pub thread_id: String,
     pub pid: i64,
-    /// Process-group id. The UDS `runtime.attach_process` wire reports `pid`
-    /// only (the runtime knows its pid, not its group), so this defaults to 0
-    /// and is derived daemon-side while capturing the live process identity.
-    /// Direct in-process callers (the detached spawn path) set it explicitly.
+    /// Daemon-observed process-group id. UDS self-attachment accepts no numeric
+    /// process claim: its authenticated peer supplies the target and group
+    /// identity. Trusted spawn callers also set these host coordinates.
     #[serde(default)]
     pub pgid: i64,
-    /// Daemon-captured, PID-reuse-safe identity. Wire callers omit this and the
-    /// UDS boundary derives it from the live process before attachment.
+    /// Daemon-captured, PID-reuse-safe identity. This is an internal contract,
+    /// not the UDS request; attachment always requires a captured identity.
     #[serde(default)]
     pub process_identity: Option<crate::process::ExecutionProcessIdentity>,
     #[serde(default)]
