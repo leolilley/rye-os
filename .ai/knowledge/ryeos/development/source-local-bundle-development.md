@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T04:41:04Z:d095efa18b51ada3186242192e8c39ad0616c6c3bec705fe9d1961f19a73f1a4:68mfU6PF1vUNLcQE9CvAKTuCNWpQYn5LOVs6nHANu8Kzgh8igjmz8P53sfkXS4ZZC/fZ5dPWKk++tfY2k81iDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T05:12:11Z:27f8cfbe5129c8280914280e142357f47a0ce85fc56f7611cfb96435a3aff252:msyES+/zUaE6rutqfyfFN+AkoLAaKdfzF7yoPfS9jsTFVcZ3lvhBh2fznLC4yon3uB8gaTeuoKqjyhGA9IN/Bw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -136,6 +136,23 @@ identity only. It grants no operator, node, release, deployment, vault,
 publication, or remote authority.
 
 ## Development execution confinement
+
+The project-owned `config:development/ryeos/worker-environment` composes the
+shared authoring environment with the exact restricted-client tree. Its finite
+request currently contains only `format-check`, `format-file` and
+`platform-inspect`; each workspace-access assertion matches the corresponding
+signed Tool. Compiler content is child-owned, not root-worker content. The
+request does not itself grant authority: node policy, initiating principal,
+parent delegation and resolved child contracts still intersect at admission.
+The Codex bundle's general authoring environment remains client-free.
+
+The client digest names the measured local development artifact from revision
+`e0fd43c89`, not a published release. It must be replaced with the exact released
+artifact when release qualification reaches that gate. Source composition
+checks are not evidence of target-local bindings or a successful worker call.
+Cargo dependency production and check/build/test routes are still pending real
+input production; do not grant nonexistent operations or substitute placeholder
+manifest hashes to advertise them early.
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
 clean-cut isolation-adapter v6 protocol. The backend is available signed data,

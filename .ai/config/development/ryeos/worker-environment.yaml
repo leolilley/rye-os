@@ -1,0 +1,60 @@
+# ryeos:signed:2026-09-06T05:11:00Z:3f77125598bd5ffad69e9d275b7539f1c084bef5c608d76777f9a0b3abc99f8d:SJ+/Rqu0PyXpht3k+kQ2CK7ts4PLx/I+0xMhwVnZ8VWV6eQSh0oZ0b2go0FsaSrDJIOfZwp9ezd8Cq0FLnqfAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# Root authoring and child operations are separate admitted programs. This
+# environment requests only the concrete operations already implemented below;
+# compiler and dependency trees remain each child Tool's own external content.
+category: development/ryeos
+schema: ryeos.worker_environment.v4
+worker_ref: worker:codex/hosted-authoring
+external_content:
+  - id: authoring-tools
+    kind: tree
+    mode: pinned
+    digest: 1ca7a7fe9ecc1d19c38c986ba9df435ff7bbe6d4ba020f2643564b8bba0c84e6
+    mount_root: execution_runtime
+    mount: authoring-tools
+  - id: workload-client
+    kind: tree
+    mode: pinned
+    digest: d40872b7d6da2a9d4768a99297ffbfaa10e2c10fb35f65a0bbc5c9d45490f177
+    mount_root: project
+    mount: environment/workload-client
+configuration:
+  executable_search:
+    - realization_id: authoring-tools
+      relative_directory: bin
+    - realization_id: workload-client
+      relative_directory: bin
+  process_environment:
+    GIT_CONFIG_NOSYSTEM: {kind: literal, value: "1"}
+    GIT_CONFIG_GLOBAL: {kind: literal, value: /dev/null}
+    GIT_PAGER: {kind: literal, value: cat}
+    TZ: {kind: literal, value: UTC}
+credential_requirement:
+  workload_family: codex
+  required_state: active
+  subject_projection_contract: codex.account.v1
+portable_state_contract: ryeos.worker_session.restore.v1
+workload_client:
+  protocol: ryeos.workload-client/v1
+  client:
+    realization_id: workload-client
+    relative_path: bin/ryeos
+  executions:
+    - item_ref: tool:ryeos/development/format-check
+      ref_bindings: {}
+      calls: [{kind: default}]
+      effect_classes: [live]
+      workspace_access: immutable_current_generation
+    - item_ref: tool:ryeos/development/format-file
+      ref_bindings: {}
+      calls: [{kind: default}]
+      effect_classes: [live]
+      workspace_access: shared_exclusive
+    - item_ref: tool:ryeos/development/platform-inspect
+      ref_bindings: {}
+      calls: [{kind: default}]
+      effect_classes: [live]
+      workspace_access: immutable_current_generation
+  max_in_flight: 1
+  max_invocations_per_boot: 16
+  max_lifetime_seconds: 1800
