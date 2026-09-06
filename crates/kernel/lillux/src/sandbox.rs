@@ -878,7 +878,7 @@ mod imp {
             if !self
                 .root
                 .remove_empty_child_if_same(name, &self.mountpoint)
-                .map_err(|error| format!("remove detached sealed mountpoint: {error}"))?
+                .map_err(|error| format!("remove detached sealed mountpoint: {error:#}"))?
             {
                 return Err("detached sealed mountpoint is not empty".to_string());
             }
@@ -1206,6 +1206,13 @@ mod imp {
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EROFS) {
             return Err("sealed mount probe did not prove read-only mount enforcement".to_string());
         }
+        // The inherited probe source is /tmp, the ancestor of this fresh
+        // sandbox root. Its recursive clone also retains the setup subtree's
+        // mounts. Drop that probe-only alias after proving attachment, before
+        // removing the sealed staging mountpoint; otherwise the cloned mount
+        // keeps its underlying dentry busy. The sealed-byte target remains
+        // attached, exactly as it does in a real launch.
+        unmount_path(&rooted(&PathBuf::from("/.inherited-directory-probe"))?)?;
         Ok(())
     }
 
