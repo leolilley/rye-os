@@ -1,0 +1,11 @@
+*
+!Dockerfile.publisher
+!Dockerfile.probe
+!produce.py
+!inputs.json
+!README.md
+!probe.sh
+!fetch.py
+!verify.py
+!qualify.py
+!test_contract.py

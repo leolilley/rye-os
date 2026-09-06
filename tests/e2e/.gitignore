@@ -18,3 +18,4 @@ __pycache__/
 !*/outputs/
 !*/outputs/.gitkeep
 !execution-comparison/README.md
+!authoring-environment/test_production.py

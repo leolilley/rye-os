@@ -1,0 +1,58 @@
+# ryeos:signed:2026-09-06T03:45:22Z:026ac38e611c264bd7729055a5485a695e2ec1003a46fd40e5092a08020fd0e2:Gzy/F54us6xxSxJYn7FQviHyxRSMVAj3Urzx8fy65L8StWONjE0jCuVMyKdkH5Prf6Gbqtkc/gfrfJmDhxn6BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+category: ryeos/development/authoring-environment-production
+name: runtime
+version: "1.0.0"
+description: Exact standalone Python for the finite authoring-environment operations
+executor_id: "@subprocess"
+execution_protocol: protocol:ryeos/core/opaque
+effects: live
+filesystem_authority: captured_execution
+network_authority: isolated
+source_scope:
+  location: item_namespace
+  load_roots: [item_directory, namespace_root, namespace_lib]
+  materialization: read_only
+config:
+  command: realization:producer-python/lib/ld-musl-x86_64.so.1
+  args:
+    - --library-path
+    - /ryeos/realizations/producer-python/lib
+    - /ryeos/realizations/producer-python/python/bin/python3.14
+    - -P
+    - -S
+    - -B
+    - -u
+    - -c
+    - literal: |
+        import hashlib, json, os, sys
+        from pathlib import Path
+        sealed = sys.argv[1]
+        handoff = json.loads(os.environ.get("RYEOS_VERIFIED_CODE_MAP", "null"))
+        if not isinstance(handoff, dict) or handoff.get("version") != 1:
+            raise SystemExit("missing sealed production source authority")
+        entry = handoff.get("entries", {}).get(sealed)
+        if not isinstance(entry, dict):
+            raise SystemExit("missing sealed production entry")
+        source = Path(sealed).read_bytes()
+        if hashlib.sha256(source).hexdigest() != entry["content_hash"]:
+            raise SystemExit("production source digest mismatch")
+        logical = Path(entry["logical_path"])
+        sys.path.insert(0, str(logical.parent / "lib"))
+        sys.argv = [str(logical), "--project-path", sys.argv[2]]
+        exec(compile(source, str(logical), "exec"), dict(
+            __name__="__main__", __file__=str(logical), __package__=None,
+            __cached__=None, __spec__=None))
+    - "${tool_path}"
+    - "${project_path}"
+  env:
+    PYTHONHOME: /ryeos/realizations/producer-python/python
+    PYTHONPATH: ""
+    PYTHONHASHSEED: "0"
+    PYTHONDONTWRITEBYTECODE: "1"
+    PYTHONNOUSERSITE: "1"
+    PYTHONSAFEPATH: "1"
+    LANG: C
+    LC_ALL: C
+    PATH: ""
+  input_data: "${params_json}"
+  timeout_secs: 300

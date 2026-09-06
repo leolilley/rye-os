@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "artifact": "ryeos-authoring-environment-v1-x86_64-linux",
+  "identity_basis": "source-level assembly and independent reproduction; expected manifests are not node receipts",
+  "input_contract_sha256": "88e99105df613be12870b3ff6283af77c36d78075d741595a4d028c048a5f946",
+  "input_files": 107,
+  "input_bytes": 139930117,
+  "output_files": 101,
+  "output_bytes": 135151248,
+  "inventory_sha256": "a129c55758fbd51577b9b99b7d595b353214e06e6747cc6109cf087067a497bd",
+  "expected_manifests": {
+    "assembly_inputs": "cc090b3d53dd41c0351dcd5ea7a18bfd4e37957ae5738569039b9b88ffd9ff80",
+    "environment": "1ca7a7fe9ecc1d19c38c986ba9df435ff7bbe6d4ba020f2643564b8bba0c84e6",
+    "production": "31852861af3ec0384240611b8675ea600ae7d93b76cf6c5c1451276e0f7bd49c",
+    "shell_file": "f609633ef39f5458263e6150590d889c044d590b702333fca82584057b1fc7c4"
+  },
+  "shell_sha256": "9573fabf1a8e0ebdd29fb1af62f62b1dc6004db10d9fc0b37ea687d849dc4364",
+  "qualification": {
+    "independent_reproduction": true,
+    "offline_empty_root": true,
+    "ryeos_production": false,
+    "retained_result_import": false,
+    "consumer_binding": false,
+    "hosted_turn": false,
+    "restart": false
+  },
+  "empty_root_probe": {
+    "image_id": "sha256:37df3db95c2b91caf72c28f029ebfa79c7f70ca030d49af6935188c4b032bbbf",
+    "exit_code": 0,
+    "changed_file_sha256": "17cbbec0b19b84e7729ef8bba7e45944bfa331f56fa873b4e796d1730b8f953f",
+    "execution_user": 65534,
+    "network": "none",
+    "host_libraries": false,
+    "descriptor_search": true
+  }
+}
