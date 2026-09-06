@@ -75,6 +75,9 @@ fn typed_duplex_channel_is_installed_at_its_exact_child_descriptor() {
             .envs
             .contains(&("RYEOS_TEST_CHANNEL_FD".to_owned(), "9".to_owned()))
     );
+    // The request now retains the child endpoint. Keeping this parent-owned
+    // clone would prevent EOF even after the real child has exited.
+    drop(child);
     let result = run(request);
     assert!(result.success, "{}", result.stderr);
     let mut message = String::new();
@@ -95,6 +98,7 @@ fn typed_duplex_channel_can_replace_child_standard_input_as_full_duplex() {
             .envs
             .contains(&("RYEOS_TEST_CHANNEL_FD".to_owned(), "0".to_owned()))
     );
+    drop(child);
     let result = run(request);
     assert!(result.success, "{}", result.stderr);
     let mut message = String::new();
@@ -407,11 +411,8 @@ fn output_overflow_terminates_a_continuously_writing_group() {
 #[test]
 #[cfg(target_os = "linux")]
 fn sealed_memfd_is_rewound_cloexec_and_immutable() {
-    use std::io::{Read as _, Seek as _, Write as _};
-    use std::os::fd::AsRawFd as _;
-
     let file = sealed_memfd(c"lillux-test", b"sealed protocol bytes").expect("sealed memfd");
-    let fd = file.as_raw_fd();
+    let fd = file.inherited_descriptor().unwrap() as i32;
     assert!(fd > libc::STDERR_FILENO);
 
     let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -423,24 +424,24 @@ fn sealed_memfd_is_rewound_cloexec_and_immutable() {
     let observed_seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
     assert_eq!(observed_seals & required_seals, required_seals);
 
-    let mut view = file.try_clone().expect("clone sealed memfd");
-    assert_eq!(view.stream_position().expect("position"), 0);
-    let mut bytes = Vec::new();
-    view.read_to_end(&mut bytes).expect("read sealed memfd");
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }, 0);
+    let (bytes, _) = file.read_regular_file_stable_bounded(128).unwrap();
     assert_eq!(bytes, b"sealed protocol bytes");
 
-    let error = view.write_all(b"mutation").unwrap_err();
+    assert_eq!(
+        unsafe { libc::write(fd, b"mutation".as_ptr().cast(), 8) },
+        -1
+    );
+    let error = std::io::Error::last_os_error();
     assert_eq!(error.raw_os_error(), Some(libc::EPERM));
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn sealed_executable_memfd_is_owner_executable_and_not_permission_writable() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let file =
         sealed_executable_memfd(c"lillux-executable-test", b"executable bytes").expect("memfd");
-    assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o500);
+    assert_eq!(file.file_identity().unwrap().mode() & 0o777, 0o500);
 }
 
 #[test]

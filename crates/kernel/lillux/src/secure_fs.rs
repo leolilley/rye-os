@@ -55,7 +55,7 @@ fn try_reflink_regular_file(source: &File, target: &File) -> Result<bool> {
 /// a huge or sparse file cannot make verification perform work beyond the
 /// sealed file size. A one-byte sentinel still detects growth during the read.
 pub fn digest_open_regular_file_stable_exact(
-    file: &mut File,
+    file: &File,
     expected_bytes: u64,
 ) -> Result<(String, std::fs::Metadata)> {
     for attempt in 0..2 {
@@ -501,7 +501,7 @@ pub fn ensure_open_regular_file_unchanged(
 /// Positional reads are mandatory: cloned descriptors share a seek cursor and
 /// must not corrupt one another's verification when reused concurrently.
 pub fn read_open_regular_file_stable_bounded(
-    file: &mut File,
+    file: &File,
     before: &OpenRegularFileObservation,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
@@ -549,7 +549,7 @@ fn read_regular_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::
     }
 }
 
-fn digest_open_regular_file_exact(file: &mut File, expected_bytes: u64) -> Result<String> {
+fn digest_open_regular_file_exact(file: &File, expected_bytes: u64) -> Result<String> {
     let mut digest = sha2::Sha256::new();
     use sha2::Digest as _;
     let mut buffer = [0_u8; 1024 * 1024];
@@ -1241,6 +1241,22 @@ impl PinnedRegularFile {
         self.file
             .try_clone()
             .with_context(|| format!("duplicate pinned regular file {}", self.path.display()))
+    }
+
+    /// Derive a child descriptor with one registered lifetime owner. The
+    /// original remains a pinned byte source, never a plain inherited handle.
+    pub fn inherited_descriptor_authority(
+        &self,
+    ) -> Result<crate::exec::InheritedDescriptorAuthority> {
+        #[cfg(not(unix))]
+        anyhow::bail!("inherited descriptor authority is unavailable on this platform");
+        #[cfg(unix)]
+        {
+            let lease = crate::exec::retain_fork_sensitive_descriptors();
+            let file = self.file.try_clone()?;
+            crate::exec::InheritedDescriptorAuthority::from_owned_file(file, &lease)
+                .map_err(anyhow::Error::msg)
+        }
     }
 
     /// Require this already-open regular file to carry at least one executable
@@ -3068,6 +3084,65 @@ impl PinnedDirectory {
         self,
     ) -> Result<crate::exec::InheritedDescriptorAuthority> {
         crate::exec::inherited_descriptor_path(self.directory).map_err(anyhow::Error::msg)
+    }
+
+    pub fn inherited_descriptor_authority(
+        &self,
+    ) -> Result<crate::exec::InheritedDescriptorAuthority> {
+        #[cfg(not(unix))]
+        anyhow::bail!("inherited descriptor authority is unavailable on this platform");
+        #[cfg(unix)]
+        {
+            let lease = crate::exec::retain_fork_sensitive_descriptors();
+            let file = self.directory.try_clone()?;
+            crate::exec::InheritedDescriptorAuthority::from_owned_file(file, &lease)
+                .map_err(anyhow::Error::msg)
+        }
+    }
+
+    /// Open and register an exact child mount descriptor before another
+    /// attachment may fork. Ordinary byte-stream callers keep open_regular.
+    pub fn open_inherited_mount_entry(
+        &self,
+        name: &OsStr,
+    ) -> Result<Option<crate::exec::InheritedDescriptorAuthority>> {
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            anyhow::bail!("inherited mount authority is unavailable on this platform");
+        }
+        #[cfg(unix)]
+        {
+            let lease = crate::exec::retain_fork_sensitive_descriptors();
+            self.open_mount_entry(name)?
+                .map(|file| {
+                    crate::exec::InheritedDescriptorAuthority::from_owned_file(file, &lease)
+                        .map_err(anyhow::Error::msg)
+                })
+                .transpose()
+        }
+    }
+
+    pub fn open_inherited_regular(
+        &self,
+        name: &OsStr,
+        writable: bool,
+    ) -> Result<Option<crate::exec::InheritedDescriptorAuthority>> {
+        #[cfg(not(unix))]
+        {
+            let _ = (name, writable);
+            anyhow::bail!("inherited descriptor authority is unavailable on this platform");
+        }
+        #[cfg(unix)]
+        {
+            let lease = crate::exec::retain_fork_sensitive_descriptors();
+            self.open_regular(name, writable)?
+                .map(|file| {
+                    crate::exec::InheritedDescriptorAuthority::from_owned_file(file, &lease)
+                        .map_err(anyhow::Error::msg)
+                })
+                .transpose()
+        }
     }
 
     /// Pin one direct child as an `O_PATH` mount source. Regular files,
@@ -5238,7 +5313,9 @@ pub fn current_user_home() -> Option<PathBuf> {
 /// following its final component, and prove the resulting descriptor still
 /// resolves to that exact canonical spelling. Raw open/fcntl/procfs mechanics
 /// stay entirely inside Lillux.
-pub fn pin_canonical_mount_source(path: &Path) -> Result<File> {
+pub fn pin_canonical_mount_source(
+    path: &Path,
+) -> Result<crate::exec::InheritedDescriptorAuthority> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = path;
@@ -5255,6 +5332,7 @@ pub fn pin_canonical_mount_source(path: &Path) -> Result<File> {
         }
         let encoded = CString::new(path.as_os_str().as_bytes())
             .context("mount source contains an interior NUL")?;
+        let lease = crate::exec::retain_fork_sensitive_descriptors();
         let mut descriptor = unsafe {
             libc::open(
                 encoded.as_ptr(),
@@ -5295,7 +5373,8 @@ pub fn pin_canonical_mount_source(path: &Path) -> Result<File> {
                 observed.display()
             );
         }
-        Ok(file)
+        crate::exec::InheritedDescriptorAuthority::from_owned_file(file, &lease)
+            .map_err(anyhow::Error::msg)
     }
 }
 

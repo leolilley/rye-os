@@ -484,10 +484,10 @@ fn host_isolation_target() -> Result<ryeos_isolation_protocol::IsolationTargetTr
 }
 
 fn inspect_isolation_backend(
-    adapter: &Arc<std::fs::File>,
+    adapter: &lillux::InheritedDescriptorAuthority,
     artifact_handles: &std::collections::BTreeMap<
         ryeos_isolation_protocol::IsolationArtifactRole,
-        Arc<std::fs::File>,
+        lillux::InheritedDescriptorAuthority,
     >,
     artifact_digests: &std::collections::BTreeMap<
         ryeos_isolation_protocol::IsolationArtifactRole,
@@ -509,12 +509,10 @@ fn inspect_isolation_backend(
     }
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd as _;
         let artifacts = artifact_handles
             .iter()
             .map(|(role, handle)| {
-                let fd = u32::try_from(handle.as_raw_fd())
-                    .map_err(|_| anyhow::anyhow!("captured descriptor is negative"))?;
+                let fd = handle.inherited_descriptor().map_err(anyhow::Error::msg)?;
                 Ok((*role, fd))
             })
             .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
@@ -535,11 +533,14 @@ fn inspect_isolation_backend(
         let request_handle = lillux::sealed_memfd(c"ryeos-isolation-inspection", &request)
             .map_err(|error| anyhow::anyhow!("seal isolation inspection request: {error}"))?;
         let result = lillux::run(lillux::SubprocessRequest {
-            cmd: format!("/proc/self/fd/{}", adapter.as_raw_fd()),
+            cmd: adapter.path().to_string_lossy().into_owned(),
             argv0: None,
             args: vec![
                 "inspect".to_string(),
-                request_handle.as_raw_fd().to_string(),
+                request_handle
+                    .inherited_descriptor()
+                    .map_err(anyhow::Error::msg)?
+                    .to_string(),
             ],
             cwd: Some("/".to_string()),
             envs: Vec::new(),

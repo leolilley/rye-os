@@ -225,7 +225,7 @@ pub struct EngineContext {
     /// descriptor numbers are paired with signed protocol environment
     /// bindings before this context is constructed; no ambient descriptor is
     /// inherited.
-    pub inherited_fds: Vec<Arc<std::fs::File>>,
+    pub inherited_fds: Vec<lillux::InheritedDescriptorAuthority>,
     pub thread_id: String,
     pub chain_root_id: String,
     pub current_site_id: String,

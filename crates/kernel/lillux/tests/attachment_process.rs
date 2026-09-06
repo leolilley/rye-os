@@ -167,13 +167,14 @@ fn attachment_deadline_expiry_fails_closed() {
 
 #[test]
 fn supervised_target_uses_the_same_typed_attachment_transition() {
-    use std::os::fd::AsRawFd as _;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("executed");
     let pipe = supervised_launcher_attachment_status_pipe().expect("attachment status pipe");
     let status_fd = pipe.writer_descriptor().unwrap() as i32;
-    let release_reader = pipe.attachment_release_reader.as_raw_fd();
+    let release_reader = pipe
+        .attachment_release_reader
+        .inherited_descriptor()
+        .unwrap();
     let script = format!(
         "(/bin/dd bs=1 count=1 <&{release_reader} >/dev/null 2>&1; printf executed > {}) & target=$!; printf '{{\"child-pid\":%s}}\\n' \"$target\" >&{status_fd}; wait \"$target\"",
         marker.display()
@@ -445,13 +446,14 @@ fn released_target_timeout_still_terminates_its_process_group() {
 
 #[test]
 fn supervised_output_overflow_before_release_fails_closed() {
-    use std::os::fd::AsRawFd as _;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("executed");
     let pipe = supervised_launcher_attachment_status_pipe().expect("attachment status pipe");
     let status_fd = pipe.writer_descriptor().unwrap() as i32;
-    let release_reader = pipe.attachment_release_reader.as_raw_fd();
+    let release_reader = pipe
+        .attachment_release_reader
+        .inherited_descriptor()
+        .unwrap();
     let script = format!(
         "(/bin/dd bs=1 count=1 <&{release_reader} >/dev/null 2>&1; printf executed > {}) & target=$!; printf '{{\"child-pid\":%s}}\\n' \"$target\" >&{status_fd}; /bin/dd if=/dev/zero bs=1024 count=4 2>/dev/null; wait \"$target\"",
         marker.display()

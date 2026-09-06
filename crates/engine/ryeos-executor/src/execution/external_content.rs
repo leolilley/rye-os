@@ -15,7 +15,7 @@ fn realization_mount_authority(
     root: ryeos_state::objects::ExternalContentMountRoot,
     source_path: PathBuf,
     destination: PathBuf,
-    source: fs::File,
+    source: lillux::InheritedDescriptorAuthority,
 ) -> ryeos_engine::isolation::IsolationReadOnlyMountAuthority {
     use ryeos_engine::isolation::IsolationReadOnlyMountAuthority;
     match root {
@@ -159,7 +159,7 @@ struct ExternalMaterializationCache {
 struct MaterializedExternalGeneration {
     root: lillux::PinnedDirectory,
     source_path: PathBuf,
-    source: fs::File,
+    source: lillux::InheritedDescriptorAuthority,
     leases: Vec<fs::File>,
 }
 
@@ -336,15 +336,17 @@ impl ExternalMaterializationCache {
         let (source_path, source) = match kind {
             ExternalContentKind::Tree => (
                 generation.path().to_path_buf(),
-                generation.try_clone_descriptor()?,
+                generation.inherited_descriptor_authority()?,
             ),
             ExternalContentKind::File => {
                 let name = OsStr::new(ryeos_engine::external_content::FILE_REALIZATION_ENTRY_PATH);
-                let source = generation.open_mount_entry(name)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "file realization {manifest_hash} has no materialized content entry"
-                    )
-                })?;
+                let source = generation
+                    .open_inherited_mount_entry(name)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "file realization {manifest_hash} has no materialized content entry"
+                        )
+                    })?;
                 (generation.path().join(name), source)
             }
         };
@@ -446,15 +448,17 @@ impl ExternalMaterializationCache {
         let (source_path, source) = match kind {
             ExternalContentKind::Tree => (
                 generation.path().to_path_buf(),
-                generation.try_clone_descriptor()?,
+                generation.inherited_descriptor_authority()?,
             ),
             ExternalContentKind::File => {
                 let name = OsStr::new(ryeos_engine::external_content::FILE_REALIZATION_ENTRY_PATH);
-                let source = generation.open_mount_entry(name)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "file realization {manifest_hash} has no materialized content entry"
-                    )
-                })?;
+                let source = generation
+                    .open_inherited_mount_entry(name)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "file realization {manifest_hash} has no materialized content entry"
+                        )
+                    })?;
                 (generation.path().join(name), source)
             }
         };

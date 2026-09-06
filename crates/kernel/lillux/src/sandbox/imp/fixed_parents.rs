@@ -388,7 +388,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let source = crate::secure_fs::pin_canonical_mount_source(temporary.path()).unwrap();
         let root_mount = LinuxSandboxMount {
-            source_fd: source.as_raw_fd() as u32,
+            source_fd: source.inherited_descriptor().unwrap(),
             destination: PathBuf::from("/project"),
             access: LinuxSandboxMountAccess::Writable,
             layer: 0,
@@ -404,7 +404,7 @@ mod tests {
         assert!(validate(&request).unwrap_err().contains("aliases"));
         let other = tempfile::tempdir().unwrap();
         let other = crate::secure_fs::pin_canonical_mount_source(other.path()).unwrap();
-        request.mounts[1].source_fd = other.as_raw_fd() as u32;
+        request.mounts[1].source_fd = other.inherited_descriptor().unwrap();
         request.mounts[1].destination = "/project/control/file".into();
         assert!(validate(&request).unwrap_err().contains("conflicts"));
         request.mounts[1].destination = "/project/control".into();
@@ -430,12 +430,12 @@ mod tests {
             if pid == 0 {
                 let result = (|| {
                     enter_namespaces(LinuxSandboxNetwork::Isolated)?;
-                    let source = reanchor_mount_source(source.as_raw_fd())?;
+                    let source = reanchor_mount_source(source.file().as_raw_fd())?;
                     mount_private_root()?;
                     let target = rooted(&PathBuf::from("/project"))?;
                     create_target(&target, DescriptorKind::Directory)?;
                     let mount = LinuxSandboxMount {
-                        source_fd: source.as_raw_fd() as u32,
+                        source_fd: source.inherited_descriptor()?,
                         destination: "/project".into(),
                         access,
                         layer: 0,
@@ -529,14 +529,14 @@ mod tests {
         if pid == 0 {
             let result = (|| {
                 enter_namespaces(LinuxSandboxNetwork::Isolated)?;
-                let source = reanchor_mount_source(source.as_raw_fd())?;
+                let source = reanchor_mount_source(source.file().as_raw_fd())?;
                 mount_private_root()?;
                 create_target(
                     &rooted(&PathBuf::from("/project"))?,
                     DescriptorKind::Directory,
                 )?;
                 let mount = LinuxSandboxMount {
-                    source_fd: source.as_raw_fd() as u32,
+                    source_fd: source.inherited_descriptor()?,
                     destination: "/project".into(),
                     access: LinuxSandboxMountAccess::Writable,
                     layer: 0,

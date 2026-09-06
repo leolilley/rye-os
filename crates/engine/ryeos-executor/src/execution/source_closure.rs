@@ -195,7 +195,7 @@ fn bind_source_with(
             ryeos_engine::isolation::IsolationReadOnlyMountAuthority::new(
                 source_path,
                 destination.clone(),
-                source.try_clone_descriptor()?,
+                source.inherited_descriptor_authority()?,
             ),
         ],
         BindingMode::PrivateWorkspace => {

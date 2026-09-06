@@ -13,10 +13,16 @@
 //! The resolution cache is deliberately different: it retains no project
 //! materialization guard, and rebinds hits to the current admitted checkout.
 //!
-//! The directory is removed recursively when the **last** `Arc` holder
-//! drops. The internal `Mutex<Option<PathBuf>>` allows `disarm()` to
-//! transfer ownership to a long-running detached owner without dropping
-//! the dir. Disarm is rare; the common path is just Drop.
+//! Ordinary temporary directories are removed when the last holder drops.
+//! Shared cache generations instead release their cache leases; eviction owns
+//! their removal. Journal-owned workspaces are deliberately preserved on Drop
+//! and require the explicit owner-fenced lifecycle to remove them. An Arc's
+//! lifetime is not proof that every independently launched workspace borrower
+//! has stopped. Keep that proof in the existing launch/workspace authorities,
+//! not in a reference-count check or a guard reconstructed from a path.
+//!
+//! The internal path slot allows `disarm()` to transfer ordinary cleanup
+//! ownership without removing the directory.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,8 +34,8 @@ struct PinnedRemoval {
     root: lillux::PinnedDirectory,
 }
 
-/// RAII guard for a materialised temp directory. Removes the directory
-/// recursively when the LAST `Arc<TempDirGuard>` drops.
+/// Materialization lifeline with explicit temporary, cache, and journal-owned
+/// workspace cleanup modes. Only ordinary temporary guards remove on Drop.
 pub struct TempDirGuard {
     inner: Mutex<Option<PathBuf>>,
     effective_path: PathBuf,

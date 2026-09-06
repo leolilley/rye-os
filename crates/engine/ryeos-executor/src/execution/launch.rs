@@ -1495,7 +1495,7 @@ struct ExecutorCacheLayout {
 }
 
 struct VerifiedOpenedExecutor {
-    handle: Arc<std::fs::File>,
+    handle: lillux::InheritedDescriptorAuthority,
     identity: ExecutorFileIdentity,
 }
 
@@ -1549,19 +1549,17 @@ fn validate_secure_cache_directory(
 }
 
 #[cfg(unix)]
-fn executor_file_identity(metadata: &std::fs::Metadata) -> ExecutorFileIdentity {
-    use std::os::unix::fs::MetadataExt as _;
-
+fn executor_file_identity(metadata: &lillux::OpenFileIdentity) -> ExecutorFileIdentity {
     ExecutorFileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.len(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
+        device: metadata.device(),
+        inode: metadata.inode(),
+        size: metadata.size(),
+        modified_seconds: metadata.modified_seconds(),
+        modified_nanoseconds: metadata.modified_nanoseconds(),
+        changed_seconds: metadata.changed_seconds(),
+        changed_nanoseconds: metadata.changed_nanoseconds(),
         mode: metadata.mode(),
-        file_type: metadata.mode() & libc::S_IFMT,
+        file_type: metadata.file_type(),
     }
 }
 
@@ -1618,7 +1616,7 @@ enum MaterializedArtifactInspection {
 }
 
 fn verify_opened_executor_file(
-    mut file: std::fs::File,
+    file: lillux::InheritedDescriptorAuthority,
     expected_hash: &str,
     expected_len: u64,
     expected_mode: u32,
@@ -1631,21 +1629,9 @@ fn verify_opened_executor_file(
     }
     #[cfg(unix)]
     let before_identity = {
-        use std::os::unix::fs::MetadataExt as _;
-
         let metadata = file
-            .metadata()
+            .require_owned_regular()
             .map_err(|error| format!("failed to inspect opened executor: {error}"))?;
-        if !metadata.file_type().is_file() {
-            return Err("opened executor is not a regular file".to_string());
-        }
-        let daemon_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != daemon_uid {
-            return Err(format!(
-                "opened executor is owned by uid {}, expected daemon uid {daemon_uid}",
-                metadata.uid()
-            ));
-        }
         let actual_mode = metadata.mode() & 0o7777;
         if actual_mode & !0o777 != 0 {
             return Err(format!(
@@ -1662,10 +1648,10 @@ fn verify_opened_executor_file(
                 "opened executor has group/other writable mode {actual_mode:#o}"
             ));
         }
-        if metadata.len() != expected_len {
+        if metadata.size() != expected_len {
             return Err(format!(
                 "opened executor has length {}, expected signed blob length {expected_len}",
-                metadata.len()
+                metadata.size()
             ));
         }
         executor_file_identity(&metadata)
@@ -1682,9 +1668,15 @@ fn verify_opened_executor_file(
         return Err("native executor Unix validation is unavailable on this platform".to_string());
     }
 
-    let (actual_hash, after_metadata) =
-        lillux::digest_open_regular_file_stable_exact(&mut file, expected_len)
-            .map_err(|error| format!("failed to hash opened executor: {error}"))?;
+    let observation = file
+        .regular_file_observation()
+        .map_err(|error| error.to_string())?;
+    if observation.size() != expected_len {
+        return Err("opened executor length changed before hashing".to_owned());
+    }
+    let actual_hash = file
+        .digest_regular_file_stable_exact(&observation)
+        .map_err(|error| format!("failed to hash opened executor: {error}"))?;
     if actual_hash != expected_hash {
         return Err(format!(
             "opened executor failed its content-address check for {executor_ref}"
@@ -1692,14 +1684,10 @@ fn verify_opened_executor_file(
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let daemon_uid = unsafe { libc::geteuid() };
-        if !after_metadata.file_type().is_file()
-            || after_metadata.uid() != daemon_uid
-            || after_metadata.mode() & 0o7777 != expected_mode
-            || after_metadata.mode() & 0o022 != 0
-            || after_metadata.len() != expected_len
+        let after_metadata = file
+            .require_owned_regular()
+            .map_err(|error| error.to_string())?;
+        if after_metadata.mode() & 0o7777 != expected_mode || after_metadata.size() != expected_len
         {
             return Err("opened executor security metadata changed while hashing".to_string());
         }
@@ -1708,7 +1696,7 @@ fn verify_opened_executor_file(
             return Err("opened executor identity changed while hashing".to_string());
         }
         Ok(VerifiedOpenedExecutor {
-            handle: Arc::new(file),
+            handle: file,
             identity: after_identity,
         })
     }
@@ -1745,7 +1733,7 @@ fn inspect_materialized_executor(
     if let Err(error) = validate_executor_cache_ancestors(layout, &blob_dir, bare) {
         return MaterializedArtifactInspection::Invalid(error.to_string());
     }
-    let file = match blob_dir.open_regular(OsStr::new(bare), false) {
+    let file = match blob_dir.open_inherited_regular(OsStr::new(bare), false) {
         Ok(Some(file)) => file,
         Ok(None) => {
             return MaterializedArtifactInspection::Invalid(
@@ -1760,9 +1748,7 @@ fn inspect_materialized_executor(
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let metadata = match file.metadata() {
+        let metadata = match file.require_owned_regular() {
             Ok(metadata) => metadata,
             Err(error) => {
                 return MaterializedArtifactInspection::Invalid(format!(
@@ -1770,15 +1756,11 @@ fn inspect_materialized_executor(
                 ));
             }
         };
-        let daemon_uid = unsafe { libc::geteuid() };
         let actual_mode = metadata.mode() & 0o7777;
-        if !metadata.file_type().is_file()
-            || metadata.uid() != daemon_uid
-            || actual_mode & 0o022 != 0
-        {
+        if actual_mode & 0o022 != 0 {
             return MaterializedArtifactInspection::Invalid(format!(
                 "materialized executor descriptor is not a daemon-owned, non-group/other-writable regular file (uid={}, mode={actual_mode:#o})",
-                metadata.uid()
+                metadata.owner()
             ));
         }
     }
@@ -1906,10 +1888,8 @@ fn stage_managed_executor_blob(
     }
     #[cfg(unix)]
     let bytes = {
-        use std::os::unix::fs::FileExt as _;
-
         let descriptor = executor.verified_command.executable();
-        let before = descriptor.metadata().map_err(|error| {
+        let before = descriptor.file_identity().map_err(|error| {
             BuildAndLaunchError::Internal(anyhow::anyhow!(
                 "inspect managed executor before CAS admission: {error}"
             ))
@@ -1931,34 +1911,19 @@ fn stage_managed_executor_blob(
                 "managed executor descriptor identity changed before CAS admission"
             )));
         }
-        if !native_executor_size_is_admissible(before.len()) {
+        if !native_executor_size_is_admissible(before.size()) {
             return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
                 "managed executor exceeds {MAX_NATIVE_EXECUTOR_BYTES} bytes"
             )));
         }
-        let len = usize::try_from(before.len()).map_err(|_| {
-            BuildAndLaunchError::Internal(anyhow::anyhow!(
-                "managed executor is too large to admit on this platform"
-            ))
-        })?;
-        let mut bytes = vec![0_u8; len];
-        let mut offset = 0_usize;
-        while offset < bytes.len() {
-            let read = descriptor
-                .read_at(&mut bytes[offset..], offset as u64)
-                .map_err(|error| {
-                    BuildAndLaunchError::Internal(anyhow::anyhow!(
-                        "read managed executor for CAS admission: {error}"
-                    ))
-                })?;
-            if read == 0 {
-                return Err(BuildAndLaunchError::Internal(anyhow::anyhow!(
-                    "managed executor ended before its verified size"
-                )));
-            }
-            offset += read;
-        }
-        let after = descriptor.metadata().map_err(|error| {
+        let (bytes, _) = descriptor
+            .read_regular_file_stable_bounded(MAX_NATIVE_EXECUTOR_BYTES)
+            .map_err(|error| {
+                BuildAndLaunchError::Internal(anyhow::anyhow!(
+                    "read managed executor for CAS admission: {error}"
+                ))
+            })?;
+        let after = descriptor.file_identity().map_err(|error| {
             BuildAndLaunchError::Internal(anyhow::anyhow!(
                 "reinspect managed executor after CAS admission read: {error}"
             ))
@@ -2208,7 +2173,7 @@ fn publish_verified_executor_blob(
         })?;
     drop(staged_file);
     let staged_file = staging
-        .open_regular(OsStr::new(bare), false)
+        .open_inherited_regular(OsStr::new(bare), false)
         .map_err(|error| MaterializationError::MaterializationFailed {
             executor_ref: bare.to_string(),
             detail: format!("failed to reopen staged executor: {error}"),
@@ -11676,7 +11641,6 @@ mod tests {
     #[test]
     fn materialized_descriptor_survives_path_substitution_without_inode_rebinding() {
         let _guard = materializer_test_guard();
-        use std::io::{Read as _, Seek as _};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -11695,9 +11659,9 @@ mod tests {
         let held_inode = materialized
             .verified_command
             .executable()
-            .metadata()
+            .file_identity()
             .unwrap()
-            .ino();
+            .inode();
         let displaced = materialized.path.with_extension("displaced");
         std::fs::rename(&materialized.path, &displaced).unwrap();
         std::fs::write(&materialized.path, vec![0u8; fixture.bytes.len()]).unwrap();
@@ -11708,16 +11672,12 @@ mod tests {
             held_inode
         );
 
-        let mut exact = materialized
-            .verified_command
-            .executable()
-            .try_clone()
+        let exact = materialized.verified_command.executable();
+        let (bytes, _) = exact
+            .read_regular_file_stable_bounded(fixture.bytes.len() as u64)
             .unwrap();
-        exact.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let mut bytes = Vec::new();
-        exact.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, fixture.bytes);
-        assert_eq!(exact.metadata().unwrap().ino(), held_inode);
+        assert_eq!(exact.file_identity().unwrap().inode(), held_inode);
     }
 
     #[test]

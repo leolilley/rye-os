@@ -12,7 +12,6 @@ pub mod signature;
 pub mod time;
 pub mod vault;
 
-pub use exec::retain_fork_sensitive_descriptors;
 pub use exec::take_inherited_duplex_channel_from_env;
 pub use exec::{
     AbortedProcess, AttachmentAbortError, AttachmentReleaseError, CooperativeChildTermination,
@@ -25,10 +24,11 @@ pub use exec::{
     configure_inherited_descriptor_authorities, configure_inherited_fds,
     configure_owner_private_creation_mask, configure_subprocess_limits, disable_process_core_dumps,
     inherited_descriptor_coordinate, inherited_descriptor_path_for, inherited_duplex_channel_pair,
-    protect_descriptor_from_exec, sealed_executable_memfd, sealed_memfd,
+    protect_descriptor_from_exec, replace_current_process, sealed_executable_memfd, sealed_memfd,
     supervised_launcher_attachment_status_pipe, supervised_launcher_status_pipe,
     validate_subprocess_limits,
 };
+pub use exec::{retain_fork_sensitive_descriptors, retain_fork_sensitive_descriptors_until};
 
 pub use atomic_fs::{
     AtomicMutationError, AtomicMutationResult, atomic_exchange_paths, atomic_write,
@@ -45,6 +45,14 @@ pub use locks::{
 };
 pub use process_control::{
     ExactProcessIdentity, QuiescedProcessGroup, quiesce_exact_process_group,
+};
+
+#[cfg(target_os = "linux")]
+pub use exec::{
+    DescriptorTransferBounds, InheritedDescriptorTransferChildAuthority,
+    InheritedDescriptorTransferReceiver, InheritedDescriptorTransferSender,
+    ReceivedDescriptorAuthority, ReceivedDescriptorTransfer, inherited_descriptor_transfer_pair,
+    take_inherited_descriptor_transfer_sender,
 };
 pub use secure_fs::{
     DirectoryTraversalBudget, FilesystemCapacity, NoFollowDirectoryTree, OpenFileIdentity,

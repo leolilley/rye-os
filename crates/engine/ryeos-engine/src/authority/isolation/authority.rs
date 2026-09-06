@@ -125,7 +125,7 @@ pub struct IsolationDescriptorFileIdentity {
 #[derive(Debug, Clone)]
 pub struct IsolationDescriptorBoundCommand {
     identity: IsolationVerifiedCode,
-    executable: Arc<std::fs::File>,
+    executable: lillux::InheritedDescriptorAuthority,
     file_identity: IsolationDescriptorFileIdentity,
 }
 
@@ -192,7 +192,7 @@ impl From<IsolationRealizationMemberCommand> for IsolationAdmittedCommand {
 impl IsolationDescriptorBoundCommand {
     pub fn new(
         identity: IsolationVerifiedCode,
-        executable: Arc<std::fs::File>,
+        executable: lillux::InheritedDescriptorAuthority,
         file_identity: IsolationDescriptorFileIdentity,
     ) -> Self {
         Self {
@@ -206,7 +206,7 @@ impl IsolationDescriptorBoundCommand {
         &self.identity
     }
 
-    pub fn executable(&self) -> &Arc<std::fs::File> {
+    pub fn executable(&self) -> &lillux::InheritedDescriptorAuthority {
         &self.executable
     }
 
@@ -250,7 +250,7 @@ pub trait IsolationCommandAuthority: std::fmt::Debug + Send + Sync {
 pub struct IsolationReadOnlyMountAuthority {
     source_path: PathBuf,
     destination: PathBuf,
-    source: Arc<std::fs::File>,
+    source: lillux::InheritedDescriptorAuthority,
     scope: IsolationReadOnlyMountScope,
 }
 
@@ -265,21 +265,25 @@ impl IsolationReadOnlyMountAuthority {
     pub fn new_execution_runtime(
         source_path: PathBuf,
         destination: PathBuf,
-        source: std::fs::File,
+        source: lillux::InheritedDescriptorAuthority,
     ) -> Self {
         Self {
             source_path,
             destination,
-            source: Arc::new(source),
+            source,
             scope: IsolationReadOnlyMountScope::ExecutionRuntimeRealization,
         }
     }
 
-    pub fn new(source_path: PathBuf, destination: PathBuf, source: std::fs::File) -> Self {
+    pub fn new(
+        source_path: PathBuf,
+        destination: PathBuf,
+        source: lillux::InheritedDescriptorAuthority,
+    ) -> Self {
         Self {
             source_path,
             destination,
-            source: Arc::new(source),
+            source,
             scope: IsolationReadOnlyMountScope::ProjectRealization,
         }
     }
@@ -287,12 +291,12 @@ impl IsolationReadOnlyMountAuthority {
     pub fn new_state_overlay(
         source_path: PathBuf,
         destination: PathBuf,
-        source: std::fs::File,
+        source: lillux::InheritedDescriptorAuthority,
     ) -> Self {
         Self {
             source_path,
             destination,
-            source: Arc::new(source),
+            source,
             scope: IsolationReadOnlyMountScope::StateOverlay,
         }
     }
@@ -305,7 +309,7 @@ impl IsolationReadOnlyMountAuthority {
         &self.destination
     }
 
-    pub(crate) fn source(&self) -> &Arc<std::fs::File> {
+    pub(crate) fn source(&self) -> &lillux::InheritedDescriptorAuthority {
         &self.source
     }
 
@@ -403,7 +407,10 @@ impl IsolationTargetChannelAuthority {
             .map_err(anyhow::Error::msg)
     }
 
-    pub(crate) fn retain_for_child(&self, inherited_fds: &mut Vec<Arc<std::fs::File>>) {
+    pub(crate) fn retain_for_child(
+        &self,
+        inherited_fds: &mut Vec<lillux::InheritedDescriptorAuthority>,
+    ) {
         self.channel.retain_for_child(inherited_fds);
     }
 }

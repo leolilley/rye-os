@@ -369,23 +369,10 @@ async fn exec_client(
 
     let args = client_args_from_launch(launch, command_def, tail, project_path)?;
 
-    // Exec: client replaces the process (inherited stdio)
-    #[cfg(unix)]
-    let executable = {
-        use std::os::fd::AsRawFd as _;
-        let fd = captured.handle.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-            return Err(local_err(anyhow::anyhow!(
-                "make captured client executable inheritable: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        PathBuf::from(format!("/proc/self/fd/{fd}"))
-    };
-    #[cfg(not(unix))]
-    let executable = captured.identity.absolute_path.clone();
-    let mut command = std::process::Command::new(&executable);
+    // The client replaces this process using the captured executable. Reuse
+    // Lillux's retained inheritance owner and exec mechanics; never reopen the
+    // display path or manipulate descriptor flags in the CLI.
+    let mut command = std::process::Command::new(captured.handle.path());
     command.args(&args);
     command
         .env("RYEOS_CLIENT_PROJECT_PATH", project_path)
@@ -393,24 +380,17 @@ async fn exec_client(
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let error = command.exec();
-        Err(CliError::Local {
-            detail: format!("exec client '{item_ref}' from verified descriptor: {error}"),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let status = command.status().map_err(local_err)?;
-        if !status.success() {
-            return Err(CliError::Local {
-                detail: format!("client '{}' failed with exit {:?}", item_ref, status.code()),
-            });
-        }
-        Ok(OfflineDispatchOutcome::Silent)
-    }
+    lillux::configure_inherited_descriptor_authorities(
+        &mut command,
+        std::slice::from_ref(&captured.handle),
+    )
+    .map_err(|error| CliError::Local {
+        detail: format!("retain captured client executable: {error}"),
+    })?;
+    let error = lillux::replace_current_process(&mut command);
+    Err(CliError::Local {
+        detail: format!("exec client '{item_ref}' from verified descriptor: {error}"),
+    })
 }
 
 fn client_requires_daemon(value: &Value) -> bool {

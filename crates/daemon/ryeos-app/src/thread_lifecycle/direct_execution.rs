@@ -1802,7 +1802,7 @@ pub struct SpawnItemParams<'a> {
     /// context as the isolation root.
     pub isolation_workspace: Option<std::path::PathBuf>,
     /// Deliberately inherited, already-open protocol descriptors.
-    pub inherited_fds: Vec<std::sync::Arc<std::fs::File>>,
+    pub inherited_fds: Vec<lillux::InheritedDescriptorAuthority>,
     /// Canonical JSON of the launch's sealed external realization set, or
     /// `None` when the program realizes nothing. Injected per spawn so a
     /// runtime references the identity it executes under without

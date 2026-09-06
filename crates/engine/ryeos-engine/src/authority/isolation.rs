@@ -177,7 +177,7 @@ struct PinnedDaemonSocket {
     destination: PathBuf,
     parent: Arc<lillux::PinnedDirectory>,
     name: std::ffi::OsString,
-    entry: Arc<std::fs::File>,
+    entry: lillux::InheritedDescriptorAuthority,
 }
 
 #[derive(Debug)]
@@ -193,7 +193,7 @@ struct VerifiedArtifactStore {
 #[derive(Debug)]
 struct MaterializedArtifact {
     path: PathBuf,
-    handle: Arc<std::fs::File>,
+    handle: lillux::InheritedDescriptorAuthority,
 }
 
 #[derive(Debug, Default)]
@@ -207,7 +207,7 @@ struct VerifiedArtifactUsage {
 struct VerifiedArtifactEntry {
     content_hash: String,
     content_len: u64,
-    handle: Arc<std::fs::File>,
+    handle: lillux::InheritedDescriptorAuthority,
 }
 
 impl VerifiedArtifactStore {
@@ -228,7 +228,7 @@ impl VerifiedArtifactStore {
                 "verified artifact name `{name}` was reused for different content"
             )));
         }
-        let handle = Arc::clone(&entry.handle);
+        let handle = entry.handle.clone();
         drop(usage);
         self.validate_existing(name, expected_hash, handle)
             .map(Some)
@@ -238,20 +238,15 @@ impl VerifiedArtifactStore {
         &self,
         name: &str,
         expected_hash: &str,
-        handle: Arc<std::fs::File>,
+        handle: lillux::InheritedDescriptorAuthority,
     ) -> Result<MaterializedArtifact, EngineError> {
         let artifact = self.root.path().join(name);
         // Reuse is read-only validation. Re-running chmod here changes ctime
         // and races every concurrent reader; it also repairs permissions that
         // should instead make an already-published artifact fail closed.
-        let (content, observation) = read_regular_file_handle_limited(
-            "verified artifact",
-            &artifact,
-            handle
-                .try_clone()
-                .map_err(|error| refused(error.to_string()))?,
-            self.max_file_bytes,
-        )?;
+        let (content, observation) = handle
+            .read_regular_file_stable_bounded(self.max_file_bytes)
+            .map_err(|error| refused(format!("read verified artifact: {error}")))?;
         if observation
             .full_permission_mode()
             .map_err(|error| refused(error.to_string()))?
@@ -353,7 +348,7 @@ impl VerifiedArtifactStore {
                     "verified artifact name `{name}` was reused for different content"
                 )));
             }
-            let handle = Arc::clone(&entry.handle);
+            let handle = entry.handle.clone();
             drop(usage);
             return self.validate_existing(name, expected_hash, handle);
         }
@@ -381,17 +376,13 @@ impl VerifiedArtifactStore {
 
         let file = match self
             .root
-            .open_regular(name.as_ref(), false)
+            .open_inherited_regular(name.as_ref(), false)
             .map_err(|error| refused(format!("verified artifact cannot be opened: {error}")))?
         {
             Some(file) => {
-                let (existing, _) = read_regular_file_handle_limited(
-                    "verified artifact",
-                    &artifact,
-                    file.try_clone()
-                        .map_err(|error| refused(error.to_string()))?,
-                    self.max_file_bytes,
-                )?;
+                let (existing, _) = file
+                    .read_regular_file_stable_bounded(self.max_file_bytes)
+                    .map_err(|error| refused(format!("read verified artifact: {error}")))?;
                 if existing != content || lillux::cas::sha256_hex(&existing) != expected_hash {
                     return Err(refused(format!(
                         "verified artifact {} exists with unexpected content",
@@ -415,7 +406,7 @@ impl VerifiedArtifactStore {
                     // close it and pin the published inode read-only.
                     drop(writable_file);
                     self.root
-                        .open_regular(name.as_ref(), false)
+                        .open_inherited_regular(name.as_ref(), false)
                         .map_err(|error| {
                             refused(format!(
                                 "verified artifact cannot be reopened read-only: {error}"
@@ -431,7 +422,7 @@ impl VerifiedArtifactStore {
                 None => {
                     let file = self
                         .root
-                        .open_regular(name.as_ref(), false)
+                        .open_inherited_regular(name.as_ref(), false)
                         .map_err(|error| {
                             refused(format!("verified artifact cannot be opened: {error}"))
                         })?
@@ -441,13 +432,9 @@ impl VerifiedArtifactStore {
                                 artifact.display()
                             ))
                         })?;
-                    let (existing, _) = read_regular_file_handle_limited(
-                        "verified artifact",
-                        &artifact,
-                        file.try_clone()
-                            .map_err(|error| refused(error.to_string()))?,
-                        self.max_file_bytes,
-                    )?;
+                    let (existing, _) = file
+                        .read_regular_file_stable_bounded(self.max_file_bytes)
+                        .map_err(|error| refused(format!("read verified artifact: {error}")))?;
                     if existing != content || lillux::cas::sha256_hex(&existing) != expected_hash {
                         return Err(refused(format!(
                             "verified artifact {} exists with unexpected content",
@@ -459,13 +446,9 @@ impl VerifiedArtifactStore {
             },
         };
         protect_verified_artifact(&file, &artifact)?;
-        let (captured, _) = read_regular_file_handle_limited(
-            "verified artifact",
-            &artifact,
-            file.try_clone()
-                .map_err(|error| refused(error.to_string()))?,
-            self.max_file_bytes,
-        )?;
+        let (captured, _) = file
+            .read_regular_file_stable_bounded(self.max_file_bytes)
+            .map_err(|error| refused(format!("read verified artifact: {error}")))?;
         if lillux::cas::sha256_hex(&captured) != expected_hash {
             return Err(refused(format!(
                 "verified artifact {} failed its content-address check",
@@ -474,13 +457,13 @@ impl VerifiedArtifactStore {
         }
         usage.files = next_files;
         usage.total_bytes = next_total;
-        let handle = Arc::new(file);
+        let handle = file;
         usage.entries.insert(
             name.to_string(),
             VerifiedArtifactEntry {
                 content_hash: expected_hash.to_string(),
                 content_len,
-                handle: Arc::clone(&handle),
+                handle: handle.clone(),
             },
         );
         Ok(MaterializedArtifact {
@@ -490,8 +473,11 @@ impl VerifiedArtifactStore {
     }
 }
 
-fn protect_verified_artifact(file: &std::fs::File, path: &Path) -> Result<(), EngineError> {
-    lillux::set_open_regular_file_mode(file, 0o500).map_err(|error| {
+fn protect_verified_artifact(
+    file: &lillux::InheritedDescriptorAuthority,
+    path: &Path,
+) -> Result<(), EngineError> {
+    file.set_regular_file_mode(0o500).map_err(|error| {
         refused(format!(
             "verified artifact {} cannot be protected: {error}",
             path.display()
@@ -538,7 +524,7 @@ fn open_relative_directory(
 struct ReadableMount {
     source: PathBuf,
     destination: PathBuf,
-    source_handle: Arc<std::fs::File>,
+    source_handle: lillux::InheritedDescriptorAuthority,
     layer: u32,
 }
 
@@ -572,7 +558,7 @@ struct WritableMount {
     source: PathBuf,
     destination: PathBuf,
     authority: WritableMountAuthority,
-    source_handle: Arc<std::fs::File>,
+    source_handle: lillux::InheritedDescriptorAuthority,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -614,13 +600,13 @@ struct WritableMountResolution<'a> {
     namespace: MountNamespace<'a>,
     checkpoint_destination: Option<&'a Path>,
     canonical_checkpoint_dir: Option<&'a Path>,
-    checkpoint_source_handle: Option<&'a Arc<std::fs::File>>,
-    project_source_handle: Option<&'a Arc<std::fs::File>>,
+    checkpoint_source_handle: Option<&'a lillux::InheritedDescriptorAuthority>,
+    project_source_handle: Option<&'a lillux::InheritedDescriptorAuthority>,
 }
 
 struct ReadableMountResolution<'a> {
     namespace: MountNamespace<'a>,
-    project_source_handle: Option<&'a Arc<std::fs::File>>,
+    project_source_handle: Option<&'a lillux::InheritedDescriptorAuthority>,
     app_root: Option<&'a Path>,
     app_root_authority: Option<&'a lillux::PinnedDirectory>,
     app_root_destination: Option<&'a Path>,
@@ -643,8 +629,8 @@ struct WritableMountValidation<'a> {
 
 struct PreparedProjectWorkspace {
     workspace_id: String,
-    project: Arc<std::fs::File>,
-    backend_state: Arc<std::fs::File>,
+    project: lillux::InheritedDescriptorAuthority,
+    backend_state: lillux::InheritedDescriptorAuthority,
 }
 
 fn open_backend_relative_directory(
@@ -901,26 +887,26 @@ impl IsolationRuntime {
                 Some(&backend_state_root),
             )?;
             let project = project_root
-                .try_clone_descriptor()
+                .inherited_descriptor_authority()
                 .map_err(|error| refused(format!("clone workspace project: {error}")))?;
             let backend_state = backend_state_root
-                .try_clone_descriptor()
+                .inherited_descriptor_authority()
                 .map_err(|error| refused(format!("clone workspace backend state: {error}")))?;
             let authorities = vec![
                 IsolationAuthority {
                     id: IsolationAuthorityId::new("workspace-project")
                         .map_err(|error| refused(error.to_string()))?,
-                    inherited_fd: lillux::inherited_descriptor_coordinate(&project).map_err(
-                        |error| refused(format!("inspect workspace project descriptor: {error}")),
-                    )?,
+                    inherited_fd: project.inherited_descriptor().map_err(|error| {
+                        refused(format!("inspect workspace project descriptor: {error}"))
+                    })?,
                     purpose: IsolationAuthorityPurpose::WorkspaceProject,
                 },
                 IsolationAuthority {
                     id: IsolationAuthorityId::new("workspace-backend-state")
                         .map_err(|error| refused(error.to_string()))?,
-                    inherited_fd: lillux::inherited_descriptor_coordinate(&backend_state).map_err(
-                        |error| refused(format!("inspect workspace state descriptor: {error}")),
-                    )?,
+                    inherited_fd: backend_state.inherited_descriptor().map_err(|error| {
+                        refused(format!("inspect workspace state descriptor: {error}"))
+                    })?,
                     purpose: IsolationAuthorityPurpose::WorkspaceBackendState,
                 },
             ];
@@ -946,14 +932,12 @@ impl IsolationRuntime {
                 lillux::sealed_memfd(c"ryeos-workspace-request", &request_bytes)
                     .map_err(|error| refused(format!("seal workspace request: {error}")))?;
             let result = lillux::run(lillux::SubprocessRequest {
-                cmd: lillux::inherited_descriptor_path_for(&backend.adapter_handle)
-                    .map_err(|error| refused(format!("resolve adapter descriptor path: {error}")))?
-                    .to_string_lossy()
-                    .into_owned(),
+                cmd: backend.adapter_handle.path().to_string_lossy().into_owned(),
                 argv0: None,
                 args: vec![
                     "workspace".to_string(),
-                    lillux::inherited_descriptor_coordinate(&request_handle)
+                    request_handle
+                        .inherited_descriptor()
                         .map_err(|error| {
                             refused(format!("inspect workspace request descriptor: {error}"))
                         })?
@@ -973,8 +957,8 @@ impl IsolationRuntime {
                 }),
                 inherited_fds: vec![
                     backend.adapter_handle.clone(),
-                    Arc::new(project),
-                    Arc::new(backend_state),
+                    project,
+                    backend_state,
                     request_handle,
                 ],
                 inherited_fd_mappings: Vec::new(),
@@ -1126,12 +1110,13 @@ impl IsolationRuntime {
             .map_err(|error| refused(format!("daemon socket parent cannot be pinned: {error}")))?
             .ok_or_else(|| refused("daemon socket parent disappeared".to_string()))?;
         let entry = parent
-            .open_mount_entry(socket_name)
+            .open_inherited_mount_entry(socket_name)
             .map_err(|error| refused(format!("daemon socket cannot be pinned: {error}")))?
             .ok_or_else(|| {
                 refused("daemon socket disappeared before isolation load".to_string())
             })?;
-        if lillux::open_mount_entry_kind(&entry)
+        if entry
+            .mount_entry_kind()
             .map_err(|error| refused(format!("daemon socket cannot be inspected: {error}")))?
             != lillux::OpenMountEntryKind::UnixSocket
         {
@@ -1145,7 +1130,7 @@ impl IsolationRuntime {
             destination: daemon_socket.to_path_buf(),
             parent: Arc::new(parent),
             name: socket_name.to_os_string(),
-            entry: Arc::new(entry),
+            entry,
         };
         Self::load_inner(app_root, Some(socket), backend)
     }
@@ -1192,12 +1177,13 @@ impl IsolationRuntime {
             .map_err(|error| refused(format!("daemon socket parent cannot be pinned: {error}")))?
             .ok_or_else(|| refused("daemon socket parent disappeared".to_string()))?;
         let entry = parent
-            .open_mount_entry(socket_name)
+            .open_inherited_mount_entry(socket_name)
             .map_err(|error| refused(format!("daemon socket cannot be pinned: {error}")))?
             .ok_or_else(|| {
                 refused("daemon socket disappeared before isolation load".to_string())
             })?;
-        if lillux::open_mount_entry_kind(&entry)
+        if entry
+            .mount_entry_kind()
             .map_err(|error| refused(format!("daemon socket cannot be inspected: {error}")))?
             != lillux::OpenMountEntryKind::UnixSocket
         {
@@ -1211,7 +1197,7 @@ impl IsolationRuntime {
             destination: daemon_socket.to_path_buf(),
             parent: Arc::new(parent),
             name: socket_name.to_os_string(),
-            entry: Arc::new(entry),
+            entry,
         };
         Self::resolve_compiled_policy_inner(app_root, policy, source, digest, Some(socket), backend)
     }
@@ -1685,31 +1671,22 @@ impl IsolationRuntime {
                 "realization-member command has invalid SHA-256 digest `{expected_hash}`"
             )));
         }
-        let root = lillux::PinnedDirectory::from_open_directory(
-            mount.source_path().to_path_buf(),
-            mount
-                .source()
-                .try_clone()
-                .map_err(|error| refused(format!("clone realization root: {error}")))?,
-        )
-        .map_err(|error| refused(format!("adopt realization root: {error}")))?;
+        let root = mount.source();
         let member = root
-            .open_pinned_regular_descendant(relative_path, false)
+            .open_regular_descendant(relative_path)
             .map_err(|error| refused(format!("open realization command member: {error}")))?
             .ok_or_else(|| refused("realization command member disappeared".to_string()))?;
         let observed = member
-            .observation()
+            .regular_file_observation()
             .map_err(|error| refused(format!("observe realization command member: {error}")))?;
-        let size = member
-            .size()
-            .map_err(|error| refused(format!("size realization command member: {error}")))?;
+        let size = observed.size();
         let max_bytes = self.inspection.limits.verified_artifact_file_bytes;
         if size > max_bytes {
             return Err(refused(format!(
                 "realization command member is {size} bytes, exceeding configured per-file limit {max_bytes}"
             )));
         }
-        let mode = member.permission_mode().map_err(|error| {
+        let mode = observed.permission_mode().map_err(|error| {
             refused(format!("inspect realization command member mode: {error}"))
         })?;
         if mode != 0o755 {
@@ -1718,17 +1695,14 @@ impl IsolationRuntime {
             )));
         }
         let observed_hash = member
-            .digest_stable_exact(&observed)
+            .digest_regular_file_stable_exact(&observed)
             .map_err(|error| refused(format!("digest realization command member: {error}")))?;
         if observed_hash != expected_hash {
             return Err(refused(format!(
                 "realization command member failed its content check (expected {expected_hash}, got {observed_hash})"
             )));
         }
-        let executable =
-            std::sync::Arc::new(member.try_clone_descriptor().map_err(|error| {
-                refused(format!("retain realization command descriptor: {error}"))
-            })?);
+        let executable = member;
         let file_identity = descriptor_file_identity(&executable)?;
         let identity = IsolationVerifiedCode {
             source_path: mount.destination().join(relative_path),
@@ -1738,7 +1712,7 @@ impl IsolationRuntime {
         validate_descriptor_bound_command(&command)?;
         Ok(IsolationRealizationMemberCommand::new(
             command,
-            root.identity()
+            root.directory_identity()
                 .map_err(|error| refused(format!("identify realization root: {error}")))?,
             mount.destination().to_path_buf(),
         ))
@@ -2095,10 +2069,7 @@ impl IsolationRuntime {
                         }
                         _ => self.seal_verified_code_for_disabled(identity, is_command)?,
                     };
-                    let destination =
-                        lillux::inherited_descriptor_path_for(&handle).map_err(|error| {
-                            refused(format!("resolve verified-code descriptor path: {error}"))
-                        })?;
+                    let destination = handle.path().to_path_buf();
                     if descriptor_bound {
                         rewrite_descriptor_bound_code_references(
                             &mut request.args,
@@ -2286,9 +2257,9 @@ impl IsolationRuntime {
                     )));
                 }
                 retained_live_project_handle =
-                    Some(Arc::new(root.try_clone_descriptor().map_err(|error| {
+                    Some(root.inherited_descriptor_authority().map_err(|error| {
                         refused(format!("live project descriptor cannot be cloned: {error}"))
-                    })?));
+                    })?);
                 let mut previous: Option<&Path> = None;
                 let mut destinations = Vec::with_capacity(denied_control_paths.len());
                 for relative in denied_control_paths {
@@ -2397,11 +2368,11 @@ impl IsolationRuntime {
                     "runtime workspace does not match its pinned named-child authority".to_string(),
                 ));
             }
-            let handle = Arc::new(expected.try_clone_descriptor().map_err(|error| {
+            let handle = expected.inherited_descriptor_authority().map_err(|error| {
                 refused(format!(
                     "runtime workspace authority cannot be cloned: {error}"
                 ))
-            })?);
+            })?;
             let backend_state = expected_root
                 .open_child_directory(std::ffi::OsStr::new(
                     crate::execution_workspace::BACKEND_STATE_DIR,
@@ -2424,13 +2395,13 @@ impl IsolationRuntime {
                 Some(PreparedProjectWorkspace {
                     workspace_id,
                     project: handle,
-                    backend_state: Arc::new(backend_state.try_clone_descriptor().map_err(
+                    backend_state: backend_state.inherited_descriptor_authority().map_err(
                         |error| {
                             refused(format!(
                                 "runtime workspace backend state cannot be cloned: {error}"
                             ))
                         },
-                    )?),
+                    )?,
                 }),
             )
         } else if context.project_authority == IsolationProjectAuthority::EphemeralScratch {
@@ -2469,11 +2440,11 @@ impl IsolationRuntime {
                         .to_string(),
                 ));
             }
-            let handle = Arc::new(expected.try_clone_descriptor().map_err(|error| {
+            let handle = expected.inherited_descriptor_authority().map_err(|error| {
                 refused(format!(
                     "projectless scratch authority cannot be cloned: {error}"
                 ))
-            })?);
+            })?;
             (true, Some(handle), None)
         } else if let Some(handle) = retained_live_project_handle {
             (false, Some(handle), None)
@@ -2573,13 +2544,13 @@ impl IsolationRuntime {
                     expected.display()
                 )));
             }
-            checkpoint_source_handle = Some(Arc::new(
+            checkpoint_source_handle = Some(
                 requested_authority
-                    .try_clone_descriptor()
+                    .inherited_descriptor_authority()
                     .map_err(|error| {
                         refused(format!("checkpoint authority cannot be cloned: {error}"))
                     })?,
-            ));
+            );
         }
         let writable_resolution = WritableMountResolution {
             namespace: mount_namespace,
@@ -2874,7 +2845,7 @@ impl IsolationRuntime {
                 }
                 let current = configured
                     .parent
-                    .open_mount_entry(&configured.name)
+                    .open_inherited_mount_entry(&configured.name)
                     .map_err(|error| {
                         refused(format!(
                             "daemon socket authority cannot be checked: {error}"
@@ -3132,7 +3103,7 @@ impl IsolationRuntime {
         let target_authority = {
             let mut add_mount = |prefix: &str,
                                  index: usize,
-                                 handle: Arc<std::fs::File>,
+                                 handle: lillux::InheritedDescriptorAuthority,
                                  destination: &Path,
                                  access: IsolationMountAccess,
                                  purpose: IsolationAuthorityPurpose,
@@ -3266,16 +3237,13 @@ impl IsolationRuntime {
                             .to_string(),
                     )
                 })?;
-                let current_root = lillux::PinnedDirectory::from_open_directory(
-                    matching_root.source_path().to_path_buf(),
-                    matching_root.source().try_clone().map_err(|error| {
-                        refused(format!("clone realization command root: {error}"))
-                    })?,
-                )
-                .map_err(|error| refused(format!("adopt realization command root: {error}")))?;
-                if current_root.identity().map_err(|error| {
-                    refused(format!("identify realization command root: {error}"))
-                })? != command.realization_root()
+                if matching_root
+                    .source()
+                    .directory_identity()
+                    .map_err(|error| {
+                        refused(format!("identify realization command root: {error}"))
+                    })?
+                    != command.realization_root()
                 {
                     return Err(refused(
                         "realization-member command tree authority changed before launch"
@@ -3286,7 +3254,7 @@ impl IsolationRuntime {
                 target_authority = Some(add_mount(
                     "realization-command",
                     0,
-                    Arc::clone(command.command().executable()),
+                    command.command().executable().clone(),
                     &command_path,
                     IsolationMountAccess::ReadOnly,
                     IsolationAuthorityPurpose::Executable,
@@ -3515,10 +3483,7 @@ impl IsolationRuntime {
 
         Ok(CompiledIsolationLaunch {
             request: lillux::SubprocessRequest {
-                cmd: lillux::inherited_descriptor_path_for(&backend.adapter_handle)
-                    .map_err(|error| refused(format!("resolve adapter descriptor path: {error}")))?
-                    .to_string_lossy()
-                    .into_owned(),
+                cmd: backend.adapter_handle.path().to_string_lossy().into_owned(),
                 argv0: None,
                 args: vec!["launch".to_string(), request_fd],
                 cwd: Some(canonical_cwd.to_string_lossy().into_owned()),
@@ -3782,7 +3747,7 @@ impl IsolationRuntime {
             identity.source_path.clone(),
             MaterializedArtifact {
                 path: identity.source_path.clone(),
-                handle: Arc::clone(command.executable()),
+                handle: command.executable().clone(),
             },
             namespace,
         )
@@ -3795,7 +3760,7 @@ impl IsolationRuntime {
     fn seal_descriptor_bound_command_for_disabled(
         &self,
         command: &IsolationDescriptorBoundCommand,
-    ) -> Result<(PathBuf, Arc<std::fs::File>), EngineError> {
+    ) -> Result<(PathBuf, lillux::InheritedDescriptorAuthority), EngineError> {
         validate_descriptor_bound_command(command)?;
         let identity = command.identity();
 
@@ -3825,17 +3790,7 @@ impl IsolationRuntime {
                 )));
             }
 
-            let mut executable = command
-                .executable()
-                .try_clone()
-                .map_err(|error| refused(format!("clone descriptor-bound command: {error}")))?;
-            let observation = lillux::observe_open_regular_file(&executable)
-                .map_err(|error| refused(format!("observe descriptor-bound command: {error}")))?;
-            let content = lillux::read_open_regular_file_stable_bounded(
-                &mut executable,
-                &observation,
-                max_bytes,
-            )
+            let (content, _) = command.executable().read_regular_file_stable_bounded(max_bytes)
             .map_err(|error| {
                 refused(format!(
                     "descriptor-bound command {} cannot be read exactly from its retained descriptor: {error}",
@@ -3881,7 +3836,7 @@ impl IsolationRuntime {
         &self,
         verified: &IsolationVerifiedCode,
         executable: bool,
-    ) -> Result<(PathBuf, Arc<std::fs::File>), EngineError> {
+    ) -> Result<(PathBuf, lillux::InheritedDescriptorAuthority), EngineError> {
         if !verified.source_path.is_absolute() {
             return Err(refused(format!(
                 "verified code path must be absolute: {}",
@@ -4036,9 +3991,10 @@ impl IsolationRuntime {
 }
 
 fn descriptor_file_identity(
-    file: &std::fs::File,
+    file: &lillux::InheritedDescriptorAuthority,
 ) -> Result<IsolationDescriptorFileIdentity, EngineError> {
-    let identity = lillux::observe_open_file_identity(file)
+    let identity = file
+        .file_identity()
         .map_err(|error| refused(format!("descriptor identity cannot be observed: {error}")))?;
     Ok(IsolationDescriptorFileIdentity {
         device: identity.device(),
@@ -4094,11 +4050,14 @@ fn validate_descriptor_bound_command(
     }
     #[cfg(unix)]
     {
-        lillux::require_effective_user_owned_executable(command.executable()).map_err(|error| {
-            refused(format!(
-                "descriptor-bound command is not protected: {error}"
-            ))
-        })?;
+        command
+            .executable()
+            .require_owned_executable()
+            .map_err(|error| {
+                refused(format!(
+                    "descriptor-bound command is not protected: {error}"
+                ))
+            })?;
         let observed = descriptor_file_identity(command.executable())?;
         if observed != command.file_identity() {
             return Err(refused(format!(
@@ -4669,24 +4628,29 @@ fn canonicalize_launch_path(kind: &str, path: &Path) -> Result<PathBuf, EngineEr
 /// descriptor for the isolation adapter. Validation and mount execution therefore refer
 /// to the same kernel object; a pathname swap after this point cannot redirect
 /// the bind to a protected node path.
-fn pin_mount_source(kind: &str, path: &Path) -> Result<Arc<std::fs::File>, EngineError> {
-    lillux::pin_canonical_mount_source(path)
-        .map(Arc::new)
-        .map_err(|error| {
-            refused(format!(
-                "{kind} {} cannot be pinned: {error}",
-                path.display()
-            ))
-        })
+fn pin_mount_source(
+    kind: &str,
+    path: &Path,
+) -> Result<lillux::InheritedDescriptorAuthority, EngineError> {
+    lillux::pin_canonical_mount_source(path).map_err(|error| {
+        refused(format!(
+            "{kind} {} cannot be pinned: {error}",
+            path.display()
+        ))
+    })
 }
 
-fn inherited_fd(handle: &Arc<std::fs::File>) -> Result<u32, EngineError> {
-    lillux::inherited_descriptor_coordinate(handle)
+fn inherited_fd(handle: &lillux::InheritedDescriptorAuthority) -> Result<u32, EngineError> {
+    handle
+        .inherited_descriptor()
         .map_err(|error| refused(format!("invalid inherited descriptor authority: {error}")))
 }
 
-fn same_file_identity(left: &std::fs::File, right: &std::fs::File) -> Result<bool, EngineError> {
-    lillux::same_open_file_identity(left, right)
+fn same_file_identity(
+    left: &lillux::InheritedDescriptorAuthority,
+    right: &lillux::InheritedDescriptorAuthority,
+) -> Result<bool, EngineError> {
+    left.same_file_identity(right)
         .map_err(|error| refused(format!("isolation authority cannot be compared: {error}")))
 }
 
@@ -4804,7 +4768,7 @@ fn resolve_readable_mounts(
             "node public identity parent",
         )?;
         let source_handle = identity_parent
-            .open_regular("public-identity.json".as_ref(), false)
+            .open_inherited_regular("public-identity.json".as_ref(), false)
             .map_err(|error| refused(format!("node public identity cannot be opened: {error}")))?
             .ok_or_else(|| {
                 refused(format!(
@@ -4815,7 +4779,7 @@ fn resolve_readable_mounts(
         return Ok(vec![ReadableMount {
             source: source_path,
             destination,
-            source_handle: Arc::new(source_handle),
+            source_handle,
             layer: 20,
         }]);
     }
@@ -5142,7 +5106,7 @@ mod tests {
 
     #[cfg(unix)]
     fn resolved_backend() -> ResolvedIsolationBackend {
-        let launcher = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let launcher = lillux::sealed_memfd(c"test-launcher", b"").unwrap();
         ResolvedIsolationBackend {
             selection: IsolationBackendSelection {
                 bundle: "example-isolation-backend".to_string(),
@@ -5164,7 +5128,7 @@ mod tests {
             bundle_manifest_digest: "a".repeat(64),
             signer_fingerprint: "b".repeat(64),
             adapter_digest: "d".repeat(64),
-            adapter_handle: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            adapter_handle: lillux::sealed_memfd(c"test-adapter", b"").unwrap(),
             artifact_handles: BTreeMap::from([(IsolationArtifactRole::Launcher, launcher)]),
             adapter_build: "0.1.0".to_string(),
             effective_capabilities: BTreeSet::from([IsolationCapability::FilesystemPrivateRoot]),
@@ -5189,8 +5153,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn verified_artifact_reuse_keeps_one_pinned_inode_across_parallel_reads() {
-        use std::os::unix::fs::MetadataExt as _;
-
         let app_root = tempfile::tempdir().unwrap();
         let pinned_root = lillux::PinnedDirectory::open(app_root.path())
             .unwrap()
@@ -5207,13 +5169,13 @@ mod tests {
         let first = store
             .materialize(&content_hash, &content_hash, &content)
             .unwrap();
-        let first_metadata = first.handle.metadata().unwrap();
+        let first_metadata = first.handle.file_identity().unwrap();
 
         // Reuse is anchored to the already-verified open inode, not a fresh
         // pathname lookup. Removing the name therefore cannot redirect later
         // readers, and each reader still re-hashes the pinned bytes.
         std::fs::remove_file(&first.path).unwrap();
-        let before_reuse = lillux::observe_open_regular_file(&first.handle).unwrap();
+        let before_reuse = first.handle.file_identity().unwrap();
         let start = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             let workers = (0..8)
@@ -5232,12 +5194,12 @@ mod tests {
                 .collect::<Vec<_>>();
             for worker in workers {
                 let reused = worker.join().unwrap();
-                let metadata = reused.handle.metadata().unwrap();
-                assert_eq!(metadata.dev(), first_metadata.dev());
-                assert_eq!(metadata.ino(), first_metadata.ino());
+                let metadata = reused.handle.file_identity().unwrap();
+                assert_eq!(metadata.device(), first_metadata.device());
+                assert_eq!(metadata.inode(), first_metadata.inode());
             }
         });
-        lillux::ensure_open_regular_file_unchanged(&first.handle, &before_reuse).unwrap();
+        assert_eq!(first.handle.file_identity().unwrap(), before_reuse);
     }
 
     #[cfg(unix)]
@@ -5254,8 +5216,8 @@ mod tests {
         .unwrap();
         let hash = lillux::cas::sha256_hex(b"admitted bytes");
         let artifact = store.materialize(&hash, &hash, b"admitted bytes").unwrap();
-        lillux::set_open_regular_file_mode(&artifact.handle, 0o700).unwrap();
-        let changed = lillux::observe_open_regular_file(&artifact.handle).unwrap();
+        artifact.handle.set_regular_file_mode(0o700).unwrap();
+        let changed = artifact.handle.file_identity().unwrap();
         assert!(
             store
                 .existing(&hash, &hash)
@@ -5263,7 +5225,7 @@ mod tests {
                 .to_string()
                 .contains("protected permissions")
         );
-        lillux::ensure_open_regular_file_unchanged(&artifact.handle, &changed).unwrap();
+        assert_eq!(artifact.handle.file_identity().unwrap(), changed);
     }
 
     #[cfg(unix)]
@@ -5430,7 +5392,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn admitted_nonexecutable_cas_blob_becomes_a_hash_checked_sealed_command() {
-        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::PermissionsExt as _;
 
         let app_root = tempfile::tempdir().unwrap();
@@ -5454,16 +5415,15 @@ mod tests {
             .unwrap();
         assert_eq!(command.identity(), &identity);
         assert_ne!(
-            command
-                .executable()
-                .metadata()
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111,
+            command.executable().file_identity().unwrap().mode() & 0o111,
             0
         );
-        let seals = unsafe { libc::fcntl(command.executable().as_raw_fd(), libc::F_GET_SEALS) };
+        let seals = unsafe {
+            libc::fcntl(
+                command.executable().inherited_descriptor().unwrap() as i32,
+                libc::F_GET_SEALS,
+            )
+        };
         assert_ne!(seals, -1, "retained command must be a sealed memfd");
 
         let mut wrong_identity = identity;
@@ -5480,9 +5440,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn disabled_descriptor_bound_command_seals_retained_fd_without_reopening_path() {
-        use std::io::Write as _;
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{FileExt as _, MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let app_root = tempfile::tempdir().unwrap();
         write_policy(app_root.path(), &IsolationPolicy::disabled_for_authoring());
@@ -5492,11 +5450,20 @@ mod tests {
         let admitted_bytes = std::fs::read("/bin/echo").unwrap();
         std::fs::write(&command_path, &admitted_bytes).unwrap();
         std::fs::set_permissions(&command_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let executable = Arc::new(std::fs::File::open(&command_path).unwrap());
-        let original_metadata = executable.metadata().unwrap();
-        let original_inode = original_metadata.ino();
+        let executable = lillux::PinnedDirectory::open(cache.path())
+            .unwrap()
+            .unwrap()
+            .open_inherited_regular(command_path.file_name().unwrap(), false)
+            .unwrap()
+            .unwrap();
+        let original_inode = executable.file_identity().unwrap().inode();
         assert_eq!(
-            unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GET_SEALS) },
+            unsafe {
+                libc::fcntl(
+                    executable.inherited_descriptor().unwrap() as i32,
+                    libc::F_GET_SEALS,
+                )
+            },
             -1,
             "fixture must begin as an ordinary unsealed cache file"
         );
@@ -5571,16 +5538,21 @@ mod tests {
         );
 
         let prepared = &applied.request.inherited_fds[0];
-        let mut prepared_bytes = vec![0_u8; admitted_bytes.len()];
-        prepared.read_exact_at(&mut prepared_bytes, 0).unwrap();
+        let (prepared_bytes, _) = prepared
+            .read_regular_file_stable_bounded(admitted_bytes.len() as u64)
+            .unwrap();
         assert_eq!(prepared_bytes, admitted_bytes);
         let required_seals =
             libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-        let seals = unsafe { libc::fcntl(prepared.as_raw_fd(), libc::F_GET_SEALS) };
+        let seals = unsafe {
+            libc::fcntl(
+                prepared.inherited_descriptor().unwrap() as i32,
+                libc::F_GET_SEALS,
+            )
+        };
         assert_eq!(seals & required_seals, required_seals);
-        assert_ne!(prepared.metadata().unwrap().permissions().mode() & 0o111, 0);
-        let mut attempted_writer = prepared.try_clone().unwrap();
-        assert!(attempted_writer.write_all(b"mutate").is_err());
+        assert_ne!(prepared.file_identity().unwrap().mode() & 0o111, 0);
+        assert!(std::fs::write(prepared.path(), b"mutate").is_err());
 
         let result = lillux::run(applied.request);
         assert!(result.success, "stderr: {}", result.stderr);
@@ -5589,8 +5561,6 @@ mod tests {
 
     #[test]
     fn disabled_runtime_executes_restartable_command_through_pinned_descriptor() {
-        use std::io::Write as _;
-
         let app_root = tempfile::tempdir().unwrap();
         write_policy(app_root.path(), &IsolationPolicy::disabled_for_authoring());
         let runtime = IsolationRuntime::load(app_root.path()).unwrap();
@@ -5637,15 +5607,13 @@ mod tests {
         assert!(applied.request.cmd.starts_with("/proc/self/fd/"));
         assert_eq!(applied.request.argv0.as_deref(), Some("/bin/true"));
         assert_eq!(applied.request.inherited_fds.len(), 1);
-        let mut attempted_writer = applied.request.inherited_fds[0].try_clone().unwrap();
-        assert!(attempted_writer.write_all(b"mutate").is_err());
+        assert!(std::fs::write(applied.request.inherited_fds[0].path(), b"mutate").is_err());
         assert!(lillux::run(applied.request).success);
     }
 
     #[cfg(unix)]
     #[test]
     fn disabled_runtime_seals_and_rewrites_all_verified_code_before_exec() {
-        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
         let app_root = tempfile::tempdir().unwrap();
@@ -5705,8 +5673,7 @@ mod tests {
 
         std::fs::write(&tool, b"printf mutated").unwrap();
         for handle in &applied.request.inherited_fds {
-            let mut attempted_writer = handle.try_clone().unwrap();
-            assert!(attempted_writer.write_all(b"mutate").is_err());
+            assert!(std::fs::write(handle.path(), b"mutate").is_err());
         }
         let result = lillux::run(applied.request);
         assert!(result.success, "stderr: {}", result.stderr);
@@ -5716,8 +5683,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn enforced_runtime_hands_verified_code_identity_to_runtime_loader() {
-        use std::io::{Read as _, Seek as _};
-
         let app_root = tempfile::tempdir().unwrap();
         let mut policy = IsolationPolicy::disabled_for_authoring();
         policy.mode = IsolationMode::Enforce;
@@ -5806,16 +5771,13 @@ mod tests {
             )
             .unwrap();
 
-        let mut request_handle = applied
+        let (request_bytes, _) = applied
             .request
             .inherited_fds
             .last()
             .unwrap()
-            .try_clone()
+            .read_regular_file_stable_bounded(ryeos_isolation_protocol::MAX_REQUEST_BYTES as u64)
             .unwrap();
-        request_handle.rewind().unwrap();
-        let mut request_bytes = Vec::new();
-        request_handle.read_to_end(&mut request_bytes).unwrap();
         let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
         let handoff = request["plan"]["environment"]["values"][VERIFIED_CODE_MAP_ENV]
             .as_str()
@@ -5833,8 +5795,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn captured_execution_plan_has_no_ambient_system_mounts() {
-        use std::io::{Read as _, Seek as _};
-
         let app_root = tempfile::tempdir().unwrap();
         let mut policy = IsolationPolicy::disabled_for_authoring();
         policy.mode = IsolationMode::Enforce;
@@ -5889,7 +5849,7 @@ mod tests {
         let runtime_mount = IsolationReadOnlyMountAuthority::new_execution_runtime(
             content.path().to_path_buf(),
             runtime_destination.clone(),
-            content.try_clone_descriptor().unwrap(),
+            content.inherited_descriptor_authority().unwrap(),
         );
         let applied = runtime
             .apply_with_provenance(
@@ -5928,16 +5888,13 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut request_handle = applied
+        let (request_bytes, _) = applied
             .request
             .inherited_fds
             .last()
             .unwrap()
-            .try_clone()
+            .read_regular_file_stable_bounded(ryeos_isolation_protocol::MAX_REQUEST_BYTES as u64)
             .unwrap();
-        request_handle.rewind().unwrap();
-        let mut request_bytes = Vec::new();
-        request_handle.read_to_end(&mut request_bytes).unwrap();
         let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
         assert_eq!(request["plan"]["network"], "isolated");
         let mounts = request["plan"]["mounts"].as_array().unwrap();
@@ -6094,7 +6051,7 @@ mod tests {
         let external = IsolationReadOnlyMountAuthority::new(
             source_path.clone(),
             app_root.path().join("external"),
-            std::fs::File::open(&source_path).unwrap(),
+            lillux::pin_canonical_mount_source(&source_path).unwrap(),
         );
         let request = lillux::SubprocessRequest {
             cmd: "/bin/true".to_string(),

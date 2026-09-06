@@ -47,6 +47,36 @@ pub struct LinuxSandboxOverlay {
     pub destination: PathBuf,
 }
 
+/// One never-attached overlay mount retained by exact descriptor authority.
+///
+/// Cloning this value shares the template's lifetime; it does not mount another
+/// overlay or attach the template. Each confined borrower must instead clone
+/// the mount into its own fresh namespace. This is process-local kernel
+/// authority, not a durable receipt or a pathname that can be reconstructed.
+#[derive(Debug, Clone)]
+pub struct LinuxOverlayTemplate {
+    authority: crate::InheritedDescriptorAuthority,
+}
+
+impl LinuxOverlayTemplate {
+    /// Retain the exact template in the existing typed subprocess transport.
+    pub fn inherited_authority(&self) -> &crate::InheritedDescriptorAuthority {
+        &self.authority
+    }
+
+    /// Accept a descriptor delivered by an authenticated, correlated creator
+    /// invocation. This checks its kernel object class, not its protocol role.
+    /// The caller must already have proved that role and exact creator identity.
+    /// A later clone in the borrower's fresh namespace also fails if the source
+    /// is an ordinary attached mount; an equal host path is never substituted.
+    pub fn from_transferred_authority(
+        authority: crate::InheritedDescriptorAuthority,
+    ) -> Result<Self, String> {
+        imp::validate_overlay_template(&authority)?;
+        Ok(Self { authority })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxSandboxNetwork {
     Host,
@@ -272,6 +302,26 @@ pub fn operate_linux_overlay_workspace(
     imp::workspace(project_fd, state_fd, operation, max_mutations)
 }
 
+/// Create exactly one detached overlay in a dedicated trusted creator process.
+///
+/// This changes the calling process's user and mount namespaces. Like
+/// [`launch_linux_sandbox`], it must not run inside a multithreaded daemon.
+/// The caller supplies prepared, pinned lower and backend-state directories;
+/// the latter must already contain the exact `upper` and `work` directories.
+/// Namespace reanchoring re-proves those held objects before creating the
+/// filesystem. No host-visible merged mountpoint or keeper process is needed.
+/// Unsupported kernel mechanics fail; there is no legacy mount alternative.
+/// An error after namespace entry leaves this creator partially transitioned,
+/// and filesystem creation may already have changed backend state. The caller
+/// must exit/reconcile that exact invocation, not reuse the process or assume
+/// the prepared directories were untouched.
+pub fn create_linux_overlay_template(
+    project_fd: u32,
+    state_fd: u32,
+) -> Result<LinuxOverlayTemplate, String> {
+    imp::create_overlay_template(project_fd, state_fd)
+}
+
 /// Write a bounded protocol payload to an inherited descriptor without
 /// transferring raw descriptor ownership to the caller.
 pub fn write_inherited_descriptor(fd: u32, bytes: &[u8]) -> Result<(), String> {
@@ -303,6 +353,19 @@ pub fn exit_with_linux_sandbox_status(status: LinuxSandboxExit) -> ! {
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use super::*;
+
+    pub fn create_overlay_template(
+        _project_fd: u32,
+        _state_fd: u32,
+    ) -> Result<LinuxOverlayTemplate, String> {
+        Err("detached Linux overlay templates are unavailable on this platform".to_string())
+    }
+
+    pub fn validate_overlay_template(
+        _authority: &crate::InheritedDescriptorAuthority,
+    ) -> Result<(), String> {
+        Err("detached Linux overlay templates are unavailable on this platform".to_string())
+    }
 
     pub fn inspect() -> Result<LinuxSandboxInspection, String> {
         Err("native Linux sandboxing is unavailable on this platform".to_string())
@@ -352,7 +415,10 @@ mod imp {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
     use std::os::unix::ffi::OsStrExt as _;
 
+    mod detached_overlay;
     mod fixed_parents;
+
+    pub(super) use detached_overlay::{create_overlay_template, validate_overlay_template};
 
     const ROOT: &str = "/tmp";
     const OLD_ROOT: &str = "/tmp/.lillux-old-root";
@@ -414,14 +480,16 @@ mod imp {
             close_fd(report[0]);
             let result = (|| {
                 enter_namespaces(LinuxSandboxNetwork::Isolated)?;
-                let directory = reanchor_mount_source(inherited_directory.as_raw_fd())?;
+                let directory = reanchor_mount_source(inherited_directory.file().as_raw_fd())?;
                 mount_private_root()?;
                 create_minimal_devices()?;
                 create_private_tmp()?;
                 let staging = SealedSourceStaging::create()?;
-                let bytes =
-                    materialize_sealed_mount_source(inherited_bytes.as_raw_fd(), &staging.content)?;
-                probe_inherited_descriptor_mounts(&directory, &bytes)?;
+                let bytes = materialize_sealed_mount_source(
+                    inherited_bytes.file().as_raw_fd(),
+                    &staging.content,
+                )?;
+                probe_inherited_descriptor_mounts(directory.file(), bytes.file())?;
                 staging.detach()?;
                 probe_descriptor_mount()?;
                 fixed_parents::probe()?;
@@ -497,11 +565,11 @@ mod imp {
             }
         }
         for mount in &mut request.mounts {
-            mount.source_fd = sources[&mount.source_fd].as_raw_fd() as u32;
+            mount.source_fd = sources[&mount.source_fd].inherited_descriptor()?;
         }
         if let Some(overlay) = &mut request.overlay {
-            overlay.lower_fd = sources[&overlay.lower_fd].as_raw_fd() as u32;
-            overlay.state_fd = sources[&overlay.state_fd].as_raw_fd() as u32;
+            overlay.lower_fd = sources[&overlay.lower_fd].inherited_descriptor()?;
+            overlay.state_fd = sources[&overlay.state_fd].inherited_descriptor()?;
         }
         if request.minimal_devices {
             create_minimal_devices()?;
@@ -676,7 +744,7 @@ mod imp {
         Ok(())
     }
 
-    fn enter_namespaces(network: LinuxSandboxNetwork) -> Result<(), String> {
+    fn enter_mapped_user_namespace() -> Result<(), String> {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         syscall_zero(
@@ -693,7 +761,11 @@ mod imp {
         syscall_zero(
             unsafe { libc::setresuid(0, 0, 0) },
             "enter mapped sandbox uid",
-        )?;
+        )
+    }
+
+    fn enter_namespaces(network: LinuxSandboxNetwork) -> Result<(), String> {
+        enter_mapped_user_namespace()?;
         let mut flags =
             libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS | libc::CLONE_NEWPID;
         if network == LinuxSandboxNetwork::Isolated {
@@ -740,17 +812,20 @@ mod imp {
         Ok(unsafe { stat.assume_init() })
     }
 
-    fn reanchor_mount_source(fd: RawFd) -> Result<File, String> {
+    fn reanchor_mount_source(fd: RawFd) -> Result<crate::InheritedDescriptorAuthority, String> {
         let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
             .map_err(|error| format!("locate inherited mount descriptor: {error}"))?;
         reanchor_mount_source_at(fd, &path)
     }
 
-    fn reanchor_mount_source_at(fd: RawFd, path: &std::path::Path) -> Result<File, String> {
+    fn reanchor_mount_source_at(
+        fd: RawFd,
+        path: &std::path::Path,
+    ) -> Result<crate::InheritedDescriptorAuthority, String> {
         let expected = mount_source_stat(fd)?;
         let source = crate::secure_fs::pin_canonical_mount_source(path)
             .map_err(|error| format!("pin mount source in cloned namespace: {error}"))?;
-        let observed = mount_source_stat(source.as_raw_fd())?;
+        let observed = mount_source_stat(source.file().as_raw_fd())?;
         // open_tree cannot clone a vfsmount owned by the former namespace.
         // A kernel-reported path is only a locator: a replacement, symlink,
         // deleted object, or inaccessible source must fail, not authorize new
@@ -791,7 +866,7 @@ mod imp {
 
     fn reanchor_request_sources(
         request: &LinuxSandboxRequest,
-    ) -> Result<BTreeMap<u32, File>, String> {
+    ) -> Result<BTreeMap<u32, crate::InheritedDescriptorAuthority>, String> {
         let mut descriptors = request
             .mounts
             .iter()
@@ -901,9 +976,10 @@ mod imp {
     fn materialize_sealed_mount_source(
         fd: RawFd,
         root: &crate::PinnedDirectory,
-    ) -> Result<File, String> {
+    ) -> Result<crate::InheritedDescriptorAuthority, String> {
         use std::os::unix::fs::FileExt as _;
 
+        let lease = crate::retain_fork_sensitive_descriptors();
         if !mount_source_is_sealed(fd)? {
             return Err("private byte materialization requires a sealed source".to_string());
         }
@@ -977,7 +1053,7 @@ mod imp {
         // an unlinked source. The caller detaches the whole private staging
         // filesystem after mounting, preserving linked executable identity
         // without exposing this setup alias to the workload.
-        Ok(pinned)
+        crate::InheritedDescriptorAuthority::from_owned_file(pinned, &lease)
     }
 
     fn descriptor_kind(fd: u32) -> Result<DescriptorKind, String> {
@@ -2709,14 +2785,14 @@ mod imp {
             let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
             let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
             assert_eq!(
-                descriptor_kind(original.as_raw_fd() as u32).unwrap(),
+                descriptor_kind(original.inherited_descriptor().unwrap()).unwrap(),
                 DescriptorKind::UnixSocket
             );
-            assert!(reanchor_mount_source(original.as_raw_fd()).is_ok());
+            assert!(reanchor_mount_source(original.file().as_raw_fd()).is_ok());
             std::fs::rename(&path, temporary.path().join("retained.sock")).unwrap();
             let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
             assert!(
-                reanchor_mount_source_at(original.as_raw_fd(), &path)
+                reanchor_mount_source_at(original.file().as_raw_fd(), &path)
                     .unwrap_err()
                     .contains("changed across namespace")
             );
@@ -2742,11 +2818,11 @@ mod imp {
             if pid == 0 {
                 let result = (|| {
                     enter_namespaces(LinuxSandboxNetwork::Isolated)?;
-                    let source = reanchor_mount_source(original.as_raw_fd())?;
+                    let source = reanchor_mount_source(original.file().as_raw_fd())?;
                     mount_private_root()?;
                     create_private_tmp()?;
                     let mount = LinuxSandboxMount {
-                        source_fd: source.as_raw_fd() as u32,
+                        source_fd: source.inherited_descriptor()?,
                         destination: PathBuf::from("/tmp/callback.sock"),
                         access: LinuxSandboxMountAccess::ReadOnly,
                         layer: 0,
@@ -2777,11 +2853,11 @@ mod imp {
             let path = temporary.path().join("source");
             std::fs::write(&path, b"admitted").unwrap();
             let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
-            assert!(reanchor_mount_source_at(original.as_raw_fd(), &path).is_ok());
+            assert!(reanchor_mount_source_at(original.file().as_raw_fd(), &path).is_ok());
             std::fs::rename(&path, temporary.path().join("retained")).unwrap();
             std::fs::write(&path, b"substitute").unwrap();
             assert!(
-                reanchor_mount_source_at(original.as_raw_fd(), &path)
+                reanchor_mount_source_at(original.file().as_raw_fd(), &path)
                     .unwrap_err()
                     .contains("changed across namespace")
             );
@@ -2795,7 +2871,7 @@ mod imp {
             let original = crate::secure_fs::pin_canonical_mount_source(&path).unwrap();
             std::fs::rename(&path, temporary.path().join("retained")).unwrap();
             std::os::unix::fs::symlink("retained", &path).unwrap();
-            assert!(reanchor_mount_source_at(original.as_raw_fd(), &path).is_err());
+            assert!(reanchor_mount_source_at(original.file().as_raw_fd(), &path).is_err());
         }
 
         #[test]
@@ -2819,13 +2895,13 @@ mod imp {
             let mut request = super::super::tests::minimal_request();
             request.mounts = vec![
                 LinuxSandboxMount {
-                    source_fd: sealed.as_raw_fd() as u32,
+                    source_fd: sealed.inherited_descriptor().unwrap(),
                     destination: PathBuf::from("/read-only"),
                     access: LinuxSandboxMountAccess::ReadOnly,
                     layer: 0,
                 },
                 LinuxSandboxMount {
-                    source_fd: sealed.as_raw_fd() as u32,
+                    source_fd: sealed.inherited_descriptor().unwrap(),
                     destination: PathBuf::from("/writable"),
                     access: LinuxSandboxMountAccess::Writable,
                     layer: 0,
@@ -2844,7 +2920,7 @@ mod imp {
                 let source = crate::secure_fs::pin_canonical_mount_source(path).unwrap();
                 let mut request = super::super::tests::minimal_request();
                 request.mounts.push(LinuxSandboxMount {
-                    source_fd: source.as_raw_fd() as u32,
+                    source_fd: source.inherited_descriptor().unwrap(),
                     destination: PathBuf::from("/source"),
                     access: LinuxSandboxMountAccess::ReadOnly,
                     layer: 0,
@@ -2859,7 +2935,7 @@ mod imp {
             let source = crate::secure_fs::pin_canonical_mount_source(directory.path()).unwrap();
             let mut request = super::super::tests::minimal_request();
             request.mounts.push(LinuxSandboxMount {
-                source_fd: source.as_raw_fd() as u32,
+                source_fd: source.inherited_descriptor().unwrap(),
                 destination: PathBuf::from("/source"),
                 access: LinuxSandboxMountAccess::ReadOnly,
                 layer: 0,
@@ -2981,12 +3057,11 @@ mod imp {
                 let entry = if sealed {
                     crate::sealed_memfd(c"proc-exec-test", &std::fs::read(&executable).unwrap())
                         .unwrap()
-                        .try_clone()
-                        .unwrap()
                 } else {
                     crate::secure_fs::pin_canonical_mount_source(&executable).unwrap()
                 };
-                let high = unsafe { libc::fcntl(entry.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+                let high =
+                    unsafe { libc::fcntl(entry.file().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
                 assert!(high >= 200);
                 let sentinel = unsafe { File::from_raw_fd(high) };
                 let retained = libraries
@@ -3027,14 +3102,14 @@ mod imp {
                     .iter()
                     .zip(&retained)
                     .map(|(path, file)| LinuxSandboxMount {
-                        source_fd: file.as_raw_fd() as u32,
+                        source_fd: file.inherited_descriptor().unwrap(),
                         destination: path.clone(),
                         access: LinuxSandboxMountAccess::ReadOnly,
                         layer: 0,
                     })
                     .collect();
                 request.mounts.push(LinuxSandboxMount {
-                    source_fd: entry.as_raw_fd() as u32,
+                    source_fd: entry.inherited_descriptor().unwrap(),
                     destination: PathBuf::from("/probe"),
                     access: LinuxSandboxMountAccess::ReadOnly,
                     layer: 0,

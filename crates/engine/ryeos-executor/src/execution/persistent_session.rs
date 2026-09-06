@@ -2182,7 +2182,7 @@ fn prepare_structured_session_baseline(
     }
     let source_path = source_file.path().to_path_buf();
     let destination = state_root.join(&profile.baseline_destination);
-    let source_descriptor = source_file.try_clone_descriptor()?;
+    let source_descriptor = source_file.inherited_descriptor_authority()?;
     Ok(Some(
         ryeos_engine::isolation::IsolationReadOnlyMountAuthority::new_state_overlay(
             source_path,
