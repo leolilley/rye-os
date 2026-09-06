@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Acquire locked public registry inputs; never execute Cargo or write node state.
 
-This is the explicit bootstrap input boundary, like authoring-baseline/fetch.py.
+This is the explicit publisher/operator input acquisition boundary only.
 It emits Cargo's documented local-registry format, not Cargo's private cache.
 The admitted Stage-0 Cargo owns unpacking and final vendored-source production.
 Import/binding and retained-result authority remain RyeOS operations.

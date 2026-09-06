@@ -19,6 +19,7 @@ __pycache__/
 !*/outputs/.gitkeep
 !execution-comparison/README.md
 !authoring-environment/test_production.py
+!authoring-environment/test_development_contract.py
 !authoring-environment/test_preparation.py
 !authoring-environment/test_utilities.py
 !authoring-environment/test_probe.py
