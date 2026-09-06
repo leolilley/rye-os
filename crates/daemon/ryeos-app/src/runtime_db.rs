@@ -1502,7 +1502,10 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // Neither the source-local epoch 22 nor the
 // separately checkpointed campaign epochs 22–24 can authorize this combined
 // execution contract; there is no open-time migration.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 25;
+// Epoch 27 requires retained prepared-content target contracts in request 18,
+// capsule 25, and launch metadata 29. Epoch 26 is already allocated to the
+// coordinating fixed-parent confinement cut. No ambient-kind recovery substitution.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 27;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK

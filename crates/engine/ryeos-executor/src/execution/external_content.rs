@@ -1030,6 +1030,24 @@ pub(crate) fn bind_external_realizations_in_private_workspace_with_budget(
     )
 }
 
+/// Fixed runtime roots have no private-project-copy interpretation. Use this
+/// same check at preflight and final binding before any materialization work.
+pub(crate) fn require_supported_mount_roots(
+    roots: impl IntoIterator<Item = ryeos_state::objects::ExternalContentMountRoot>,
+    enforced: bool,
+) -> anyhow::Result<()> {
+    if !enforced
+        && roots
+            .into_iter()
+            .any(|root| root != ryeos_state::objects::ExternalContentMountRoot::Project)
+    {
+        anyhow::bail!(
+            "execution-runtime realizations require enforced isolation; no project-copy substitute is permitted"
+        );
+    }
+    Ok(())
+}
+
 fn bind_external_realizations_with(
     state: &ryeos_app::state::AppState,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
@@ -1048,6 +1066,10 @@ fn bind_external_realizations_with(
     if realized.is_empty() {
         return Ok(None);
     }
+    require_supported_mount_roots(
+        realized.iter().map(|entry| entry.mount_root),
+        binding == ExternalRealizationBinding::IsolationMounts,
+    )?;
     let sealed_set_env = lillux::cas::canonical_json(&realized.to_value()?)?;
     let authority = super::pinned_state_authority(state)?;
     let guard = authority.acquire_shared_guard()?;
@@ -1076,13 +1098,6 @@ fn bind_external_realizations_with(
     let mut mounts = Vec::with_capacity(realized.iter().len());
     let mut leases = Vec::with_capacity(realized.iter().len());
     for entry in realized.iter() {
-        if binding == ExternalRealizationBinding::PrivateWorkspace
-            && entry.mount_root != ryeos_state::objects::ExternalContentMountRoot::Project
-        {
-            anyhow::bail!(
-                "execution-runtime realizations require enforced isolation; no project-copy substitute is permitted"
-            );
-        }
         if let Some(manifest) =
             ryeos_state::objects::load_if_large_content_manifest(&cas, &entry.manifest_hash)?
         {
@@ -1868,6 +1883,16 @@ fn verify_materialized_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_content_mount_support_preserves_private_project_execution() {
+        use ryeos_state::objects::ExternalContentMountRoot::{ExecutionRuntime, Project};
+        require_supported_mount_roots([Project], false).unwrap();
+        require_supported_mount_roots([], false).unwrap();
+        require_supported_mount_roots([Project, ExecutionRuntime], true).unwrap();
+        assert!(require_supported_mount_roots([ExecutionRuntime], false).is_err());
+        assert!(require_supported_mount_roots([Project, ExecutionRuntime], false).is_err());
+    }
 
     fn tree_mount(destination: &str, files: &[(&str, u64)]) -> SealedRealizationMount {
         SealedRealizationMount {

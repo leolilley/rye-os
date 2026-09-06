@@ -85,7 +85,9 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // as current launch authority.
 // v27 combines that source-local authority with sealed scheduled fires and
 // independent candidate evaluation/integration in capsule 23/request 16.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 27;
+// v29 carries capsule 25/request 18 and their retained content-target ceilings.
+// v28 is already allocated to the coordinating fixed-parent confinement cut.
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 29;
 
 /// Per-thread daemon-owned state directory.
 ///

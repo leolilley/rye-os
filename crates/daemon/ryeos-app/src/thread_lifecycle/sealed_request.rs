@@ -133,7 +133,10 @@ where
 /// authority.
 /// v16 combines candidate/scheduler authority with the current exact
 /// filesystem/network and realization-root execution contract.
-pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 16;
+/// v18 requires retained source/runtime and receiving-kind content ceilings in
+/// prepared launches; predecessor preparation cannot authorize this boundary.
+/// v17 is already allocated to the coordinating fixed-parent confinement cut.
+pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

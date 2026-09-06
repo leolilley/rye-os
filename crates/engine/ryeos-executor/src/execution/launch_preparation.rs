@@ -209,6 +209,10 @@ pub struct PreparedContentDependency {
     pub targets: Vec<String>,
     pub executable_search: Vec<ryeos_handler_protocol::ExecutableSearchPathEntryWire>,
     pub external_content_policy: ryeos_engine::runtime_registry::LaunchContentExternalPolicy,
+    /// Exact signed target-kind ceilings. Recovery uses these captured facts,
+    /// never a newer kind schema at the same name. Evidence has a separate grant.
+    pub target_content_contracts:
+        BTreeMap<String, ryeos_engine::kind_registry::KindExternalContentDecl>,
 }
 
 impl PreparedContentDependency {
@@ -234,6 +238,9 @@ impl PreparedContentDependency {
         }
         if self.external_content_policy.max_declarations == 0 {
             anyhow::bail!("prepared content dependency has no declaration ceiling");
+        }
+        if self.target_content_contracts.keys().ne(self.targets.iter()) {
+            anyhow::bail!("prepared content dependency target contracts disagree with its targets");
         }
         let mut searches = BTreeSet::new();
         for entry in &self.executable_search {
@@ -1739,6 +1746,7 @@ fn finish_runtime_launch_preparation_parts(
     let execution_dependencies =
         resolve_execution_dependencies(engine, contract, inputs, result.execution_dependencies)?;
     let content_dependencies = resolve_content_dependencies(
+        engine,
         contract,
         inputs,
         &execution_dependencies,
@@ -2133,7 +2141,44 @@ fn resolve_execution_dependencies(
     Ok(resolved)
 }
 
+fn intersect_content_policy(
+    outer: &ryeos_engine::runtime_registry::LaunchContentExternalPolicy,
+    source: &ryeos_engine::kind_registry::KindExternalContentDecl,
+) -> anyhow::Result<ryeos_engine::runtime_registry::LaunchContentExternalPolicy> {
+    let allowed_mount_roots = outer
+        .allowed_mount_roots
+        .iter()
+        .copied()
+        .filter(|root| source.allowed_mount_roots.contains(root))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let max_declarations = usize::from(outer.max_declarations).min(source.max_declarations) as u16;
+    if allowed_mount_roots.is_empty() || max_declarations == 0 {
+        anyhow::bail!("source kind and runtime have no shared external-content grant");
+    }
+    let large_content_max_total_bytes =
+        match (outer.large_content_max_total_bytes, &source.large_content) {
+            (Some(outer), Some(source)) => Some(
+                outer.min(
+                    source
+                        .max_total_bytes
+                        .unwrap_or(ryeos_state::objects::MAX_LARGE_CONTENT_TOTAL_BYTES),
+                ),
+            ),
+            _ => None,
+        };
+    Ok(
+        ryeos_engine::runtime_registry::LaunchContentExternalPolicy {
+            allowed_mount_roots,
+            max_declarations,
+            large_content_max_total_bytes,
+        },
+    )
+}
+
 fn resolve_content_dependencies(
+    engine: &ryeos_engine::engine::Engine,
     contract: &ryeos_engine::runtime_registry::LaunchContractDecl,
     inputs: &PreparedRuntimeLaunchInputs,
     execution_dependencies: &BTreeMap<String, PreparedExecutionDependency>,
@@ -2213,6 +2258,27 @@ fn resolve_content_dependencies(
                 LaunchPrepareErrorClass::Internal,
             )
         })?;
+        let source_ref = CanonicalRef::parse(&resolution.root.resolved_ref)
+            .map_err(|error| DispatchError::Internal(error.into()))?;
+        let source_contract = engine
+            .kinds
+            .get(&source_ref.kind)
+            .and_then(|kind| kind.external_content_contract())
+            .ok_or_else(|| {
+                preparation_error(
+                    "content_dependency_kind_contract_missing",
+                    format!("content dependency `{name}` kind has no external-content contract"),
+                    LaunchPrepareErrorClass::Configuration,
+                )
+            })?;
+        let external_policy =
+            intersect_content_policy(external_policy, source_contract).map_err(|error| {
+                preparation_error(
+                    "content_dependency_kind_contract_denied",
+                    error.to_string(),
+                    LaunchPrepareErrorClass::Configuration,
+                )
+            })?;
         let synthetic_contract = external_policy.declaration_contract();
         let declarer =
             ryeos_engine::external_content::declaring_authority(resolution).map_err(|error| {
@@ -2256,13 +2322,38 @@ fn resolve_content_dependencies(
                 LaunchPrepareErrorClass::Configuration,
             ));
         }
+        let target_content_contracts = request
+            .targets
+            .iter()
+            .map(|target| {
+                let subject = execution_dependencies[target].captured_verified_subject()?;
+                let contract = engine
+                    .kinds
+                    .get(&subject.resolved.kind)
+                    .and_then(|kind| kind.external_content_contract())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "content target `{target}` kind has no external-content contract"
+                        )
+                    })?;
+                Ok((target.clone(), contract.clone()))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()
+            .map_err(|error| {
+                preparation_error(
+                    "content_dependency_target_contract_missing",
+                    error.to_string(),
+                    LaunchPrepareErrorClass::Configuration,
+                )
+            })?;
         let dependency = PreparedContentDependency {
             binding: request.binding,
             canonical_ref: resolution.root.resolved_ref.clone(),
             resolution: ryeos_engine::resolution::RetainedResolutionOutput::capture(resolution),
             targets: request.targets,
             executable_search: request.executable_search,
-            external_content_policy: external_policy.clone(),
+            external_content_policy: external_policy,
+            target_content_contracts,
         };
         dependency.validate().map_err(|error| {
             preparation_error(
@@ -2302,6 +2393,61 @@ fn resolve_content_dependencies(
         prepared.insert(name, dependency);
     }
     Ok(prepared)
+}
+
+#[cfg(test)]
+mod content_contract_tests {
+    use super::*;
+    use ryeos_engine::external_content::ExternalContentMountRoot::{ExecutionRuntime, Project};
+    use ryeos_engine::kind_registry::{KindExternalContentDecl, KindLargeContentGrant};
+    use ryeos_engine::runtime_registry::LaunchContentExternalPolicy;
+
+    #[test]
+    fn prepared_content_policy_intersects_source_and_runtime_without_creating_grants() {
+        let outer = LaunchContentExternalPolicy {
+            allowed_mount_roots: vec![ExecutionRuntime, Project],
+            max_declarations: 8,
+            large_content_max_total_bytes: Some(100),
+        };
+        let mut source = KindExternalContentDecl {
+            realization_derived: "effective_external_realizations".into(),
+            allowed_roots: vec![],
+            allowed_mount_roots: vec![Project],
+            max_declarations: 2,
+            large_content: None,
+        };
+        let bounded = intersect_content_policy(&outer, &source).unwrap();
+        assert_eq!(bounded.allowed_mount_roots, [Project]);
+        assert_eq!(bounded.max_declarations, 2);
+        assert_eq!(bounded.large_content_max_total_bytes, None);
+        source.large_content = Some(KindLargeContentGrant {
+            max_total_bytes: None,
+        });
+        assert_eq!(
+            intersect_content_policy(&outer, &source)
+                .unwrap()
+                .large_content_max_total_bytes,
+            Some(100)
+        );
+        source.large_content = Some(KindLargeContentGrant {
+            max_total_bytes: Some(50),
+        });
+        assert_eq!(
+            intersect_content_policy(&outer, &source)
+                .unwrap()
+                .large_content_max_total_bytes,
+            Some(50)
+        );
+        source.allowed_mount_roots = vec![ExecutionRuntime, Project];
+        assert_eq!(
+            intersect_content_policy(&outer, &source)
+                .unwrap()
+                .allowed_mount_roots,
+            [Project, ExecutionRuntime]
+        );
+        source.allowed_mount_roots.clear();
+        assert!(intersect_content_policy(&outer, &source).is_err());
+    }
 }
 
 fn validate_external_effect_authority(
@@ -2373,7 +2519,7 @@ fn prepared_launch_skeleton_key(
             )
         })?;
     let value = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "request_engine_generation_identity": authority.request_engine_generation_identity,
         "effective_trust_identity": authority.effective_trust_identity,
         "subject_resolution_authority": authority.subject_resolution_authority,

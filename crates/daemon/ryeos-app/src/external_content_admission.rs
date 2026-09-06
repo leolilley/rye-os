@@ -303,7 +303,9 @@ pub fn preview_portable_content_dependency_with_realizations(
     })
 }
 
-fn validate_retained_declaration_totals(
+/// Check storage-tier grants without changing the exact consumer binding.
+/// Also used for the aggregate content supplied to a prepared execution target.
+pub fn validate_retained_declaration_totals(
     state: &AppState,
     contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
     declarations: &[ExternalContentDeclaration],
@@ -312,6 +314,14 @@ fn validate_retained_declaration_totals(
     let guard = authority.acquire_shared_guard()?;
     authority.ensure_guard(&guard)?;
     let cas = authority.cas_store()?;
+    validate_retained_declaration_totals_with_cas(&cas, contract, declarations)
+}
+
+fn validate_retained_declaration_totals_with_cas(
+    cas: &lillux::CasStore,
+    contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
+    declarations: &[ExternalContentDeclaration],
+) -> anyhow::Result<()> {
     let mut ordinary_total = 0u64;
     let mut large_total = 0u64;
     for declaration in declarations {
@@ -349,9 +359,14 @@ fn validate_retained_declaration_totals(
                     .ok_or_else(|| {
                         anyhow::anyhow!("large-content realization byte total overflow")
                     })?;
-                let ceiling = contract
+                let grant = contract
                     .and_then(|contract| contract.large_content.as_ref())
-                    .and_then(|grant| grant.max_total_bytes)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "external content `{}` names a large manifest without a signed large-content grant",
+                        declaration.id
+                    ))?;
+                let ceiling = grant
+                    .max_total_bytes
                     .unwrap_or(ryeos_state::objects::MAX_LARGE_CONTENT_TOTAL_BYTES);
                 if large_total > ceiling {
                     anyhow::bail!(
@@ -1139,4 +1154,108 @@ fn capture_kind(kind: ExternalContentKind) -> ExternalContentCaptureKind {
 
 fn pinned_state_authority(state: &AppState) -> anyhow::Result<ryeos_state::PinnedStateAuthority> {
     state.state_store.pinned_state_authority()
+}
+
+#[cfg(test)]
+mod content_contract_tests {
+    use super::*;
+
+    #[test]
+    fn retained_content_target_totals_enforce_the_combined_ordinary_tier() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = lillux::CasStore::new(root.path().join("cas"));
+        // Manifest-only budget test: actual payload verification is owned by
+        // realization admission, not this aggregate-metadata check.
+        let bytes = 25 * 1024 * 1024;
+        let manifest =
+            ryeos_state::objects::ExternalContentManifestObject::from_value(&serde_json::json!({
+            "schema":ryeos_state::objects::EXTERNAL_CONTENT_TREE_SCHEMA,
+                "kind":ryeos_state::objects::EXTERNAL_CONTENT_MANIFEST_KIND,
+                "entry_count":6, "total_bytes":6 * bytes,
+                "entries":(0..6).map(|i| serde_json::json!({
+                    "path":format!("file-{i}"), "kind":"file", "mode":420,
+                    "blob_hash":"a".repeat(64), "size":bytes
+                })).collect::<Vec<_>>()
+            }))
+            .unwrap();
+        let hash = cas
+            .store_object(&serde_json::to_value(&manifest).unwrap())
+            .unwrap();
+        let declaration = |id| {
+            serde_json::from_value::<ExternalContentDeclaration>(serde_json::json!({
+                "id":id, "kind":"tree", "mode":"pinned", "digest":hash,
+                "mount_root":"project", "mount":id
+            }))
+            .unwrap()
+        };
+        let own = declaration("own");
+        let contributed = declaration("contributed");
+        validate_retained_declaration_totals_with_cas(&cas, None, std::slice::from_ref(&own))
+            .unwrap();
+        validate_retained_declaration_totals_with_cas(
+            &cas,
+            None,
+            std::slice::from_ref(&contributed),
+        )
+        .unwrap();
+        assert!(
+            validate_retained_declaration_totals_with_cas(&cas, None, &[own, contributed])
+                .unwrap_err()
+                .to_string()
+                .contains("content-tier launch bound")
+        );
+    }
+
+    #[test]
+    fn retained_content_target_totals_require_a_large_grant_even_for_tiny_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let cas = lillux::CasStore::new(root.path().join("cas"));
+        let blob = cas.store_blob(b"x").unwrap();
+        let manifest = ryeos_state::objects::ExternalLargeContentManifestObject::from_value(&serde_json::json!({
+            "schema":ryeos_state::objects::EXTERNAL_LARGE_CONTENT_SCHEMA,
+            "kind":ryeos_state::objects::EXTERNAL_LARGE_CONTENT_MANIFEST_KIND,
+            "entry_count":1, "total_bytes":1,
+            "entries":[{"path":"content", "kind":"file", "mode":420, "blob_hash":blob, "size":1}]
+        })).unwrap();
+        let hash = cas.store_object(&manifest.to_value().unwrap()).unwrap();
+        let declaration = |id: &str| {
+            serde_json::from_value::<ExternalContentDeclaration>(serde_json::json!({
+                "id":id, "kind":"file", "mode":"pinned", "digest":hash,
+                "mount_root":"project", "mount":id
+            }))
+            .unwrap()
+        };
+        let first = declaration("first");
+        let mut contract = ryeos_engine::kind_registry::KindExternalContentDecl {
+            realization_derived: "effective_external_realizations".into(),
+            allowed_roots: vec![],
+            allowed_mount_roots: vec![ryeos_state::objects::ExternalContentMountRoot::Project],
+            max_declarations: 8,
+            large_content: None,
+        };
+        let check = |contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
+                     declarations: &[ExternalContentDeclaration]| {
+            validate_retained_declaration_totals_with_cas(&cas, contract, declarations)
+        };
+        assert!(
+            check(None, std::slice::from_ref(&first))
+                .unwrap_err()
+                .to_string()
+                .contains("without a signed large-content grant")
+        );
+        assert!(check(Some(&contract), std::slice::from_ref(&first)).is_err());
+        contract.large_content = Some(ryeos_engine::kind_registry::KindLargeContentGrant {
+            max_total_bytes: Some(1),
+        });
+        check(Some(&contract), std::slice::from_ref(&first)).unwrap();
+        let combined = [first, declaration("second")];
+        assert!(
+            check(Some(&contract), &combined)
+                .unwrap_err()
+                .to_string()
+                .contains("exceed the signed 1-byte grant")
+        );
+        contract.large_content.as_mut().unwrap().max_total_bytes = None;
+        check(Some(&contract), &combined).unwrap();
+    }
 }

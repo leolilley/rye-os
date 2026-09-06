@@ -1688,6 +1688,114 @@ config:
     // ── Test: chain walks to terminal with executor_id null ─────────────
 
     #[test]
+    fn bundled_worker_filesystem_ceiling_survives_preparation_and_retention() {
+        use crate::isolation::IsolationFilesystemAuthorityCeiling::{
+            CapturedExecution, NodePolicy,
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let schemas = tempfile::tempdir().unwrap();
+        let ts = test_ts();
+        write_tool_schema(schemas.path());
+        // Exercise the actual signed kind's parser, composed contract and
+        // runtime allowlist, rather than a fixture-only projection declaration.
+        let worker_schema = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../bundles/core/.ai/node/engine/kinds/worker/worker.kind-schema.yaml"
+        ));
+        let worker_schema = worker_schema
+            .lines()
+            .filter(|line| !line.starts_with("# ryeos:signed:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let schema_dir = schemas.path().join("worker");
+        fs::create_dir(&schema_dir).unwrap();
+        fs::write(
+            schema_dir.join("worker.kind-schema.yaml"),
+            sign_yaml(&worker_schema),
+        )
+        .unwrap();
+        let kinds = KindRegistry::load_base(&[schemas.path().to_path_buf()], &ts).unwrap();
+        let parsers = crate::parsers::test_helpers::dispatcher_with_canonical_bundle_descriptors();
+        write_terminal(project.path(), "ryeos/core/subprocess/execute");
+        let worker_dir = project.path().join(AI_DIR).join("workers/fixture");
+        fs::create_dir_all(&worker_dir).unwrap();
+        let worker_path = worker_dir.join("session.yaml");
+        let ctx = test_plan_context(Some(project.path().to_path_buf()));
+        let roots = ResolutionRoots::from_flat(Some(project.path().join(AI_DIR)), vec![]);
+
+        for (authored, expected) in [
+            (None, NodePolicy),
+            (Some("captured_execution"), CapturedExecution),
+        ] {
+            let mut worker = json!({
+                "category": "fixture",
+                "version": "1.0.0",
+                "executor_id": "@subprocess",
+                "execution_protocol": "protocol:ryeos/core/structured_session",
+                "supported_target": {"os": "linux", "arch": "x86_64"},
+                "source": {"root": "lib/session", "entry": "profile.json", "digest": "a".repeat(64)},
+                "external_content": [],
+                "config": {"command": "/bin/sh", "args": ["--version"]}
+            });
+            if let Some(authored) = authored {
+                worker["filesystem_authority"] = json!(authored);
+            }
+            let shape = kinds
+                .get("worker")
+                .unwrap()
+                .composed_value_contract
+                .validate_instance(&worker);
+            assert!(shape.errors.is_empty(), "{shape:?}");
+            fs::write(&worker_path, serde_yaml::to_string(&worker).unwrap()).unwrap();
+            let mut item = make_verified_item(
+                "worker:fixture/session",
+                "worker",
+                worker_path.clone(),
+                Some("@subprocess"),
+                Some(project.path().to_path_buf()),
+            );
+            item.resolved.source_format = ResolvedSourceFormat {
+                extension: ".yaml".to_owned(),
+                parser: "parser:ryeos/core/yaml/yaml".to_owned(),
+                signature: SignatureEnvelope {
+                    prefix: "#".to_owned(),
+                    suffix: None,
+                    after_shebang: false,
+                },
+            };
+            let plan = build_plan(BuildPlanInput {
+                item: &item,
+                root_source: None,
+                parameters: &json!({}),
+                hints: &ExecutionHints::default(),
+                ctx: &ctx,
+                kinds: &kinds,
+                parsers: &parsers,
+                roots: &roots,
+                registry_fingerprint: "fp:test",
+                trust_store: &ts,
+                node_trust_store: &ts,
+                host_env: &HostEnvBindings::default(),
+                // runtime_workspace's protocol ceiling must not widen a
+                // narrower ceiling authored by the worker itself.
+                filesystem_authority_ceiling: NodePolicy,
+                project_authority: None,
+                sealed_content: None,
+            })
+            .unwrap();
+            assert_eq!(plan.filesystem_authority_ceiling, expected);
+            assert_eq!(
+                plan.filesystem_authority_ceiling.intersect(NodePolicy),
+                expected
+            );
+            let retained: ExecutionPlan =
+                serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+            assert_eq!(retained.filesystem_authority_ceiling, expected);
+        }
+    }
+
+    #[test]
     fn chain_walks_to_null_terminal() {
         let project_dir = tempdir();
         let kinds_dir = tempdir();

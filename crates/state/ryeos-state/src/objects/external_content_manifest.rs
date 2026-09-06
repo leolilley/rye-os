@@ -266,12 +266,9 @@ pub enum ExternalContentMountRoot {
 pub const EXECUTION_RUNTIME_REALIZATIONS_ROOT: &str = "/ryeos/realizations";
 
 impl ExternalContentMountRoot {
-    pub fn destination(
-        self,
-        project_root: Option<&std::path::Path>,
-        mount: &str,
-    ) -> anyhow::Result<std::path::PathBuf> {
-        super::validate_canonical_project_relative_path(mount)?;
+    /// Resolve the existing logical mount namespace inside the admitted process.
+    /// This selects a location, not permission to expose or populate that location.
+    pub fn root(self, project_root: Option<&std::path::Path>) -> anyhow::Result<&std::path::Path> {
         let root = match self {
             Self::Project => project_root.ok_or_else(|| {
                 anyhow::anyhow!("project realization requires an admitted project root")
@@ -281,7 +278,16 @@ impl ExternalContentMountRoot {
         if !root.is_absolute() {
             anyhow::bail!("realization mount root must be absolute");
         }
-        Ok(root.join(mount))
+        Ok(root)
+    }
+
+    pub fn destination(
+        self,
+        project_root: Option<&std::path::Path>,
+        mount: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        super::validate_canonical_project_relative_path(mount)?;
+        Ok(self.root(project_root)?.join(mount))
     }
 }
 
@@ -836,6 +842,24 @@ mod tests {
         assert!(ExternalContentRealizationSet::from_value(&value).is_err());
 
         let project_root = std::path::Path::new("/project");
+        assert_eq!(
+            ExternalContentMountRoot::Project
+                .root(Some(project_root))
+                .unwrap(),
+            project_root
+        );
+        assert_eq!(
+            ExternalContentMountRoot::ExecutionRuntime
+                .root(Some(project_root))
+                .unwrap(),
+            std::path::Path::new(EXECUTION_RUNTIME_REALIZATIONS_ROOT)
+        );
+        assert!(ExternalContentMountRoot::Project.root(None).is_err());
+        assert!(
+            ExternalContentMountRoot::Project
+                .root(Some(std::path::Path::new("relative")))
+                .is_err()
+        );
         assert_eq!(
             ExternalContentMountRoot::Project
                 .destination(Some(project_root), "platform")

@@ -472,6 +472,33 @@ pub(crate) fn reset_for_cross_site_admission(
     principal: &EffectivePrincipal,
     prepared: &mut PreparedRuntimeLaunch,
 ) -> Result<()> {
+    // This is a new receiving-node admission, not same-node recovery. Preserve
+    // the portable contract exactly, but refuse a node that cannot admit its
+    // captured ceilings rather than silently replacing or widening them.
+    for dependency in prepared.content_dependencies.values() {
+        dependency.validate()?;
+        let source = ryeos_engine::canonical_ref::CanonicalRef::parse(&dependency.canonical_ref)?;
+        let receiving = engine
+            .kinds
+            .get(&source.kind)
+            .and_then(|kind| kind.external_content_contract());
+        require_receiving_content_contract(
+            &dependency.external_content_policy.declaration_contract(),
+            receiving,
+        )?;
+        for (target, retained) in &dependency.target_content_contracts {
+            let target = prepared
+                .execution_dependencies
+                .get(target)
+                .ok_or_else(|| anyhow!("transferred content target is absent"))?
+                .captured_verified_subject()?;
+            let receiving = engine
+                .kinds
+                .get(&target.resolved.kind)
+                .and_then(|kind| kind.external_content_contract());
+            require_receiving_content_contract(retained, receiving)?;
+        }
+    }
     prepared.admitted_sessions.clear();
     for dependency in prepared.execution_dependencies.values_mut() {
         dependency.validate()?;
@@ -568,6 +595,39 @@ pub(crate) fn reset_for_cross_site_admission(
     Ok(())
 }
 
+fn require_receiving_content_contract(
+    retained: &ryeos_engine::kind_registry::KindExternalContentDecl,
+    receiving: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
+) -> Result<()> {
+    let receiving = receiving.ok_or_else(|| {
+        anyhow!("receiving kind has no content contract for the transferred program")
+    })?;
+    let large_ceiling = |contract: &ryeos_engine::kind_registry::KindExternalContentDecl| {
+        contract.large_content.as_ref().map(|grant| {
+            grant
+                .max_total_bytes
+                .unwrap_or(ryeos_state::objects::MAX_LARGE_CONTENT_TOTAL_BYTES)
+        })
+    };
+    if retained.realization_derived != receiving.realization_derived
+        || retained.max_declarations > receiving.max_declarations
+        || retained
+            .allowed_roots
+            .iter()
+            .any(|root| !receiving.allowed_roots.contains(root))
+        || retained
+            .allowed_mount_roots
+            .iter()
+            .any(|root| !receiving.allowed_mount_roots.contains(root))
+        || large_ceiling(retained) > large_ceiling(receiving)
+    {
+        bail!(
+            "receiving kind does not admit the transferred content contract; select a compatible target"
+        );
+    }
+    Ok(())
+}
+
 fn clear_node_local_admission_projections(
     resolution: &mut ryeos_engine::resolution::ResolutionOutput,
 ) {
@@ -601,6 +661,7 @@ pub(crate) fn admit_or_verify_prepared_sessions(
     prepared: &mut PreparedRuntimeLaunch,
     recovered: bool,
 ) -> Result<AdmittedSessionPublications> {
+    validate_prepared_content_targets(state, prepared)?;
     let mut expected_names = BTreeSet::new();
     let (content_by_target, search_by_target, realizations_by_dependency, mut publications) =
         admit_or_verify_content_dependencies(state, prepared, recovered)?;
@@ -633,6 +694,11 @@ pub(crate) fn admit_or_verify_prepared_sessions(
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        // The precheck proved that repeated contracts for this target agree.
+        let content_target_contract = prepared
+            .content_dependencies
+            .values()
+            .find_map(|content| content.target_content_contracts.get(name));
         if recovered {
             if (!target_environment.is_empty() || !target_evidence.is_empty())
                 && !admitted_sessions.contains_key(name)
@@ -651,6 +717,7 @@ pub(crate) fn admit_or_verify_prepared_sessions(
                 search_by_target.get(name).map(Vec::as_slice).unwrap_or(&[]),
                 target_environment,
                 target_evidence,
+                content_target_contract,
             )
             .with_context(|| format!("verify recovered session dependency `{name}`"))?;
         } else {
@@ -676,6 +743,7 @@ pub(crate) fn admit_or_verify_prepared_sessions(
                 search_by_target.get(name).map(Vec::as_slice).unwrap_or(&[]),
                 target_environment,
                 target_evidence,
+                content_target_contract,
             )
             .inspect_err(|error| {
                 tracing::warn!(
@@ -728,6 +796,7 @@ pub(crate) fn preview_prepared_dependencies(
     engine: &ryeos_engine::engine::Engine,
     prepared: &PreparedRuntimeLaunch,
 ) -> Result<PreparedDependencyValidationPreview> {
+    validate_prepared_content_targets(state, prepared)?;
     let roots = engine.resolution_roots(None);
     let mut execution_dependencies = BTreeMap::new();
     let mut content_dependencies = BTreeMap::new();
@@ -746,6 +815,19 @@ pub(crate) fn preview_prepared_dependencies(
             .with_context(|| format!("validate prepared execution dependency `{name}`"))?;
         let verified = dependency.captured_verified_subject()?;
         let kind = verified.resolved.kind.as_str();
+        if let Some(declarations) = ryeos_engine::external_content::declarations_from_composed(
+            &dependency.resolution.composed.composed,
+            engine
+                .kinds
+                .get(kind)
+                .and_then(|kind| kind.external_content_contract()),
+            ryeos_engine::external_content::declaring_authority(&dependency.resolution)?,
+        )? {
+            super::external_content::require_supported_mount_roots(
+                declarations.iter().map(|entry| entry.mount_root),
+                state.isolation.is_enforced(),
+            )?;
+        }
         let source = ryeos_app::source_closure_admission::preview_source_closure(
             state,
             engine,
@@ -879,6 +961,143 @@ pub(crate) fn preview_prepared_dependencies(
         environment_contributions,
         admission_ready,
     })
+}
+
+/// Content contributions do not widen the receiving execution kind. Check
+/// captured source/runtime ceilings and aggregate target ceilings independently;
+/// no rebinding to the target, live item lookup, or evidence-policy substitution.
+fn validate_prepared_content_targets(
+    state: &AppState,
+    prepared: &PreparedRuntimeLaunch,
+) -> Result<()> {
+    use ryeos_engine::external_content::{declarations_from_composed, declaring_authority};
+    let mut by_target: BTreeMap<
+        String,
+        (
+            ryeos_engine::kind_registry::KindExternalContentDecl,
+            Vec<ryeos_engine::external_content::ExternalContentDeclaration>,
+        ),
+    > = BTreeMap::new();
+    for (name, dependency) in &prepared.content_dependencies {
+        dependency.validate()?;
+        let resolution = dependency.resolution.restore();
+        let source_contract = dependency.external_content_policy.declaration_contract();
+        let declarations = declarations_from_composed(
+            &resolution.composed.composed,
+            Some(&source_contract),
+            declaring_authority(&resolution)?,
+        )?
+        .ok_or_else(|| anyhow!("content dependency `{name}` has no declarations"))?;
+        if declarations.is_empty()
+            || declarations.iter().any(|entry| {
+                entry.locator.is_some()
+                    || entry.mode != ryeos_state::objects::ExternalContentMode::Pinned
+            })
+        {
+            bail!("content dependency `{name}` is not locator-free pinned content");
+        }
+        super::external_content::require_supported_mount_roots(
+            declarations.iter().map(|entry| entry.mount_root),
+            state.isolation.is_enforced(),
+        )?;
+        ryeos_app::external_content_admission::validate_retained_declaration_totals(
+            state,
+            Some(&source_contract),
+            &declarations,
+        )?;
+        for (target, contract) in &dependency.target_content_contracts {
+            if !prepared.execution_dependencies.contains_key(target) {
+                bail!("content dependency `{name}` target `{target}` is absent");
+            }
+            let (incumbent, aggregate) = by_target
+                .entry(target.clone())
+                .or_insert_with(|| (contract.clone(), Vec::new()));
+            if serde_json::to_value(&*incumbent)? != serde_json::to_value(contract)? {
+                bail!("content contributions disagree on target `{target}` contract");
+            }
+            aggregate.extend(declarations.iter().cloned());
+        }
+    }
+    for (target, (contract, contributed)) in by_target {
+        let resolution = &prepared.execution_dependencies[&target].resolution;
+        let combined = combined_target_content_declarations(
+            &resolution.composed.composed,
+            declaring_authority(resolution)?,
+            &contract,
+            &contributed,
+        )
+        .with_context(|| format!("content target `{target}` exceeds its retained kind contract"))?;
+        ryeos_app::external_content_admission::validate_retained_declaration_totals(
+            state,
+            Some(&contract),
+            &combined,
+        )
+        .with_context(|| format!("content target `{target}` exceeds its retained storage grant"))?;
+    }
+    Ok(())
+}
+
+fn combined_target_content_declarations(
+    composed: &Value,
+    declarer: ryeos_engine::external_content::DeclaringAuthority<'_>,
+    contract: &ryeos_engine::kind_registry::KindExternalContentDecl,
+    contributed: &[ryeos_engine::external_content::ExternalContentDeclaration],
+) -> Result<Vec<ryeos_engine::external_content::ExternalContentDeclaration>> {
+    use ryeos_engine::external_content::declarations_from_composed;
+    let mut declarations =
+        declarations_from_composed(composed, Some(contract), declarer)?.unwrap_or_default();
+    declarations.extend(contributed.iter().cloned());
+    Ok(declarations_from_composed(
+        &json!({"external_content": declarations}),
+        Some(contract),
+        declarer,
+    )?
+    .expect("combined declaration list is present"))
+}
+
+/// Validate actual retained manifests after capture, not locator declarations.
+/// The conversion is only an input to the existing storage-budget validator;
+/// it does not replace authored declarations or the admitted realization set.
+fn validate_captured_target_content(
+    state: &AppState,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    contract: &ryeos_engine::kind_registry::KindExternalContentDecl,
+    evidence: &[PreparedEvidenceAttachment],
+) -> Result<()> {
+    let realized = realization_set(resolution)?;
+    let declarations = captured_target_content_declarations(&realized, evidence)?;
+    ryeos_app::external_content_admission::validate_retained_declaration_totals(
+        state,
+        Some(contract),
+        &declarations,
+    )
+}
+
+fn captured_target_content_declarations(
+    realized: &ryeos_engine::external_realization::RealizedExternalContentSet,
+    evidence: &[PreparedEvidenceAttachment],
+) -> Result<Vec<ryeos_engine::external_content::ExternalContentDeclaration>> {
+    let evidence_ids = evidence_realizations(evidence)?
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(realized
+        .iter()
+        .filter(|entry| !evidence_ids.contains(&entry.id))
+        .map(
+            |entry| ryeos_engine::external_content::ExternalContentDeclaration {
+                id: entry.id.clone(),
+                kind: entry.kind,
+                mode: ryeos_state::objects::ExternalContentMode::Pinned,
+                locator: None,
+                digest: Some(entry.manifest_hash.clone()),
+                exclude: Vec::new(),
+                metadata_hint: None,
+                mount_root: entry.mount_root,
+                mount: entry.mount.clone(),
+            },
+        )
+        .collect::<Vec<_>>())
 }
 
 type TargetContentSets =
@@ -1441,6 +1660,7 @@ fn admit_session_capsule(
     executable_search: &[ExecutableSearchPathEntry],
     environment: &BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue>,
     evidence_attachments: &[PreparedEvidenceAttachment],
+    content_target_contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
 ) -> Result<(String, Vec<ryeos_state::PendingCasPublication>)> {
     let roots = engine.resolution_roots(None);
     let mut resolution = dependency.resolution.clone();
@@ -1467,6 +1687,20 @@ fn admit_session_capsule(
             inherited_content,
             &mut publication,
         )?;
+    if let Some(value) = resolution
+        .composed
+        .derived
+        .get(ryeos_state::objects::EXTERNAL_REALIZATIONS_DERIVED_KEY)
+    {
+        let realized = ryeos_state::objects::ExternalContentRealizationSet::from_value(value)?;
+        super::external_content::require_supported_mount_roots(
+            realized.iter().map(|entry| entry.mount_root),
+            state.isolation.is_enforced(),
+        )?;
+    }
+    if let Some(contract) = content_target_contract {
+        validate_captured_target_content(state, &resolution, contract, evidence_attachments)?;
+    }
     let validation = engine.effective_validators.validate(
         &dependency.captured_verified_subject()?.resolved.kind,
         &resolution,
@@ -1662,6 +1896,7 @@ fn verify_session_capsule(
     executable_search: &[ExecutableSearchPathEntry],
     environment: &BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue>,
     evidence_attachments: &[PreparedEvidenceAttachment],
+    content_target_contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
 ) -> Result<AdmittedPersistentSessionCapsule> {
     let capsule = load_capsule(state, capsule_hash)?;
     let exact: PersistentSessionExactProgram =
@@ -1693,6 +1928,9 @@ fn verify_session_capsule(
     let resolution = exact.resolution_output.restore();
     ryeos_app::source_closure_admission::recover_source_closure(state, &state.engine, &resolution)?;
     ryeos_app::external_content_admission::recover_external_realizations(state, &resolution)?;
+    if let Some(contract) = content_target_contract {
+        validate_captured_target_content(state, &resolution, contract, evidence_attachments)?;
+    }
     super::execution_realization::verify_persistent_session(
         state,
         &capsule,
@@ -2605,6 +2843,30 @@ mod tests {
             .unwrap(),
             realized
         );
+        let mut captured = test_realization("own", "runtime/own", 'd');
+        captured.mode = ryeos_state::objects::ExternalContentMode::Captured;
+        let mut combined = realized.iter().cloned().collect::<Vec<_>>();
+        combined.push(captured.clone());
+        combined.push(test_realization(
+            "ev-not-an-attachment",
+            "runtime/contributed",
+            'e',
+        ));
+        let combined =
+            ryeos_engine::external_realization::RealizedExternalContentSet::new(combined).unwrap();
+        let budget_entries = captured_target_content_declarations(&combined, &[binding]).unwrap();
+        assert_eq!(budget_entries.len(), 2);
+        let own = budget_entries
+            .iter()
+            .find(|entry| entry.id == "own")
+            .unwrap();
+        assert_eq!(own.digest.as_ref(), Some(&captured.manifest_hash));
+        assert!(own.locator.is_none());
+        assert!(
+            budget_entries
+                .iter()
+                .any(|entry| entry.id == "ev-not-an-attachment")
+        );
     }
 
     #[test]
@@ -2700,6 +2962,126 @@ mod tests {
             vec![search["runtime"][0].clone(), search["runtime"][0].clone()],
         )]);
         assert!(validate_content_target_aggregation(valid, duplicate_search).is_err());
+    }
+
+    #[test]
+    fn prepared_content_target_checks_authored_and_all_contributed_declarations() {
+        use ryeos_engine::external_content::{DeclaringAuthority, ExternalContentDeclaration};
+        use ryeos_state::objects::ExternalContentMountRoot::{ExecutionRuntime, Project};
+        let mut contract = ryeos_engine::kind_registry::KindExternalContentDecl {
+            realization_derived: "effective_external_realizations".into(),
+            allowed_roots: vec![],
+            allowed_mount_roots: vec![Project],
+            max_declarations: 2,
+            large_content: None,
+        };
+        let declaration = |id: &str, mount_root| {
+            serde_json::from_value::<ExternalContentDeclaration>(json!({
+                "id":id, "kind":"tree", "mode":"pinned", "digest":"a".repeat(64),
+                "mount_root":mount_root, "mount":id
+            }))
+            .unwrap()
+        };
+        let own = json!({"external_content":[declaration("own", Project)]});
+        let first = declaration("first", Project);
+        let second = declaration("second", Project);
+        let compile = |contract: &_, entries: &[_]| {
+            combined_target_content_declarations(
+                &own,
+                DeclaringAuthority::Bundle("fixture"),
+                contract,
+                entries,
+            )
+        };
+        assert_eq!(
+            compile(&contract, std::slice::from_ref(&first))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(compile(&contract, &[first.clone(), second.clone()]).is_err());
+        contract.max_declarations = 3;
+        assert_eq!(
+            compile(&contract, &[first.clone(), second]).unwrap().len(),
+            3
+        );
+        assert!(compile(&contract, &[declaration("runtime", ExecutionRuntime)]).is_err());
+        assert!(compile(&contract, &[declaration("own", Project)]).is_err());
+        contract.allowed_mount_roots.push(ExecutionRuntime);
+        assert!(compile(&contract, &[declaration("runtime", ExecutionRuntime)]).is_ok());
+        // A future kind edit cannot change the copied receiving contract.
+        let retained = serde_json::to_value(&contract).unwrap();
+        contract.allowed_mount_roots.clear();
+        let retained = serde_json::from_value(retained).unwrap();
+        assert!(compile(&retained, &[first]).is_ok());
+    }
+
+    #[test]
+    fn prepared_content_target_contracts_are_mandatory_and_exact_on_recovery() {
+        let exact = retained_program_fixture("/fixture/worker.yaml", 'a');
+        let policy = ryeos_engine::runtime_registry::LaunchContentExternalPolicy {
+            allowed_mount_roots: vec![ryeos_state::objects::ExternalContentMountRoot::Project],
+            max_declarations: 8,
+            large_content_max_total_bytes: None,
+        };
+        let mut dependency = PreparedContentDependency {
+            binding: "environment".into(),
+            canonical_ref: exact.resolution_output.root_ref().into(),
+            resolution: exact.resolution_output,
+            targets: vec!["worker".into()],
+            executable_search: vec![],
+            target_content_contracts: BTreeMap::from([(
+                "worker".into(),
+                policy.declaration_contract(),
+            )]),
+            external_content_policy: policy,
+        };
+        dependency.validate().unwrap();
+        let wire = serde_json::to_value(&dependency).unwrap();
+        let decoded: PreparedContentDependency = serde_json::from_value(wire.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded.target_content_contracts).unwrap(),
+            wire["target_content_contracts"]
+        );
+        let mut predecessor = wire;
+        predecessor
+            .as_object_mut()
+            .unwrap()
+            .remove("target_content_contracts");
+        assert!(serde_json::from_value::<PreparedContentDependency>(predecessor).is_err());
+        dependency.target_content_contracts.clear();
+        assert!(dependency.validate().is_err());
+    }
+
+    #[test]
+    fn prepared_content_cross_site_receiver_must_admit_the_retained_ceiling() {
+        use ryeos_state::objects::ExternalContentMountRoot::{ExecutionRuntime, Project};
+        let retained = ryeos_engine::kind_registry::KindExternalContentDecl {
+            realization_derived: "effective_external_realizations".into(),
+            allowed_roots: vec![],
+            allowed_mount_roots: vec![Project, ExecutionRuntime],
+            max_declarations: 4,
+            large_content: Some(ryeos_engine::kind_registry::KindLargeContentGrant {
+                max_total_bytes: Some(100),
+            }),
+        };
+        require_receiving_content_contract(&retained, Some(&retained)).unwrap();
+        assert!(require_receiving_content_contract(&retained, None).is_err());
+        let mut receiving = retained.clone();
+        receiving.allowed_mount_roots = vec![Project];
+        assert!(require_receiving_content_contract(&retained, Some(&receiving)).is_err());
+        receiving = retained.clone();
+        receiving.max_declarations = 3;
+        assert!(require_receiving_content_contract(&retained, Some(&receiving)).is_err());
+        receiving = retained.clone();
+        receiving.large_content = None;
+        assert!(require_receiving_content_contract(&retained, Some(&receiving)).is_err());
+        receiving = retained.clone();
+        receiving.large_content.as_mut().unwrap().max_total_bytes = Some(99);
+        assert!(require_receiving_content_contract(&retained, Some(&receiving)).is_err());
+        receiving.large_content.as_mut().unwrap().max_total_bytes = None;
+        require_receiving_content_contract(&retained, Some(&receiving)).unwrap();
     }
 
     fn resource_override_declaration() -> PersistentSessionDecl {
