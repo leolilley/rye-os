@@ -14,7 +14,7 @@ import yaml
 BUNDLE = Path(__file__).resolve().parent
 REPOSITORY = BUNDLE.parent.parent
 SOURCE = BUNDLE / ".ai/workers/codex/lib/hosted"
-PUBLISHER = REPOSITORY / "scripts/release/authoring-baseline"
+AUTHORING_E2E = REPOSITORY / "tests/e2e/authoring-environment"
 
 
 def load(relative):
@@ -35,7 +35,7 @@ class AuthoringEnvironmentTests(unittest.TestCase):
         cls.default = load(".ai/config/codex/environments/default.yaml")
         cls.worker = load(".ai/workers/codex/hosted-authoring.yaml")
         cls.default_worker = load(".ai/workers/codex/hosted.yaml")
-        cls.selection = json.loads((PUBLISHER / "selection.json").read_text())
+        cls.selection = json.loads((AUTHORING_E2E / "selection.json").read_text())
 
     def test_default_and_login_remain_minimal(self):
         self.assertEqual([item["id"] for item in self.default["external_content"]], ["command-tools"])

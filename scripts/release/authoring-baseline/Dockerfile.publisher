@@ -1,7 +1,0 @@
-# No package manager or execution-host inputs. COPY freezes the publisher's
-# code and lock before production, even when another thread edits its checkout.
-FROM --platform=linux/amd64 docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c
-ENV RYEOS_AUTHORING_PUBLISHER_IMAGE=docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c
-WORKDIR /publisher
-COPY produce.py inputs.json README.md probe.sh fetch.py verify.py qualify.py test_contract.py Dockerfile.probe Dockerfile.publisher /publisher/
-ENTRYPOINT ["python3", "/publisher/produce.py"]

@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import time
 HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[2]
+PRODUCTION_OWNER = REPOSITORY / ".ai/tools/ryeos/development/authoring-environment-production/lib/production.py"
 
 
 class ProbeRefused(RuntimeError):
@@ -59,8 +61,7 @@ def main() -> None:
     parser.add_argument("--inventory-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    owner = HERE.parents[2] / ".ai/tools/ryeos/development/authoring-environment-production/lib/production.py"
-    spec = importlib.util.spec_from_file_location("production", owner)
+    spec = importlib.util.spec_from_file_location("production", PRODUCTION_OWNER)
     production = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(production)
     if production.receipt(args.production)["inventory_sha256"] != args.inventory_sha256:

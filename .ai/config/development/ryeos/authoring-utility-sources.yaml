@@ -1,6 +1,10 @@
+# ryeos:signed:2026-09-06T04:58:49Z:7ac97ebb3eeae94bf2af2e2592d9b7bb8013f40b21e4f26e15bc42c7b7efed71:uCYLI5nlOHgjioptc7DLTAZ0E7Z6dB/2/J8fBK8kk4K7lpOsZ3XYq6psfLTWM9pL6BQs03g0olwMARqsxW0+BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 {
-  "artifact": "ryeos-authoring-tools-1.0.0-x86_64-linux-musl",
-  "publisher_image": "docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c",
+  "category": "development/ryeos",
+  "name": "authoring-utility-sources",
+  "version": "1.0.0",
+  "schema": "ryeos.development.authoring-utility-sources.v1",
+  "input_image": "docker.io/library/rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c",
   "source_date_epoch": 1788566400,
   "publisher_notices": [
     {"path": "/usr/share/common-licenses/LGPL-2.1", "target": "licenses/LGPL-2.1", "sha256": "20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95"}
