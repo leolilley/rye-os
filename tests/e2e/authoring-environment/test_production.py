@@ -246,6 +246,11 @@ class ProductionTests(unittest.TestCase):
         self.assertIn("RYEOS_VERIFIED_CODE_MAP", runtime)
         self.assertIn("realization:producer-python/lib/ld-musl-x86_64.so.1", runtime)
         self.assertNotIn("local_binary", runtime)
+        # Empty PATH is still a typed path contribution, not an unproven
+        # runtime-descriptor overwrite of the protected process field.
+        self.assertIn('env_config:\n', runtime)
+        self.assertIn('  env_paths:\n    PATH:\n      prepend: []\n      append: []', runtime)
+        self.assertNotIn('    PATH:', runtime.split('\nconfig:\n', 1)[1])
 
 
 if __name__ == "__main__":

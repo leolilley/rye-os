@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T03:45:22Z:026ac38e611c264bd7729055a5485a695e2ec1003a46fd40e5092a08020fd0e2:Gzy/F54us6xxSxJYn7FQviHyxRSMVAj3Urzx8fy65L8StWONjE0jCuVMyKdkH5Prf6Gbqtkc/gfrfJmDhxn6BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T04:59:17Z:d4c5ce26f60f794dddc56c0b14d349bad2718d016cbf2b5253072480b940a24f:OiumUJ7wT7bAVQrS2GgLmO+T1DC/XjXcHtUuy4asmQRX0orL4TrACFE3hmJXzDy4ZC9XDyrSpaBTkpADJ6AzCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: ryeos/development/authoring-environment-production
 name: runtime
 version: "1.0.0"
@@ -12,6 +12,15 @@ source_scope:
   location: item_namespace
   load_roots: [item_directory, namespace_root, namespace_lib]
   materialization: read_only
+env_config:
+  # PATH authority belongs to the existing typed path composer, not config.env.
+  # Every child uses an exact admitted absolute executable; inherit no search path.
+  env:
+    PATH: ""
+  env_paths:
+    PATH:
+      prepend: []
+      append: []
 config:
   command: realization:producer-python/lib/ld-musl-x86_64.so.1
   args:
@@ -53,6 +62,5 @@ config:
     PYTHONSAFEPATH: "1"
     LANG: C
     LC_ALL: C
-    PATH: ""
   input_data: "${params_json}"
   timeout_secs: 300
