@@ -82,12 +82,114 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
         self.assertNotIn("tool:ryeos/development/cargo-vendor",
                          [route["item_ref"] for route in self.environment["workload_client"]["executions"]])
 
+    def test_development_closure_policy_covers_observed_vendor_artifact(self):
+        policy = load("bundles/.ai/node/init/profiles/development.yaml")["policies"]["object_closure"]
+        # Observed complete vendor output, not an engine/compiler special case.
+        # The registered Rust compiler separately validates protocol and encoded
+        # response bounds when this signed policy is installed.
+        self.assertGreaterEqual(policy["max_total_blob_bytes"], 575879606)
+        self.assertGreaterEqual(policy["max_blobs"], 25804)
+
     def test_producer_timeouts_survive_project_execution_config_precedence(self):
         execution = load(".ai/config/execution/execution.yaml")["items"]["tool"]
         runtime = load(".ai/tools/ryeos/development/authoring-environment-production/runtime.yaml")
         for operation in ("prepare", "assemble", "verify"):
             self.assertEqual(execution["ryeos/development/authoring-environment-production/" + operation]["timeout"],
                              runtime["config"]["timeout_secs"])
+
+    def test_cargo_operations_are_bounded_offline_children_not_ambient_builds(self):
+        execution = load(".ai/config/execution/execution.yaml")["items"]["tool"]
+        for operation in ("check", "build", "test"):
+            ref = "ryeos/development/cargo-" + operation
+            tool = load(".ai/tools/" + ref + ".yaml")
+            self.assertEqual(tool["executor_id"], "@subprocess")
+            self.assertEqual(tool["execution_protocol"], "protocol:ryeos/core/opaque")
+            self.assertEqual(tool["workspace_access"], "immutable_current_generation")
+            self.assertEqual(tool["filesystem_authority"], "captured_execution")
+            self.assertEqual(tool["network_authority"], "isolated")
+            declarations = {entry["id"]: entry for entry in tool["external_content"]}
+            self.assertEqual(set(declarations), {"platform", "vendor"})
+            self.assertEqual(declarations["vendor"]["digest"],
+                             "8dac785a06faad238b3210c79ba3ca7bee37dc211fe0e95acf80dff6500a75ac")
+            self.assertTrue(all(entry["mount_root"] == "execution_runtime"
+                                and entry["mode"] == "pinned" for entry in declarations.values()))
+            args = tool["config"]["args"]
+            for flag in (operation, "--locked", "--frozen", "--offline", "--lib"):
+                self.assertIn(flag, args)
+            self.assertNotIn("--target", args)
+            self.assertEqual(args[args.index("--jobs") + 1], "2")
+            self.assertEqual(args[args.index("--package") + 1], "${params.package}")
+            self.assertEqual(tool["config_schema"]["properties"]["package"]["enum"],
+                             ["lillux", "ryeos-isolation-protocol"])
+            self.assertFalse(tool["config_schema"]["additionalProperties"])
+            self.assertEqual(tool["config"]["env"]["CARGO_TARGET_DIR"], "/tmp/target")
+            self.assertEqual(tool["env_config"]["env"]["PATH"], "")
+            self.assertEqual(execution[ref]["timeout"], tool["config"]["timeout_secs"])
+            if operation == "test":
+                self.assertIn("--exact", args)
+                self.assertIn("${params.test}", args)
+                self.assertEqual(tool["config_schema"]["properties"]["test"]["minLength"], 1)
+
+    def test_complete_distribution_has_its_own_nonexecutable_retention_consumer(self):
+        distribution = load(".ai/config/development/ryeos/authoring-distribution.yaml")
+        self.assertNotIn("executor_id", distribution)
+        artifact = distribution["external_content"][0]
+        self.assertEqual(artifact["id"], "distribution")
+        self.assertEqual(artifact["digest"],
+                         "31852861af3ec0384240611b8675ea600ae7d93b76cf6c5c1451276e0f7bd49c")
+        self.assertNotIn(artifact["digest"],
+                         [entry["digest"] for entry in self.environment["external_content"]])
+
+    def test_production_graph_is_closed_sequential_and_fail_fast(self):
+        prefix = "ryeos/development/authoring-environment-production"
+        graph = load(".ai/graphs/" + prefix + ".yaml")
+        config = graph["config"]
+        self.assertEqual(config["start"], "assemble")
+        self.assertEqual(config["max_steps"], 3)
+        self.assertEqual(config["on_error"], "fail")
+        self.assertEqual(config["config_schema"], {
+            "type": "object", "properties": {}, "additionalProperties": False})
+        self.assertEqual(set(config["nodes"]), {"assemble", "verify", "done"})
+        self.assertEqual(graph["requires"]["capabilities"]["declared"], [
+            "ryeos.execute.tool." + prefix + "/" + operation
+            for operation in ("assemble", "verify")])
+        for operation, successor in (("assemble", "verify"), ("verify", "done")):
+            node = config["nodes"][operation]
+            self.assertEqual(node["node_type"], "action")
+            self.assertEqual(node["action"], {
+                "item_id": "tool:" + prefix + "/" + operation,
+                "ref_bindings": {}, "params": {}, "thread": "inline"})
+            self.assertEqual(node["effects"], "live")
+            self.assertFalse(node["cache_result"])
+            for separate_or_recovering_flow in ("follow", "detach", "parallel", "retry", "on_error"):
+                self.assertNotIn(separate_or_recovering_flow, node)
+            self.assertEqual(node["next"], {"type": "unconditional", "to": successor})
+        self.assertEqual(config["nodes"]["done"], {
+            "node_type": "return", "output": {
+                "assembly": "${state.assembly}", "verification": "${state.verification}"}})
+        execution = load(".ai/config/execution/execution.yaml")["items"]
+        self.assertGreater(execution["graph"][prefix]["timeout"], sum(
+            execution["tool"][prefix + "/" + operation]["timeout"]
+            for operation in ("assemble", "verify")))
+        for manifest in ("manifest.source.yaml", "manifest.yaml"):
+            self.assertIn("graph", load(".ai/" + manifest)["requires_kinds"])
+
+    def test_production_graph_leaves_use_same_exact_inputs_and_opaque_protocol(self):
+        leaves = []
+        for operation in ("assemble", "verify"):
+            source = (ROOT / ".ai/tools/ryeos/development/authoring-environment-production" /
+                      (operation + ".py")).read_text()
+            header = "\n".join(line[2:] for line in source.splitlines()
+                               if line.startswith("# ") and not line.startswith("# ryeos:signed:"))
+            tool = yaml.safe_load(header)["ryeos-tool"]
+            self.assertEqual(tool["execution_protocol"], "protocol:ryeos/core/opaque")
+            self.assertEqual(tool["filesystem_authority"], "captured_execution")
+            self.assertEqual(tool["network_authority"], "isolated")
+            self.assertEqual(tool["config_schema"], {
+                "type": "object", "properties": {}, "additionalProperties": False})
+            leaves.append(tool)
+        for field in ("executor_id", "external_content", "config_resolve"):
+            self.assertEqual(leaves[0][field], leaves[1][field])
 
     def test_python_runtime_uses_admitted_prefix_not_protected_environment(self):
         runtime = load(".ai/tools/ryeos/development/authoring-environment-production/runtime.yaml")

@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T11:13:37Z:ea2d39403f788ed4d3ce691738f2b78474e6293407f35d0532bf88edd750507b:ZYM7TUZNX5apx9DMZaOTUJ5yA1iCHMPOoRW54aUup1CN5ujxZLz5Va3rWbe7hgpIou0djkENZWlA7Y9k7ugcAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T22:52:09Z:e925b1ad62c15091463f49c4f0e53bcc66840fa2162b170067d75654179010db:aF3fUsdaqew18sc8V5IQYOtvnNl/WGZjF7bzK17M97ivBedWmF1wTT4U/ExTyVgbxYAUSyFYoMEdiuX+eo6gCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/development
 tags: [development, authoring, external-content, production]
-version: "1.0.2"
+version: "1.1.0"
 description: Finite production and qualification of the shared command environment.
 ---
 
@@ -46,8 +46,10 @@ and receipts instead verify their exact physical permission bits.
    `products/authoring-prepared-inputs/tree`, then bind it to `assemble` and
    `verify`. A changed input selection requires explicit authoring/signing.
 2. Admit a pinned private producer with retained result authority. Run
-   `assemble` followed by `verify` in the same result lineage. Their filesystem
-   ceiling is `captured_execution` and network authority is `isolated`.
+   `graph:ryeos/development/authoring-environment-production`: its two inline
+   actions run `assemble` followed by `verify` in the same private workspace.
+   Their filesystem ceiling is `captured_execution` and network authority is
+   `isolated`.
 3. Retain `products/authoring-environment` through the existing project result
    snapshot. Do not use shared-exclusive worker-child execution for this
    artifact-producing root: its output must survive terminal retention.
@@ -60,6 +62,50 @@ and receipts instead verify their exact physical permission bits.
    consumer authorization.
 6. Qualify the actual worker/environment pair, durable completion, fenced
    candidate retention and independent candidate validation.
+
+### Run the retained production graph
+
+Push the signed source generation containing the graph and both Tools into the
+selected principal's project HEAD. Bind `producer-python` and `assembly-inputs`
+to each exact Tool consumer **at that same source snapshot** before launch.
+Project consumer bindings include the snapshot hash: existing content manifests
+can be reused, but bindings to an older source generation cannot authorize the
+new one. Use `ryeos external-content import-binding <exact-active-binding-hash>
+<maximum-bytes>` for a fresh receipt, then bind that receipt to the new exact
+Tool/snapshot. The source binding must still be active under the local
+operator's current authority; a completed receipt cannot simply be reused for
+another consumer. The graph does not redeclare its children's dependencies.
+
+From that project, using the selected node's ordinary CLI connection, run:
+
+```sh
+ryeos execute graph:ryeos/development/authoring-environment-production --current-head --no-operator-vault --async
+```
+
+The existing current-HEAD policy gives the graph one retained CoW workspace.
+Both opaque subprocess leaves borrow that workspace and its original pinned
+subject generation; the second sees the first's products without making those
+products a new source-definition or consumer-binding authority. Leaves receive
+no callback bearer, and only the graph root owns terminal snapshot retention.
+The project execution config allows both bounded leaves plus graph overhead.
+Failure stops the graph before later actions; these live production actions are
+not cross-run cached or automatically retried.
+
+Keep the default inherited child policy; do not add `--retain-child-results`.
+Use inline actions rather than detached or follow children: the pipeline needs
+one uninterrupted shared-workspace sequence, not separate child-root ownership
+or generation boundaries. Two separate `--current-head`
+Tool invocations also do not compose: retaining a result does not advance HEAD,
+so `verify` would not see `assemble`'s output. No live filesystem copy or project
+apply-snapshot operation is needed.
+
+After canonical graph completion, import from the graph's exact retained
+`result_project_snapshot_hash`, selecting `products/authoring-environment`.
+The graph's returned inventory values are useful reproduction evidence, not
+CAS receipts, consumer bindings or publication permission. Running `verify`
+here qualifies artifact reproduction; it is not independent hosted candidate
+qualification. Admitted graph execution must still be demonstrated on the
+selected node; source contract tests alone do not prove that acceptance.
 
 `prepare` consumes the pinned raw tree at
 `/ryeos/realizations/authoring-source-inputs` and resolves both the assembly-input
@@ -107,8 +153,14 @@ complete production output and shell file. Project HEAD remained unchanged.
 `tests/e2e/authoring-environment/selection.json` retains the exact thread,
 capsule, result and import coordinates, separately from the expected pins.
 
-Independent admitted verification, final Worker/Config bindings, restart and
-real hosted candidate qualification remain gates. The v7 source integration
+The shell and runtime now have exact installed Worker/Config bindings on the
+disposable target. The complete output has a separate project Config binding,
+`config:development/ryeos/authoring-distribution`, which retains corresponding
+sources and notices as well as runtime bytes. It is a non-executable consumer,
+not a second worker environment or an input to independent reproduction.
+
+Independent admitted verification, restart and real hosted candidate
+qualification remain gates. The v7 source integration
 replaces per-launch overlay creation with one original retained view and exact
 transitive borrower freeze/cleanup fencing. Each isolated child attaches its
 own clone of that template; the backing workspace is not remounted separately

@@ -23,7 +23,7 @@
     "admitted_verify": false,
     "ryeos_production": false,
     "retained_result_import": true,
-    "consumer_binding": false,
+    "consumer_binding": true,
     "hosted_turn": false,
     "restart": false
   },
@@ -43,6 +43,22 @@
       "capsule_hash": "79ed2f0be57e8c9bc14f10db4548fc29b5653b5160bdbe82dc096032beb55ed7",
       "result_snapshot_hash": "bea84a8bd2f3a134fa74afe309a413db235acb86407c430fa14ad5de094fc50d",
       "outcome_code": "exit:0"
+    },
+    "observed_bindings": {
+      "date": "2026-09-07",
+      "environment": {
+        "consumer_ref": "config:codex/environments/authoring",
+        "binding_hash": "b1ad0ca84276adac043e36e6c4ef02a765d0685d648cf08276c447eb427a4784"
+      },
+      "shell_file": {
+        "consumer_ref": "worker:codex/hosted-authoring",
+        "binding_hash": "403639b0b5682eedbbb4a98af34dc71b6e1d6df2a3f9f467881627ef36029187"
+      },
+      "production": {
+        "consumer_ref": "config:development/ryeos/authoring-distribution",
+        "source_snapshot_hash": "6e3e7decb0a588e95ebdd6ae09cbff255aae64f181c9eec522b9f6e58e372912",
+        "binding_hash": "bd39f5afb7f092366ff68e0c4b98c69e0a7e38bed5efc981bf56aa1ae39b58d0"
+      }
     },
     "observed_imports": {
       "assembly_inputs": {

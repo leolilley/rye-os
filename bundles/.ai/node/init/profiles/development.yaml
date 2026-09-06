@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T04:39:23Z:8aba10259484b4904f66bf44c5d5311df48f08bed3907a31cb5347f5fe9d548f:OxijiD14kvGr9eUb7XLWa7qGeuTqcohau13TPDu+yHmqC+C/lvdDOW/vFK8RSzXmi9ZkmujMPbs70ILaVuFYAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T22:34:09Z:5d16bfe103694287c5e72ba55ea7951d08bb026e58cf9cb8e2d0643f27259fb0:JtgQv16+ogxBbGAKSmbiww+1f53MIegbBg0TcEVMyRGMasY32OB/jwb3VcLOwL+AquGQqsAXtsW45s8m4fmYCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -136,9 +136,11 @@ policies:
     max_object_bytes: 33554432
     max_total_object_bytes: 67108864
     max_blob_bytes: 134217728
-    # Development platform small-file CAS closure is about 384 MB. The five
-    # large files use the existing large-object store, not this blob allowance.
-    max_total_blob_bytes: 536870912
+    # The locked vendor tree is about 576 MB; the platform's small-file CAS
+    # closure is about 384 MB. Admit either exact operation closure with
+    # bounded headroom, within the existing 1 GiB encoded response ceiling.
+    # Large files use the existing large-object store, not this blob allowance.
+    max_total_blob_bytes: 671088640
     max_response_bytes: 1073741824
     max_links_per_object: 100000
   thread_history:

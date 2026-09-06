@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-06T22:17:52Z:cf3bada1f6c3e18d3cb050def79ac3d944b5655df2550412ffc54facae8e7adb:b7X1pM0OeoJExI3WMyWFTOcOlGQ34rqeI1ffOOP8CC2sAxMOXclDYQin6xUM5I3ndTH7C+FdoMBYniFjAXlcBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T22:36:36Z:2e1e35785619a9807a55591c14179f90b3c79b85f0f0623d0840371b0e492ba1:dHkrZYT9pndfnpp4qXgS/eiAaE3rYgjd6yS+rark30MENJbyFhtZz//SmHLD1yFCCamP3wj5PIq0avnJQ/R2BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.10.0"
+version: "1.11.0"
 ```
 
 # Source-Local Bundle Development
@@ -237,10 +237,21 @@ The client digest names the measured local development artifact from revision
 `e0fd43c89`, not a published release. It must be replaced with the exact released
 artifact when release qualification reaches that gate. Source composition
 checks are not evidence of target-local bindings or a successful worker call.
-Cargo dependency production now has an observed manifest. Finite check/build/
-test Tools, their exact target-local bindings and workload-client grants still
-need implementation and isolated qualification. Do not grant nonexistent
-operations or substitute placeholder manifests to advertise them early.
+Cargo dependency production now has an observed manifest. The finite
+`cargo-check`, `cargo-build` and `cargo-test` Tools select that exact vendor
+closure and the admitted platform. Their initial package allowlist is only
+`lillux` and `ryeos-isolation-protocol`; tests require one exact nonempty test
+name. They use offline locked resolution, two jobs, private Cargo/target state
+and no caller-selected flags. A test process exiting successfully with zero
+matched tests is not positive qualification evidence.
+
+Those three Tools are source-authored, not yet installed-qualified or added
+to worker grants. Exact target-local bindings, positive and broken-source
+checks, and the worker-to-child loop remain gates. Broader workspace packages
+and native build dependencies are not implied by this finite first selection.
+The development node's object-closure policy admits the approximately 576 MB
+vendor tree with a 640 MiB aggregate blob ceiling; it still fits the existing
+1 GiB response bound. No compiler-specific runtime limit or bypass is added.
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
 clean-cut isolation-adapter v7 protocol. The backend is available signed data,
@@ -560,12 +571,12 @@ separate import/binding authorities, not a second environment bootstrap.
 ## Development operation and script ownership
 
 The source-local Tools currently authored under `tools/ryeos/development/`
-are `platform-inspect`, `format-check`, and `format-file`. They select the
+include `platform-inspect`, `format-check`, and `format-file`. They select the
 real imported platform manifest, captured-filesystem execution and isolated
 network. Inspection/checking borrow an immutable current generation;
 formatting borrows the exclusive workspace. They still require target-local
-binding and actual CLI qualification. Cargo operations must not be advertised
-as ready before the locked dependency realization exists.
+binding and actual CLI qualification. The three finite Cargo operations above
+are authored against the observed vendor manifest, but are not yet qualified.
 
 Resolved operation timeouts use the existing project execution configuration
 at `.ai/config/execution/execution.yaml`. Its per-item selections override

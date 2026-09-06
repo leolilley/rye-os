@@ -92,6 +92,12 @@ logs/
 /.ai/config/development/*
 !/.ai/config/development/ryeos/
 !/.ai/config/development/ryeos/*.yaml
+!/.ai/graphs/
+/.ai/graphs/*
+!/.ai/graphs/ryeos/
+/.ai/graphs/ryeos/*
+!/.ai/graphs/ryeos/development/
+!/.ai/graphs/ryeos/development/**
 !/.ai/tools/
 /.ai/tools/*
 !/.ai/tools/ryeos/
