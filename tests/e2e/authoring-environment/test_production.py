@@ -2,7 +2,9 @@
 
 import copy
 import importlib.util
+import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 
@@ -100,6 +102,43 @@ class ProductionTests(unittest.TestCase):
             production.assemble(self.inputs, self.root / "out", self.config, tools=tools)
         self.assertFalse((self.root / "out").exists())
         self.assertEqual(tools.calls, [])
+
+    def test_readonly_inputs_match_portable_identity_without_changing_storage_modes(self):
+        for name, identity in self.config["inputs"].items():
+            (self.inputs / name).chmod(identity["mode"] & ~0o222)
+        before = production.inventory(self.inputs)
+        self.assertEqual(before["licenses/NOTICE"]["mode"], 0o444)
+        self.assertEqual(before["utilities/cat"]["mode"], 0o555)
+        self.assertEqual(production.input_inventory(self.inputs), self.config["inputs"])
+        self.assemble()
+        self.assertEqual(production.inventory(self.inputs), before)
+        outputs = production.inventory(self.root / "output")
+        self.assertEqual(outputs["environment/licenses/NOTICE"]["mode"], 0o644)
+        self.assertEqual(outputs["environment/bin/cat"]["mode"], 0o755)
+
+    def test_portable_input_modes_preserve_executable_class_and_reject_special_files(self):
+        for mode, expected in ((0o444, 0o644), (0o600, 0o644),
+                               (0o555, 0o755), (0o700, 0o755), (0o641, 0o755)):
+            self.assertEqual(production.portable_regular_mode(stat.S_IFREG | mode), expected)
+        for kind in (stat.S_IFDIR, stat.S_IFLNK, stat.S_IFIFO, stat.S_IFSOCK):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "regular file"):
+                production.portable_regular_mode(kind | 0o755)
+        (self.inputs / "licenses/NOTICE").chmod(0o555)
+        with self.assertRaisesRegex(ValueError, "source bytes or modes"):
+            production.checked_inputs(self.inputs, self.config)
+
+    def test_special_input_refuses_without_reading_it(self):
+        path = self.inputs / "licenses/NOTICE"
+        path.unlink()
+        os.mkfifo(path)
+        with self.assertRaisesRegex(ValueError, "link or special"):
+            production.checked_inputs(self.inputs, self.config)
+
+    def test_receipts_still_detect_output_write_bit_changes(self):
+        receipt = self.assemble()
+        output = self.root / "output/environment/licenses/NOTICE"
+        output.chmod(0o444)
+        self.assertNotEqual(production.receipt(self.root / "output"), receipt)
 
     def test_extra_input_and_mode_change_are_identity_changes(self):
         self.add_file("extra")

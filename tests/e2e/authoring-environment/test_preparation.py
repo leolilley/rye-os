@@ -183,6 +183,27 @@ class PreparationTests(unittest.TestCase):
             self.prepare()
         self.assertFalse((self.root / "prepared").exists())
 
+    def test_readonly_materialized_archives_preserve_portable_input_identity(self):
+        for name, item in production.inventory(self.raw).items():
+            (self.raw / name).chmod(item["mode"] & ~0o222)
+        before = production.inventory(self.raw)
+        self.assertEqual(before["bootstrap/" + self.binary_name]["mode"], 0o444)
+        self.prepare()
+        self.assertEqual(production.inventory(self.raw), before)
+        self.assertEqual(production.inventory(self.root / "prepared/tree"), self.config["inputs"])
+
+    def test_prepared_output_modes_remain_physical_not_portable(self):
+        target = self.root / "prepared/tree" / next(
+            name for name, identity in self.config["inputs"].items() if identity["mode"] == 0o644)
+        chmod = Path.chmod
+
+        def drift(path, mode, *args, **kwargs):
+            return chmod(path, 0o444 if path == target else mode, *args, **kwargs)
+
+        with patch.object(Path, "chmod", drift), self.assertRaisesRegex(ValueError, "prepared output bytes or modes"):
+            self.prepare()
+        self.assertFalse((self.root / "prepared/input-contract.json").exists())
+
     def test_extra_input_refuses_before_creating_output(self):
         self.write_raw("extra", b"extra")
         with self.assertRaisesRegex(ValueError, "inventory differs"):

@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T03:45:22Z:079c5c7ac30b9ada49b740f1c1ca388257635d5141936fcc6d7d12689fd2d7ad:6do8rkwaNeVhCtPdEIQxVOh2c8zXTdt8CLDd93NVn97BCxuge9fHeh1qsUzN/MevIawddyXBIiGWPblZH8xJCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T07:00:11Z:65ceaa261b9ad57299094b024d79ede17ab2b8a7c91586483cd40b1ebc2d8f85:xVT7baKIbsoq1CZ/D7lCkAVfNGYOBEnPe83oFPQjQOIjaD1WU8R6tOs+xKGRprxkOHO3YseohG+0Y7vSbbczCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Finite, offline authoring-environment assembly; no acquisition or publication.
 
 RyeOS owns capture, namespaces, result snapshots and import/binding. This code
@@ -140,7 +140,30 @@ def validate_config(config: dict) -> None:
         raise ValueError("bootstrap and upstream source provenance is required")
 
 
+def portable_regular_mode(mode: int) -> int:
+    """Match Lillux's normalized_portable_regular_mode for admitted inputs.
+
+    Content manifests commit regular-file bytes and executable class, not
+    mutable storage permissions. An immutable large-object hardlink may be
+    0444 while its portable manifest mode is 0644. Never chmod that shared
+    input to satisfy its manifest, or use this projection for output receipts.
+    """
+    if not stat.S_ISREG(mode):
+        raise ValueError("portable input mode requires an ordinary regular file")
+    return 0o755 if mode & 0o111 else 0o644
+
+
 def inventory(root: Path) -> dict:
+    """Physical output inventory: retain exact permission bits in receipts."""
+    return _inventory(root, portable_inputs=False)
+
+
+def input_inventory(root: Path) -> dict:
+    """Admitted content identity, using the same portable mode as its manifest."""
+    return _inventory(root, portable_inputs=True)
+
+
+def _inventory(root: Path, *, portable_inputs: bool) -> dict:
     if not stat.S_ISDIR(root.lstat().st_mode):
         raise ValueError("artifact is not an ordinary directory")
     result, total = {}, 0
@@ -163,8 +186,8 @@ def inventory(root: Path) -> dict:
                 total += info.st_size
                 if info.st_size > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
                     raise ValueError("artifact byte limit exceeded")
-                result[name] = {"sha256": sha256(path), "bytes": info.st_size,
-                                "mode": stat.S_IMODE(info.st_mode)}
+                mode = portable_regular_mode(info.st_mode) if portable_inputs else stat.S_IMODE(info.st_mode)
+                result[name] = {"sha256": sha256(path), "bytes": info.st_size, "mode": mode}
             else:
                 raise ValueError(f"unselected link or special artifact member: {name}")
     return result
@@ -172,7 +195,7 @@ def inventory(root: Path) -> dict:
 
 def checked_inputs(root: Path, config: dict) -> None:
     validate_config(config)
-    if inventory(root) != config["inputs"]:
+    if input_inventory(root) != config["inputs"]:
         raise ValueError("admitted source bytes or modes differ from the authored input inventory")
 
 

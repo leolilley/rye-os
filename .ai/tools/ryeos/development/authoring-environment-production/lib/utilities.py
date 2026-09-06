@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T04:58:50Z:74822063892765ab36010fc234f58e032e2a779eaf900843d0c187af558c8f01:A8uQ9Rqj6R03Nr7PikF2XTpSMLwAKbuVSdv7LN9LbKBoEBxurHptPW/mLLwLh6e5wlSmzecnK2TezXfEuD/nCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T07:00:11Z:cad975c4a57b06b8f21b5e55c066345c39d26ffbf09e38953b60fa09d5cae04a:QFA3fkQMOLdCwN5BDMFBphLakoAVQRcE0INw+uilZZEZPkpujGWErgsEKF8xquSFULMw28S1KrSNVHPDXEt3Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Finite utility production for an admitted, private RyeOS Tool execution.
 
 This is a library, not an admission-ready Tool or a bootstrap command. A real
@@ -23,8 +23,8 @@ import subprocess
 from archives import open_archive
 
 from production import (ELF_TOOLS, MAX_FILE_BYTES, MAX_TOTAL_BYTES, REQUIRED_COMMANDS,
-                        ElfTools, canonical_json, inventory, ordinary_member,
-                        receipt, relative, sha256)
+                        ElfTools, canonical_json, input_inventory, ordinary_member,
+                        portable_regular_mode, receipt, relative, sha256)
 
 
 SCHEMA = "ryeos.development.authoring-utility-sources.v1"
@@ -116,7 +116,7 @@ def validate_sources(config: dict) -> dict:
 def checked_support(root: Path, config: dict) -> dict[str, Path]:
     if not isinstance(config, dict) or set(config) != {"inputs", "commands", "notices"}:
         raise ValueError("exact build-support inventory is required")
-    if not config["inputs"] or inventory(root) != config["inputs"]:
+    if not config["inputs"] or input_inventory(root) != config["inputs"]:
         raise ValueError("build-support bytes or modes differ from the exact inventory")
     if any(member not in config["inputs"] or config["inputs"][member]["mode"] != 0o755
            for member in ELF_TOOLS.values()):
@@ -128,7 +128,7 @@ def checked_support(root: Path, config: dict) -> dict[str, Path]:
         if len(relative(command).parts) != 1 or member != f"bin/{command}":
             raise ValueError("build-support commands must select their exact bin member")
         path = ordinary_member(root, member)
-        if stat.S_IMODE(path.stat().st_mode) != 0o755:
+        if portable_regular_mode(path.lstat().st_mode) != 0o755:
             raise ValueError("build-support command is not executable")
         with path.open("rb") as stream:
             if stream.read(4) != b"\x7fELF":
@@ -192,7 +192,7 @@ def run(argv: list[str], cwd: Path, env: dict[str, str], log: Path) -> None:
 
 def build_environment(work: Path, commands: dict[str, Path], platform: Path) -> dict[str, str]:
     zig = ordinary_member(platform, "zig/zig")
-    if stat.S_IMODE(zig.stat().st_mode) != 0o755:
+    if portable_regular_mode(zig.lstat().st_mode) != 0o755:
         raise ValueError("admitted Stage0 Zig is not executable")
     shell = str(commands["sh"])
     return {

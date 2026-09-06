@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tarfile
@@ -37,7 +38,7 @@ class UtilityTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"\x7fELFsynthetic; must never execute")
             path.chmod(0o755)
-        return root, {"inputs": utilities.inventory(root), "commands": commands, "notices": {}}
+        return root, {"inputs": utilities.input_inventory(root), "commands": commands, "notices": {}}
 
     def archive(self, members):
         path = self.root / "source.tar"
@@ -85,19 +86,19 @@ class UtilityTests(unittest.TestCase):
     def test_shell_support_refuses_scripts_even_when_inventory_matches(self):
         root, config = self.support()
         (root / "bin/sh").write_bytes(b"#!/bin/sh\necho ambient\n")
-        config["inputs"] = utilities.inventory(root)
+        config["inputs"] = utilities.input_inventory(root)
         with self.assertRaisesRegex(ValueError, "never an ambient shebang"):
             utilities.checked_support(root, config)
 
     def test_extra_path_member_or_missing_elf_helper_refuses(self):
         root, config = self.support()
         (root / "bin/unselected").write_bytes(b"\x7fELFnot selected")
-        config["inputs"] = utilities.inventory(root)
+        config["inputs"] = utilities.input_inventory(root)
         with self.assertRaisesRegex(ValueError, "unselected"):
             utilities.checked_support(root, config)
         (root / "bin/unselected").unlink()
         (root / utilities.ELF_TOOLS["readelf"]).unlink()
-        config["inputs"] = utilities.inventory(root)
+        config["inputs"] = utilities.input_inventory(root)
         with self.assertRaisesRegex(ValueError, "ELF inspection"):
             utilities.checked_support(root, config)
 
@@ -117,6 +118,45 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(env["CC"], f"{platform}/zig/zig cc -target x86_64-linux-musl -static")
         self.assertNotIn("MAKEFLAGS", env)
         self.assertNotIn("RYEOS_AUTHORING_PUBLISHER_IMAGE", env)
+
+    def test_readonly_support_matches_manifest_without_chmod_or_executable_relaxation(self):
+        root, config = self.support()
+        notice = root / "NOTICE"
+        notice.write_bytes(b"support notice")
+        notice.chmod(0o644)
+        config["inputs"] = utilities.input_inventory(root)
+        for member, identity in config["inputs"].items():
+            (root / member).chmod(identity["mode"] & ~0o222)
+        before = {member: (root / member).lstat().st_mode for member in config["inputs"]}
+        utilities.checked_support(root, config)
+        self.assertEqual(before, {member: (root / member).lstat().st_mode for member in config["inputs"]})
+        (root / "bin/sh").chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "bytes or modes"):
+            utilities.checked_support(root, config)
+
+    def test_special_support_entry_refuses_before_reading_or_executing_it(self):
+        root, config = self.support()
+        member = root / "bin/sh"
+        member.unlink()
+        os.mkfifo(member)
+        with self.assertRaisesRegex(ValueError, "link or special"):
+            utilities.checked_support(root, config)
+
+    def test_readonly_stage0_executable_is_not_relabelled(self):
+        root, config = self.support()
+        commands = utilities.checked_support(root, config)
+        platform = self.root / "platform"
+        (platform / "zig").mkdir(parents=True)
+        zig = platform / "zig/zig"
+        zig.write_bytes(b"synthetic compiler; never executed")
+        zig.chmod(0o555)
+        before = zig.lstat().st_mode
+        env = utilities.build_environment(self.root / "work", commands, platform)
+        self.assertTrue(env["CC"].startswith(str(zig) + " cc "))
+        self.assertEqual(zig.lstat().st_mode, before)
+        zig.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            utilities.build_environment(self.root / "work", commands, platform)
 
     def test_all_build_recipes_select_shell_and_make_explicitly(self):
         sources = utilities.validate_sources(source_config())

@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T04:59:17Z:d4c5ce26f60f794dddc56c0b14d349bad2718d016cbf2b5253072480b940a24f:OiumUJ7wT7bAVQrS2GgLmO+T1DC/XjXcHtUuy4asmQRX0orL4TrACFE3hmJXzDy4ZC9XDyrSpaBTkpADJ6AzCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T06:46:10Z:ac52e74f2cf9b4abbaf01fed20003a785f78d610911cd24f332ed5a886d91497:v5kOO5MEg/L4kUzOomERrrf8tvwLCJvHdXAh9egArMgHR4uiS49LNvlGdALd2vVGGT7nK7GsZt2+BSnpIJPkDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: ryeos/development/authoring-environment-production
 name: runtime
 version: "1.0.0"
@@ -30,11 +30,17 @@ config:
     - -P
     - -S
     - -B
+    - -X
+    - utf8
     - -u
     - -c
     - literal: |
         import hashlib, json, os, sys
         from pathlib import Path
+        # The exact executable discovers its own admitted standard library.
+        # Do not override protected PYTHONHOME/PYTHONPATH or inherit host paths.
+        if Path(sys.prefix) != Path("/ryeos/realizations/producer-python/python"):
+            raise SystemExit("producer Python prefix escaped the admitted runtime")
         sealed = sys.argv[1]
         handoff = json.loads(os.environ.get("RYEOS_VERIFIED_CODE_MAP", "null"))
         if not isinstance(handoff, dict) or handoff.get("version") != 1:
@@ -54,13 +60,9 @@ config:
     - "${tool_path}"
     - "${project_path}"
   env:
-    PYTHONHOME: /ryeos/realizations/producer-python/python
-    PYTHONPATH: ""
     PYTHONHASHSEED: "0"
     PYTHONDONTWRITEBYTECODE: "1"
     PYTHONNOUSERSITE: "1"
     PYTHONSAFEPATH: "1"
-    LANG: C
-    LC_ALL: C
   input_data: "${params_json}"
   timeout_secs: 300

@@ -89,6 +89,21 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
             self.assertEqual(execution["ryeos/development/authoring-environment-production/" + operation]["timeout"],
                              runtime["config"]["timeout_secs"])
 
+    def test_python_runtime_uses_admitted_prefix_not_protected_environment(self):
+        runtime = load(".ai/tools/ryeos/development/authoring-environment-production/runtime.yaml")
+        for environment in (runtime["config"]["env"], runtime["env_config"]["env"],
+                            runtime["env_config"]["env_paths"]):
+            self.assertNotIn("PYTHONHOME", environment)
+            self.assertNotIn("PYTHONPATH", environment)
+            self.assertNotIn("LANG", environment)
+            self.assertNotIn("LC_ALL", environment)
+        args = runtime["config"]["args"]
+        for flag in ("-P", "-S", "-B"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("-X") + 1], "utf8")
+        bootstrap = next(arg["literal"] for arg in args if isinstance(arg, dict))
+        self.assertIn('Path(sys.prefix) != Path("/ryeos/realizations/producer-python/python")', bootstrap)
+
 
 if __name__ == "__main__":
     unittest.main()

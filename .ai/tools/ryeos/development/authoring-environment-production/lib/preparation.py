@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T04:58:50Z:075c4c3b2d9d6c0e7737934b20d2c264b1ecfaf054d72b11879361798f3a596c:53CvrLLdDQkRgpGCR0v6/GU4+zCxCZZL5p8xtey+/8CtHs3bsoggQQnbjVozysBv/NiFuAqSms15NXn2Y5yPDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-06T07:00:11Z:51406f3257b7a995b224bb8ad344c55b85a825d4274ece7b11f43d12f692a327:a/zU+WhE57J3zMHHDSgGO3SqHstkxUM8TeXnlxsbZsqb5SRuk1DfbzhmaUshm0B+p1XkdpHutnjk2/B92sdrBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Select admitted archives into the existing, independently authored input contract.
 
 No downloads, container access, host tool discovery, signing or publication.
@@ -16,7 +16,7 @@ import stat
 import sys
 
 from archives import read_members
-from production import (canonical_json, checked_inputs, inventory,
+from production import (canonical_json, input_inventory, inventory,
                         ordinary_member, receipt, relative, validate_config)
 from utilities import validate_sources
 
@@ -75,7 +75,9 @@ def selection(config: dict, source_config: dict) -> tuple:
 
 def checked_raw(root: Path, expected: dict) -> None:
     # Reuse production's regular-file, symlink, entry, depth and total bounds.
-    observed = inventory(root)
+    # Raw materializations carry portable manifest modes, not mutable cache
+    # write bits. Output receipts continue to retain physical modes.
+    observed = input_inventory(root)
     if observed.keys() != expected.keys():
         raise ValueError("raw input inventory differs from its exact selection")
     for name, identity in expected.items():
@@ -132,7 +134,10 @@ def prepare(root: Path, destination: Path, config: dict, source_config: dict) ->
         for name, content in read_members(io.BytesIO(data), names).items():
             notice = name.removeprefix(source["directory"] + "/")
             put("utilities/licenses/" + source["name"] + "/" + notice, content)
-    checked_inputs(tree, config)
+    # These are newly produced files, not immutable input materializations.
+    # Keep their physical permission bits exact before reporting completion.
+    if inventory(tree) != config["inputs"]:
+        raise ValueError("prepared output bytes or modes differ from the authored inventory")
     # This is a copy of the admitted contract, not an output-generated signature.
     contract = destination / "input-contract.json"
     with contract.open("xb") as output:

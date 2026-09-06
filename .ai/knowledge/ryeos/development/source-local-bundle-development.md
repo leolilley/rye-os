@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T06:51:53Z:5a71b42773108719719b9448509b86d6c5e5f49e7ea3ece066f7ed72ab2dac18:BJBE1UPEFLl7m9kevoo9oEONA9SsG5B2aT83s6jyq0RuFPozEYRhoKfEFo8P6nmckNcvTWlSv8KHtPUsSd59Cw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T07:07:52Z:95bd70c7483071b099ff7376d959bace4ee4266197c7b1c92c5207a7e9ca0503:rzLrU9dmIgulwn7xeV6pkk1arv09dG5Q/x3GLxjC+iQVGOyaLlY4qPN1QnJeH1hUSx6qWWg6hNIOhPekZETPBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -531,6 +531,11 @@ a parallel Tool environment field. The main command remains an exact
 `realization:` command, and its captured-filesystem ceiling still confines
 all descendants. Worker environments separately use their already-owned
 `executable_search` contract.
+
+The adjacent `authoring-environment-production` development knowledge owns
+the producer's exact Python runtime, portable input-mode verification and
+strict output receipts. Those operations use the same retained-result and
+separate import/binding authorities, not a second environment bootstrap.
 
 ## Development operation and script ownership
 

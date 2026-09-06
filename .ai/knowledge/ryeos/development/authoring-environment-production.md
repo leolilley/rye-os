@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T04:58:50Z:45f82b280839fa804da268b0095ca995e41aedc40bb066a5c2170e0541b9b0d6:XlWV4Ta/+un9JvFKIfc0wgY/ScHHiW2pTBvfWgkrUFaf90FKocTaO7N5kJiSvulcx+CGNqK/Rhc8yEfk894XBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-06T07:07:52Z:d0523f0f0491400d9b1b4e1befae6dbb0b3c1354f55135a2fa19c46acbc6c879:bU+R2Av//sK29pE0JLv9HnHlHvrVgX0L9XCiaIbVWEX/fXZMPXJ4rpCwV8pjVVOqc6fUkTsiqfKSbE8CY1qQCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/development
 tags: [development, authoring, external-content, production]
@@ -14,12 +14,26 @@ ordinary Tool operations: `prepare`, `assemble` and `verify`. The adjacent `runt
 executes their sealed Python source using an exact admitted interpreter.
 It is not the runtime supplied to the final worker.
 
+The exact Python executable discovers its own admitted standard library. Its
+prefix is checked before loading verified source, and UTF-8 is selected through
+argv. The runtime does not override protected `PYTHONHOME`, `PYTHONPATH` or
+locale names. Missing runtime content fails qualification; it never permits
+host path inheritance or a weaker node environment policy.
+
 The selected `config:development/ryeos/authoring-environment-inputs` enumerates
 every input's hash, bytes and mode, selected output members, exact relocation
 targets and upstream provenance. Assembly and verification pin the same locator-free input
 tree and interpreter. Inputs must be imported and bound to each Tool before
 launch; the source-bearing input tree requires explicit large-content authority.
 Execution has no acquisition, network, signing, binding or publication operation.
+
+Input modes describe portable manifest identity, matching Lillux: an ordinary
+regular file normalizes to `0755` if any executable bit is set, otherwise
+`0644`. Immutable cache materializations may expose those bytes as `0555` or
+`0444`. Preparation, assembly and utility-support checks use that input-only
+projection without chmodding shared content. Exact hashes, sizes, complete
+inventories and regular-file/bounds checks still apply. Newly produced trees
+and receipts instead verify their exact physical permission bits.
 
 ## Flow through existing owners
 
@@ -54,7 +68,7 @@ and `config:development/ryeos/authoring-utility-sources` contracts. Raw layout:
 holds the selected resource package; `upstreams/` holds the named source/notice
 files; `elf/` and the remaining `notices/` hold exact previously selected members.
 Archive members are bounded, regular, exact-name selections; unselected entries
-are not extracted. The operation verifies all 107 final hashes, sizes and modes
+are not extracted. The operation verifies all 107 final hashes, sizes and physical modes
 before advertising completion. It does not execute the acquired binaries,
 contact a container daemon, use host PATH, acquire packages or manufacture pins.
 
