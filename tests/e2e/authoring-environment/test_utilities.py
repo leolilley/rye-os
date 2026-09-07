@@ -53,6 +53,15 @@ class UtilityTests(unittest.TestCase):
                 output.addfile(item, content)
         return path
 
+    def platform(self):
+        root = self.root / "platform"
+        for member in ("zig/zig", "native/bin/ld.lld"):
+            path = root / member
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"synthetic admitted compiler; never executed")
+            path.chmod(0o755)
+        return root
+
     def test_source_contract_preserves_finite_inputs_not_image_authority(self):
         config = source_config()
         self.assertEqual(set(utilities.validate_sources(config)), set(utilities.BUILD_ORDER) | {"zig"})
@@ -105,10 +114,7 @@ class UtilityTests(unittest.TestCase):
     def test_environment_reuses_stage0_and_never_host_path(self):
         root, config = self.support()
         commands = utilities.checked_support(root, config)
-        platform = self.root / "platform"
-        (platform / "zig").mkdir(parents=True)
-        (platform / "zig/zig").write_bytes(b"synthetic admitted compiler")
-        (platform / "zig/zig").chmod(0o755)
+        platform = self.platform()
         with patch.dict("os.environ", {"PATH": "/ambient/bin", "CC": "/host/cc", "MAKEFLAGS": "-j999"}):
             env = utilities.build_environment(self.root / "work", commands, platform)
         self.assertEqual(env["PATH"], str(root / "bin"))
@@ -116,6 +122,7 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(env["SHELL"], env["CONFIG_SHELL"])
         self.assertEqual(env["PKG_CONFIG"], str(root / "bin/false"))
         self.assertEqual(env["CC"], f"{platform}/zig/zig cc -target x86_64-linux-musl -static")
+        self.assertEqual(env["LD"], f"{platform}/native/bin/ld.lld")
         self.assertNotIn("MAKEFLAGS", env)
         self.assertNotIn("RYEOS_AUTHORING_PUBLISHER_IMAGE", env)
 
@@ -145,8 +152,7 @@ class UtilityTests(unittest.TestCase):
     def test_readonly_stage0_executable_is_not_relabelled(self):
         root, config = self.support()
         commands = utilities.checked_support(root, config)
-        platform = self.root / "platform"
-        (platform / "zig").mkdir(parents=True)
+        platform = self.platform()
         zig = platform / "zig/zig"
         zig.write_bytes(b"synthetic compiler; never executed")
         zig.chmod(0o555)
@@ -156,6 +162,18 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(zig.lstat().st_mode, before)
         zig.chmod(0o444)
         with self.assertRaisesRegex(ValueError, "not executable"):
+            utilities.build_environment(self.root / "work", commands, platform)
+
+    def test_missing_stage0_linker_refuses_instead_of_host_discovery(self):
+        root, config = self.support()
+        commands = utilities.checked_support(root, config)
+        platform = self.platform()
+        linker = platform / "native/bin/ld.lld"
+        linker.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            utilities.build_environment(self.root / "work", commands, platform)
+        linker.unlink()
+        with self.assertRaises(FileNotFoundError):
             utilities.build_environment(self.root / "work", commands, platform)
 
     def test_all_build_recipes_select_shell_and_make_explicitly(self):
@@ -168,6 +186,9 @@ class UtilityTests(unittest.TestCase):
                 commands = utilities.build_commands(name, sources[name], Path("/private/source"),
                                                      Path("/private/zlib"), env)
                 self.assertTrue(all(command[0] in (env["CONFIG_SHELL"], env["MAKE"]) for command in commands))
+                if name == "git":
+                    self.assertIn("SHELL_PATH=/selected/bin/sh", commands[0])
+                    self.assertIn('SHELL_PATH_CQ="/ryeos/realizations/authoring-tools/bin/zsh"', commands[0])
                 for command in commands:
                     if command[0] == env["MAKE"]:
                         self.assertIn("SHELL=/selected/bin/sh", command)

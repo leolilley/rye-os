@@ -7,7 +7,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/ryeos-terminal.sh
-source "$script_dir/lib/ryeos-terminal.sh"
+source "$script_dir/../../../scripts/lib/ryeos-terminal.sh"
 ryeos_term_init
 
 APP_ROOT="${RYEOS_SMOKE_APP_ROOT:-}"

@@ -5,7 +5,7 @@
 # ryeos-request-v1 protocol and asserts SSE frames arrive.
 #
 # Usage:
-#   ./scripts/smoke-execute-stream.sh \
+#   ./tests/e2e/execute-stream/smoke.sh \
 #     --url http://localhost:8000 \
 #     --key-pem /tmp/client.pem \
 #     --audience "fp:abc123..." \
@@ -16,7 +16,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/ryeos-terminal.sh
-source "$script_dir/lib/ryeos-terminal.sh"
+source "$script_dir/../../../scripts/lib/ryeos-terminal.sh"
 ryeos_term_init
 
 URL=""

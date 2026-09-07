@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T22:36:36Z:0fdb26dca147bc03cec01b64cf28fbe43496268f812b14e82caa0c248da54b6e:ScWiS78Zgk2O4vj2EeWFhUF6advCgpzYIgniNCCyX0dcwQRsC1iZq00YPcfoSZPzWHksJ93cN/YvLIjVhKdrBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T08:05:59Z:73d6f885d65e0e1bd672f4ecff990297c87c21ff248336b3192ba72e2580b556:nwGgNa7oej0XBaUcLfDlzAjQcxfSohRKZUD+Le1msbi42JVbqKbZasC4bccBIwkEvCIxJxKvk9zWNqRX2kGHDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: execution
 version: "1.0.0"
 schema_version: "2.1.0"
@@ -11,7 +11,21 @@ items:
       # Both 300-second leaves plus bounded graph/lifecycle overhead.
       timeout: 660
   tool:
+    ryeos/development/authoring-environment-production/build-utilities:
+      timeout: 1800
+    ryeos/development/registry-production/assemble:
+      timeout: 60
+    ryeos/development/repository-validation/dependency-layers:
+      timeout: 30
+    ryeos/development/repository-validation/naming:
+      timeout: 30
+    ryeos/development/repository-validation/no-content-wrap:
+      timeout: 30
+    ryeos/development/repository-validation/cli-presentation:
+      timeout: 30
     ryeos/development/authoring-environment-production/prepare:
+      timeout: 300
+    ryeos/development/authoring-environment-production/assemble-build-support:
       timeout: 300
     ryeos/development/authoring-environment-production/assemble:
       timeout: 300

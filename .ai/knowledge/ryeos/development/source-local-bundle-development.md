@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T04:53:44Z:21d604b50181e28d486c96d29074ee5c849b43dc19661fd5cac526c41677bbc4:Bo4qg8elWEKOAWlAELBrcluhDK3PsZC5mJ/FGKpCm8mpT6un0O/yCzeLqxWN8N8BWaFYYv4B6EC70YTvK7ajDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T07:54:25Z:5bfb7a35e5c8068827fe8d0d4e348db5f9f8fff9f6e2281032cb792a88509211:CnaxO7CuGeI8H4TtxdTl73M07fwD5mlrlr918E+eKDx274t/T7Ls/DulQyCI/K9FPY+8U9uPE8ZaG3l+StWZCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.12.0"
+version: "1.13.0"
 ```
 
 # Source-Local Bundle Development
@@ -111,7 +111,7 @@ flag. There is no schema-1 decoder or implicit migration.
 The repository-root `.ai` tree is also the source-local `ryeos` project
 bundle. Its signed `.ai/manifest.yaml` is generated from
 `.ai/manifest.source.yaml`; both are exact-file project sync surfaces. The
-manifest declares only the `config`, `knowledge`, and `tool` kind dependencies
+manifest declares the `config`, `knowledge`, `tool`, and `graph` kind dependencies
 and no runtime authority.
 
 Project AI surfaces have an explicit shape:
@@ -173,8 +173,11 @@ exact detached source generation.
 
 ## Locked registry input acquisition
 
-`scripts/release/fetch-development-registry.py` is an explicit operator/publisher
-bootstrap helper, not a worker operation. It consumes the selected
+`scripts/release/fetch-development-registry.py` currently provides the explicit
+operator input-acquisition entry. Its reusable selection/checking/assembly now
+has one canonical owner beside `tool:ryeos/development/registry-production/assemble`.
+The script retains only host transport and input loading; both paths call
+`registry-production/lib/registry_inputs.py`. It consumes the selected
 `config:development/ryeos/registry-acquisition` and `Cargo.lock`, and obtains
 only the locked public registry coordinates. It verifies archive checksums
 against both the lock and selected index entries; it never executes Cargo,
@@ -195,6 +198,22 @@ directory prevents failed downloads from publishing a partial registry. The
 operator must exclusively own the destination during acquisition; this helper
 is not a concurrent no-replace transaction or a replacement for Lillux's
 node-owned filesystem authorities.
+
+The signed `registry-production/assemble` Tool takes the same lock and public
+selection Config plus `config:development/ryeos/registry-production` for project
+paths. It reuses the exact admitted Python runtime and reads only the bound
+registry tree with captured filesystem and isolated network. Missing or changed
+input fails; no transport is available. Its output retains verified archive
+bytes and selected index rows. The new `registry-inputs.json` distinguishes
+`public_https_acquisition` from `admitted_retained_inputs`; it is an audit
+receipt, not a manifest, consumer binding or new acquisition claim. Historical
+archives/receipts are preserved. Production does not unpack crates or run
+Cargo; the existing Cargo Tool still owns vendoring.
+
+Focused production tests live in `tests/e2e/registry-production`; tests of the
+retained external curl boundary stay beside that script. Installed reproduction
+and full input/output comparison are separate from source tests and from
+hosted-worker development qualification. No new worker grant is implied.
 
 Import/bind that input tree through ordinary external-content authority. The
 admitted Stage-0 Cargo then owns final vendoring with isolated networking and
@@ -484,7 +503,9 @@ the produced tree.
 The official GNU Rust host executables are dynamically linked. The separately
 pinned upstream ELF authoring tool rewrites their interpreter and library paths
 to `/ryeos/realizations/platform`, with default-library search disabled. The
-shared publisher/verifier helper is bootstrap code, never a worker dispatcher.
+shared publisher/verifier helper currently executes in the publisher boundary.
+Its reusable production behavior belongs beside compiler production Tools;
+the first-bootstrap caller must reuse that same implementation, not fork it.
 It records every pre/post digest in `RYEOS-ELF-TRANSFORMS`, records selected image
 members in `RYEOS-RUNTIME-SOURCES`, and inventories final interpreter/DT_NEEDED
 edges in `RYEOS-RUNTIME-DEPENDENCIES`. The verifier resolves every such edge
@@ -608,8 +629,8 @@ network. Inspection/checking borrow an immutable current generation;
 formatting borrows the exclusive workspace. Target-local bindings and standalone
 CLI platform-inspect/format-check have passed on the bounded fixture. The
 worker's changed-generation negative check and shared-exclusive format/readback
-remain unqualified. The three finite Cargo operations above are authored
-against the observed vendor manifest, but are not yet qualified.
+remain unqualified. The three finite Cargo operations above have operator-driven
+installed evidence against the observed vendor manifest, not worker-driven proof.
 
 Resolved operation timeouts use the existing project execution configuration
 at `.ai/config/execution/execution.yaml`. Its per-item selections override
@@ -618,27 +639,37 @@ input, not an immutable ceiling; do not infer an executed deadline from that
 field alone. Inspect the admitted plan and its configuration provenance. Node
 limits and parent workload-client lifetime/authority remain independent limits.
 
-The `scripts/` inventory is divided by caller and authority, not by language.
-Moving a file under `.ai/tools/` does not by itself make it an admitted operation.
+Source ownership and execution authorization are separate decisions.
+**Not granted to a hosted worker does not mean belongs in scripts.** Operator-only
+production, packaging, signing and verification may still be ordinary signed
+Tools. A reusable operation has one canonical implementation beside its Tool;
+project selections live in Config; composition lives in Graphs; qualification
+fixtures and node/container acceptance live under tests/E2E.
 
-| Current scripts | Owner and disposition |
-| --- | --- |
-| `pkg/`, `populate-bundles.sh`, `lib/ryeos-terminal.sh` | Host installation and signed bundle publication. Remain externally callable; never grant a hosted worker install/publication authority. |
-| `release/package-*`, `release/verify-bundle-artifact.sh`, `release/prepare-aur.sh`, `release/resolve-version.sh`, `release/official-publisher-fingerprint.sh` | Release/package provenance and external distribution. Remain release operations, not project worker operations. |
-| `release/produce-development-toolchain-stage0.sh`, `release/development-toolchain-stage0-runtime.sh`, `release/verify-development-toolchain-stage0.sh`, `release/fixtures/development-toolchain-stage0/` | Explicit compiler bootstrap authoring and its bounded qualification fixture. Retire duplicated reproduction behavior only after the admitted Stage-1 operation proves identical manifests. |
-| `release/package-workload-client-realization.sh`, `release/verify-workload-client-realization.sh` | Packaging of an already built restricted-client artifact; not a worker-side compiler or client installer. |
-| `release/author-local-inference-realizations.py`, `release/local-inference-*.json`, `release/verify-local-inference-release.py`, `release/qualify-local-inference-node.sh` | Separate local-inference realization and qualification workstream. Not prerequisites or fallback dependencies for hosted development. |
-| `release/qualify-container-image.sh`, `release/container-mock-chat-provider.py`, `dev/qualify-configured-remote.sh`, `smoke-execute-stream.sh`, `smoke-installed-resume.sh` | External node/deployment acceptance harnesses. Keep operator credentials, restart/reset and remote-admission authority outside workers. |
-| `ci/`, `gate.sh`, `check-ui-wasm-fresh.sh`, `dev-tui.sh`, `dev-ui-assets.sh` | CI/host/UI orchestration. The gate is not the default development child operation; UI workflows need their own exact dependencies before conversion. |
-| `lint-cli-presentation.sh`, `lint-dependency-layers.py`, `lint-naming.sh`, `lint-no-content-wrap.sh` | Ordinary repository validation behavior to expose as finite project Tools once their exact interpreter/utility closures are admitted. Do not duplicate their checks in a new dispatcher. |
-| `dev/sign-dev.sh`, `dev/revert-sig-churn.sh`, `dev/free-build-space.py` | Maintainer signing, working-tree maintenance and host resource cleanup. Not worker grants, even though the development signing fixture is public. |
-| `pkg/test-*`, `release/test-*`, `dev/test-*`, `ci/test-*` | Focused tests of the corresponding external scripts. Keep with that owner; run only the relevant tests for a change. |
+External entrypoints are justified only by a specific pre-RyeOS, host-install,
+or external-orchestration requirement. "Release", "bootstrap" and "not
+worker-side" are not blanket exemptions. A first-bootstrap entry identifies
+exactly which immutable inputs it seeds and calls the canonical implementation.
+It must not become a second implementation after admitted execution exists.
 
-Retained human/CI wrappers can become thin calls to qualified project Tools.
-Do not delete their existing implementation or silently move host assumptions
-into the worker before the replacement executes with its complete declared
-inputs. Locked dependency production and the finite installed Cargo operation
-selection now have the observations above. Broader packages, ordinary lint
-conversion, Stage-1 reproduction and the worker-to-child loop remain explicit
-completion gates; a compiler fixture or successful declarations alone cannot
-close them.
+The complete family inventory, actual disposition, dependency requirements and
+completion criteria are in `development-operation-ownership.md`. The compiler
+behavior fixture now lives in `tests/e2e/development-toolchain-stage0/`.
+Relocation does not rebuild historical archives or change their recorded
+producer hashes. Tests of genuinely external scripts can remain beside them.
+
+The four `repository-validation/` Tools reuse the already admitted sealed-source
+Python runtime and select rules from
+`config:development/ryeos/repository-validation`. They require no Cargo,
+shell/search executable, network, private node mount or additional worker grant.
+The canonical checks are shared with explicit pre-install CI invocation;
+host CI execution alone is not RyeOS admission evidence. Rule selection names
+the current crate layout and refuses absent/empty inputs, rather than suppressing
+search errors or treating obsolete roots as a successful check.
+
+No ambient interpreter, shell, curl, Docker, TLS/resolver files or host libraries
+may be hidden behind a Tool descriptor. Missing closure or acquisition authority
+remains an explicit gate. Keep the verified authoring environment unchanged
+while independently qualifying fresh utility build support and compilation.
+Completed operator-driven Cargo evidence remains distinct from still-open
+worker edit/child/completion-fence/candidate/restart/remote acceptance.

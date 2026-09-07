@@ -1,5 +1,11 @@
 # Stage-0 offline behavior fixture
 
+This fixture belongs to E2E qualification, not compiler production. Its move
+here preserves the existing source bytes and does not reproduce or rewrite any
+historical platform archive, producer testimony, inventory or result receipt.
+The strengthened nonshared-link probe still needs a fresh complete publisher
+run; the separate installed Cargo evidence is in `../development-cargo/`.
+
 This tiny, dependency-free Rust workspace exercises a build script, generated
 source, a procedural macro, native C compilation/archive/linkage, a Rust test
 and a child executable. Its C file is test input, not a RyeOS/compiler adapter.

@@ -12,10 +12,53 @@ python3 -B -m unittest discover -s tests/e2e/authoring-environment -p 'test_*.py
 python3 -B -m unittest discover -s bundles/codex -p 'test_authoring_environment.py'
 ```
 
-The utility-build tests are synthetic recipe/boundary tests. They do not prove
-that the not-yet-provisioned build-support artifact closes every upstream
-configure/Make subprocess. There is deliberately no executable build Tool until
-that dependency and its confinement qualification exist.
+The utility-build unit tests are synthetic recipe/boundary tests. Installed
+captured/offline support assembly, nested subprocess qualification and a full
+fresh utility build have separately passed; their exact execution coordinates
+are in `build-support-qualification.json`. Assembly alone does not prove the
+upstream configure/Make closure. The ordinary `build-utilities` entry reuses the
+qualified recipe; its installed-execution gate is recorded separately below.
+
+`build_support_probe.py` is an E2E Tool fixture. In a disposable copy of the
+source project, materialize it beside the existing production runtime as
+`build-support-probe.py` and sign that fixture. Capture the project using
+`ryeos snapshot create <message>`, independently import/bind its exact Python,
+support and Stage0 declarations to the fixture at that snapshot, then run:
+
+```sh
+ryeos execute tool:ryeos/development/authoring-environment-production/build-support-probe --current-head --no-operator-vault --async
+```
+
+The fixture verifies missing ambient shell/compiler/loader-cache paths, loads
+every selected helper, builds a tiny static C program through nested Make and
+shell, strips and runs it, and checks exact output. It uses the production
+environment constructor and existing runtime bounds, with one Make job. It is
+not a worker grant, full fresh utility build or hosted development acceptance.
+`build-support-qualification.json` distinguishes these gates and retains exact
+observed coordinates; it does not overwrite historical artifact evidence.
+
+The nested probe passed on 2026-09-07 after an operator-approved target-only
+open-file policy change from 1024 to 4096; its first failure is also retained.
+It produced six selected result files and no retained compiler cache.
+
+After that gate, `utility_build_probe.py` is the separate disposable E2E entry
+for the sole `lib/utilities.py` fresh-build recipe. Materialize/sign it as
+`utility-build-probe.py` beside that runtime and set its finite deadline using
+project execution Config. Bind its four production dependencies at the captured
+snapshot: Python, build support, Stage0 and source archives. The fifth exact
+authoring-runtime input independently exercises fresh Git's final shell path;
+it does not supply the freshly compiled utilities. The fixture extracts/builds
+in isolated `/tmp`, retaining only products and bounded per-source logs.
+The whole recipe passed on 2026-09-07, including fresh Git's shell alias. The
+ordinary `build-utilities` Tool and this E2E entry share `utility_production.py`;
+only the E2E entry adds the independent final-runtime probe. The installed Tool
+entry also passed in `T-1632d8ec-05a1-793c-595a-339807f6104d`, retaining 80 files
+and 92,435,329 bytes without publication. Independent retained-manifest comparison
+matched all 41 executable entries, including bytes, modes and paths, against the
+successful E2E build. Only the added shared-entry source and updated recipe/evidence
+files differ; this is not whole-artifact equality. Historical utility archives and the
+worker authoring environment remain separate evidence. This is operator-driven,
+not worker/remote-loop qualification.
 
 ## Independent artifact probe
 

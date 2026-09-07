@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T07:00:11Z:65ceaa261b9ad57299094b024d79ede17ab2b8a7c91586483cd40b1ebc2d8f85:xVT7baKIbsoq1CZ/D7lCkAVfNGYOBEnPe83oFPQjQOIjaD1WU8R6tOs+xKGRprxkOHO3YseohG+0Y7vSbbczCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T06:32:12Z:fd2b50a897337a15d6ca4f100ebc7a3fbea8b615b76b4c808473a294f6253f4d:QBTPCk4chyQEgm+mEBEztEkKLa7LTW/VHN52PGOnIW+XMFc7pPgVZVs2lc0izeTBcsLFLVAXq+lDabTZe2uhBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Finite, offline authoring-environment assembly; no acquisition or publication.
 
 RyeOS owns capture, namespaces, result snapshots and import/binding. This code
@@ -267,7 +267,39 @@ class ElfTools:
         return sorted(owners), sorted(functions)
 
 
-def check_closure(environment: Path, files: dict, tools: ElfTools, relocated: set[str]) -> None:
+def relocate_elf(path: Path, tools: ElfTools, runtime_root: str) -> dict:
+    """One relocation owner shared by authoring and compiler-support production.
+
+    The calling signed recipe supplies its exact realization mount. Do not add
+    host-library discovery, ELF rewriting, or a second symbol verifier here.
+    """
+    before, symbols = sha256(path), tools.symbols(path)
+    facts = tools.facts(path)
+    if not facts["dynamic"] or not (facts["interpreter"] or facts["needed"]):
+        raise ValueError("only declared dynamic ELF inputs may be relocated")
+    if facts["interpreter"]:
+        tools.run("patchelf", "--no-sort", "--set-interpreter",
+                  runtime_root + "/lib/ld-linux-x86-64.so.2", str(path))
+    tools.run("patchelf", "--no-sort", "--set-rpath", runtime_root + "/lib",
+              "--no-default-lib", str(path))
+    if tools.symbols(path) != symbols:
+        raise ValueError(f"ELF symbol ownership or function coordinates changed: {path.name}")
+    return {"before": before, "after": sha256(path)}
+
+
+def copy_selected_files(inputs: Path, destination: Path, files: dict, identities: dict) -> None:
+    """Copy an already verified finite selection into fresh private output."""
+    for target, source in sorted(files.items()):
+        selected = ordinary_member(inputs, source)
+        output = destination.joinpath(*relative(target).parts)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with selected.open("rb") as reader, output.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+        output.chmod(identities[source]["mode"])
+
+
+def check_closure(environment: Path, files: dict, tools: ElfTools, relocated: set[str],
+                  *, runtime_root: str) -> None:
     interpreter = ordinary_member(environment, RUNTIME_LOADER.removeprefix("environment/"))
     if stat.S_IMODE(interpreter.stat().st_mode) != 0o755:
         raise ValueError("runtime interpreter is not executable")
@@ -283,14 +315,14 @@ def check_closure(environment: Path, files: dict, tools: ElfTools, relocated: se
             raise ValueError(f"command is not executable: {local}")
         facts = tools.facts(path)
         loader = local == "lib/ld-linux-x86-64.so.2"
-        if facts["interpreter"] not in ([], [RUNTIME_ROOT + "/lib/ld-linux-x86-64.so.2"]):
+        if facts["interpreter"] not in ([], [runtime_root + "/lib/ld-linux-x86-64.so.2"]):
             raise ValueError(f"unclosed interpreter: {local}")
         # Static PIE executables also have a dynamic section for their own
         # relocations. Only interpreter/library edges require our runtime;
         # do not rewrite an otherwise self-contained upstream executable.
         needs_runtime = bool(facts["interpreter"] or facts["needed"])
         if needs_runtime and not loader:
-            if (member not in relocated or facts["runpath"] != [RUNTIME_ROOT + "/lib"] or
+            if (member not in relocated or facts["runpath"] != [runtime_root + "/lib"] or
                     facts["rpath"] or not facts["nodeflib"]):
                 raise ValueError(f"unclosed library search: {local}")
         elif member in relocated:
@@ -313,28 +345,12 @@ def assemble(inputs: Path, destination: Path, config: dict, *, tools=None) -> di
     destination.mkdir(mode=0o700)
     tools = tools or ElfTools(inputs)
     transformations = {}
-    for target, source in sorted(config["files"].items()):
-        selected = ordinary_member(inputs, source)
-        output = destination.joinpath(*relative(target).parts)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with selected.open("rb") as reader, output.open("xb") as writer:
-            shutil.copyfileobj(reader, writer, length=1024 * 1024)
-        output.chmod(config["inputs"][source]["mode"])
+    copy_selected_files(inputs, destination, config["files"], config["inputs"])
     for member in config["relocate"]:
         path = ordinary_member(destination, member)
-        before, symbols = sha256(path), tools.symbols(path)
-        facts = tools.facts(path)
-        if not facts["dynamic"] or not (facts["interpreter"] or facts["needed"]):
-            raise ValueError("only declared dynamic ELF inputs may be relocated")
-        if facts["interpreter"]:
-            tools.run("patchelf", "--no-sort", "--set-interpreter",
-                      RUNTIME_ROOT + "/lib/ld-linux-x86-64.so.2", str(path))
-        tools.run("patchelf", "--no-sort", "--set-rpath", RUNTIME_ROOT + "/lib",
-                  "--no-default-lib", str(path))
-        if tools.symbols(path) != symbols:
-            raise ValueError(f"ELF symbol ownership or function coordinates changed: {member}")
-        transformations[member] = {"before": before, "after": sha256(path)}
-    check_closure(destination / "environment", config["files"], tools, set(transformations))
+        transformations[member] = relocate_elf(path, tools, RUNTIME_ROOT)
+    check_closure(destination / "environment", config["files"], tools, set(transformations),
+                  runtime_root=RUNTIME_ROOT)
     provenance = {"schema": 1, "input_contract_sha256": hashlib.sha256(canonical_json(config)).hexdigest(),
                   "runtime_mount": RUNTIME_ROOT, "transformations": transformations,
                   "sources": config["provenance"]}

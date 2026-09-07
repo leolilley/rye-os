@@ -172,7 +172,7 @@ class ProductionTests(unittest.TestCase):
                 return result
         with self.assertRaisesRegex(ValueError, "unclosed interpreter"):
             production.check_closure(self.root / "output/environment", self.config["files"],
-                                     BadTools(), set())
+                                     BadTools(), set(), runtime_root=production.RUNTIME_ROOT)
 
     def test_selected_file_links_and_ancestor_links_are_refused(self):
         selected = self.inputs / "utilities/cat"
@@ -234,7 +234,7 @@ class ProductionTests(unittest.TestCase):
         (self.root / "output/environment/lib/ld-linux-x86-64.so.2").unlink()
         with self.assertRaises(FileNotFoundError):
             production.check_closure(self.root / "output/environment", self.config["files"],
-                                     FakeElfTools(), set())
+                                     FakeElfTools(), set(), runtime_root=production.RUNTIME_ROOT)
 
     def test_loader_cannot_itself_depend_on_another_loader(self):
         class DependentLoader(FakeElfTools):

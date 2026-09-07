@@ -1,9 +1,8 @@
-# ryeos:signed:2026-09-06T07:00:11Z:cad975c4a57b06b8f21b5e55c066345c39d26ffbf09e38953b60fa09d5cae04a:QFA3fkQMOLdCwN5BDMFBphLakoAVQRcE0INw+uilZZEZPkpujGWErgsEKF8xquSFULMw28S1KrSNVHPDXEt3Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T08:05:59Z:16bc998bec744227321243302fedfaf50de3c8863af1452e8523855deaf152ed:UHRfF9jgnJ14v/gYd6cVEV7ythXhJAs674KPLTjUt89WVfwUinHnX842BAKHzFFep7UplW/cfLx3Sb+6j55zAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Finite utility production for an admitted, private RyeOS Tool execution.
 
-This is a library, not an admission-ready Tool or a bootstrap command. A real
-build-support inventory and namespace/subprocess qualification are still needed
-before exposing the operation. Stage0 owns the compiler; the separate admitted
+This library owns the recipe used by build-utilities and its separate E2E probe.
+Stage0 owns the compiler; the separate admitted
 support tree owns shell, make and build helpers. Nothing discovers host tools,
 acquires packages, signs definitions, imports results, or publishes bindings.
 
@@ -22,7 +21,7 @@ import subprocess
 
 from archives import open_archive
 
-from production import (ELF_TOOLS, MAX_FILE_BYTES, MAX_TOTAL_BYTES, REQUIRED_COMMANDS,
+from production import (ELF_TOOLS, MAX_FILE_BYTES, MAX_TOTAL_BYTES, REQUIRED_COMMANDS, RUNTIME_ROOT,
                         ElfTools, canonical_json, input_inventory, ordinary_member,
                         portable_regular_mode, receipt, relative, sha256)
 
@@ -36,13 +35,13 @@ MAX_SOURCE_BYTES = 128 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024
 MAX_EXTRACTED_ENTRIES = 100_000
 MAX_LOG_BYTES = 8 * 1024 * 1024
-RECIPE_FILES = ("utilities.py", "production.py", "archives.py")
+RECIPE_FILES = ("utilities.py", "utility_production.py", "production.py", "archives.py")
 # This is a minimum, not a claim that upstream's whole subprocess closure has
 # already been qualified. Every additional helper must be in the exact inventory.
 REQUIRED_SUPPORT_COMMANDS = frozenset("""
 sh make strip false awk basename cat chmod cmp cp cut dirname expr find grep
 head install ln ls mkdir mv printf pwd rm rmdir sed sort tail test touch tr
-uname uniq wc xargs
+uname uniq wc xargs tee
 """.split())
 
 
@@ -66,9 +65,13 @@ def validate_sources(config: dict) -> dict:
             raise ValueError("incomplete utility source selection")
         common = {"name", "version", "directory", "archive", "url", "sha256", "bytes", "licenses"}
         required = common if source.get("name") == "zig" else common | {"programs"}
+        if source.get("name") == "git":
+            required |= {"runtime_shell"}
         if not required <= set(source) or set(source) - required - {"configure"}:
             raise ValueError("incomplete utility source selection")
         name = source["name"]
+        if name == "git" and source["runtime_shell"] != "bin/zsh":
+            raise ValueError("Git runtime shell must select the declared authoring shell")
         if name not in (*BUILD_ORDER, "zig") or name in selected:
             raise ValueError("duplicate or unsupported utility source")
         for field in ("directory", "archive"):
@@ -192,14 +195,20 @@ def run(argv: list[str], cwd: Path, env: dict[str, str], log: Path) -> None:
 
 def build_environment(work: Path, commands: dict[str, Path], platform: Path) -> dict[str, str]:
     zig = ordinary_member(platform, "zig/zig")
-    if portable_regular_mode(zig.lstat().st_mode) != 0o755:
-        raise ValueError("admitted Stage0 Zig is not executable")
+    # Stage0 already owns this native linker alias and its runtime closure.
+    # Autoconf queries LD independently of CC; do not discover a host linker,
+    # construct a second compiler wrapper, or change the admitted PATH.
+    linker = ordinary_member(platform, "native/bin/ld.lld")
+    for executable in (zig, linker):
+        if portable_regular_mode(executable.lstat().st_mode) != 0o755:
+            raise ValueError("admitted Stage0 compiler/linker is not executable")
     shell = str(commands["sh"])
     return {
         "PATH": str(commands["sh"].parent), "HOME": str(work / "home"),
         "LC_ALL": "C", "LANG": "C", "TZ": "UTC", "ZERO_AR_DATE": "1",
         "CONFIG_SHELL": shell, "SHELL": shell, "MAKE": str(commands["make"]),
         "CC": f"{zig} cc -target x86_64-linux-musl -static",
+        "LD": str(linker),
         "AR": f"{zig} ar", "RANLIB": f"{zig} ranlib",
         "CFLAGS": f"-Os -g0 -ffile-prefix-map={work}=/usr/src/authoring -fno-ident",
         "LDFLAGS": "-static -Wl,--build-id=none", "PKG_CONFIG": str(commands["false"]),
@@ -214,7 +223,13 @@ def build_commands(name: str, source: dict, source_dir: Path, zlib: Path,
     shell, make = env["CONFIG_SHELL"], env["MAKE"]
     prefix = [make, "-j2", f"SHELL={shell}"]
     if name == "git":
+        # Upstream uses SHELL_PATH for build generators AND compiled runtime
+        # behavior. Its separate C-quoted setting keeps the build helper path
+        # out of the delivered executable. Select the final authoring shell
+        # from Config; do not bake a scratch/build-support path into Git.
         return [[*prefix, f"CC={env['CC']}", f"AR={env['AR']}",
+                 f"SHELL_PATH={shell}",
+                 f'SHELL_PATH_CQ="{RUNTIME_ROOT}/{source["runtime_shell"]}"',
                  *[f"NO_{feature}=YesPlease" for feature in (
                      "CURL", "EXPAT", "OPENSSL", "GETTEXT", "TCLTK", "PERL",
                      "PYTHON", "ICONV", "REGEX", "RUST")],
@@ -239,8 +254,9 @@ def build_utilities(source_config: dict, support_config: dict, source_archives: 
                     support: Path = SUPPORT) -> dict:
     """Produce a retained tree; caller supplies admitted roots and private paths.
 
-    This function intentionally has no executable Tool descriptor until the
-    support artifact and complete subprocess closure have been qualified.
+    The Tool entry and E2E probe call this same recipe. Support and final-runtime
+    qualification do not authorize publication or make arbitrary support inputs
+    interchangeable with the exact selected realization.
     """
     from archives import read_members
 

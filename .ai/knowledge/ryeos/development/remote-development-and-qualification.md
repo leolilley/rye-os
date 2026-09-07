@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-04T06:00:33Z:593e6b434c4cfa91ec60127e1c6f9e3d09ce9baabd4cd79e3fc9b71f938b29b3:bxqouLGLISf+ix01o+jMU37ZcOTUXwBDLhwH4P75RfBn+vs30MdNx+Uw4N35wyJgMYU2BdudXFntaFU36e6gBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T06:05:34Z:b37a7d25e2fd9f4db31417fa5ae7219344221b9c88133d3a1277ec64b3bb5d8e:PAbmwZW58+nNAlPmYQpd73PWRBrBVeM2kXexoJ+BhrmeTFgooLdkxgwZCaVao6As1K1Sfslpz3rWbezvgniYDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "remote-development-and-qualification"
@@ -287,7 +287,7 @@ Invoke it as:
 
 ```bash
 RYEOS_APP_ROOT=/absolute/source-node-root \
-scripts/dev/qualify-configured-remote.sh \
+tests/e2e/configured-remote/qualify.sh \
   --remote stronger \
   --project "$PROJECT" \
   --remote-project /srv/ryeos/projects/qualification \

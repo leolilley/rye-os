@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "$0")/../.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -112,7 +112,7 @@ printf ': > %q\n' "$bootstrap_env_marker" > "$bootstrap_project/bash-env"
 chmod +x "$bootstrap_project/bin/bash" "$bootstrap_project/bin/cat"
 if PATH="$bootstrap_project/bin:$PATH" \
     BASH_ENV="$bootstrap_project/bash-env" \
-    "$root/scripts/dev/qualify-configured-remote.sh" >/dev/null 2>&1; then
+    "$root/tests/e2e/configured-remote/qualify.sh" >/dev/null 2>&1; then
     echo "expected a parameterless bootstrap probe to print usage and fail" >&2
     exit 1
 fi
@@ -132,7 +132,7 @@ mkdir -p "$captured_app_root/.ai/config/keys/signing" "$captured_app_root/.ai/no
 printf '%s\n' target-capturable-key \
     > "$captured_app_root/.ai/config/keys/signing/private_key.pem"
 if RYEOS_APP_ROOT="$captured_app_root" RYEOSD_URL="http://127.0.0.1:7400" \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$captured_root_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -146,7 +146,7 @@ test ! -e "$FAKE_CALLS"
 
 project_evidence_parent="$project/uncreated-evidence-parent"
 if RYEOS_APP_ROOT="$source_app_root" RYEOSD_URL="http://127.0.0.1:7400" \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -161,7 +161,7 @@ test ! -e "$FAKE_CALLS"
 
 node_evidence_parent="$source_app_root/.ai/node/uncreated-evidence-parent"
 if RYEOS_APP_ROOT="$source_app_root" RYEOSD_URL="http://127.0.0.1:7400" \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -175,7 +175,7 @@ test ! -e "$node_evidence_parent"
 test ! -e "$FAKE_CALLS"
 
 if RYEOS_APP_ROOT="$source_app_root" RYEOSD_URL="http://192.0.2.10:7400" \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -192,7 +192,7 @@ git clone -q "$project" "$local_lifecycle_project"
 env -u RYEOSD_URL \
     RYEOS_APP_ROOT="$source_app_root" \
     FAKE_CALLS="$tmp/local-lifecycle-calls" \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$local_lifecycle_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -208,7 +208,7 @@ if env -u RYEOSD_URL \
     RYEOS_APP_ROOT="$source_app_root" \
     FAKE_CALLS="$tmp/stale-lifecycle-calls" \
     FAKE_STATUS_STALE=1 \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -228,7 +228,7 @@ cp "$fake_ryeos" "$project_binary/ryeos"
 git -C "$project_binary" add ryeos
 git -C "$project_binary" -c user.email=qualification@example.invalid \
     -c user.name=Qualification commit -qm project-binary
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project_binary" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -240,7 +240,7 @@ if "$root/scripts/dev/qualify-configured-remote.sh" \
 fi
 
 ln -s "$fake_ryeos" "$tmp/ryeos-symlink"
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -262,7 +262,7 @@ git -C "$ancestor_project" -c user.email=qualification@example.invalid \
     -c user.name=Qualification commit -qm ancestor-realpath
 ln -s "$ancestor_project/bin" "$tmp/outside-realpath-bin"
 if PATH="$tmp/outside-realpath-bin:$PATH" \
-    "$root/scripts/dev/qualify-configured-remote.sh" \
+    "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$ancestor_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -287,7 +287,7 @@ for shadowed_tool in python3 sha256sum; do
     git -C "$tool_project" -c user.email=qualification@example.invalid \
         -c user.name=Qualification commit -qm shadowed-tool
     if PATH="$tool_project/bin:$PATH" \
-        "$root/scripts/dev/qualify-configured-remote.sh" \
+        "$root/tests/e2e/configured-remote/qualify.sh" \
         --remote stronger \
         --project "$tool_project" \
         --remote-project /srv/ryeos/projects/qualification \
@@ -301,7 +301,7 @@ for shadowed_tool in python3 sha256sum; do
 done
 
 export FAKE_DOCTOR_FAIL=1
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -315,7 +315,7 @@ test "$(cat "$tmp/doctor-failed/status")" = failed
 unset FAKE_DOCTOR_FAIL
 
 export FAKE_DEGRADED=1
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -331,7 +331,7 @@ unset FAKE_DEGRADED
 transaction_artifact_project="$tmp/transaction-artifact-project"
 git clone -q "$project" "$transaction_artifact_project"
 export FAKE_LEAVE_TRANSACTION_ARTIFACT=1
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$transaction_artifact_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -350,7 +350,7 @@ identity_case=0
 for identity_mode in FAKE_IDENTITY_INCOMPLETE FAKE_IDENTITY_MISMATCH; do
     identity_case=$((identity_case + 1))
     export "$identity_mode=1"
-    if "$root/scripts/dev/qualify-configured-remote.sh" \
+    if "$root/tests/e2e/configured-remote/qualify.sh" \
         --remote stronger \
         --project "$project" \
         --remote-project /srv/ryeos/projects/qualification \
@@ -364,7 +364,7 @@ for identity_mode in FAKE_IDENTITY_INCOMPLETE FAKE_IDENTITY_MISMATCH; do
 done
 
 printf '%s\n' '{ "probe": true }' > "$tmp/input.json"
-"$root/scripts/dev/qualify-configured-remote.sh" \
+"$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -415,7 +415,7 @@ git -C "$fsmonitor_project" -c user.email=qualification@example.invalid \
 git -C "$fsmonitor_project" config core.fsmonitor ./fsmonitor.sh
 export FAKE_REPLACE_FSMONITOR=1
 export FAKE_FSMONITOR_MARKER="$tmp/target-fsmonitor-executed"
-"$root/scripts/dev/qualify-configured-remote.sh" \
+"$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$fsmonitor_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -426,7 +426,7 @@ export FAKE_FSMONITOR_MARKER="$tmp/target-fsmonitor-executed"
 unset FAKE_REPLACE_FSMONITOR
 test ! -e "$FAKE_FSMONITOR_MARKER"
 
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$fsmonitor_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -450,7 +450,7 @@ do
     for binding in "${bad_binding_args[@]}"; do
         helper_args+=(--ref-binding "$binding")
     done
-    if "$root/scripts/dev/qualify-configured-remote.sh" \
+    if "$root/tests/e2e/configured-remote/qualify.sh" \
         --remote stronger \
         --project "$binding_project" \
         --remote-project /srv/ryeos/projects/qualification \
@@ -480,7 +480,7 @@ do
             helper_args+=(--expect-file "$expectation")
         done
     fi
-    if "$root/scripts/dev/qualify-configured-remote.sh" \
+    if "$root/tests/e2e/configured-remote/qualify.sh" \
         --remote stronger \
         --project "$expectation_project" \
         --remote-project /srv/ryeos/projects/qualification \
@@ -493,7 +493,7 @@ do
     fi
 done
 
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$project" \
     --remote-project relative/path \
@@ -505,7 +505,7 @@ if "$root/scripts/dev/qualify-configured-remote.sh" \
 fi
 
 for unsafe_path in '..' 'a/..' 'a/../../outside'; do
-    if "$root/scripts/dev/qualify-configured-remote.sh" \
+    if "$root/tests/e2e/configured-remote/qualify.sh" \
         --remote stronger \
         --project "$project" \
         --remote-project /srv/ryeos/projects/qualification \
@@ -526,7 +526,7 @@ git -C "$symlink_project" add leak.txt
 git -C "$symlink_project" -c user.email=qualification@example.invalid \
     -c user.name=Qualification commit -qm symlink-fixture
 external_hash="$(sha256sum "$tmp/external.txt" | cut -d ' ' -f 1)"
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$symlink_project" \
     --remote-project /srv/ryeos/projects/qualification \
@@ -543,7 +543,7 @@ failure_project="$tmp/failure-project"
 git clone -q "$project" "$failure_project"
 rm -f "$FAKE_RESULT_MARKER"
 export FAKE_EXECUTE_FAIL=1
-if "$root/scripts/dev/qualify-configured-remote.sh" \
+if "$root/tests/e2e/configured-remote/qualify.sh" \
     --remote stronger \
     --project "$failure_project" \
     --remote-project /srv/ryeos/projects/qualification \

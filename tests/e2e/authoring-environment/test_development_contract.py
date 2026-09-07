@@ -138,7 +138,7 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
         self.assertEqual(len(set(linker_flags)), 1)
         # The independent bootstrap probe must exercise the same link input;
         # merely having the archive in an inventory does not prove it is used.
-        probe = (ROOT / "scripts/release/fixtures/development-toolchain-stage0/probe.sh").read_text()
+        probe = (ROOT / "tests/e2e/development-toolchain-stage0/probe.sh").read_text()
         self.assertIn("-C link-arg=$platform/lib/libc_nonshared.a", probe)
 
     def test_complete_distribution_has_its_own_nonexecutable_retention_consumer(self):

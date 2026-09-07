@@ -30,7 +30,7 @@ fi
   exit 2
 }
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 WORK="$(mktemp -d)"
 SUFFIX="${GITHUB_RUN_ID:-local}-$$"
 CONTAINER="ryeos-qualify-${VARIANT}-${SUFFIX}"
@@ -120,7 +120,7 @@ docker run -d \
   --env "PORT=$DAEMON_PORT" \
   --publish "127.0.0.1::$DAEMON_PORT" \
   --mount "type=bind,src=$PROJECT_DIR,dst=/data/projects/container-knowledge" \
-  --mount "type=bind,src=$ROOT/scripts/release/container-mock-chat-provider.py,dst=/opt/ryeos-test/mock.py,readonly" \
+  --mount "type=bind,src=$ROOT/tests/e2e/container-image/mock-chat-provider.py,dst=/opt/ryeos-test/mock.py,readonly" \
   "${run_env[@]}" \
   "$IMAGE_REF" >/dev/null
 
@@ -213,7 +213,7 @@ docker exec "$CONTAINER" ryeos-core-tools authorize-client \
 
 AUDIENCE="$(docker exec "$CONTAINER" cat /data/app/.ai/node/identity/public-identity.json | jq -er '.principal_id')"
 HOST_PORT="$(docker port "$CONTAINER" "$DAEMON_PORT/tcp" | awk -F: 'NR == 1 {print $NF}')"
-"$ROOT/scripts/smoke-execute-stream.sh" \
+"$ROOT/tests/e2e/execute-stream/smoke.sh" \
   --url "http://127.0.0.1:$HOST_PORT" \
   --key-pem "$KEY_FILE" \
   --audience "$AUDIENCE" \
@@ -262,7 +262,7 @@ done
 # receives SIGTERM. The mock marks receipt before deliberately withholding its
 # response, proving the runtime has crossed the provider launch boundary.
 SHUTDOWN_STREAM="$WORK/shutdown-stream.log"
-"$ROOT/scripts/smoke-execute-stream.sh" \
+"$ROOT/tests/e2e/execute-stream/smoke.sh" \
   --url "http://127.0.0.1:$HOST_PORT" \
   --key-pem "$KEY_FILE" \
   --audience "$AUDIENCE" \
