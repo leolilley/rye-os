@@ -53,6 +53,9 @@ pub enum IsolationProjectAuthority {
 /// explicitly granted exact daemon-private state root may enter the namespace.
 /// That private state is independently bounded/pinned launch authority, never
 /// an ambient mount inherited from the node's filesystem policy.
+/// Explicit sealed node-network runtime files may also enter when the effective
+/// network ceiling allows them. They carry separate node-generation provenance;
+/// captured execution never inherits the general host filesystem as a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IsolationFilesystemAuthorityCeiling {

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T11:12:46Z:b74f690f6252caf377369e87c2fd2964224aeaba3ea2607ba3db80b34e7653e7:zlCt5szBuU0ISWaDTl3p3a99uQ8tEOSgoqV2Cw4IkkaGfEIetLgYabTIaTHhgYrZyPNSYcF5eRMpiaJIH1n5Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T22:35:43Z:0bfdbfca684001bd065cdf3661c9d40025ab02b5e64e5e2ad2cd62efc6754a72:lTrSoXDSgAQv+wXxlb1qJM9tftk4WK71PJ3UuWTSWqXZkTHPtmQu/uivTvQ+7NYbIo3ieRUMVLeEiWlz7ksJBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -104,7 +104,7 @@ reproof happens before the private root obscures host locations.
 
 ### Confined live projects
 
-Signed node isolation policy v3 selects `filesystem.live_project.mode:
+Signed node isolation policy v4 selects `filesystem.live_project.mode:
 fixed_parents` and supplies its construction `limits.max_entries` and
 `limits.max_depth`. Protected relative paths come from State's existing central
 project control-path classification, not another adapter-specific list.
@@ -206,7 +206,7 @@ The policy has two modes:
 ```yaml
 schema: 1
 policy:
-  version: 3
+  version: 4
   mode: disabled
   backend: null
   filesystem:
@@ -227,6 +227,7 @@ policy:
       - "{checkpoint_dir}"
   network:
     mode: host
+    runtime_files: []
   environment:
     allow:
       - "*"
@@ -666,3 +667,38 @@ Do not generalize this policy by adding backend-specific fields to the current
 schema. New implementations declare their adapter, artifacts, target triples,
 and capability upper bound in a signed bundle and consume the existing typed
 plan. No backend implementation is part of engine policy.
+
+## Target-local network inputs
+
+Policy v4 separates permission to use the node network from general host
+filesystem access. `network.runtime_files` explicitly selects bounded regular
+files, each with `source`, `destination`, and `max_bytes`. An empty list supplies
+none. There are no implicit resolver or certificate-directory mounts.
+
+The resolved node generation uses Lillux to read exact regular descriptors
+under their bounds and seal the bytes. Operator-selected system symlinks are
+resolved once before descriptor capture. Missing, oversized, special-file,
+overlapping-destination and node-private inputs fail closed. Subsequent source
+replacement cannot alter the sealed generation. Refresh the node generation
+when resolver settings or trust roots intentionally change.
+
+Only an effective host-network launch receives those read-only file mounts.
+An isolated-network child receives none, even when its node permits networking
+for other workloads. File destinations cannot override its workspace, code,
+realizations, private state, devices or proc surface. The exact input digests
+belong to the local isolation admission class and launch provenance, not the
+portable program identity. A different target supplies its own admitted inputs.
+
+The development profile selects node resolver/hosts files and the node's CA
+bundle explicitly. It does not turn that bundle into a portable build product
+or give a workload permission to choose different trust roots. Immutable
+workload-specific runtime/trust artifacts still use ordinary signed environment
+and external-content declarations. Changing transport inputs does not authorize
+new endpoints, worker operations, signing, credentials or publication.
+
+For an existing node, `ryeos node policy-apply isolation <source.yaml>` validates
+and atomically replaces that one signed member while retaining the other policy
+values. The daemon must be stopped. An obsolete schema in the replaced member
+is verified as signed predecessor bytes, not interpreted as current authority;
+every member of the resulting generation must compile. There is no implicit
+profile reset, migration, or missing-field fallback.

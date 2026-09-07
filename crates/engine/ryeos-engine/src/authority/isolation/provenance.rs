@@ -25,6 +25,11 @@ pub struct IsolationLaunchProvenance {
     pub adapter_protocol: Option<IsolationAdapterProtocolVersion>,
     pub payloads: BTreeMap<IsolationArtifactRole, InspectedArtifact>,
     pub effective_capabilities: BTreeSet<IsolationCapability>,
+    /// Sealed target-local network inputs in this resolved node generation.
+    /// These are local admission facts, not portable program dependencies.
+    /// An isolated-network launch receives none of these files; its concrete
+    /// mount selection remains committed by plan_digest.
+    pub network_runtime_files: BTreeMap<std::path::PathBuf, String>,
     pub plan_digest: Option<String>,
 }
 

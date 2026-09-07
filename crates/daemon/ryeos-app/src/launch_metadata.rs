@@ -92,7 +92,9 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // Classify prior launch evidence before decoding its nested authority.
 // v30 carries the strict isolation-adapter v7 provenance enum. Classify old
 // envelopes before decoding nested protocol authority; never alias v6 to v7.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 30;
+// v31 binds sealed node-network input digests in isolation provenance. Retain
+// predecessor launch records as opaque history, never decode with empty inputs.
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 31;
 
 /// Per-thread daemon-owned state directory.
 ///

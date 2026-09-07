@@ -25,6 +25,7 @@ use ryeos_isolation_protocol::{
 mod authority;
 mod backend;
 mod inspection;
+mod network_inputs;
 mod policy;
 mod provenance;
 
@@ -44,7 +45,7 @@ pub use policy::TEST_ISOLATION_POLICY_RELATIVE_PATH;
 pub use policy::{
     ISOLATION_POLICY_VERSION, IsolationEnvironmentPolicy, IsolationFilesystemPolicy,
     IsolationLimitsPolicy, IsolationLiveProjectPolicy, IsolationMode, IsolationNetworkMode,
-    IsolationNetworkPolicy, IsolationPolicy,
+    IsolationNetworkPolicy, IsolationNetworkRuntimeFile, IsolationPolicy,
 };
 use provenance::redacted_plan_digest;
 pub use provenance::{
@@ -105,6 +106,7 @@ pub struct IsolationRuntime {
     /// Exact daemon-lifetime backend capture used by enforced execution.
     /// Disabled snapshots always carry `None`.
     backend_capture: Option<Arc<ResolvedIsolationBackend>>,
+    network_runtime_files: Vec<network_inputs::CapturedNetworkFile>,
     /// Optional higher-level generation guard retained by standalone
     /// composition roots. Daemon bootstrap owns its guard outside this value.
     _generation_lifeline: Option<Arc<dyn IsolationGenerationLifeline>>,
@@ -3343,25 +3345,43 @@ impl IsolationRuntime {
                         });
                     }
                 }
-                for path in [
-                    "/etc/hosts",
-                    "/etc/nsswitch.conf",
-                    "/etc/resolv.conf",
-                    "/etc/ssl",
-                ] {
-                    let destination = PathBuf::from(path);
-                    if destination.exists() {
-                        let source =
-                            canonicalize_launch_path("system configuration mount", &destination)?;
-                        let source_handle =
-                            pin_mount_source("system configuration mount", &source)?;
-                        system_readable_mounts.push(ReadableMount {
-                            source,
-                            destination,
-                            source_handle,
-                            layer: 20,
-                        });
-                    }
+            }
+
+            // Network permission and filesystem permission are independent.
+            // Only explicit sealed node-network inputs cross a captured view;
+            // never restore the former ambient /etc directory mounts here.
+            let network_runtime_files = if context.network_authority_ceiling
+                == IsolationNetworkAuthorityCeiling::NodePolicy
+                && self.inspection.network.mode == IsolationNetworkMode::Host
+            {
+                self.network_runtime_files.as_slice()
+            } else {
+                &[]
+            };
+            for file in network_runtime_files {
+                let overlaps = |other: &Path| {
+                    file.destination.starts_with(other) || other.starts_with(&file.destination)
+                };
+                if overlaps(&project_destination)
+                    || overlaps(&command_path)
+                    || overlaps(Path::new(VERIFIED_CODE_ISOLATION_ROOT))
+                    || overlaps(Path::new(
+                        ryeos_state::objects::EXECUTION_RUNTIME_REALIZATIONS_ROOT,
+                    ))
+                    || overlaps(Path::new("/proc"))
+                    || overlaps(Path::new("/dev"))
+                    || writable_mounts
+                        .iter()
+                        .any(|mount| overlaps(&mount.destination))
+                    || readable_mounts
+                        .iter()
+                        .chain(system_readable_mounts.iter())
+                        .any(|mount| overlaps(&mount.destination))
+                {
+                    return Err(refused(format!(
+                        "network runtime input {} overlaps another launch authority",
+                        file.destination.display()
+                    )));
                 }
             }
 
@@ -3397,6 +3417,17 @@ impl IsolationRuntime {
                     index,
                     mount.source_handle.clone(),
                     &mount.destination,
+                    IsolationMountAccess::ReadOnly,
+                    IsolationAuthorityPurpose::ReadOnlyMount,
+                    20,
+                )?;
+            }
+            for (index, file) in network_runtime_files.iter().enumerate() {
+                add_mount(
+                    "network-runtime",
+                    index,
+                    file.authority.clone(),
+                    &file.destination,
                     IsolationMountAccess::ReadOnly,
                     IsolationAuthorityPurpose::ReadOnlyMount,
                     20,
@@ -3716,6 +3747,7 @@ impl IsolationRuntime {
                 .then_some(IsolationAdapterProtocolVersion::Current),
             payloads: self.inspection.backend.artifacts.clone(),
             effective_capabilities: self.inspection.backend.effective_capabilities.clone(),
+            network_runtime_files: network_inputs::digests(&self.network_runtime_files),
             plan_digest,
         }
     }
@@ -3821,6 +3853,11 @@ impl IsolationRuntime {
             .as_ref()
             .map(|backend| backend.inspected_artifacts.clone())
             .unwrap_or_default();
+        let network_runtime_files = if state == IsolationRuntimeState::Enforced {
+            network_inputs::capture(&policy.network, app_root.as_deref())?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             inspection: IsolationInspection {
                 source,
@@ -3855,6 +3892,7 @@ impl IsolationRuntime {
             daemon_socket,
             verified_artifacts,
             backend_capture: captured_backend,
+            network_runtime_files,
             _generation_lifeline: None,
             registered_generation_identity: None,
             generation_node_trust: None,
@@ -4272,6 +4310,7 @@ fn validate_descriptor_bound_command(
 }
 
 fn validate_policy_semantics(policy: &IsolationPolicy) -> Result<(), EngineError> {
+    network_inputs::validate(&policy.network)?;
     policy
         .filesystem
         .live_project
@@ -6180,6 +6219,10 @@ mod tests {
     #[test]
     fn captured_execution_plan_has_no_ambient_system_mounts() {
         let app_root = tempfile::tempdir().unwrap();
+        let network_inputs = tempfile::tempdir().unwrap();
+        let network_source = network_inputs.path().join("resolver");
+        std::fs::write(&network_source, b"exact transport input").unwrap();
+        let network_destination = Path::new("/etc/qualification-network-input");
         let mut policy = IsolationPolicy::disabled_for_authoring();
         policy.mode = IsolationMode::Enforce;
         policy.backend = Some(resolved_backend().selection.clone());
@@ -6192,6 +6235,11 @@ mod tests {
         ];
         policy.filesystem.writable = vec!["{project}".to_string(), "{checkpoint_dir}".to_string()];
         policy.network.mode = IsolationNetworkMode::Host;
+        policy.network.runtime_files = vec![IsolationNetworkRuntimeFile {
+            source: network_source,
+            destination: network_destination.to_path_buf(),
+            max_bytes: 64,
+        }];
         write_policy(app_root.path(), &policy);
 
         let mut backend = resolved_backend();
@@ -6258,7 +6306,18 @@ mod tests {
             inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         };
-        for exact_state in [None, Some(private_state.as_path())] {
+        for (exact_state, network_ceiling) in [
+            (None, IsolationNetworkAuthorityCeiling::Isolated),
+            (
+                Some(private_state.as_path()),
+                IsolationNetworkAuthorityCeiling::Isolated,
+            ),
+            (None, IsolationNetworkAuthorityCeiling::NodePolicy),
+            (
+                Some(private_state.as_path()),
+                IsolationNetworkAuthorityCeiling::NodePolicy,
+            ),
+        ] {
             let mut external_mounts = vec![runtime_mount.clone()];
             if let Some(state_root) = exact_state {
                 external_mounts.push(IsolationReadOnlyMountAuthority::new_state_overlay(
@@ -6273,7 +6332,7 @@ mod tests {
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
                 filesystem_authority_ceiling:
                     IsolationFilesystemAuthorityCeiling::CapturedExecution,
-                network_authority_ceiling: IsolationNetworkAuthorityCeiling::Isolated,
+                network_authority_ceiling: network_ceiling,
                 live_access: None,
                 state_root: exact_state,
                 checkpoint_dir: None,
@@ -6336,6 +6395,26 @@ mod tests {
                     "{error}"
                 );
             }
+            if network_ceiling == IsolationNetworkAuthorityCeiling::NodePolicy {
+                for forbidden in [
+                    project.path(),
+                    runtime_destination.as_path(),
+                    Path::new("/proc/input"),
+                ] {
+                    let mut conflicting = runtime.clone();
+                    conflicting.network_runtime_files[0].destination = forbidden.to_path_buf();
+                    let error = conflicting
+                        .apply_with_provenance(request(), IsolationLaunchContext { ..context })
+                        .err()
+                        .expect("network input cannot override admitted authority");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("overlaps another launch authority"),
+                        "{error}"
+                    );
+                }
+            }
             let applied = runtime.apply_with_provenance(request(), context).unwrap();
             let (request_bytes, _) = applied
                 .request
@@ -6347,8 +6426,23 @@ mod tests {
                 )
                 .unwrap();
             let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
-            assert_eq!(request["plan"]["network"], "isolated");
+            let host_network = network_ceiling == IsolationNetworkAuthorityCeiling::NodePolicy;
+            assert_eq!(
+                request["plan"]["network"],
+                if host_network { "host" } else { "isolated" }
+            );
             let mounts = request["plan"]["mounts"].as_array().unwrap();
+            assert_eq!(
+                mounts.iter().any(|mount| {
+                    mount["destination"].as_str() == network_destination.to_str()
+                        && mount["access"] == "read_only"
+                }),
+                host_network
+            );
+            assert_eq!(
+                applied.provenance.network_runtime_files[network_destination],
+                lillux::sha256_hex(b"exact transport input")
+            );
             assert!(
                 mounts
                     .iter()
@@ -6369,6 +6463,9 @@ mod tests {
             }
             for mount in mounts {
                 let destination = mount["destination"].as_str().unwrap();
+                if host_network && Some(destination) == network_destination.to_str() {
+                    continue;
+                }
                 assert_ne!(Some(destination), node_state.to_str());
                 assert_ne!(Some(destination), sibling_state.to_str());
                 assert!(

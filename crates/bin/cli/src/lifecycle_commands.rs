@@ -358,14 +358,14 @@ fn run_node_policy_apply_command(argv: &[String], console: &crate::tty::Console)
         .context("load node identity for policy apply")?;
     let trust_store = ryeos_engine::trust::TrustStore::load(None, &config.runtime_config_dir())
         .context("load trust store for current node policies")?;
-    let current = ryeos_app::node_policy::generation::load_policy_generation(
+    let update = ryeos_app::node_policy::generation::prepare_policy_member_replacement(
         &config.app_root,
         &trust_store,
         &table,
+        &args.section,
+        body,
+        &args.source,
     )?;
-    let mut policies = current.policies().clone();
-    policies.insert(args.section.clone(), body);
-    let update = current.prepare_replacement(&table, policies, &args.source)?;
     let policy_dir = ryeos_app::node_policy::generation::publish_policy_update(
         &config.app_root,
         &update,

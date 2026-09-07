@@ -1,7 +1,7 @@
 use ryeos_isolation_protocol::{FixedParentViewLimits, IsolationBackendSelection};
 use serde::{Deserialize, Serialize};
 
-pub const ISOLATION_POLICY_VERSION: u32 = 3;
+pub const ISOLATION_POLICY_VERSION: u32 = 4;
 #[cfg(any(test, feature = "test-support"))]
 pub const TEST_ISOLATION_POLICY_RELATIVE_PATH: &str = "test-fixtures/isolation-policy.yaml";
 
@@ -47,6 +47,7 @@ impl IsolationPolicy {
             },
             network: IsolationNetworkPolicy {
                 mode: IsolationNetworkMode::Host,
+                runtime_files: Vec::new(),
             },
             environment: IsolationEnvironmentPolicy {
                 allow: vec!["*".to_string()],
@@ -99,6 +100,17 @@ impl IsolationLiveProjectPolicy {
 #[serde(deny_unknown_fields)]
 pub struct IsolationNetworkPolicy {
     pub mode: IsolationNetworkMode,
+    /// Explicit target-local transport inputs, independent of general host
+    /// filesystem access. Empty means none; no implicit resolver/trust fallback.
+    pub runtime_files: Vec<IsolationNetworkRuntimeFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationNetworkRuntimeFile {
+    pub source: std::path::PathBuf,
+    pub destination: std::path::PathBuf,
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

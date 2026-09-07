@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T06:05:34Z:5bdbc956c19e5f7505c296dbea51e74fb81d9bbdf18eec16fe170019e6c87986:IvYKqctQ9/9WIOoMQXNKNaNiXenSEtZR1bRPe0oowZmFy5cVy4114UR26ZvBBwqho29/cierkmZzQEHdaKgECg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T22:34:48Z:56def06c93e56724f7083aa4a78868274813c0147e7761dc0298519b945d85c4:oXoqCbrRWI8LzFMOUPy6A7q0cOt8wUTyHEhZsdDgUodCE8oVmvVXObZX+D+k9wZk6pjTYkLsxgQBtc+A0Z1KAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -34,10 +34,17 @@ The current clean-cut execution formats include:
 - project snapshot schema 5;
 - admitted launch capsule schema 25;
 - persistent-session capsule schema 8;
-- runtime launch metadata epoch 30;
+- runtime launch metadata epoch 31;
 - the standalone runtime project-authority envelope epoch 4; and
 - the owned runtime SQLite operator schema epoch 28 (encoded in the RyeOS
   `PRAGMA application_id` family).
+
+Isolation policy v4 requires explicit `network.runtime_files` (including an
+explicit empty list). Launch metadata 31 binds the sealed input digests in the
+node isolation admission class. Missing predecessor fields are not defaulted;
+older launch metadata is classified before nested decoding. This cut does not
+change the transient adapter protocol, portable capsule or SQLite table schema.
+Installed policy replacement remains explicit and separate from source edits.
 
 The numbers identify independently evolving contracts. A change to a nested
 execution authority advances every enclosing durable contract whose bytes

@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T04:39:23Z:a4ed7692d75b77fd3a501a60c04286baf2f49eba48da8499cb9f5274ade91ce3:sJ85bL/uPxhb7i+iEPaGrN5w/+EpdhY0pTw4b4O7nyj17sYYYO0UgyT+exVk3EcMt6YYDNmTTbTG2YMqCuMHCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T22:34:46Z:a9ec7284ba0d9f3737cc77f8f0935673611320eaf89822fd7531d93ca9c2f6f5:CMJtcs7peM9OnW0Z4gIwspwj4JztpR6QRCm2bJ4xRg6ADpyJpfpp+mpkrsWEKsphf9i+JValSRU2GTllv4QwCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - central-auth
@@ -119,7 +119,7 @@ policies:
   isolation:
     schema: 1
     policy:
-      version: 3
+      version: 4
       mode: disabled
       backend: null
       filesystem:
@@ -140,6 +140,7 @@ policies:
           - "{checkpoint_dir}"
       network:
         mode: host
+        runtime_files: []
       environment:
         allow:
           - "*"

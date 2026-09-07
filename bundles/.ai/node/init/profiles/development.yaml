@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T22:34:09Z:5d16bfe103694287c5e72ba55ea7951d08bb026e58cf9cb8e2d0643f27259fb0:JtgQv16+ogxBbGAKSmbiww+1f53MIegbBg0TcEVMyRGMasY32OB/jwb3VcLOwL+AquGQqsAXtsW45s8m4fmYCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T22:34:46Z:05005089724df0c8684dc4475364eb77bf6afb33d45452773ac6e568fd8f9f20:GHRNDL9zkvuAhomRmrgT9HUBt5vPj0TZ4MTPSNa2jYxmKRrEIwS9YtSUXH3bCLPaMGqi6aGRZzGMJEjEgDYLCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -182,7 +182,7 @@ policies:
   isolation:
     schema: 1
     policy:
-      version: 3
+      version: 4
       mode: enforce
       backend:
         bundle: core
@@ -205,6 +205,19 @@ policies:
           - "{checkpoint_dir}"
       network:
         mode: host
+        runtime_files:
+          - source: /etc/resolv.conf
+            destination: /etc/resolv.conf
+            max_bytes: 65536
+          - source: /etc/hosts
+            destination: /etc/hosts
+            max_bytes: 65536
+          - source: /etc/ssl/certs/ca-certificates.crt
+            destination: /etc/ssl/certs/ca-certificates.crt
+            max_bytes: 4194304
+          - source: /etc/ssl/certs/ca-certificates.crt
+            destination: /etc/ssl/cert.pem
+            max_bytes: 4194304
       environment:
         allow:
           - "*"
