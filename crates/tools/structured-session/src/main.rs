@@ -776,7 +776,7 @@ fn run() -> Result<()> {
     } else {
         None
     };
-    reset_compatibility_baseline_config(
+    verify_compatibility_baseline_config(
         std::path::Path::new(&workload_home),
         &baseline_config,
         &profile.baseline_destination,
@@ -1119,13 +1119,14 @@ fn run() -> Result<()> {
     }
 }
 
-/// Atomically reset the workload's compatibility seed before each process
-/// generation. This file is deliberately not a same-UID authority boundary:
-/// the signed immutable argv is the sole security configuration authority,
-/// and an enforced generic isolation backend may additionally overlay the
-/// seed read-only. Workload-authored compatible state is discarded at the
-/// next launch rather than mistaken for admitted policy.
-fn reset_compatibility_baseline_config(
+/// Verify the seed prepared by the daemon's persistent-session launch owner.
+/// Do not repair or replace it here: the enforced backend has already mounted
+/// the exact admitted source read-only at this name, so even a same-content
+/// rename would fail. All boot modes use the same daemon preparation contract;
+/// missing or divergent bytes are a launch error, not a bridge fallback.
+/// Immutable argv remains the configuration authority; file mode alone is not
+/// a same-UID boundary (the read-only source mount may expose source mode 0644).
+fn verify_compatibility_baseline_config(
     workload_home: &std::path::Path,
     source: &std::path::Path,
     destination_name: &str,
@@ -1139,10 +1140,13 @@ fn reset_compatibility_baseline_config(
         .ok_or_else(|| anyhow!("profile workload home is missing"))?;
     let destination_name = std::ffi::OsStr::new(destination_name);
     let incumbent = home
-        .open_regular(destination_name, false)
-        .context("open compatibility seed through Lillux")?;
-    home.atomic_write_if_same(destination_name, incumbent.as_ref(), &admitted, 0o400)
-        .context("reset compatibility seed through Lillux")
+        .open_pinned_regular(destination_name, false)
+        .context("open daemon-prepared compatibility seed through Lillux")?
+        .ok_or_else(|| anyhow!("daemon-prepared compatibility seed is missing"))?;
+    if incumbent.read_bounded(64 * 1024)? != admitted {
+        bail!("daemon-prepared compatibility seed differs from the admitted baseline");
+    }
+    Ok(())
 }
 
 fn resolve_pinned_executable(
@@ -3298,29 +3302,53 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_baseline_is_owner_only_and_resets_workload_state() {
+    fn compatibility_baseline_verification_preserves_the_daemon_prepared_file() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("admitted.conf");
+        let destination = root.path().join("runtime.conf");
         std::fs::write(&source, b"policy = \"fixed\"\n").unwrap();
-        reset_compatibility_baseline_config(root.path(), &source, "runtime.conf").unwrap();
-        assert_eq!(
-            std::fs::metadata(root.path().join("runtime.conf"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o400
+        std::fs::write(&destination, b"policy = \"fixed\"\n").unwrap();
+        // Source-overlay mode and private-seed mode are both valid. Checking
+        // the inode also catches unnecessary atomic replacement without
+        // requiring this unit test to create a kernel mount namespace.
+        for mode in [0o644, 0o400] {
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode)).unwrap();
+            let before = std::fs::metadata(&destination).unwrap();
+            verify_compatibility_baseline_config(root.path(), &source, "runtime.conf").unwrap();
+            let after = std::fs::metadata(&destination).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(after.permissions().mode() & 0o777, mode);
+        }
+    }
+
+    #[test]
+    fn compatibility_baseline_verification_refuses_missing_divergent_or_oversized_state() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("admitted.conf");
+        let destination = root.path().join("runtime.conf");
+        std::fs::write(&source, b"policy = \"fixed\"\n").unwrap();
+        assert!(
+            verify_compatibility_baseline_config(root.path(), &source, "runtime.conf").is_err()
         );
-        std::fs::set_permissions(
-            root.path().join("runtime.conf"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        std::fs::write(root.path().join("runtime.conf"), b"workload = \"state\"\n").unwrap();
-        reset_compatibility_baseline_config(root.path(), &source, "runtime.conf").unwrap();
+        assert!(!destination.exists());
+        std::fs::write(&destination, b"workload = \"state\"\n").unwrap();
+        assert!(
+            verify_compatibility_baseline_config(root.path(), &source, "runtime.conf").is_err()
+        );
         assert_eq!(
-            std::fs::read(root.path().join("runtime.conf")).unwrap(),
-            b"policy = \"fixed\"\n"
+            std::fs::read(&destination).unwrap(),
+            b"workload = \"state\"\n"
+        );
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&destination, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(
+            verify_compatibility_baseline_config(root.path(), &source, "runtime.conf").is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().len(),
+            64 * 1024 + 1
         );
     }
 
@@ -3333,7 +3361,9 @@ mod tests {
         std::fs::write(&target, b"workload = \"state\"\n").unwrap();
         std::os::unix::fs::symlink("workload.conf", root.path().join("runtime.conf")).unwrap();
 
-        assert!(reset_compatibility_baseline_config(root.path(), &source, "runtime.conf").is_err());
+        assert!(
+            verify_compatibility_baseline_config(root.path(), &source, "runtime.conf").is_err()
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"workload = \"state\"\n");
     }
 

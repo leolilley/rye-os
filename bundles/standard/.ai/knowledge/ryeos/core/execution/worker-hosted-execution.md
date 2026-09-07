@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T02:06:48Z:0ed00dc62d5e2a68b7a11aab0b78b46614cca0d68c6a7bb2d0b1b6938772a0c1:8PdgOyBs3n7NgwB4V3Mqxyjd0hvvyKENYQeeUZ5wB+ap3S8l2wf8ews6x+APETgiTXqlYnZKbfdIlO7KMFZcBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T02:16:41Z:784b6d1693d2489ba84ee5e7471df0b5653de95d9a3e8bf3f5ea13ad70e7c98f:J8MvRSzaOGMtDZTXnHiVso9ZQ0D4oBbHN/A7gX2MAOgMxD69Blkj/p4j2ligjJq+iORGFhpQdtbHsVHItrElAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.4"
+version: "1.7.5"
 ```
 
 # Worker-Hosted Execution
@@ -37,6 +37,13 @@ namespace coordinate; its mount may not exist in the daemon namespace at all.
 Baseline paths use the captured manifest root, matching profile compilation.
 The enforced read-only overlay retains that exact file descriptor, not a
 reopened workload path or a substituted live bundle file.
+
+The daemon is the sole compatibility-seed preparation owner. The bridge
+verifies the bounded, no-follow file against the admitted baseline before
+starting the workload; it does not rewrite it after isolation has mounted it
+read-only. Missing or divergent bytes refuse launch in every isolation mode.
+The source mount's file mode is not a replacement for mount or immutable-argv
+authority. Do not add a bridge-side seed repair or mount-error fallback.
 
 This is installed RyeOS runtime knowledge shipped by the standard bundle. It
 describes the authority visible to operators and authored integrations; it is
