@@ -13372,6 +13372,8 @@ impl RuntimeDb {
 
     /// Clear live process ownership only if it is still the exact incarnation
     /// the caller finished waiting/reaping. This cannot erase a later attach.
+    /// Workspace borrowers must use atomic workspace/process settlement instead:
+    /// clearing only the identity destroys cold recovery's exact death proof.
     pub fn clear_process_if_matches(
         &self,
         thread_id: &str,
@@ -13383,7 +13385,9 @@ impl RuntimeDb {
             "UPDATE thread_runtime
                 SET pid = NULL, pgid = NULL, process_identity = NULL,
                     process_dead_observed_at_ms = NULL
-              WHERE thread_id = ?1 AND process_identity = ?2",
+              WHERE thread_id = ?1 AND process_identity = ?2
+                AND workspace_id IS NULL AND workspace_view_identity IS NULL
+                AND workspace_borrower_launch_owner IS NULL",
             params![thread_id, identity_json],
         )? > 0)
     }

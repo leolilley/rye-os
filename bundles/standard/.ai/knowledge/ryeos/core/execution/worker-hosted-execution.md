@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T11:20:21Z:476c87d5ce88b7992b95998ffdeb1acf38115dc72b5f41af90384b32c9eb378e:ycR8F9hRahCbF1rOiHwuI3dtbqRXgCddf56F0QEgFslRgSimnU4HojCPyM1ZeYmy0k9afAtq3NFDBv456ilJCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T23:13:21Z:7c3a0b4cd4fb9504c84f8339db0289996435eab8ae73f855eda188c52e6f89ff:CmSbAsu6KjjCoiOgAbpFI9TJQtFFvs675R9Vxm03Jqyyr4RL+o0zhRgnv9Lg0qDbjRkR/1JT/Wa+xJvvsXDfCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.7"
+version: "1.7.8"
 ```
 
 # Worker-Hosted Execution
@@ -939,6 +939,20 @@ restart or reattach the external worker to already-frozen mutable bytes. The
 controller waits on pushed projection changes, reconstructs the canonical
 generic session result after owner disposition, and commits the terminal root
 event; candidate exposure is permitted only after workspace closure.
+
+Shutdown settles a runtime process identity and its exact workspace membership
+together, after proving group death. Process-only detachment is refused while
+membership remains; unsettled descendants retain the parent's exact identity
+for recovery. A missing identity cannot prove that an earlier borrower never
+contacted the workspace.
+
+An ownerless root with retained borrower membership or an uncommitted freezing
+journal remains workspace-quarantined. Readiness recognizes that existing
+durable authority without resuming the root or releasing its workspace or
+credential fences. This is not successful execution recovery: unrelated node
+work may proceed, but cleanup still requires exact settlement proof. An older
+record that lost that proof is not repaired by interpreting NULL as process
+death, and history is not implicitly reset.
 
 ## Explicit non-claims
 

@@ -13352,6 +13352,38 @@ impl StateStore {
             .execution_workspace_has_members(workspace_id)
     }
 
+    /// Classify an ownerless root from its existing durable workspace journal.
+    /// This grants neither execution nor cleanup: membership and unfinished
+    /// freeze authority stay fenced until their exact owners settle them.
+    /// A NULL PID, terminal lifecycle, or arbitrary lookup failure is not proof.
+    pub fn has_retained_workspace_quarantine(&self, thread_id: &str) -> Result<bool> {
+        let g = self.lock()?;
+        let Some(workspace) = g.runtime_db.workspace_for_thread(thread_id)? else {
+            return Ok(false);
+        };
+        let Some(raw_owner) = workspace.launch_owner.as_deref() else {
+            return Ok(false);
+        };
+        let owner: runtime_db::LaunchOwner = serde_json::from_str(raw_owner)?;
+        let active = self
+            .active_launch_owners
+            .lock()
+            .map_err(|_| anyhow!("active launch-owner registry poisoned"))?;
+        if owner.thread_id != thread_id || active.contains(raw_owner) {
+            return Ok(false);
+        }
+        if g.runtime_db
+            .get_launch_claim(thread_id)?
+            .is_some_and(|claim| claim.owner != owner || active.contains(&claim.claimed_by))
+        {
+            return Ok(false);
+        }
+        Ok(g.runtime_db
+            .execution_workspace_has_members(&workspace.workspace_id)?
+            || (workspace.state == runtime_db::WorkspaceState::Freezing
+                && workspace.frozen_snapshot_hash.is_none()))
+    }
+
     fn authorize_thread_workspace_contact_locked(g: &Inner, thread_id: &str) -> Result<()> {
         if let Some(binding) = g.runtime_db.thread_workspace_binding(thread_id)? {
             Self::authorize_workspace_root_lifecycle_locked(g, &binding)?;
@@ -17337,6 +17369,103 @@ mod tests {
             )
             .unwrap();
         identity
+    }
+
+    #[test]
+    fn workspace_binding_quarantine_requires_retained_authority_not_missing_pid() {
+        let (store, binding) = workspace_binding_fixture();
+        let root = "T-workspace-root";
+        assert!(!store.has_retained_workspace_quarantine("T-absent").unwrap());
+        assert!(!store.has_retained_workspace_quarantine(root).unwrap());
+        let claim = store.get_launch_claim(root).unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(root, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        assert!(store.has_retained_workspace_quarantine(root).unwrap());
+        assert_eq!(store.thread_workspace_binding(root).unwrap(), Some(binding));
+
+        let (settled, binding) = workspace_binding_fixture();
+        let identity = attach_workspace_test_process(&settled, &binding);
+        assert!(
+            settled
+                .settle_reaped_thread_workspace_owned(root, &binding, &identity)
+                .unwrap()
+        );
+        let claim = settled.get_launch_claim(root).unwrap().unwrap();
+        settled
+            .release_active_thread_launch_claim(root, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        // Missing process identity plus an ordinary journal is insufficient.
+        assert!(!settled.has_retained_workspace_quarantine(root).unwrap());
+        settled
+            .transition_execution_workspace(
+                &binding.workspace_id,
+                &[runtime_db::WorkspaceState::Active],
+                runtime_db::WorkspaceState::Freezing,
+                None,
+            )
+            .unwrap();
+        assert!(settled.has_retained_workspace_quarantine(root).unwrap());
+    }
+
+    #[test]
+    fn workspace_binding_refuses_process_only_clear_until_atomic_settlement() {
+        let (store, root_binding) = workspace_binding_fixture();
+        let child = "T-process-only-clear";
+        let binding = workspace_child_fixture(&store, "T-workspace-root", child, &root_binding);
+        store.bind_thread_workspace(child, &binding).unwrap();
+        let identity = attach_workspace_test_process(&store, &binding);
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        assert!(
+            !store
+                .clear_thread_process_if_matches(child, &identity)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .clear_thread_process_if_matches_owned(child, &identity, &claim.claimed_by)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity,
+            Some(identity.clone())
+        );
+        assert_eq!(
+            store.thread_workspace_binding(child).unwrap(),
+            Some(binding.clone())
+        );
+        assert!(
+            store
+                .list_attached_thread_ids()
+                .unwrap()
+                .iter()
+                .any(|id| id == child)
+        );
+        // Shutdown's abandoned-owner path retains the same coordinates after
+        // the waiting task drops its claim; only joint settlement releases them.
+        store
+            .release_active_thread_launch_claim(child, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        assert!(
+            store
+                .settle_dead_thread_workspace_if_matches(child, &binding, &identity)
+                .unwrap()
+        );
+        assert!(store.thread_workspace_binding(child).unwrap().is_none());
+        assert!(
+            store
+                .get_thread(child)
+                .unwrap()
+                .unwrap()
+                .runtime
+                .process_identity
+                .is_none()
+        );
     }
 
     #[test]
