@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T10:12:26Z:0108120e5f5bd0f55473ed37239a89720d9b2f5bf246acbacad3c51a29ac8967:Z1rHsjULVB7aEzHLTpBJfjAyoT+vYLt+uLs2M9+ckJUvDHjMlz8gjUg2bIdSr+4v6k5eqwlrmFHtMXRqA8K2DQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T10:31:21Z:6c5b2736998ad429b76bbf692446b45f3a4b398f894fb9cf99c4b26c98a13339:QHkr/uhull6hY6GuDR+vOyNhNAodh0btbhP0Q+RJR8NXKF0D71JV+DnhUPIpmYhcowXR67je8E+QNBl54CeXAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/remote
 tags: [remote, cli, reference, manpage, capabilities]
@@ -255,6 +255,9 @@ RYEOS_APP_ROOT=/path/to/target-app-root ryeos authorize-client \
 
 The command uses retained node signing authority through the same service
 online or standalone; it does not launch a Tool with access to node keys.
+On a freshly initialized node, start the node normally before provisioning
+peers. Standalone dispatch opens established state only; it does not create
+an execution-history projection as a side effect of changing a grant.
 Pass `--merge-scopes` to add exact capabilities while retaining existing ones.
 Keep the same `--origin-site-id` when updating a remote operator. Changing an
 incumbent principal's class or origin requires explicit
