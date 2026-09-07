@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T00:58:45Z:fa58311f2597deb6b6fb869d3b89c69f29fef050555aac036c71866230271a42:3OMLCmoiTP9zsFqfAXQ2GdzS1FI001GWr2KcXFXeTebUV+OhopiQHIXGVF2K1fD0iYzdoLLt6+7v3pksaeaiDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T01:28:01Z:ca3f311f2835137c7aa04ef63fa7ddbaa25f99336866d8c2f7f0c2b20a83380e:xo/1160sUhYSTrUX8A9rMfDvCAmgLLTZcZGvO3t6IRygn3A3/uirM/FKIOWD7NsMn4JlJNl0FSdJwZcFO6dRBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.1"
+version: "1.7.2"
 ```
 
 # Worker-Hosted Execution
@@ -13,6 +13,15 @@ version: "1.7.1"
 Worker-hosted execution runs one long-lived subordinate workload for one
 ordinary RyeOS root execution. It is generic execution substrate, not an
 engine kind, agent identity, or local-inference implementation.
+
+A persistent execution dependency is not a separate thread root. Its direct
+plan consumes the dependency's existing finalized effective program: the
+complete composed subject supplies the registered kind's filesystem/network
+projections, while retained root bytes supply parsing. It must not require or
+fabricate a second root admission, borrow the enclosing runtime's composition,
+or silently use node defaults because that dependency has no root thread.
+Subject identity, enclosing restrictions and retained protocol narrowing remain
+mandatory before the plan is sealed; recovery consumes that sealed plan.
 
 This is installed RyeOS runtime knowledge shipped by the standard bundle. It
 describes the authority visible to operators and authored integrations; it is

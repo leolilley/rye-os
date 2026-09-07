@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-06T22:36:36Z:2e1e35785619a9807a55591c14179f90b3c79b85f0f0623d0840371b0e492ba1:dHkrZYT9pndfnpp4qXgS/eiAaE3rYgjd6yS+rark30MENJbyFhtZz//SmHLD1yFCCamP3wj5PIq0avnJQ/R2BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T01:28:01Z:d40eec4cfead9714030edab0c30e4f2d2de509ad2ab6bc7131844ac68ba99788:ru58c55/zaUL3f0HOKkR+d3MYwjw2TTwuqpK8ydQknnGQJbbQQhG0hWeZ3CKTwHO1OLyAvMaII1ESoGda3h5CA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.11.0"
+version: "1.11.1"
 ```
 
 # Source-Local Bundle Development
@@ -292,8 +292,10 @@ overlay over the parent's backing directories. The original workspace lifeline
 owns the descriptor, and the existing per-launch runtime rows retain exact
 borrower membership. Capture quiesces every writer; close/recreation require
 proved settlement, including pending dedicated-worker starts. Missing process
-attachment is not proof of no contact. This v7 source cut still requires the
-combined installed graph and worker-to-child acceptance before remote use.
+attachment is not proof of no contact. The installed v7 authoring graph now
+passes actual assembly and independent verification in the same retained view;
+the exact evidence is in `tests/e2e/authoring-environment/selection.json`.
+Worker-to-child acceptance and restart remain gates before remote use.
 
 Per-child filesystem and network denial are data driven. The signed Tool kind
 projects composed `filesystem_authority` and `network_authority` into the
@@ -574,9 +576,11 @@ The source-local Tools currently authored under `tools/ryeos/development/`
 include `platform-inspect`, `format-check`, and `format-file`. They select the
 real imported platform manifest, captured-filesystem execution and isolated
 network. Inspection/checking borrow an immutable current generation;
-formatting borrows the exclusive workspace. They still require target-local
-binding and actual CLI qualification. The three finite Cargo operations above
-are authored against the observed vendor manifest, but are not yet qualified.
+formatting borrows the exclusive workspace. Target-local bindings and standalone
+CLI platform-inspect/format-check have passed on the bounded fixture. The
+worker's changed-generation negative check and shared-exclusive format/readback
+remain unqualified. The three finite Cargo operations above are authored
+against the observed vendor manifest, but are not yet qualified.
 
 Resolved operation timeouts use the existing project execution configuration
 at `.ai/config/execution/execution.yaml`. Its per-item selections override

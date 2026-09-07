@@ -1804,7 +1804,7 @@ fn admit_session_capsule(
         engine,
         &request,
         &verified,
-        &dependency.resolution.root.raw_content,
+        &finalized,
         &state.isolation,
         None,
         session.workspace_authority.filesystem_ceiling(),
@@ -2818,6 +2818,9 @@ fn direct_request(
             scheduled_fire: None,
             validate_only: false,
         },
+        // This is not a separately admitted thread root. The captured-plan
+        // builder receives our FinalizedEffectiveProgram for composed policy
+        // projection; never substitute the enclosing runtime's root admission.
         root_admission: None,
     })
 }

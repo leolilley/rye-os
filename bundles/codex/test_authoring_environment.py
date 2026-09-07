@@ -135,11 +135,30 @@ class AuthoringEnvironmentTests(unittest.TestCase):
                     (operation + ".py")).read_text()
             self.assertIn(self.selection["expected_manifests"]["assembly_inputs"], text)
 
-    def test_evidence_does_not_claim_node_or_model_qualification(self):
+    def test_evidence_distinguishes_admitted_production_from_model_qualification(self):
         self.assertTrue(self.selection["qualification"]["independent_reproduction"])
         self.assertTrue(self.selection["qualification"]["offline_empty_root"])
-        for gate in ("ryeos_production", "retained_result_import", "consumer_binding",
-                     "hosted_turn", "restart"):
+        for gate in ("admitted_prepare", "admitted_assemble", "admitted_verify",
+                     "ryeos_production", "retained_result_import", "consumer_binding"):
+            self.assertTrue(self.selection["qualification"][gate])
+        evidence = self.selection["admitted_production_evidence"]
+        graph = evidence["shared_workspace_graph"]
+        self.assertRegex(graph["thread_id"], r"^T-[0-9a-f-]+$")
+        for field in ("capsule_hash", "base_snapshot_hash", "result_snapshot_hash"):
+            self.assertRegex(graph[field], r"^[0-9a-f]{64}$")
+        self.assertNotEqual(graph["base_snapshot_hash"], graph["result_snapshot_hash"])
+        self.assertEqual(graph["inventory_sha256"], self.selection["inventory_sha256"])
+        self.assertTrue(graph["assemble_executed"])
+        self.assertTrue(graph["independent_verify_executed"])
+        self.assertFalse(graph["cache_hit"])
+        self.assertFalse(graph["source_head_advanced"])
+        self.assertFalse(graph["binding_published"])
+        self.assertEqual(set(evidence["observed_imports"]),
+                         {"assembly_inputs", "environment", "production", "shell_file"})
+        for binding in evidence["observed_bindings"].values():
+            if isinstance(binding, dict):
+                self.assertRegex(binding["binding_hash"], r"^[0-9a-f]{64}$")
+        for gate in ("hosted_turn", "restart"):
             self.assertFalse(self.selection["qualification"][gate])
         self.assertNotIn("release_url", self.selection)
         self.assertNotIn("staging_id", self.selection)

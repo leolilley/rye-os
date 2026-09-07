@@ -1713,14 +1713,17 @@ pub fn prepare_item_plan(
     })
 }
 
-/// Compile a direct plan from an engine-verified root carrier and the exact
-/// retained root bytes captured by an outer admitted launch.  The root path is
-/// provenance/parser context only; it is never reopened for program bytes.
+/// Compile a direct plan from the finalized dependency already captured by an
+/// outer admitted launch. It is not another thread root: do not fabricate a
+/// RootExecutionAdmission or borrow the outer runtime's composed subject.
+/// The dependency's finalized composition owns its kind-declared isolation
+/// projections; its retained root bytes own parsing. The pathname is context
+/// only and is never reopened for program bytes.
 pub fn prepare_captured_item_plan(
     engine: &Engine,
     resolved: &ResolvedExecutionRequest,
     verified: &VerifiedItem,
-    root_source: &str,
+    program: &ryeos_engine::effective_program::FinalizedEffectiveProgram,
     isolation: &ryeos_engine::isolation::IsolationRuntime,
     sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
     enclosing_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
@@ -1731,20 +1734,28 @@ pub fn prepare_captured_item_plan(
         {
             bail!("captured direct-plan subject contradicts its request carrier");
         }
-        let filesystem_ceiling =
-            super::project_execution_filesystem_authority_ceiling(engine, resolved)?
-                .intersect(enclosing_filesystem_ceiling);
+        let execution = engine
+            .kinds
+            .get(&verified.resolved.kind)
+            .and_then(|schema| schema.execution.as_ref())
+            .ok_or_else(|| anyhow!("captured dependency has no execution schema"))?;
+        let (filesystem_ceiling, network_ceiling) = captured_plan_isolation_ceilings(
+            execution,
+            program,
+            &resolved.item_ref,
+            &resolved.root_raw_content_digest,
+            enclosing_filesystem_ceiling,
+        )?;
         let mut plan = engine.build_plan_from_captured_root(
             &resolved.plan_context,
             verified,
-            root_source,
+            &program.resolution().root.raw_content,
             &resolved.parameters,
             &resolved.plan_context.execution_hints,
             sealed_content,
             filesystem_ceiling,
         )?;
-        plan.network_authority_ceiling =
-            super::project_execution_network_authority_ceiling(engine, resolved)?;
+        plan.network_authority_ceiling = network_ceiling;
         plan.filesystem_authority_ceiling = plan
             .filesystem_authority_ceiling
             .intersect(filesystem_ceiling);
@@ -1788,6 +1799,31 @@ pub fn prepare_captured_item_plan(
             realization_command: None,
         })
     })
+}
+
+fn captured_plan_isolation_ceilings(
+    execution: &ryeos_engine::kind_registry::ExecutionSchema,
+    program: &ryeos_engine::effective_program::FinalizedEffectiveProgram,
+    expected_ref: &str,
+    expected_raw_digest: &str,
+    enclosing_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
+) -> Result<(
+    ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
+    ryeos_engine::isolation::IsolationNetworkAuthorityCeiling,
+)> {
+    let resolution = program.resolution();
+    if resolution.root.resolved_ref != expected_ref
+        || resolution.root.raw_content_digest != expected_raw_digest
+    {
+        bail!("finalized dependency contradicts its captured direct-plan subject");
+    }
+    let composed = &resolution.composed.composed;
+    Ok((
+        execution
+            .project_filesystem_authority_ceiling(composed)?
+            .intersect(enclosing_filesystem_ceiling),
+        execution.project_network_authority_ceiling(composed)?,
+    ))
 }
 
 /// Run the prepared engine plan's spawn phase.
@@ -2171,6 +2207,136 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finalized_dependency_fixture(
+        composed: Value,
+    ) -> ryeos_engine::effective_program::FinalizedEffectiveProgram {
+        use ryeos_engine::resolution::{KindComposedView, ResolutionOutput, ResolvedAncestor};
+        let engine = Engine::new(
+            ryeos_engine::kind_registry::KindRegistry::empty(),
+            ryeos_engine::parsers::ParserDispatcher::new(
+                ryeos_engine::parsers::ParserRegistry::empty(),
+                Arc::new(ryeos_engine::handlers::HandlerRegistry::empty()),
+            ),
+            Vec::new(),
+        );
+        let resolution = ResolutionOutput {
+            root: ResolvedAncestor {
+                requested_id: "fixture:session".to_owned(),
+                resolved_ref: "fixture:session".to_owned(),
+                source_path: PathBuf::from("/not-reopened/session.yaml"),
+                source_space: ItemSpace::Bundle,
+                source_root: ItemSourceRoot::Bundle {
+                    name: "fixture".to_owned(),
+                },
+                trust_class: ryeos_engine::resolution::TrustClass::TrustedBundle,
+                signer_fingerprint: Some("f".repeat(64)),
+                alias_resolution: None,
+                added_by: ryeos_engine::resolution::ResolutionStepName::PipelineInit,
+                // Composition, not a second raw parse, owns the final ceilings.
+                raw_content: "filesystem_authority: node_policy\nnetwork_authority: node_policy\n"
+                    .to_owned(),
+                source_content_digest: "a".repeat(64),
+                raw_content_digest: "b".repeat(64),
+            },
+            ancestors: Vec::new(),
+            references_edges: Vec::new(),
+            referenced_items: Vec::new(),
+            step_outputs: Default::default(),
+            effective_trust_class: ryeos_engine::resolution::TrustClass::TrustedBundle,
+            composed: KindComposedView::identity(composed),
+        };
+        let validation = engine
+            .effective_validators
+            .validate("fixture", &resolution)
+            .unwrap();
+        let candidate = ryeos_engine::effective_program::lock_validated_effective_program(
+            resolution, validation,
+        )
+        .unwrap();
+        let proof = ryeos_engine::effective_program::prove_finalization_authority(
+            &candidate,
+            &[],
+            &engine.resolution_roots(None),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        ryeos_engine::effective_program::finalize_effective_program(candidate, proof).unwrap()
+    }
+
+    #[test]
+    fn captured_dependency_projects_finalized_policy_without_a_synthetic_root() {
+        use ryeos_engine::isolation::{
+            IsolationFilesystemAuthorityCeiling::{CapturedExecution, NodePolicy},
+            IsolationNetworkAuthorityCeiling::{Isolated, NodePolicy as NodeNetwork},
+        };
+        let execution: ryeos_engine::kind_registry::ExecutionSchema =
+            serde_json::from_value(json!({
+                "filesystem_authority_ceiling": {
+                    "path": ["filesystem_authority"], "default": "node_policy"
+                },
+                "network_authority_ceiling": {
+                    "path": ["network_authority"], "default": "node_policy"
+                }
+            }))
+            .unwrap();
+        let program = finalized_dependency_fixture(json!({
+            "filesystem_authority": "captured_execution", "network_authority": "isolated"
+        }));
+        assert_eq!(
+            captured_plan_isolation_ceilings(
+                &execution,
+                &program,
+                "fixture:session",
+                &"b".repeat(64),
+                NodePolicy,
+            )
+            .unwrap(),
+            (CapturedExecution, Isolated),
+        );
+        for (reference, digest) in [
+            ("fixture:other", "b".repeat(64)),
+            ("fixture:session", "c".repeat(64)),
+        ] {
+            assert!(
+                captured_plan_isolation_ceilings(
+                    &execution, &program, reference, &digest, NodePolicy,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("contradicts")
+            );
+        }
+        let inherited = finalized_dependency_fixture(json!({}));
+        assert_eq!(
+            captured_plan_isolation_ceilings(
+                &execution,
+                &inherited,
+                "fixture:session",
+                &"b".repeat(64),
+                CapturedExecution,
+            )
+            .unwrap(),
+            (CapturedExecution, NodeNetwork),
+        );
+        for malformed in [
+            json!({"filesystem_authority": "host"}),
+            json!({"network_authority": "host"}),
+        ] {
+            assert!(
+                captured_plan_isolation_ceilings(
+                    &execution,
+                    &finalized_dependency_fixture(malformed),
+                    "fixture:session",
+                    &"b".repeat(64),
+                    NodePolicy,
+                )
+                .is_err()
+            );
+        }
+    }
 
     fn portable_direct_plan(project_root: &Path) -> ExecutionPlan {
         let mut plan: ExecutionPlan = serde_json::from_value(serde_json::json!({

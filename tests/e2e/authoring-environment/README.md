@@ -39,15 +39,16 @@ empty-root evidence and separately identified admitted-production observations.
 Expected manifests are computed from selected bytes; observed imports instead
 come from exact completed-thread retained results through the normal CLI.
 Admitted preparation, single-root assembly and all four manifest imports passed
-on 2026-09-06. These are not independent admitted verification, final consumer
-binding, a hosted turn or restart qualification. The cumulative `ryeos_production`
-gate remains false until admitted verification passes as well.
+on 2026-09-06. On 2026-09-07 the complete authoring graph executed assembly and
+independent verification in the native backend's one retained shared view.
+Both returned the selected inventory digest; the exact graph/capsule/result
+coordinates are recorded in `selection.json`. The source HEAD did not advance
+and no binding was published by the graph. `ryeos_production` is now qualified.
 
-Do not qualify inline assembly/verification against the current native backend:
-the live parent and inline child would mount separate overlays over the same
-upper/work directories. The generic workspace owner must first provide one
-retained merged view and transitive borrower freeze/cleanup fencing. A passing
-standalone kernel-mechanics probe does not establish those runtime contracts.
+The owner/borrower integration uses one detached view, not separate overlays
+over the same upper/work directories. The real graph result qualifies this
+assembly/verification path, not the still-pending hosted worker/child loop,
+restart, whole-repository Cargo operations or a remote development campaign.
 
 The complete source/input trees require large-content authority. The original
 utility binary and corresponding-source archives remain exact historical inputs;

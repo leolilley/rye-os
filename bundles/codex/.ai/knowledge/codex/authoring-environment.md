@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-06T04:58:50Z:c8cdc1d810ad357c08810f9060da394064a4203c6da7138325900cc03d6e496f:RUxTnqu/2MV/ikokDfsdIyjnv1Hoou/oQnf4wYPJ0F1lK8KKAyWoXvpFpq9WY/e4NWIUNr32Ffv2iBap55E7CQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T01:28:01Z:ac8b855b08760320e6374df395b73af7c94da72e639345a079a560db0486ca26:hxL3cFPJpElBOGqNWVQ0gbkKe96zp5MpfgjqeWxFMPx3AP2dpQFxfcC8T0VOHeXxKV+Zf9x3Puuc10kSfBoGCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [hosted-execution, environments, authoring, external-content]
-version: "1.0.1"
+version: "1.0.2"
 description: >
   Explicit authoring worker and command environment, separate from child
   project-operation dependencies and restricted client authority.
@@ -33,6 +33,17 @@ Git environment variables. Select the complete worker/environment pair; the
 authoring worker is not a standalone replacement for the default worker.
 Content bindings remain exact to each consumer. The default activation's
 bindings do not authorize this new worker or environment.
+
+For the four unchanged vendor resources (Codex, code-mode host, upstream
+sandbox resource and ripgrep), complete `config:codex/activation` first. Its
+verified archive cache supports an explicit `offline` invocation. Inspect the
+default worker's admitted dependency preview for each exact active binding,
+then use `external-content import-binding <binding-hash> <maximum-bytes>` and
+independently bind each returned stage to `worker:codex/hosted-authoring` with
+`installed_bundle` scope. Do not reuse the default worker's zsh: the authoring
+shell comes from the retained production below. No managed activation recipe
+is claimed for that unpublished artifact; a partial recipe must not bypass the
+existing complete-consumer activation contract.
 
 ## Available commands and runtime
 
