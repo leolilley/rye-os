@@ -13,7 +13,8 @@ use anyhow::Context as _;
 pub(crate) struct BoundSourceClosure {
     mounts: Vec<ryeos_engine::isolation::IsolationReadOnlyMountAuthority>,
     sealed_identity_env: String,
-    entry_path: PathBuf,
+    execution_entry_path: PathBuf,
+    source_directory: lillux::PinnedDirectory,
     _leases: Vec<std::fs::File>,
 }
 
@@ -26,8 +27,17 @@ impl BoundSourceClosure {
         &self.sealed_identity_env
     }
 
-    pub(crate) fn entry_path(&self) -> &Path {
-        &self.entry_path
+    /// Workload-namespace coordinate, not a daemon-readable pathname. The
+    /// mount need not exist in the daemon's namespace before process launch.
+    pub(crate) fn execution_entry_path(&self) -> &Path {
+        &self.execution_entry_path
+    }
+
+    /// Exact verified materialization retained by this binding and its lease.
+    /// Daemon-side reads must use this authority, never reopen the workload's
+    /// execution coordinate or look up the installed/live source again.
+    pub(crate) fn source_directory(&self) -> &lillux::PinnedDirectory {
+        &self.source_directory
     }
 }
 
@@ -214,7 +224,8 @@ fn bind_source_with(
     Ok(Some(BoundSourceClosure {
         mounts,
         sealed_identity_env,
-        entry_path: destination.join(entry),
+        execution_entry_path: destination.join(entry),
+        source_directory: source,
         _leases: vec![lease],
     }))
 }
@@ -456,6 +467,35 @@ fn open_source_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_source_keeps_daemon_authority_separate_from_execution_coordinate() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(cache.path().join("baseline.toml"), b"captured = true\n").unwrap();
+        let bound = BoundSourceClosure {
+            mounts: Vec::new(),
+            sealed_identity_env: "{}".to_owned(),
+            execution_entry_path: workspace.path().join("not-mounted/profile.json"),
+            source_directory: lillux::PinnedDirectory::open(cache.path())
+                .unwrap()
+                .unwrap(),
+            _leases: Vec::new(),
+        };
+        assert!(!bound.execution_entry_path().parent().unwrap().exists());
+        let file = bound
+            .source_directory()
+            .open_pinned_regular_descendant(Path::new("baseline.toml"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.read_bounded(64).unwrap(), b"captured = true\n");
+        assert!(
+            bound
+                .source_directory()
+                .open_pinned_regular_descendant(Path::new("../baseline.toml"), false)
+                .is_err()
+        );
+    }
 
     #[test]
     fn source_and_external_mounts_refuse_exact_or_nested_overlap() {

@@ -2190,17 +2190,15 @@ fn create_node_owned_runtime_view(workspace: &Path) -> Result<lillux::PinnedDire
 
 fn prepare_structured_session_baseline(
     profile: &ryeos_state::objects::AdmittedStructuredSessionProfile,
-    source_entry: &Path,
+    source_directory: &lillux::PinnedDirectory,
     state_root: &Path,
     enforced: bool,
 ) -> Result<Option<ryeos_engine::isolation::IsolationReadOnlyMountAuthority>> {
-    let source_parent = source_entry
-        .parent()
-        .ok_or_else(|| anyhow!("structured-session entry has no source parent"))?;
-    let source_directory = lillux::PinnedDirectory::open(source_parent)?
-        .ok_or_else(|| anyhow!("structured-session source parent is missing"))?;
+    // The profile compiler resolves baseline_source relative to the captured
+    // source manifest root. The worker-visible mount/entry path is not an
+    // ambient daemon path, nor an authority for reopening the baseline.
     let source_file = source_directory
-        .open_pinned_regular(std::ffi::OsStr::new(&profile.baseline_source), false)?
+        .open_pinned_regular_descendant(Path::new(&profile.baseline_source), false)?
         .ok_or_else(|| anyhow!("admitted structured-session baseline is missing"))?;
     let bytes = source_file.read_bounded(64 * 1024)?;
     if bytes.is_empty() {
@@ -2340,14 +2338,15 @@ fn spawn_capsule_process_held(
             mounts.extend_from_slice(source.mounts());
             (
                 Some(source.sealed_identity_env()),
-                Some(source.entry_path()),
+                Some(source.execution_entry_path()),
             )
         }
         None => (None, None),
     };
     if let Some(profile) = capsule.structured_session_profile.as_ref() {
-        let source_entry = source_entry
-            .ok_or_else(|| anyhow!("structured-session capsule has no bound source entry"))?;
+        let bound_source = source
+            .as_ref()
+            .ok_or_else(|| anyhow!("structured-session capsule has no bound source authority"))?;
         let state_root = state_root
             .ok_or_else(|| anyhow!("structured-session capsule has no exact state root"))?;
         // The admission-compiled immutable argv is the structured workload's
@@ -2356,7 +2355,7 @@ fn spawn_capsule_process_held(
         // structured-session substrate does not require one.
         if let Some(overlay) = prepare_structured_session_baseline(
             profile,
-            source_entry,
+            bound_source.source_directory(),
             state_root,
             state.isolation.is_enforced(),
         )? {
@@ -3503,8 +3502,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let source_root = tempfile::tempdir().unwrap();
-        let source_entry = source_root.path().join("worker.yaml");
-        std::fs::write(&source_entry, b"worker").unwrap();
+        let source_directory = lillux::PinnedDirectory::open(source_root.path())
+            .unwrap()
+            .unwrap();
         std::fs::write(
             source_root.path().join("baseline.toml"),
             b"setting = true\n",
@@ -3519,9 +3519,13 @@ mod tests {
             baseline_destination: "config.toml".to_owned(),
         };
 
-        let overlay =
-            prepare_structured_session_baseline(&profile, &source_entry, state_root.path(), false)
-                .unwrap();
+        let overlay = prepare_structured_session_baseline(
+            &profile,
+            &source_directory,
+            state_root.path(),
+            false,
+        )
+        .unwrap();
 
         assert!(overlay.is_none());
         let destination = state_root.path().join("config.toml");
@@ -3536,14 +3540,54 @@ mod tests {
         );
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&destination, b"workload = true\n").unwrap();
-        let overlay =
-            prepare_structured_session_baseline(&profile, &source_entry, state_root.path(), false)
-                .unwrap();
+        let overlay = prepare_structured_session_baseline(
+            &profile,
+            &source_directory,
+            state_root.path(),
+            false,
+        )
+        .unwrap();
         assert!(overlay.is_none());
         assert_eq!(std::fs::read(&destination).unwrap(), b"setting = true\n");
         assert_eq!(
             std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
             0o400
+        );
+        // Enforced launch must construct its read-only overlay directly from
+        // the same pinned source authority, without a worker mount in this
+        // process's namespace. A nested baseline is relative to the captured
+        // manifest root, exactly as it was during profile compilation.
+        std::fs::create_dir(source_root.path().join("nested")).unwrap();
+        std::fs::write(
+            source_root.path().join("nested/baseline.toml"),
+            b"nested = true\n",
+        )
+        .unwrap();
+        let mut nested = profile;
+        nested.baseline_source = "nested/baseline.toml".to_owned();
+        let overlay = prepare_structured_session_baseline(
+            &nested,
+            &source_directory,
+            state_root.path(),
+            true,
+        )
+        .unwrap();
+        assert!(overlay.is_some());
+        assert_eq!(
+            std::fs::read(state_root.path().join("config.toml")).unwrap(),
+            b"nested = true\n"
+        );
+        std::os::unix::fs::symlink("baseline.toml", source_root.path().join("linked.toml"))
+            .unwrap();
+        nested.baseline_source = "linked.toml".to_owned();
+        assert!(
+            prepare_structured_session_baseline(
+                &nested,
+                &source_directory,
+                state_root.path(),
+                true,
+            )
+            .is_err()
         );
     }
 

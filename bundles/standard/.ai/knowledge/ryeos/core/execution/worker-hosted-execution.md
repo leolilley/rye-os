@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T01:45:53Z:711f17cbd9b5d0f30436f1df48a04cc426f8ea3ecbab8ebd89dc1da0ab1865af:tA4+ylEzzsl7rcDN34bo9FdTFx4lZviXRMagfuaCCBmJS0G079OP2eigiIUTIS2G3/rHfLVBIH8yfbFuOMveBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T02:06:48Z:0ed00dc62d5e2a68b7a11aab0b78b46614cca0d68c6a7bb2d0b1b6938772a0c1:8PdgOyBs3n7NgwB4V3Mqxyjd0hvvyKENYQeeUZ5wB+ap3S8l2wf8ews6x+APETgiTXqlYnZKbfdIlO7KMFZcBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.3"
+version: "1.7.4"
 ```
 
 # Worker-Hosted Execution
@@ -29,6 +29,14 @@ must match that reserved tuple and credential generation; empty worker fields
 are not an admissible pre-start state. This reservation fences cleanup but is
 not liveness evidence: the separate held-process attachment still owns that
 transition. Do not clear the pending identity to make client setup pass.
+
+Bound source has separate daemon and workload coordinates. Daemon baseline
+preparation reads the already-pinned, verified source generation under its
+existing materialization lease. The execution entry path is only a target
+namespace coordinate; its mount may not exist in the daemon namespace at all.
+Baseline paths use the captured manifest root, matching profile compilation.
+The enforced read-only overlay retains that exact file descriptor, not a
+reopened workload path or a substituted live bundle file.
 
 This is installed RyeOS runtime knowledge shipped by the standard bundle. It
 describes the authority visible to operators and authored integrations; it is
