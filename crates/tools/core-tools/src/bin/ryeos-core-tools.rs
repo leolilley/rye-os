@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
-use base64::Engine;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]

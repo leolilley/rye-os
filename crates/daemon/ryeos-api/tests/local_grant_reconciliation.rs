@@ -177,3 +177,67 @@ async fn non_operator_callers_are_rejected_before_decoding_or_grant_access() {
         assert!(serde_json::from_value::<Request>(value).is_err());
     }
 }
+
+#[tokio::test]
+async fn semantic_conversion_borrows_only_the_exact_standalone_lock() {
+    let (_node, state) = test_state::build_test_state();
+    let mut state = Arc::new(state);
+    let operator = NodeIdentity::load(&state.config.operator_signing_key_path).unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+    let client = NodeIdentity::create(&client_dir.path().join("client.pem")).unwrap();
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(client.verifying_key().as_bytes());
+    let context = HandlerContext::new_with_authority(
+        operator.principal_id(),
+        vec!["*".into()],
+        true,
+        Some(AuthorizedKeyPrincipalClass::LocalClient),
+        None,
+    );
+    let request = |origin: &str, conversion: bool| -> Request {
+        serde_json::from_value(json!({
+            "public_key":public_key, "scopes":"ryeos.execute.service.health/status",
+            "origin_site_id":origin, "allow_semantic_conversion":conversion,
+        }))
+        .unwrap()
+    };
+    handle(
+        request("site:source", false),
+        context.clone(),
+        state.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        handle(request("site:other", true), context.clone(), state.clone())
+            .await
+            .is_err()
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    let wrong_lock = ryeos_app::state_lock::StateLock::acquire(
+        &ryeos_app::state_lock::default_lock_path(other.path()),
+    )
+    .unwrap();
+    let mut extensions = ryeos_app::extension_state::ExtensionState::new();
+    extensions.insert(Arc::new(wrong_lock));
+    Arc::get_mut(&mut state).unwrap().extensions = Arc::new(extensions);
+    assert!(
+        handle(request("site:other", true), context.clone(), state.clone())
+            .await
+            .is_err()
+    );
+
+    let lock_path = ryeos_app::state_lock::default_lock_path(&state.config.app_root);
+    let lock = Arc::new(ryeos_app::state_lock::StateLock::acquire(&lock_path).unwrap());
+    let mut extensions = ryeos_app::extension_state::ExtensionState::new();
+    extensions.insert(lock.clone());
+    Arc::get_mut(&mut state).unwrap().extensions = Arc::new(extensions);
+    assert!(ryeos_app::state_lock::StateLock::acquire(&lock_path).is_err());
+    let result = handle(request("site:other", true), context, state.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["previous_origin_site_id"], "site:source");
+    assert_eq!(result["origin_site_id"], "site:other");
+    assert!(ryeos_app::state_lock::StateLock::acquire(&lock_path).is_err());
+}

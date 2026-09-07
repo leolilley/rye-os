@@ -220,7 +220,12 @@ pub fn run_authorize_client(params: AuthorizeClientParams) -> Result<AuthorizeCl
     let _stopped_node_lock = acquire_semantic_conversion_lock(&params)?;
     let root = ryeos_engine::roots::RuntimeRoot::new(params.app_root.clone());
     let node_identity = ryeos_app::identity::NodeIdentity::load(&root.node_signing_key_path())?;
-    reconcile_client_grant(params, &node_identity, &root.authorized_keys_dir())
+    run_authorize_client_with_authority(
+        params,
+        &node_identity,
+        &root.authorized_keys_dir(),
+        _stopped_node_lock.as_ref(),
+    )
 }
 
 /// Reuse the canonical grant writer with the selected node's retained
@@ -229,8 +234,13 @@ pub fn run_authorize_client_with_authority(
     params: AuthorizeClientParams,
     node_identity: &ryeos_app::identity::NodeIdentity,
     auth_dir: &std::path::Path,
+    stopped_node_authority: Option<&ryeos_app::state_lock::StateLock>,
 ) -> Result<AuthorizeClientResult> {
-    let _stopped_node_lock = acquire_semantic_conversion_lock(&params)?;
+    if params.allow_semantic_conversion {
+        stopped_node_authority
+            .context("semantic authorized-key conversion requires stopped-node authority")?
+            .ensure_protects_app_root(&params.app_root)?;
+    }
     reconcile_client_grant(params, node_identity, auth_dir)
 }
 

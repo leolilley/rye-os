@@ -26,10 +26,15 @@ pub async fn handle(
         .context("grant reconciliation requires the configured local operator")?;
     let params = request.into_params(state.config.app_root.clone())?;
     tokio::task::spawn_blocking(move || {
+        // Standalone dispatch already owns this exact lock. Borrow that
+        // authority, not a boolean mode flag or a second flock acquisition.
+        // The live daemon deliberately does not expose its lifecycle lock.
+        let stopped_node = state.extensions.get::<ryeos_app::state_lock::StateLock>();
         let result = ryeos_core_tools::actions::authorize::run_authorize_client_with_authority(
             params,
             &state.identity,
             &state.config.authorized_keys_dir,
+            stopped_node.as_deref(),
         )?;
         serde_json::to_value(result).map_err(Into::into)
     })

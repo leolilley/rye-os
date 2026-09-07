@@ -2975,9 +2975,10 @@ async fn run_service_standalone(
     // any expensive bootstrap work. Otherwise standalone mode would
     // perform identity/engine/node-config loads while a competing
     // daemon held the lock, only to fail late.
-    let _state_lock =
+    let standalone_state_lock = Arc::new(
         state_lock::StateLock::acquire(&state_lock::default_lock_path(&config.app_root))
-            .context("failed to acquire state lock — is the daemon running?")?;
+            .context("failed to acquire state lock — is the daemon running?")?,
+    );
     bootstrap::verify_initialized(config)?;
 
     let identity = NodeIdentity::load(&config.node_signing_key_path)?;
@@ -3173,6 +3174,10 @@ async fn run_service_standalone(
         thread_auth: Arc::new(ryeos_app::callback_token::ThreadAuthStore::new()),
         extensions: {
             let mut extensions = ryeos_app::extension_state::ExtensionState::new();
+            // This is the stopped-node invocation's actual exclusion guard,
+            // retained through service completion. Never install the running
+            // daemon's lifecycle lock as standalone authority in extensions.
+            extensions.insert(Arc::clone(&standalone_state_lock));
             extensions.insert(standalone_ui_state);
             extensions.insert(standalone_node_config_validator);
             Arc::new(extensions)
