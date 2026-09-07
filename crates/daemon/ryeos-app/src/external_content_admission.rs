@@ -241,17 +241,22 @@ pub fn preview_portable_content_dependency(
     state: &AppState,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
     policy: &ryeos_engine::runtime_registry::LaunchContentExternalPolicy,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
 ) -> anyhow::Result<ExternalContentValidationPreview> {
-    Ok(
-        preview_portable_content_dependency_with_realizations(state, resolution, policy)?
-            .validation,
-    )
+    Ok(preview_portable_content_dependency_with_realizations(
+        state,
+        resolution,
+        policy,
+        subject_resolution_authority,
+    )?
+    .validation)
 }
 
 pub fn preview_portable_content_dependency_with_realizations(
     state: &AppState,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
     policy: &ryeos_engine::runtime_registry::LaunchContentExternalPolicy,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
 ) -> anyhow::Result<PortableContentDependencyPreview> {
     let contract = policy.declaration_contract();
     let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
@@ -277,7 +282,7 @@ pub fn preview_portable_content_dependency_with_realizations(
             state,
             Some(&contract),
             resolution,
-            &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+            subject_resolution_authority,
             declaration,
         )?;
         ready_for_admission &= ready;
@@ -639,10 +644,16 @@ pub fn admit_external_realizations_in_publication(
 /// dependency. The signed launch policy supplies only mechanical ceilings;
 /// manifest identity and consumer binding remain owned by the resolved item
 /// and the existing external-content subsystem.
+///
+/// Portable does not mean projectless: a bound project item keeps the exact
+/// subject generation already admitted by its outer launch. Pass that authority
+/// through preview and admission; never infer it from a path, current HEAD, or
+/// the installed execution dependency receiving the content.
 pub fn admit_portable_content_dependency_in_publication(
     state: &AppState,
     resolution: &mut ryeos_engine::resolution::ResolutionOutput,
     policy: &ryeos_engine::runtime_registry::LaunchContentExternalPolicy,
+    subject_resolution_authority: &ryeos_engine::contracts::SubjectResolutionAuthority,
     inherited: Option<&RealizedExternalContentSet>,
     publication: &mut Option<PendingCasPublication>,
 ) -> anyhow::Result<AdmittedExternalRealizations> {
@@ -672,7 +683,7 @@ pub fn admit_portable_content_dependency_in_publication(
         resolution,
         Some(&contract),
         declarations,
-        &ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+        subject_resolution_authority,
         inherited,
         publication,
         "content-dependency",

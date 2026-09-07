@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-05T01:24:31Z:247a8f8366f4af0d519aec72610d8959f4eb7f035d705d48bf92389c15031786:FNmcfRpbdolCTOpSywuhNaAMoky2bCxBzTa2G/zpt69IFhFZtg1ozYP3UUCWwYz4FcQThIKAORMahMCKrVArBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T00:58:45Z:fa58311f2597deb6b6fb869d3b89c69f29fef050555aac036c71866230271a42:3OMLCmoiTP9zsFqfAXQ2GdzS1FI001GWr2KcXFXeTebUV+OhopiQHIXGVF2K1fD0iYzdoLLt6+7v3pksaeaiDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.0"
+version: "1.7.1"
 ```
 
 # Worker-Hosted Execution
@@ -176,6 +176,17 @@ existing external-content authority; the bridge receives only descriptor-
 rooted search directories and never inherits an ambient host `PATH`. Changing
 the config bytes at the same canonical ref therefore changes
 `exact_program_hash`.
+
+Portable content is not necessarily bundle-owned. A project environment's
+consumer binding is keyed by the exact definition generation already admitted
+by the outer launch, including a COW subject's current operational generation.
+Static preview and launch use that same authority; neither a live path nor the
+latest project HEAD can substitute for it. On another site, project content is
+resolved under that admitted definition generation and compared with its
+retained portable program before target-local binding admission. Installed
+execution and content dependencies remain projectless: selecting them from a
+project must not give their code a project overlay. Same-site recovery keeps
+the captured realizations rather than re-resolving mutable names.
 
 The v4 configuration may also declare `process_environment`. This is not an
 extension of content authority and is not a project/vault environment overlay.

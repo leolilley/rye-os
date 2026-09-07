@@ -140,6 +140,161 @@ fn request(hash: &str, maximum_bytes: u64) -> ImportRequest {
     })
 }
 
+#[test]
+fn portable_content_uses_the_admitted_project_generation_for_preview_and_launch() {
+    use ryeos_app::external_content_admission::{
+        admit_portable_content_dependency_in_publication, preview_portable_content_dependency,
+    };
+    use ryeos_engine::contracts::{ItemSourceRoot, ItemSpace, SubjectResolutionAuthority};
+    use ryeos_engine::resolution::{
+        KindComposedView, ResolutionOutput, ResolutionStepName, ResolvedAncestor, TrustClass,
+    };
+
+    let (_tmp, state, _context, source_binding_hash, manifest_hash) = fixture(false);
+    let resolution = ResolutionOutput {
+        root: ResolvedAncestor {
+            requested_id: "test/environment".into(),
+            resolved_ref: "config:test/environment".into(),
+            source_path: "/fixture/.ai/config/test/environment.yaml".into(),
+            source_space: ItemSpace::Project,
+            source_root: ItemSourceRoot::Project,
+            trust_class: TrustClass::TrustedProject,
+            signer_fingerprint: Some("a".repeat(64)),
+            alias_resolution: None,
+            added_by: ResolutionStepName::PipelineInit,
+            raw_content: String::new(),
+            source_content_digest: "b".repeat(64),
+            raw_content_digest: "c".repeat(64),
+        },
+        ancestors: Vec::new(),
+        references_edges: Vec::new(),
+        referenced_items: Vec::new(),
+        step_outputs: Default::default(),
+        effective_trust_class: TrustClass::TrustedProject,
+        composed: KindComposedView::identity(json!({
+            "external_content": [{
+                "id":"content", "kind":"tree", "mode":"pinned",
+                "digest":manifest_hash, "mount_root":"project", "mount":"content"
+            }]
+        })),
+    };
+    let snapshot_hash = "d".repeat(64);
+    let consumer = ExternalContentConsumerAuthority::pinned_project(
+        resolution.root.resolved_ref.clone(),
+        "a".repeat(64),
+        snapshot_hash.clone(),
+        ryeos_engine::external_content::pre_external_realization_consumer_digest(&resolution)
+            .unwrap(),
+        None,
+    )
+    .unwrap();
+    let authority = state.state_store.pinned_state_authority().unwrap();
+    let guard = authority.acquire_exclusive_guard(true).unwrap();
+    let cas = authority.cas_store().unwrap();
+    let source =
+        ExternalContentBinding::from_value(&cas.get_object(&source_binding_hash).unwrap().unwrap())
+            .unwrap();
+    let binding = ExternalContentBinding::active(
+        manifest_hash,
+        source.manifest_kind,
+        consumer,
+        source.target_node_fingerprint,
+        source.authorized_by,
+        source.authorizer_grant_digest,
+    )
+    .unwrap();
+    let binding_hash = cas.store_object(&binding.to_value().unwrap()).unwrap();
+    let signer = ryeos_app::state_store::NodeIdentitySigner::from_identity(&state.identity);
+    state
+        .state_store
+        .with_state_db(|db| {
+            db.advance_generic_head_ref(
+                ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE,
+                &binding.binding_subject_id,
+                &binding_hash,
+                None,
+                &signer,
+                &guard,
+            )
+        })
+        .unwrap();
+    drop(guard);
+    let policy = ryeos_engine::runtime_registry::LaunchContentExternalPolicy {
+        allowed_mount_roots: vec![ryeos_state::objects::ExternalContentMountRoot::Project],
+        max_declarations: 1,
+        large_content_max_total_bytes: None,
+    };
+    // COW uses its current admitted generation, not its original base or a
+    // mutable path. Both preview and launch must select the same exact binding.
+    for subject in [
+        SubjectResolutionAuthority::PinnedGeneration {
+            snapshot_hash: snapshot_hash.clone(),
+        },
+        SubjectResolutionAuthority::CowWorkspace {
+            base_snapshot_hash: "e".repeat(64),
+            current_operational_generation: snapshot_hash,
+        },
+    ] {
+        let preview =
+            preview_portable_content_dependency(&state, &resolution, &policy, &subject).unwrap();
+        assert!(preview.ready_for_admission);
+        assert_eq!(
+            preview.declarations[0].binding_digest.as_deref(),
+            Some(binding_hash.as_str())
+        );
+        let mut admitted = resolution.clone();
+        let mut publication = None;
+        admit_portable_content_dependency_in_publication(
+            &state,
+            &mut admitted,
+            &policy,
+            &subject,
+            None,
+            &mut publication,
+        )
+        .unwrap();
+        assert!(publication.is_some());
+    }
+    for subject in [
+        SubjectResolutionAuthority::Projectless,
+        SubjectResolutionAuthority::LiveFs,
+    ] {
+        assert!(
+            preview_portable_content_dependency(&state, &resolution, &policy, &subject).is_err()
+        );
+        assert!(
+            admit_portable_content_dependency_in_publication(
+                &state,
+                &mut resolution.clone(),
+                &policy,
+                &subject,
+                None,
+                &mut None,
+            )
+            .is_err()
+        );
+    }
+    let other = SubjectResolutionAuthority::PinnedGeneration {
+        snapshot_hash: "f".repeat(64),
+    };
+    assert!(
+        !preview_portable_content_dependency(&state, &resolution, &policy, &other)
+            .unwrap()
+            .ready_for_admission
+    );
+    let error = admit_portable_content_dependency_in_publication(
+        &state,
+        &mut resolution.clone(),
+        &policy,
+        &other,
+        None,
+        &mut None,
+    )
+    .err()
+    .expect("another snapshot must not borrow the admitted consumer binding");
+    assert!(error.downcast_ref::<ryeos_app::external_content_admission::ExternalContentBindingUnavailable>().is_some());
+}
+
 #[tokio::test]
 async fn exact_binding_reuse_preserves_manifest_and_independent_durable_stage() {
     for large_tier in [false, true] {

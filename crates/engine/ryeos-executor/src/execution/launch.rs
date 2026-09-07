@@ -4470,6 +4470,8 @@ async fn prepare_managed_launch_authority(
             engine,
             &params.resolved.plan_context.requested_by,
             &mut prepared_launch,
+            &engine_roots,
+            &subject_resolution_authority,
         )
         .map_err(BuildAndLaunchError::Internal)?;
     }
@@ -4478,6 +4480,7 @@ async fn prepare_managed_launch_authority(
             params.state,
             engine,
             &mut prepared_launch,
+            &subject_resolution_authority,
             admitted_capsule.is_some() && !cross_site_continuation,
         )
         .map_err(|error| {

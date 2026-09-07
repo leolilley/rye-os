@@ -471,6 +471,8 @@ pub(crate) fn reset_for_cross_site_admission(
     engine: &ryeos_engine::engine::Engine,
     principal: &EffectivePrincipal,
     prepared: &mut PreparedRuntimeLaunch,
+    roots: &ryeos_engine::item_resolution::ResolutionRoots,
+    subject_resolution_authority: &SubjectResolutionAuthority,
 ) -> Result<()> {
     // This is a new receiving-node admission, not same-node recovery. Preserve
     // the portable contract exactly, but refuse a node that cannot admit its
@@ -573,12 +575,12 @@ pub(crate) fn reset_for_cross_site_admission(
         let canonical =
             ryeos_engine::canonical_ref::CanonicalRef::parse(&dependency.canonical_ref)?;
         let target_resolution =
-            engine.effective_resolution_output(ryeos_engine::engine::EffectiveItemRequest {
-                item_ref: canonical,
-                expected_kind: None,
-                project_root: None,
-                subject_resolution_authority: SubjectResolutionAuthority::Projectless,
-            })?;
+            engine.effective_resolution_output(transferred_content_resolution_request(
+                canonical,
+                source_resolution.root.source_space,
+                roots,
+                subject_resolution_authority,
+            )?)?;
         let source_portable =
             ryeos_engine::resolution::RetainedResolutionOutput::capture(&source_resolution);
         let target_portable =
@@ -593,6 +595,40 @@ pub(crate) fn reset_for_cross_site_admission(
         dependency.validate()?;
     }
     Ok(())
+}
+
+/// Content retains its own source authority on the receiving site. Installed
+/// dependencies must not gain a project overlay, while project content must
+/// resolve under the outer admission's exact definition generation (not the
+/// worker's mutable execution view). The portable comparison still follows.
+fn transferred_content_resolution_request(
+    item_ref: ryeos_engine::canonical_ref::CanonicalRef,
+    source_space: ryeos_engine::contracts::ItemSpace,
+    roots: &ryeos_engine::item_resolution::ResolutionRoots,
+    subject: &SubjectResolutionAuthority,
+) -> Result<ryeos_engine::engine::EffectiveItemRequest> {
+    let (project_root, subject_resolution_authority) = match source_space {
+        ryeos_engine::contracts::ItemSpace::Bundle => {
+            (None, SubjectResolutionAuthority::Projectless)
+        }
+        ryeos_engine::contracts::ItemSpace::Project => {
+            if subject.operational_generation().is_none() {
+                bail!("transferred project content requires exact generation authority");
+            }
+            let root = roots.authoritative_project_root()?;
+            subject.validate_for_materialized_root(root)?;
+            (root, subject.clone())
+        }
+        ryeos_engine::contracts::ItemSpace::Node => {
+            bail!("node content cannot be a portable content dependency");
+        }
+    };
+    Ok(ryeos_engine::engine::EffectiveItemRequest {
+        item_ref,
+        expected_kind: None,
+        project_root: project_root.map(std::path::Path::to_path_buf),
+        subject_resolution_authority,
+    })
 }
 
 fn require_receiving_content_contract(
@@ -659,12 +695,18 @@ pub(crate) fn admit_or_verify_prepared_sessions(
     state: &AppState,
     engine: &ryeos_engine::engine::Engine,
     prepared: &mut PreparedRuntimeLaunch,
+    subject_resolution_authority: &SubjectResolutionAuthority,
     recovered: bool,
 ) -> Result<AdmittedSessionPublications> {
     validate_prepared_content_targets(state, prepared)?;
     let mut expected_names = BTreeSet::new();
     let (content_by_target, search_by_target, realizations_by_dependency, mut publications) =
-        admit_or_verify_content_dependencies(state, prepared, recovered)?;
+        admit_or_verify_content_dependencies(
+            state,
+            prepared,
+            subject_resolution_authority,
+            recovered,
+        )?;
     let environment_by_target = resolve_target_environments(
         state,
         &prepared.environment_contributions,
@@ -795,8 +837,12 @@ pub(crate) fn preview_prepared_dependencies(
     state: &AppState,
     engine: &ryeos_engine::engine::Engine,
     prepared: &PreparedRuntimeLaunch,
+    subject_resolution_authority: &SubjectResolutionAuthority,
 ) -> Result<PreparedDependencyValidationPreview> {
     validate_prepared_content_targets(state, prepared)?;
+    // Execution dependencies are admitted bundle programs. This projectless
+    // lookup must not be copied into the content-dependency pass below: a
+    // project-bound contributor keeps the outer root's definition generation.
     let roots = engine.resolution_roots(None);
     let mut execution_dependencies = BTreeMap::new();
     let mut content_dependencies = BTreeMap::new();
@@ -891,6 +937,7 @@ pub(crate) fn preview_prepared_dependencies(
                 state,
                 &resolution,
                 &dependency.external_content_policy,
+                subject_resolution_authority,
             )?;
         let ready = preview.validation.ready_for_admission;
         if let Some(realized) = preview.realizations.as_ref() {
@@ -1111,6 +1158,7 @@ type RealizationsByDependency =
 fn admit_or_verify_content_dependencies(
     state: &AppState,
     prepared: &mut PreparedRuntimeLaunch,
+    subject_resolution_authority: &SubjectResolutionAuthority,
     recovered: bool,
 ) -> Result<(
     TargetContentSets,
@@ -1143,6 +1191,7 @@ fn admit_or_verify_content_dependencies(
                 state,
                 &mut resolution,
                 &dependency.external_content_policy,
+                subject_resolution_authority,
                 None,
                 &mut publication,
             )?;
@@ -2833,6 +2882,60 @@ fn canonical_hash(value: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_content_keeps_project_generation_without_overlaying_bundle_dependencies() {
+        use ryeos_engine::contracts::ItemSpace;
+        use ryeos_engine::item_resolution::ResolutionRoots;
+        let project = std::path::PathBuf::from("/admitted/definition-generation");
+        let roots = ResolutionRoots::from_registered(Some(project.clone()), &[]);
+        let subject = SubjectResolutionAuthority::CowWorkspace {
+            base_snapshot_hash: "a".repeat(64),
+            current_operational_generation: "b".repeat(64),
+        };
+        let request = |space, roots: &ResolutionRoots, subject: &SubjectResolutionAuthority| {
+            transferred_content_resolution_request(
+                ryeos_engine::canonical_ref::CanonicalRef::parse("config:fixture/content").unwrap(),
+                space,
+                roots,
+                subject,
+            )
+        };
+        let bundle = request(ItemSpace::Bundle, &roots, &subject).unwrap();
+        assert!(bundle.project_root.is_none());
+        assert_eq!(
+            bundle.subject_resolution_authority,
+            SubjectResolutionAuthority::Projectless
+        );
+        let pinned = request(ItemSpace::Project, &roots, &subject).unwrap();
+        assert_eq!(pinned.project_root, Some(project));
+        assert_eq!(pinned.subject_resolution_authority, subject);
+        assert!(
+            request(
+                ItemSpace::Project,
+                &roots,
+                &SubjectResolutionAuthority::LiveFs
+            )
+            .is_err()
+        );
+        assert!(
+            request(
+                ItemSpace::Project,
+                &roots,
+                &SubjectResolutionAuthority::Projectless
+            )
+            .is_err()
+        );
+        assert!(
+            request(
+                ItemSpace::Project,
+                &ResolutionRoots::from_registered(None, &[]),
+                &subject
+            )
+            .is_err()
+        );
+        assert!(request(ItemSpace::Node, &roots, &subject).is_err());
+    }
 
     #[test]
     fn evidence_destination_is_strictly_below_its_signed_prefix() {

@@ -412,6 +412,7 @@ async fn dispatch_managed_subprocess(
             state,
             &ctx.engine,
             &launch_contract,
+            root_admission.resolution_subject_authority(),
         )
         .map_err(DispatchError::Internal)?;
         let dependencies_ready = dependencies.admission_ready;
