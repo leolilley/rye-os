@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T03:16:26Z:7e41e4f6713e54efb139addb60efbd58638ded2b4f811ecdb0279018131dea18:xAsLVMaA4jp/o/XQJjWITPteZOuCxIHDBfftTifjcM0kBWD/XufNwBP1Yrp801JXle9KU79XGNJs/PpTFG8kBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T11:20:21Z:476c87d5ce88b7992b95998ffdeb1acf38115dc72b5f41af90384b32c9eb378e:ycR8F9hRahCbF1rOiHwuI3dtbqRXgCddf56F0QEgFslRgSimnU4HojCPyM1ZeYmy0k9afAtq3NFDBv456ilJCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
@@ -39,6 +39,14 @@ failed-start settlement. Refusal text, PID absence, and attempted kill/wait
 are never cleanup proof. Missing proof keeps the credential/workspace fence.
 This in-memory proof cannot retroactively settle a historical attempt which
 lost its launcher identity; replay must retain that uncertainty.
+
+Adopting a control channel at standard-input coordinate zero may leave that
+coordinate vacant. The bridge's fresh workload pipes must still survive exec;
+Lillux applies the same child-only stdio preservation used by its subprocess
+runner. No ambient standard stream or dummy host file is substituted. Startup
+diagnostics distinguish request/notification phases and may include the exact
+child's OS exit status, but never upstream private stderr. Those diagnostics
+remain separate from the daemon's cleanup testimony.
 
 Bound source has separate daemon and workload coordinates. Daemon baseline
 preparation reads the already-pinned, verified source generation under its

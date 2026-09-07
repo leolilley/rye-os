@@ -944,6 +944,30 @@ fn preserve_configured_stdio_across_exec() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Configure three fresh pipes for a directly driven child command.
+///
+/// Use this for full-duplex callers that own `ChildStdin`/`ChildStdout` rather
+/// than Lillux's buffered subprocess runner. Consuming an inherited channel
+/// can leave fd 0 closed: Rust may then allocate its CLOEXEC stdin pipe at fd
+/// 0 and skip dup2 in the fork/pre-exec path. Reuse the runner's exact child
+/// stdio preservation, not ambient `/dev/null` reopening or parent flag edits.
+/// Callers must not replace these streams with inherited stdio afterwards.
+pub fn configure_command_piped_stdio(command: &mut process::Command) {
+    command
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: Command installs our three fresh streams before this hook;
+        // the shared helper uses only allocation-free descriptor syscalls.
+        unsafe {
+            command.pre_exec(preserve_configured_stdio_across_exec);
+        }
+    }
+}
+
 fn bind_inherited_channel_to_subprocess_request(
     channel: &InheritedDescriptorAuthority,
     request: &mut SubprocessRequest,

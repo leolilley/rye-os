@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1491,12 +1491,13 @@ impl StructuredWorkload {
         let mut command = Command::new(executable);
         lillux::configure_command_argv0(&mut command, workload_argv0)
             .map_err(anyhow::Error::msg)?;
+        // Adopting the session control channel can consume fd 0. Lillux must
+        // preserve the newly configured pipes through the child exec; plain
+        // Stdio::piped plus a pre-exec hook can otherwise close stdin again.
+        lillux::configure_command_piped_stdio(&mut command);
         command
             .args(&profile.workload_args)
             .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .env_clear()
             .env("LANG", "C")
             .env("LC_ALL", "C")
