@@ -119,6 +119,7 @@ pub struct ExecutionHistoryResetReport {
     pub thread_runtime_artifacts: usize,
     pub scheduler_journal_artifacts: usize,
     pub scheduler_rows: ryeos_scheduler::db::SchedulerFireHistoryAccounting,
+    pub replay_indexes: ryeos_state::operational::ReplayIndexResetReport,
     pub projection: ProjectionDiscardReport,
 }
 
@@ -254,6 +255,52 @@ fn run_execution_history_reset_inner(
     let scheduler_journal_preview = discard_scheduler_fire_journals(&runtime_directory, true)
         .context("inspect scheduler fire journals")?;
 
+    // Replay indexes are disposable execution authority; credentials are not.
+    // Inspect both through the existing operational owner before dry-run can
+    // succeed. Never use ordinary current-open here: it correctly rejects
+    // predecessor replay epochs, even though this command explicitly retires
+    // them. The restricted preparation cannot service replay or retire rows.
+    let prepared_replay =
+        ryeos_state::OperationalDb::prepare_replay_reset_with_namespace_authority(
+            &runtime_directory,
+            runtime_directory_lock.clone(),
+            options.dry_run,
+        )
+        .context("prepare replay retirement and stable credential preservation")?;
+    let replay_indexes = prepared_replay.report();
+    let stable_profiles = prepared_replay
+        .credential_profiles()
+        .context("validate stable credential-profile authority before history retirement")?;
+
+    // Credential-profile lifecycle authority is stable node state, not
+    // execution history. OperationalDb is the only authority carried across
+    // this cutover; a predecessor RuntimeDb is deliberately opaque and its
+    // credential projection is never decoded as a compatibility format.
+    // An enrolling ceremony is owned by worker/session history that this
+    // operation retires. Its invalidation is itself a monotonic transition in
+    // the stable authority and happens before any runtime-schema mutation.
+    let stable_profiles = stable_profiles
+        .into_iter()
+        .map(|profile| -> Result<_> {
+            if profile.state != "enrolling" {
+                return Ok(profile);
+            }
+            let mut invalidated = profile;
+            invalidated.authority_revision = invalidated
+                .authority_revision
+                .checked_add(1)
+                .context("credential authority revision overflow during history retirement")?;
+            invalidated.state = "unauthenticated".to_owned();
+            invalidated.active_login_id = None;
+            invalidated.login_expires_at_ms = None;
+            invalidated.sanitized_account = None;
+            invalidated.updated_at_ms = invalidated
+                .updated_at_ms
+                .max(lillux::time::timestamp_millis() as i64);
+            Ok(invalidated)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     if options.dry_run {
         publish_progress(&mut observer, ExecutionHistoryResetPhase::Complete, None);
         return Ok(ExecutionHistoryResetReport {
@@ -267,55 +314,13 @@ fn run_execution_history_reset_inner(
             thread_runtime_artifacts: thread_runtime_preview,
             scheduler_journal_artifacts: scheduler_journal_preview,
             scheduler_rows: scheduler_preview,
+            replay_indexes,
             projection: ProjectionDiscardReport {
                 superseded_instances_deleted: authoritative_preview.superseded_projection_instances,
                 ..ProjectionDiscardReport::default()
             },
         });
     }
-
-    // Credential-profile lifecycle authority is stable node state, not
-    // execution history. OperationalDb is the only authority carried across
-    // this cutover; a predecessor RuntimeDb is deliberately opaque and its
-    // credential projection is never decoded as a compatibility format.
-    let operational_db =
-        ryeos_state::OperationalDb::open_existing_current_with_namespace_authority(
-            &runtime_directory,
-            runtime_directory_lock.clone(),
-            false,
-        )
-        .context("open stable operational authority for credential preservation")?;
-    operational_db
-        .credential_profiles()
-        .context("validate stable credential-profile authority before history retirement")?;
-    // An enrolling ceremony is owned by worker/session history that this
-    // operation retires. Its invalidation is itself a monotonic transition in
-    // the stable authority and happens before any runtime-schema mutation.
-    for profile in operational_db.credential_profiles()? {
-        if profile.state != "enrolling" {
-            continue;
-        }
-        let mut invalidated = profile;
-        invalidated.authority_revision = invalidated
-            .authority_revision
-            .checked_add(1)
-            .context("credential authority revision overflow during history retirement")?;
-        invalidated.state = "unauthenticated".to_owned();
-        invalidated.active_login_id = None;
-        invalidated.login_expires_at_ms = None;
-        invalidated.sanitized_account = None;
-        invalidated.updated_at_ms = invalidated
-            .updated_at_ms
-            .max(lillux::time::timestamp_millis() as i64);
-        operational_db
-            .merge_credential_profile(&invalidated)
-            .context("invalidate retired credential enrollment")?;
-    }
-    // Materialize and validate the exact stable records before any discard
-    // intent or runtime-schema mutation is published.
-    let stable_profiles = operational_db
-        .credential_profiles()
-        .context("capture stable credential profiles before history retirement")?;
 
     publish_progress(
         &mut observer,
@@ -325,6 +330,16 @@ fn run_execution_history_reset_inner(
     state_db
         .begin_thread_history_discard_admitted(&cas_guard)
         .context("publish offline thread-history discard intent")?;
+    // Only after durable intent may any replay rows or enrolling ceremonies
+    // be retired. A crash leaves the existing discard marker for safe retry.
+    let (operational_db, replay_indexes) = prepared_replay
+        .activate()
+        .context("activate replay indexes after durable discard intent")?;
+    for profile in &stable_profiles {
+        operational_db
+            .merge_credential_profile(profile)
+            .context("preserve stable credential authority and invalidate retired enrollment")?;
+    }
     runtime_db
         .apply_explicit_history_reset(&config.db_path)
         .context("apply runtime schema cutover after durable discard intent")?;
@@ -421,6 +436,7 @@ fn run_execution_history_reset_inner(
         thread_runtime_artifacts,
         scheduler_journal_artifacts,
         scheduler_rows: scheduler_preview,
+        replay_indexes,
         projection: ProjectionDiscardReport {
             chains_rebuilt: rebuilt.chains_rebuilt,
             threads_restored: rebuilt.threads_restored,
@@ -793,6 +809,141 @@ mod tests {
         let report = inspect_scheduler_db(&path, &directory).unwrap();
         assert_eq!(report.total_rows(), Some(0));
         assert_eq!(source_snapshot(), before);
+    }
+
+    #[test]
+    fn history_reset_composes_replay_cutover_and_preserves_stable_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::load(&ConfigSources {
+            app_root: Some(tmp.path().to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+        let identity =
+            crate::identity::NodeIdentity::create(&config.node_signing_key_path).unwrap();
+        let identity_bytes = std::fs::read(&config.node_signing_key_path).unwrap();
+        let mut trust = ryeos_state::refs::TrustStore::new();
+        trust.insert(identity.fingerprint().to_owned(), *identity.verifying_key());
+        let trust = Arc::new(trust);
+        drop(ryeos_state::StateDb::open(&config.runtime_state_dir(), trust.clone()).unwrap());
+        drop(RuntimeDb::open(&config.db_path).unwrap());
+        drop(StateLock::acquire(&default_lock_path(tmp.path())).unwrap());
+        let operational_path = config
+            .runtime_state_dir()
+            .join(ryeos_state::operational::OPERATIONAL_DB_FILENAME);
+        let profile = ryeos_state::operational::OperationalCredentialProfileRecord {
+            profile_id: "retained-active".to_owned(),
+            owner_principal: "operator".to_owned(),
+            home_id: "home".to_owned(),
+            authority_revision: 3,
+            credential_generation: 2,
+            state: "active".to_owned(),
+            active_login_id: None,
+            login_epoch: 1,
+            login_expires_at_ms: None,
+            sanitized_account: Some(serde_json::json!({"account_id":"retained-account"})),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let mut enrolling = profile.clone();
+        enrolling.profile_id = "retired-enrollment".to_owned();
+        enrolling.home_id = "enrollment-home".to_owned();
+        enrolling.state = "enrolling".to_owned();
+        enrolling.active_login_id = Some("old-login".to_owned());
+        enrolling.login_expires_at_ms = Some(100);
+        {
+            let db = ryeos_state::OperationalDb::open_existing_current(&operational_path).unwrap();
+            db.merge_credential_profile(&profile).unwrap();
+            db.merge_credential_profile(&enrolling).unwrap();
+        }
+        let current_replay_epoch = {
+            let conn = rusqlite::Connection::open(&operational_path).unwrap();
+            let epoch: i32 = conn
+                .query_row("SELECT epoch FROM replay_index_epoch", [], |r| r.get(0))
+                .unwrap();
+            conn.execute_batch("UPDATE replay_index_epoch SET epoch = epoch - 2;")
+                .unwrap();
+            epoch
+        };
+        {
+            let conn = rusqlite::Connection::open(&config.db_path).unwrap();
+            let app_id: i32 = conn
+                .query_row("PRAGMA application_id", [], |r| r.get(0))
+                .unwrap();
+            conn.pragma_update(None, "application_id", app_id - 1)
+                .unwrap();
+        }
+        let options = ExecutionHistoryResetOptions {
+            app_root: Some(tmp.path().to_owned()),
+            dry_run: true,
+            discard_project_heads: false,
+        };
+        let runtime_before = std::fs::read(&config.db_path).unwrap();
+        let operational_before = std::fs::read(&operational_path).unwrap();
+        let preview = run_execution_history_reset(&options).unwrap();
+        assert_eq!(
+            preview.replay_indexes.scope,
+            ryeos_state::operational::ReplayIndexResetScope::AllReplayRecords
+        );
+        assert_eq!(
+            preview.replay_indexes.stored_epoch,
+            current_replay_epoch - 2
+        );
+        assert_eq!(std::fs::read(&config.db_path).unwrap(), runtime_before);
+        assert_eq!(
+            std::fs::read(&operational_path).unwrap(),
+            operational_before
+        );
+        assert!(ryeos_state::OperationalDb::open_existing_current(&operational_path).is_err());
+
+        // Model resumption after a process dies with the existing durable
+        // discard intent published but before replay/runtime activation.
+        {
+            let state = ryeos_state::StateDb::open_for_projection_rebuild(
+                &config.runtime_state_dir(),
+                trust.clone(),
+            )
+            .unwrap();
+            let authority = state.pinned_authority().unwrap();
+            let guard = authority.acquire_exclusive_guard(true).unwrap();
+            state.begin_thread_history_discard_admitted(&guard).unwrap();
+        }
+        let options = ExecutionHistoryResetOptions {
+            dry_run: false,
+            ..options
+        };
+        let report = run_execution_history_reset(&options).unwrap();
+        assert_eq!(report.replay_indexes, preview.replay_indexes);
+        let db = ryeos_state::OperationalDb::open_existing_current(&operational_path).unwrap();
+        assert_eq!(
+            db.credential_profile(&profile.profile_id).unwrap(),
+            Some(profile)
+        );
+        let retired = db
+            .credential_profile(&enrolling.profile_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.state, "unauthenticated");
+        assert_eq!(retired.authority_revision, enrolling.authority_revision + 1);
+        assert_eq!(
+            retired.credential_generation,
+            enrolling.credential_generation
+        );
+        assert_eq!(retired.home_id, enrolling.home_id);
+        assert!(retired.active_login_id.is_none());
+        assert!(retired.sanitized_account.is_none());
+        drop(db);
+        drop(RuntimeDb::open(&config.db_path).unwrap());
+        drop(ryeos_state::StateDb::open(&config.runtime_state_dir(), trust).unwrap());
+        let repeated = run_execution_history_reset(&options).unwrap();
+        assert_eq!(
+            repeated.replay_indexes.scope,
+            ryeos_state::operational::ReplayIndexResetScope::Unchanged
+        );
+        assert_eq!(
+            std::fs::read(&config.node_signing_key_path).unwrap(),
+            identity_bytes
+        );
     }
 
     #[test]

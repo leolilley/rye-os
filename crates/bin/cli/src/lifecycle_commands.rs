@@ -402,7 +402,7 @@ fn run_node_policy_apply_command(argv: &[String], console: &crate::tty::Console)
 #[command(
     name = "ryeos node reset replay-indexes",
     about = "Activate the current replay-index contract",
-    long_about = "Perform the explicit clean-cut replay-index activation. The daemon must be stopped. Predecessor dispatch-effect rows are discarded; provider-call evidence, thread history, CAS content, sync state, admission attestations, and accounting state are preserved.",
+    long_about = "Perform the explicit clean-cut replay-index activation. The daemon must be stopped. The immediate predecessor retires dispatch-effect rows only; skipped replay generations retire all replay-index rows, including provider-call rows. Current indexes are unchanged. Credentials, thread history, CAS content, sync state, admission attestations, and accounting state are preserved.",
     no_binary_name = true
 )]
 struct NodeReplayResetArgs {
@@ -438,23 +438,46 @@ fn run_node_replay_reset_command(argv: &[String], console: &crate::tty::Console)
     let path = config
         .runtime_state_dir()
         .join(ryeos_state::operational::OPERATIONAL_DB_FILENAME);
-    let db = ryeos_state::OperationalDb::open_for_explicit_replay_reset(&path)
+    let (db, report) = ryeos_state::OperationalDb::open_for_explicit_replay_reset(&path)
         .with_context(|| format!("activate replay indexes in {}", path.display()))?;
     drop(db);
     if args.json {
         crate::tty::write_json(&serde_json::json!({
             "status": "activated",
             "database": path,
-            "discarded": ["dispatch_effect_records"],
-            "preserved": ["provider_call_records"],
+            "replay_indexes": report,
         }))?;
     } else {
-        console.text(&format!(
-            "Replay indexes activated: {}\nPredecessor dispatch-effect records were discarded; provider-call records, thread history, and other operational state were preserved.\n",
-            path.display()
-        ))?;
+        let mut status =
+            crate::tty::StatusBanner::new(crate::tty::Tone::Success, "REPLAY INDEX RESET COMPLETE");
+        status.detail = Some(path.display().to_string());
+        status.rows = vec![
+            crate::tty::Row::key_value("replay indexes", replay_reset_summary(report)),
+            crate::tty::Row::key_value(
+                "preserved",
+                "credentials, thread history, CAS bytes and non-replay operational state",
+            ),
+        ];
+        console.success(&status)?;
     }
     Ok(())
+}
+
+fn replay_reset_summary(report: ryeos_state::operational::ReplayIndexResetReport) -> String {
+    use ryeos_state::operational::ReplayIndexResetScope;
+    let scope = match report.scope {
+        ReplayIndexResetScope::Unchanged => "unchanged",
+        ReplayIndexResetScope::DispatchEffects => {
+            "retire dispatch-effect rows; retain provider-call rows"
+        }
+        ReplayIndexResetScope::AllReplayRecords => {
+            "retire all replay rows, including provider-call rows"
+        }
+    };
+    format!(
+        "epoch {} -> {}: {scope}",
+        report.stored_epoch, report.current_epoch
+    )
 }
 
 #[derive(Parser, Debug)]
@@ -643,7 +666,7 @@ fn run_node_auth_reset_command(argv: &[String], console: &crate::tty::Console) -
 #[command(
     name = "ryeos node reset execution-history",
     about = "Retire the local execution-history epoch while the daemon is stopped",
-    long_about = "Retire every authoritative thread-chain head, clear execution recovery rows/files and scheduler fire history, and publish an empty current thread projection. This is an offline schema/authority reset, not storage garbage collection. Principal and deployed project HEADs are preserved unless --include-project-heads is selected. Node identity, trust, config, installed bundles, vault data, signed schedule definitions, operational sync/admission state, and independently retained logs/caches are preserved. Restart the daemon and run ordinary `ryeos maintenance gc` later to reclaim newly unreachable CAS storage.",
+    long_about = "Retire every authoritative thread-chain head, clear execution recovery rows/files and scheduler fire history, activate stale replay indexes, and publish an empty current thread projection. Replay activation retires dispatch-effect rows for the immediate predecessor, or all replay rows including provider-call rows for skipped generations. This is an offline schema/authority reset, not storage garbage collection. Principal and deployed project HEADs are preserved unless --include-project-heads is selected. Node identity, trust, config, installed bundles, vault data, signed schedule definitions, operational sync/admission state, and independently retained logs/caches are preserved. Restart the daemon and run ordinary `ryeos maintenance gc` later to reclaim newly unreachable CAS storage.",
     no_binary_name = true
 )]
 struct ExecutionHistoryResetArgs {
@@ -736,6 +759,10 @@ fn run_execution_history_reset_command(
     status.rows = vec![
         crate::tty::Row::key_value("chain heads", report.chain_heads.to_string()),
         crate::tty::Row::key_value("project heads", report.project_heads.to_string()),
+        crate::tty::Row::key_value(
+            "replay indexes",
+            replay_reset_summary(report.replay_indexes),
+        ),
         crate::tty::Row::key_value(
             "chain/recovery artifacts",
             (report.chain_ref_artifacts + report.pending_transitions).to_string(),
@@ -2025,6 +2052,32 @@ fn default_app_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_reset_reporting_distinguishes_current_and_skipped_epochs() {
+        use ryeos_state::operational::{ReplayIndexResetReport, ReplayIndexResetScope};
+        for (scope, expected) in [
+            (ReplayIndexResetScope::Unchanged, "unchanged"),
+            (
+                ReplayIndexResetScope::DispatchEffects,
+                "retain provider-call rows",
+            ),
+            (
+                ReplayIndexResetScope::AllReplayRecords,
+                "retire all replay rows, including provider-call rows",
+            ),
+        ] {
+            let report = ReplayIndexResetReport {
+                stored_epoch: 1,
+                current_epoch: 3,
+                scope,
+            };
+            assert!(replay_reset_summary(report).contains(expected));
+            let encoded = serde_json::to_value(report).unwrap();
+            assert_eq!(encoded["stored_epoch"], 1);
+            assert_eq!(encoded["current_epoch"], 3);
+        }
+    }
 
     fn execution_history_reset_args(dry_run: bool, confirm: bool) -> ExecutionHistoryResetArgs {
         ExecutionHistoryResetArgs {

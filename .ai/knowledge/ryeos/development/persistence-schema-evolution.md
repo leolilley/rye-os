@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-06T22:17:52Z:649163698e13291817e20cd5773fa7ea163c1200f4376db2d5200c91488f79c9:3vtIGr8Dxk5jMu6gfyk+OYP8Na4NRnPwKdA2CMsYKwVZsBwVETwgao0qT2VZiLyqRaxXQkIAMEzGWKxc/7REBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T06:05:34Z:5bdbc956c19e5f7505c296dbea51e74fb81d9bbdf18eec16fe170019e6c87986:IvYKqctQ9/9WIOoMQXNKNaNiXenSEtZR1bRPe0oowZmFy5cVy4114UR26ZvBBwqho29/cierkmZzQEHdaKgECg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
 title: "Persistence Schema Evolution"
 description: "Rules for immutable CAS wire identities, retained SQLite migrations, rebuildable projections, and explicit history retirement"
 entry_type: reference
-version: "2.3.0"
+version: "2.3.1"
 ```
 
 # Persistence Schema Evolution
@@ -266,6 +266,19 @@ both cases. The next ordinary GC reclaims objects that are no longer rooted.
 Launch-capsule schema changes must therefore make an explicit replay-epoch
 decision; they must never leave predecessor effect rows silently pinning an
 undecodable closure.
+
+The confirmed `ryeos node reset execution-history --confirm` operation composes
+this same replay activation; operators do not need to discover and run a second
+reset first. It inspects the replay retirement scope and stable credential
+records under the existing stopped-node and pinned namespace locks, including
+during dry-run. A restricted preparation handle cannot service replay. Only
+after publishing the existing durable history-discard intent does it activate
+the replay indexes, invalidate retired enrollment ceremonies, and reset runtime
+history. Active credential profiles and private-home identities remain stable.
+A retry after interruption reuses that intent and the idempotent activation.
+Ordinary startup remains strict; this is not a stale-index compatibility path.
+Both CLI reset reports expose the actual source/target epoch and whether no
+rows, dispatch-effect rows, or all replay rows were selected for retirement.
 
 `accounting.sqlite3` is the durable financial source of truth paired with its
 node-local external financial anchor. Accounting schema v2 extends the exact v1

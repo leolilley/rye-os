@@ -1095,6 +1095,67 @@ impl std::fmt::Display for ReplayIndexActivationRequired {
 
 impl std::error::Error for ReplayIndexActivationRequired {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayIndexResetScope {
+    Unchanged,
+    DispatchEffects,
+    AllReplayRecords,
+}
+
+/// The same epoch-based retirement decision is used for preview and commit.
+/// This describes index rows, not deletion of the immutable CAS objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ReplayIndexResetReport {
+    pub stored_epoch: i32,
+    pub current_epoch: i32,
+    pub scope: ReplayIndexResetScope,
+}
+
+/// Offline reset preparation, deliberately not a usable replay database.
+/// Callers may inspect stable credentials before publishing their existing
+/// discard intent. Only activation releases a current OperationalDb. Do not
+/// expose the inner store or add stale-epoch exceptions to ordinary open.
+pub struct PreparedReplayIndexReset {
+    db: OperationalDb,
+    report: ReplayIndexResetReport,
+    read_only: bool,
+}
+
+impl PreparedReplayIndexReset {
+    fn new(db: OperationalDb, read_only: bool) -> Result<Self> {
+        let report = inspect_replay_index_reset(&db.conn, &db.path)?;
+        Ok(Self {
+            db,
+            report,
+            read_only,
+        })
+    }
+
+    pub fn report(&self) -> ReplayIndexResetReport {
+        self.report
+    }
+
+    pub fn credential_profiles(&self) -> Result<Vec<OperationalCredentialProfileRecord>> {
+        self.db.credential_profiles()
+    }
+
+    pub fn activate(self) -> Result<(OperationalDb, ReplayIndexResetReport)> {
+        if self.read_only {
+            anyhow::bail!("read-only replay-index preview cannot activate a reset");
+        }
+        ensure_operational_bindings(&self.db)?;
+        let report = inspect_replay_index_reset(&self.db.conn, &self.db.path)?;
+        if report != self.report {
+            anyhow::bail!("replay-index retirement decision changed after preparation");
+        }
+        enforce_replay_index_epoch(&self.db.conn, &self.db.path, true)?;
+        assert_current(&self.db.conn, &self.db.path)?;
+        ensure_operational_bindings(&self.db)?;
+        Ok((self.db, report))
+    }
+}
+
 impl OperationalDb {
     /// Open the stable store at its protocol-owned runtime-state path.
     ///
@@ -1219,17 +1280,17 @@ impl OperationalDb {
     /// unified predecessor it retires only dispatch-effect rows and preserves
     /// provider-call evidence; older pre-unified layouts are discarded as one
     /// explicit clean cut.
-    pub fn open_for_explicit_replay_reset(path: &Path) -> Result<Self> {
+    pub fn open_for_explicit_replay_reset(path: &Path) -> Result<(Self, ReplayIndexResetReport)> {
         let (directory, name) = pin_operational_parent(path, false)?;
         let directory_lock = directory.lock_exclusive()?;
         let db = Self::open_in_pinned_directory(
             &directory,
             &name,
-            OperationalOpenMode::ExistingReplayReset,
+            OperationalOpenMode::PrepareReplayReset { read_only: false },
             directory_lock,
         )?;
         assert_integrity(&db.conn, path)?;
-        Ok(db)
+        PreparedReplayIndexReset::new(db, false)?.activate()
     }
 
     /// Strictly open established operational state while sharing the caller's
@@ -1240,6 +1301,39 @@ impl OperationalDb {
         runtime_directory: &lillux::PinnedDirectory,
         directory_lock: lillux::PinnedDirectoryLock,
         read_only: bool,
+    ) -> Result<Self> {
+        Self::open_established_with_namespace_authority(
+            runtime_directory,
+            directory_lock,
+            if read_only {
+                OperationalOpenMode::ExistingReadOnly
+            } else {
+                OperationalOpenMode::ExistingReadWrite
+            },
+        )
+    }
+
+    /// Inspect replay retirement while retaining the caller's exact offline
+    /// namespace authority. No replay rows are changed until `activate`.
+    /// History reset uses this before durable intent, including for dry-run;
+    /// it must not open a normal replay handle merely to preserve credentials.
+    pub fn prepare_replay_reset_with_namespace_authority(
+        runtime_directory: &lillux::PinnedDirectory,
+        directory_lock: lillux::PinnedDirectoryLock,
+        read_only: bool,
+    ) -> Result<PreparedReplayIndexReset> {
+        let db = Self::open_established_with_namespace_authority(
+            runtime_directory,
+            directory_lock,
+            OperationalOpenMode::PrepareReplayReset { read_only },
+        )?;
+        PreparedReplayIndexReset::new(db, read_only)
+    }
+
+    fn open_established_with_namespace_authority(
+        runtime_directory: &lillux::PinnedDirectory,
+        directory_lock: lillux::PinnedDirectoryLock,
+        mode: OperationalOpenMode,
     ) -> Result<Self> {
         ensure_directory_path_still_pinned(runtime_directory)?;
         directory_lock.ensure_protects(runtime_directory)?;
@@ -1255,11 +1349,7 @@ impl OperationalDb {
         let mut db = Self::open_in_pinned_directory(
             runtime_directory,
             OsStr::new(OPERATIONAL_DB_FILENAME),
-            if read_only {
-                OperationalOpenMode::ExistingReadOnly
-            } else {
-                OperationalOpenMode::ExistingReadWrite
-            },
+            mode,
             directory_lock,
         )?;
         db._initialization_marker = Some(marker);
@@ -1376,8 +1466,14 @@ impl OperationalDb {
             migrate_forward_if_owned(&conn, &path)?;
         }
         assert_operational_identity(&conn, &path)?;
-        enforce_replay_index_epoch(&conn, &path, mode.permits_replay_reset())?;
-        assert_current(&conn, &path)?;
+        if matches!(mode, OperationalOpenMode::PrepareReplayReset { .. }) {
+            // This handle remains private to PreparedReplayIndexReset. Validate
+            // the reset scope without exposing or interpreting stale replay.
+            inspect_replay_index_reset(&conn, &path)?;
+        } else {
+            enforce_replay_index_epoch(&conn, &path, false)?;
+            assert_current(&conn, &path)?;
+        }
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .context("read operational journal mode")?;
@@ -1642,7 +1738,7 @@ enum OperationalOpenMode {
     CreateOrOpen,
     ExistingReadWrite,
     ExistingReadOnly,
-    ExistingReplayReset,
+    PrepareReplayReset { read_only: bool },
 }
 
 impl OperationalOpenMode {
@@ -1655,11 +1751,10 @@ impl OperationalOpenMode {
     }
 
     fn is_read_only(self) -> bool {
-        matches!(self, Self::ExistingReadOnly)
-    }
-
-    fn permits_replay_reset(self) -> bool {
-        matches!(self, Self::ExistingReplayReset)
+        matches!(
+            self,
+            Self::ExistingReadOnly | Self::PrepareReplayReset { read_only: true }
+        )
     }
 }
 
@@ -2281,6 +2376,53 @@ fn assert_exact_legacy_replay_layout(conn: &Connection, path: &Path) -> Result<(
     Ok(())
 }
 
+fn inspect_replay_index_reset(conn: &Connection, path: &Path) -> Result<ReplayIndexResetReport> {
+    let stored = replay_index_epoch(conn)?;
+    if stored == REPLAY_INDEX_EPOCH {
+        assert_current(conn, path)?;
+        return Ok(ReplayIndexResetReport {
+            stored_epoch: stored,
+            current_epoch: REPLAY_INDEX_EPOCH,
+            scope: ReplayIndexResetScope::Unchanged,
+        });
+    }
+    if stored > REPLAY_INDEX_EPOCH {
+        anyhow::bail!(
+            "operational replay-index epoch in {} is newer than this binary: stored={stored}, current={REPLAY_INDEX_EPOCH}",
+            path.display()
+        );
+    }
+    // The pinned opener performs the full integrity check once before giving
+    // out a preparation. Reinspection under that retained namespace lock
+    // checks schema/epoch, not repeated full-database integrity scans.
+    let has_unified_replay_index: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'replay_records')",
+            [],
+            |row| row.get(0),
+        )
+        .context("inspect predecessor replay-index layout")?;
+    if has_unified_replay_index {
+        // Epoch contents may be stale, but a unified predecessor must retain
+        // the exact current physical schema before any row is discarded.
+        assert_current(conn, path).context("validate unified replay predecessor before reset")?;
+    } else {
+        // The only admitted pre-unified shape is the exact v2/v3 pair. Do not
+        // let DROP TABLE normalize an unknown/corrupt table into something
+        // that merely looks current after the destructive cut.
+        assert_exact_legacy_replay_layout(conn, path)?;
+    }
+    Ok(ReplayIndexResetReport {
+        stored_epoch: stored,
+        current_epoch: REPLAY_INDEX_EPOCH,
+        scope: if has_unified_replay_index && stored == REPLAY_INDEX_EPOCH - 1 {
+            ReplayIndexResetScope::DispatchEffects
+        } else {
+            ReplayIndexResetScope::AllReplayRecords
+        },
+    })
+}
+
 fn enforce_replay_index_epoch(conn: &Connection, path: &Path, explicit_reset: bool) -> Result<()> {
     let stored = replay_index_epoch(conn)?;
     if stored == REPLAY_INDEX_EPOCH {
@@ -2299,36 +2441,15 @@ fn enforce_replay_index_epoch(conn: &Connection, path: &Path, explicit_reset: bo
         }
         .into());
     }
-    let integrity: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .context("verify operational database before replay-index reset")?;
-    if integrity != "ok" {
-        anyhow::bail!(
-            "operational database integrity check failed before replay-index reset for {}: {integrity}",
-            path.display()
-        );
-    }
-    let has_unified_replay_index: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'replay_records')",
-            [],
-            |row| row.get(0),
-        )
-        .context("inspect predecessor replay-index layout")?;
-    if has_unified_replay_index {
-        // Epoch contents may be stale, but a unified predecessor must retain
-        // the exact current physical schema before any row is discarded.
-        assert_current(conn, path).context("validate unified replay predecessor before reset")?;
-    } else {
-        // The only admitted pre-unified shape is the exact v2/v3 pair. Do not
-        // let DROP TABLE normalize an unknown/corrupt table into something
-        // that merely looks current after the destructive cut.
-        assert_exact_legacy_replay_layout(conn, path)?;
-    }
+    let report = inspect_replay_index_reset(conn, path)?;
+    let has_unified_replay_index: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'replay_records')",
+        [], |row| row.get(0),
+    )?;
     let tx = conn
         .unchecked_transaction()
         .context("begin explicit replay-index reset")?;
-    let preserve_provider_records = has_unified_replay_index && stored == REPLAY_INDEX_EPOCH - 1;
+    let preserve_provider_records = report.scope == ReplayIndexResetScope::DispatchEffects;
     tx.execute_batch(if preserve_provider_records {
         REPLAY_INDEX_RESET_DDL
     } else if has_unified_replay_index {
@@ -4563,7 +4684,7 @@ mod tests {
                 .downcast_ref::<ReplayIndexActivationRequired>()
                 .is_some()
         );
-        let db = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
+        let (db, _) = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -4624,7 +4745,7 @@ mod tests {
                 .downcast_ref::<ReplayIndexActivationRequired>()
                 .is_some()
         );
-        let db = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
+        let (db, _) = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
         assert!(db.list_replay_record_hashes().unwrap().is_empty());
     }
 
@@ -4732,6 +4853,167 @@ mod tests {
     }
 
     #[test]
+    fn replay_reset_preparation_preserves_credentials_and_is_non_mutating() {
+        for epochs_back in [0, 1, 2] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let path = tempdir.path().join(OPERATIONAL_DB_FILENAME);
+            let profile = OperationalCredentialProfileRecord {
+                profile_id: "preserved".to_owned(),
+                owner_principal: "operator".to_owned(),
+                home_id: "private-home".to_owned(),
+                authority_revision: 7,
+                credential_generation: 2,
+                state: "active".to_owned(),
+                active_login_id: None,
+                login_epoch: 1,
+                login_expires_at_ms: None,
+                sanitized_account: Some(serde_json::json!({"account_id":"account"})),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            };
+            {
+                let db = OperationalDb::open_at_runtime_state_dir(tempdir.path()).unwrap();
+                db.merge_credential_profile(&profile).unwrap();
+                db.conn
+                    .execute_batch(
+                        "INSERT INTO replay_records VALUES ('dispatch.effect',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                     'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                     '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');",
+                    )
+                    .unwrap();
+                db.conn
+                    .execute(
+                        "UPDATE replay_index_epoch SET epoch = ?1",
+                        [REPLAY_INDEX_EPOCH - epochs_back],
+                    )
+                    .unwrap();
+            }
+            let directory = lillux::PinnedDirectory::open(tempdir.path())
+                .unwrap()
+                .unwrap();
+            let lock = directory.lock_exclusive().unwrap();
+            let preview = OperationalDb::prepare_replay_reset_with_namespace_authority(
+                &directory,
+                lock.clone(),
+                true,
+            )
+            .unwrap();
+            let expected = preview.report();
+            assert_eq!(
+                expected.scope,
+                match epochs_back {
+                    0 => ReplayIndexResetScope::Unchanged,
+                    1 => ReplayIndexResetScope::DispatchEffects,
+                    _ => ReplayIndexResetScope::AllReplayRecords,
+                }
+            );
+            assert_eq!(
+                preview.credential_profiles().unwrap(),
+                vec![profile.clone()]
+            );
+            assert!(preview.activate().is_err());
+            // Dropping preparation (including a crashed caller before intent)
+            // leaves the old epoch and rows intact. No full replay handle escapes.
+            let prepared = OperationalDb::prepare_replay_reset_with_namespace_authority(
+                &directory,
+                lock.clone(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(prepared.report(), expected);
+            drop(prepared);
+            {
+                let conn = Connection::open(&path).unwrap();
+                assert_eq!(
+                    replay_index_epoch(&conn).unwrap(),
+                    REPLAY_INDEX_EPOCH - epochs_back
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM replay_records", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
+            if epochs_back > 0 {
+                assert!(
+                    OperationalDb::open_existing_current_with_namespace_authority(
+                        &directory,
+                        lock.clone(),
+                        false
+                    )
+                    .is_err()
+                );
+            }
+            let (db, actual) = OperationalDb::prepare_replay_reset_with_namespace_authority(
+                &directory,
+                lock.clone(),
+                false,
+            )
+            .unwrap()
+            .activate()
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(db.credential_profiles().unwrap(), vec![profile]);
+            assert_eq!(
+                db.list_replay_record_hashes().unwrap().len(),
+                usize::from(epochs_back == 0)
+            );
+            drop(db);
+            let repeated = OperationalDb::prepare_replay_reset_with_namespace_authority(
+                &directory, lock, false,
+            )
+            .unwrap();
+            assert_eq!(repeated.report().scope, ReplayIndexResetScope::Unchanged);
+            repeated.activate().unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_reset_preparation_refuses_future_epoch_and_wrong_namespace_lock() {
+        let tempdir = tempfile::tempdir().unwrap();
+        {
+            let db = OperationalDb::open_at_runtime_state_dir(tempdir.path()).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE replay_index_epoch SET epoch = ?1",
+                    [REPLAY_INDEX_EPOCH + 1],
+                )
+                .unwrap();
+        }
+        let directory = lillux::PinnedDirectory::open(tempdir.path())
+            .unwrap()
+            .unwrap();
+        let lock = directory.lock_exclusive().unwrap();
+        for read_only in [true, false] {
+            assert!(
+                OperationalDb::prepare_replay_reset_with_namespace_authority(
+                    &directory,
+                    lock.clone(),
+                    read_only,
+                )
+                .is_err()
+            );
+        }
+        let unrelated = tempfile::tempdir().unwrap();
+        let other = lillux::PinnedDirectory::open(unrelated.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            OperationalDb::prepare_replay_reset_with_namespace_authority(
+                &directory,
+                other.lock_exclusive().unwrap(),
+                false,
+            )
+            .is_err()
+        );
+        let conn = Connection::open(tempdir.path().join(OPERATIONAL_DB_FILENAME)).unwrap();
+        assert_eq!(replay_index_epoch(&conn).unwrap(), REPLAY_INDEX_EPOCH + 1);
+    }
+
+    #[test]
     fn skipped_replay_generations_discard_all_unproven_rows() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join(OPERATIONAL_DB_FILENAME);
@@ -4768,7 +5050,8 @@ mod tests {
                 .downcast_ref::<ReplayIndexActivationRequired>()
                 .is_some()
         );
-        let db = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
+        let (db, report) = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
+        assert_eq!(report.scope, ReplayIndexResetScope::AllReplayRecords);
         assert!(db.list_replay_record_hashes().unwrap().is_empty());
         assert_eq!(replay_index_epoch(&db.conn).unwrap(), REPLAY_INDEX_EPOCH);
     }
@@ -4808,7 +5091,8 @@ mod tests {
         }
 
         assert!(OperationalDb::open(&path).is_err());
-        let db = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
+        let (db, report) = OperationalDb::open_for_explicit_replay_reset(&path).unwrap();
+        assert_eq!(report.scope, ReplayIndexResetScope::DispatchEffects);
         let rows: Vec<(String, String)> = db
             .conn
             .prepare("SELECT namespace, record_hash FROM replay_records ORDER BY namespace")
