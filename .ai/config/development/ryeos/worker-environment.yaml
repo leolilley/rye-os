@@ -1,7 +1,8 @@
-# ryeos:signed:2026-09-06T05:11:00Z:3f77125598bd5ffad69e9d275b7539f1c084bef5c608d76777f9a0b3abc99f8d:SJ+/Rqu0PyXpht3k+kQ2CK7ts4PLx/I+0xMhwVnZ8VWV6eQSh0oZ0b2go0FsaSrDJIOfZwp9ezd8Cq0FLnqfAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T04:44:03Z:5200cbd2aa599c680101cc470fab11dff0926041bbb097bab71f8ef682d9d006:wW6+mQg57AHV8wQYw1N4jRlV33NWw0KmkC0yHJXdH7lRYD5GHsT67HC6NSyN9eCogj3Hb0RAg9Q74xU/F5DHCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 # Root authoring and child operations are separate admitted programs. This
-# environment requests only the concrete operations already implemented below;
-# compiler and dependency trees remain each child Tool's own external content.
+# environment requests only the finite project operations below. Their ordinary
+# installed execution has been qualified; worker-to-child acceptance is a
+# separate gate. Compiler/dependency trees remain child-owned external content.
 category: development/ryeos
 schema: ryeos.worker_environment.v4
 worker_ref: worker:codex/hosted-authoring
@@ -40,6 +41,21 @@ workload_client:
     realization_id: workload-client
     relative_path: bin/ryeos
   executions:
+    - item_ref: tool:ryeos/development/cargo-build
+      ref_bindings: {}
+      calls: [{kind: default}]
+      effect_classes: [live]
+      workspace_access: immutable_current_generation
+    - item_ref: tool:ryeos/development/cargo-check
+      ref_bindings: {}
+      calls: [{kind: default}]
+      effect_classes: [live]
+      workspace_access: immutable_current_generation
+    - item_ref: tool:ryeos/development/cargo-test
+      ref_bindings: {}
+      calls: [{kind: default}]
+      effect_classes: [live]
+      workspace_access: immutable_current_generation
     - item_ref: tool:ryeos/development/format-check
       ref_bindings: {}
       calls: [{kind: default}]

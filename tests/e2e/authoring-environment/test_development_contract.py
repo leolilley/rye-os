@@ -35,6 +35,8 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
         routes = self.environment["workload_client"]["executions"]
         refs = [route["item_ref"] for route in routes]
         self.assertEqual(refs, sorted(set(refs)))
+        self.assertEqual(refs, ["tool:ryeos/development/" + operation for operation in (
+            "cargo-build", "cargo-check", "cargo-test", "format-check", "format-file", "platform-inspect")])
         for route in routes:
             self.assertTrue(route["item_ref"].startswith("tool:ryeos/development/"))
             tool = load(".ai/tools/" + route["item_ref"].removeprefix("tool:") + ".yaml")

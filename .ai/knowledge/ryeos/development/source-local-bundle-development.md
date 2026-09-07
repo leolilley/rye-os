@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T01:28:01Z:d40eec4cfead9714030edab0c30e4f2d2de509ad2ab6bc7131844ac68ba99788:ru58c55/zaUL3f0HOKkR+d3MYwjw2TTwuqpK8ydQknnGQJbbQQhG0hWeZ3CKTwHO1OLyAvMaII1ESoGda3h5CA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T04:53:44Z:21d604b50181e28d486c96d29074ee5c849b43dc19661fd5cac526c41677bbc4:Bo4qg8elWEKOAWlAELBrcluhDK3PsZC5mJ/FGKpCm8mpT6un0O/yCzeLqxWN8N8BWaFYYv4B6EC70YTvK7ajDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.11.1"
+version: "1.12.0"
 ```
 
 # Source-Local Bundle Development
@@ -226,8 +226,9 @@ and [cargo vendor](https://doc.rust-lang.org/cargo/commands/cargo-vendor.html).
 
 The project-owned `config:development/ryeos/worker-environment` composes the
 shared authoring environment with the exact restricted-client tree. Its finite
-request currently contains only `format-check`, `format-file` and
-`platform-inspect`; each workspace-access assertion matches the corresponding
+request contains `format-check`, `format-file`, `platform-inspect` and the
+bounded `cargo-check`, `cargo-build`, `cargo-test` operations. Each
+workspace-access assertion matches the corresponding
 signed Tool. Compiler content is child-owned, not root-worker content. The
 request does not itself grant authority: node policy, initiating principal,
 parent delegation and resolved child contracts still intersect at admission.
@@ -245,10 +246,38 @@ name. They use offline locked resolution, two jobs, private Cargo/target state
 and no caller-selected flags. A test process exiting successfully with zero
 matched tests is not positive qualification evidence.
 
-Those three Tools are source-authored, not yet installed-qualified or added
-to worker grants. Exact target-local bindings, positive and broken-source
-checks, and the worker-to-child loop remain gates. Broader workspace packages
-and native build dependencies are not implied by this finite first selection.
+Installed, operator-driven Cargo qualification passed on 2026-09-07 against a
+captured clean source checkout: check/build for both selected packages, and
+one actual exact test in each. A separate one-file broken snapshot produced
+the intended failing test and exit 101. Captures used signed node/project
+policy; no host Cargo, network acquisition, operator vault, primary-node reset
+or execution-driven HEAD publication was involved. See the exact evidence coordinates
+in `tests/e2e/development-cargo/qualification.json`.
+
+The Lillux test exposed an omitted link input in the original recipe. The
+platform already contains `libc_nonshared.a`; its `libc.so` is a verified ELF
+copy, not the publisher's absolute-path linker script. All three Cargo Tools
+and the independent bootstrap probe now explicitly link that admitted archive.
+This preserves glibc's nonshared input without a replacement implementation,
+host library, new platform pin or executor branch. The corrected Lillux test
+links and executes successfully. The strengthened bootstrap fixture is source
+coverage; its complete publisher-image reproduction still needs qualification.
+
+These finite operations are now requested by the signed development environment;
+new snapshots still require exact target-local bindings and admission. This does
+not qualify a worker-to-child invocation: the installed runs were operator-driven.
+Worker edit/shared-child/restart/candidate and remote return/apply remain gates.
+Broader workspace packages and native build dependencies are not implied by
+this finite first selection. The approved eight-file worker fixture retains its
+earlier three-operation grant until that separate fixture is explicitly updated.
+
+The maintainer `ryeos verify` command also currently fails under this enforced
+profile: its offline inspect bootstrap tries to reopen node bundle registrations
+inside the restricted process. Signature generation/source-contract checks are
+not a claim that this command passed. Complete that remaining preflight path
+using retained engine authority, as node-owned bundle verification already does;
+do not mount node-private configuration or disable isolation for inspection.
+
 The development node's object-closure policy admits the approximately 576 MB
 vendor tree with a 640 MiB aggregate blob ceiling; it still fits the existing
 1 GiB response bound. No compiler-specific runtime limit or bypass is added.
@@ -608,6 +637,8 @@ Moving a file under `.ai/tools/` does not by itself make it an admitted operatio
 Retained human/CI wrappers can become thin calls to qualified project Tools.
 Do not delete their existing implementation or silently move host assumptions
 into the worker before the replacement executes with its complete declared
-inputs. Locked dependency production, Cargo check/build/focused-test Tools,
-Stage-1 reproduction and the worker-to-child loop remain explicit completion
-gates; the bootstrap artifact and three declarations above do not close them.
+inputs. Locked dependency production and the finite installed Cargo operation
+selection now have the observations above. Broader packages, ordinary lint
+conversion, Stage-1 reproduction and the worker-to-child loop remain explicit
+completion gates; a compiler fixture or successful declarations alone cannot
+close them.
