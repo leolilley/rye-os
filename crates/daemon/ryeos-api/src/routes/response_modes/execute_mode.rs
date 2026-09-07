@@ -1009,11 +1009,11 @@ impl CompiledResponseMode for CompiledExecuteMode {
                 "validate_only is not supported with launch_mode='accepted'".to_string(),
             ));
         }
-        if request.validate_only && !matches!(&project_source, ProjectSource::LiveFs) {
-            return Err(RouteDispatchError::BadRequest(
-                "validate_only is not supported with pinned project authority".to_string(),
-            ));
-        }
+        // Validation uses the same selected project generation, request engine
+        // and root admission as execution. Do not replace pinned authority with
+        // LiveFs to inspect it: that loses its exact content bindings. The
+        // downstream validate-only branches prepare/preview the admitted route
+        // without launching the workload or publishing a terminal candidate.
         if request.state_root.is_some()
             && !matches!(
                 &request.execution_policy.project,
@@ -1335,8 +1335,22 @@ impl CompiledResponseMode for CompiledExecuteMode {
         };
 
         // Resolve project execution context.
-        let pinned_realization =
-            pinned_realization_from_execution_policy(&request.execution_policy.project);
+        let pinned_realization = pinned_realization_from_execution_policy(
+            &request.execution_policy.project,
+        )
+        .map(|realization| {
+            if request.validate_only {
+                // Preflight resolves immutable source, not a running
+                // workspace. Retain the requested execution policy for
+                // admission checks, but borrow the exact read-only cache
+                // generation for inspection. Allocating a CoW workspace
+                // here would leave a journal owner with no thread to
+                // settle it, and copy a project that is never executed.
+                project_source::PinnedContextRealization::ReadOnly
+            } else {
+                realization
+            }
+        });
         let mut project_ctx =
             match resolve_project_context_off_thread(ResolveProjectContextRequest {
                 state: state.clone(),

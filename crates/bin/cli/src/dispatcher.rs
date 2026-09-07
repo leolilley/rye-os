@@ -2652,6 +2652,50 @@ mod tests {
     }
 
     #[test]
+    fn signed_validate_command_uses_existing_pinned_admission_controls() {
+        let path =
+            ryeos_engine::test_support::core_bundle_root().join(".ai/node/commands/validate.yaml");
+        let body = std::fs::read_to_string(path).expect("read signed validate command");
+        let mut command: CommandDef =
+            serde_yaml::from_str(&body).expect("parse signed validate command");
+        command.name = "validate".to_string();
+        let project = tempfile::tempdir().unwrap();
+        let resolved = resolve_command_for_daemon_with_commands(
+            &s(&[
+                "validate",
+                "worker:test/session",
+                "--current-head",
+                "--no-operator-vault",
+                "--profile",
+                "bounded",
+            ]),
+            &[command],
+            &ryeos_runtime::CommandRegistrationPolicy::default(),
+            Some(project.path()),
+        )
+        .unwrap();
+
+        assert!(resolved.validate_only);
+        assert!(!resolved.async_launch);
+        assert!(resolved.pin_current_head_at_admission);
+        assert!(!resolved.pin_project_at_admission);
+        assert_eq!(
+            resolved.parameters,
+            serde_json::json!({"profile": "bounded"})
+        );
+        assert_eq!(
+            execution_policy_value(true, false, false, true, false, true),
+            serde_json::to_value(
+                ryeos_app::execution_policy::ExecutionPolicy::local_pinned_current_head(
+                    ryeos_app::execution_policy::ExecutionResponse::Wait,
+                )
+                .exclude_operator_vault()
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
     fn direct_execute_pin_project_requires_project_authority() {
         let commands = vec![direct_execute_command()];
         let error = match resolve_command_for_daemon_with_commands(

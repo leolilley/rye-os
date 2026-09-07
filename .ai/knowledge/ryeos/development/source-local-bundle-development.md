@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T07:54:25Z:5bfb7a35e5c8068827fe8d0d4e348db5f9f8fff9f6e2281032cb792a88509211:CnaxO7CuGeI8H4TtxdTl73M07fwD5mlrlr918E+eKDx274t/T7Ls/DulQyCI/K9FPY+8U9uPE8ZaG3l+StWZCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T09:01:08Z:656b801fb4d9723c97c6d264bae3bb9b2367983934b50df0ec54938ad1b5a848:tRJp0DfkFn9/y00ogYFVxnJjODpgmAXfKzeqyDurjBuxQQEgsSTFQf22XPE7nfq1cTheiIF5QZql8j37YkmdBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -286,6 +286,13 @@ These finite operations are now requested by the signed development environment;
 new snapshots still require exact target-local bindings and admission. This does
 not qualify a worker-to-child invocation: the installed runs were operator-driven.
 Worker edit/shared-child/restart/candidate and remote return/apply remain gates.
+For exact project preflight, `ryeos validate <ref> --current-head
+--no-operator-vault` now uses the existing snapshot/admission path rather than
+live-source bindings. It borrows a read-only cache generation, retaining the
+requested launch policy without allocating a never-launched CoW workspace.
+The focused API check proves live drift cannot replace that generation and
+neither a thread nor HEAD publication occurs. Installed worker qualification
+remains separate. See `knowledge:ryeos/core/execution/threadless-validation`.
 Broader workspace packages and native build dependencies are not implied by
 this finite first selection. The approved eight-file worker fixture retains its
 earlier three-operation grant until that separate fixture is explicitly updated.
