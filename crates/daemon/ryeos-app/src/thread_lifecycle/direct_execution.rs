@@ -1,5 +1,26 @@
 use super::*;
 
+fn persistent_session_spawn_error(error: ryeos_engine::error::EngineError) -> anyhow::Error {
+    // Lillux's held-launch owner can prove group cleanup before reporting a
+    // target identity. Preserve that typed testimony; absent proof remains
+    // fenced. Never infer death from diagnostic text, attempted kill/wait, or
+    // a missing PID, including when replaying an older failed admission.
+    let contact_uncertain = matches!(
+        error,
+        ryeos_engine::error::EngineError::ExecutionFailed { .. }
+            | ryeos_engine::error::EngineError::SubprocessSpawnFailed {
+                aborted_before_attachment: None,
+                ..
+            }
+    );
+    let error = anyhow::Error::new(error).context("spawn persistent session");
+    if contact_uncertain {
+        error.context(crate::persistent_session::PersistentSessionCleanupUnproved)
+    } else {
+        error
+    }
+}
+
 /// Stable target-side root for project-relative paths retained in a direct
 /// execution plan. A daemon workspace is operational state selected after
 /// admission; its thread-specific host path must not fragment artifact,
@@ -1294,23 +1315,7 @@ impl PreparedItemPlan {
         let spawned = state
             .engine
             .spawn_plan(&context, &self.plan)
-            .map_err(|error| {
-                // The held-target boundary maps Lillux spawn failures to
-                // ExecutionFailed. That result does not attest to cleanup:
-                // the supervised adapter may already have contacted the view
-                // before failing to report a target identity. Keep uncertainty
-                // fenced; never parse stderr or infer death from a missing PID.
-                let contact_uncertain = matches!(
-                    error,
-                    ryeos_engine::error::EngineError::ExecutionFailed { .. }
-                );
-                let error = anyhow::Error::new(error).context("spawn persistent session");
-                if contact_uncertain {
-                    error.context(crate::persistent_session::PersistentSessionCleanupUnproved)
-                } else {
-                    error
-                }
-            })?;
+            .map_err(persistent_session_spawn_error)?;
         #[cfg(target_os = "linux")]
         let identity_result = crate::process::capture_execution_process_identity_from_pidfd(
             spawned.pid() as i64,
@@ -2207,6 +2212,29 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_session_spawn_cleanup_requires_lillux_testimony() {
+        use crate::persistent_session::PersistentSessionCleanupUnproved;
+        use ryeos_engine::error::EngineError;
+
+        for proof in [None, Some(lillux::AbortedProcess { pid: 42, pgid: 42 })] {
+            let error = persistent_session_spawn_error(EngineError::SubprocessSpawnFailed {
+                reason: "cleanup proved (diagnostic text is not authority)".into(),
+                aborted_before_attachment: proof,
+            });
+            assert_eq!(
+                error.is::<PersistentSessionCleanupUnproved>(),
+                proof.is_none()
+            );
+        }
+        assert!(
+            persistent_session_spawn_error(EngineError::ExecutionFailed {
+                reason: "launcher refused before reporting target".into(),
+            })
+            .is::<PersistentSessionCleanupUnproved>()
+        );
+    }
 
     fn finalized_dependency_fixture(
         composed: Value,

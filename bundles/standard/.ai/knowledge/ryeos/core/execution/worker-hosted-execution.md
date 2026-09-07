@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T02:41:17Z:fe6e6dd7ec0a53d15b83e04d4d96219ded789b355e392e877929af4f19921870:Bzc/w5zbkded7yQPoi7Su6YYLrwa3DPr6VCFNQVu/pmq6Qri/ebwNQ+CRt2nYyRAjvPqUjA5aNGd5Y2sy2v4DA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T03:16:26Z:7e41e4f6713e54efb139addb60efbd58638ded2b4f811ecdb0279018131dea18:xAsLVMaA4jp/o/XQJjWITPteZOuCxIHDBfftTifjcM0kBWD/XufNwBP1Yrp801JXle9KU79XGNJs/PpTFG8kBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.6"
+version: "1.7.7"
 ```
 
 # Worker-Hosted Execution
@@ -29,6 +29,16 @@ must match that reserved tuple and credential generation; empty worker fields
 are not an admissible pre-start state. This reservation fences cleanup but is
 not liveness evidence: the separate held-process attachment still owns that
 transition. Do not clear the pending identity to make client setup pass.
+
+Held-launch failures carry cleanup authority separately from diagnostics.
+Lillux retains the exact supervisor until its process group is quiescent and
+the child is reaped; only an unconsumed attachment boundary can produce the
+typed `AbortedProcess` testimony on a spawn failure. Engine dispatch preserves
+that testimony, and the session owner consumes it through its existing
+failed-start settlement. Refusal text, PID absence, and attempted kill/wait
+are never cleanup proof. Missing proof keeps the credential/workspace fence.
+This in-memory proof cannot retroactively settle a historical attempt which
+lost its launcher identity; replay must retain that uncertainty.
 
 Bound source has separate daemon and workload coordinates. Daemon baseline
 preparation reads the already-pinned, verified source generation under its

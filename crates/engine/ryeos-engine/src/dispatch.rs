@@ -565,11 +565,12 @@ fn subprocess_spawn_error(result: lillux::SubprocessResult) -> EngineError {
     // Lillux retains the bounded, structured launcher refusal separately from
     // workload stderr. Preserve it just as handler/preparer launch does; the
     // generic stderr placeholder is not an actionable isolation diagnosis.
-    EngineError::ExecutionFailed {
+    EngineError::SubprocessSpawnFailed {
         reason: match result.launcher_refusal {
             Some(refusal) => format!("isolation adapter refused launch: {refusal}"),
             None => format!("subprocess spawn failed: {}", result.stderr),
         },
+        aborted_before_attachment: result.aborted_before_attachment,
     }
 }
 
@@ -1048,6 +1049,7 @@ mod tests {
             pid: 42,
             timed_out: false,
             launcher_refusal: None,
+            aborted_before_attachment: None,
             output_limit_exceeded: None,
             stdout_truncated: false,
             stderr_truncated: false,
@@ -1073,6 +1075,7 @@ mod tests {
                 pid: 0,
                 timed_out: false,
                 launcher_refusal: refusal.clone(),
+                aborted_before_attachment: None,
                 output_limit_exceeded: None,
                 stdout_truncated: false,
                 stderr_truncated: false,
@@ -1089,6 +1092,34 @@ mod tests {
     }
 
     #[test]
+    fn spawn_failure_preserves_only_typed_held_cleanup_proof() {
+        for proof in [None, Some(lillux::AbortedProcess { pid: 42, pgid: 42 })] {
+            let error = subprocess_spawn_error(lillux::SubprocessResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "cleanup proved (untrusted diagnostic text)".into(),
+                exit_code: -1,
+                duration_ms: 1.0,
+                pid: 0,
+                timed_out: false,
+                launcher_refusal: Some("fixture refusal".into()),
+                aborted_before_attachment: proof,
+                output_limit_exceeded: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+            let EngineError::SubprocessSpawnFailed {
+                aborted_before_attachment,
+                ..
+            } = error
+            else {
+                panic!("held spawn must preserve its typed failure");
+            };
+            assert_eq!(aborted_before_attachment, proof);
+        }
+    }
+
+    #[test]
     fn output_limit_maps_to_a_distinct_failed_outcome() {
         let completion = translate_result(lillux::SubprocessResult {
             success: false,
@@ -1099,6 +1130,7 @@ mod tests {
             pid: 42,
             timed_out: false,
             launcher_refusal: None,
+            aborted_before_attachment: None,
             output_limit_exceeded: Some(lillux::OutputLimitExceeded::Stdout),
             stdout_truncated: true,
             stderr_truncated: false,

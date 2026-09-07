@@ -439,6 +439,11 @@ pub struct SubprocessResult {
     /// Canonical isolation-layer diagnostic emitted by a trusted launcher
     /// before target exec. Lillux validates only the strict outer envelope.
     pub launcher_refusal: Option<String>,
+    /// Exact held-launch cleanup proved by the existing process owner before
+    /// returning a spawn failure. Absence grants no cleanup authority: neither
+    /// a refusal diagnostic nor a missing target PID is a death certificate.
+    /// This is in-memory testimony, never inferred during history replay.
+    pub aborted_before_attachment: Option<AbortedProcess>,
     /// Set when a node-owned stdout/stderr retention limit was crossed. This
     /// outcome always makes `success` false, independently of the exit status.
     pub output_limit_exceeded: Option<OutputLimitExceeded>,
@@ -2215,8 +2220,10 @@ enum AttachmentPendingOwner {
     },
 }
 
-/// Proof that an attachment-pending process was explicitly aborted and its
-/// `Command::spawn` worker settled without allowing target execution.
+/// Proof that an attachment-pending process (or its pre-identity supervisor)
+/// was aborted, its owned group proved quiescent, and its exact child reaped
+/// without allowing target execution. Numeric fields identify the settled
+/// operation; they are not a new signalling authority after reap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbortedProcess {
     pub pid: u32,
@@ -2741,6 +2748,29 @@ impl RunningProcess {
         self.abort_and_reap_inner()
     }
 
+    /// Settle a supervised setup failure through the same owner as a running
+    /// process. Keep the unreaped wrapper as the PGID fence until every group
+    /// member is quiescent. Only an unconsumed attachment boundary proves that
+    /// target execution was never released; ordinary running failures do not.
+    fn into_spawn_failure(mut self, mut result: SubprocessResult) -> SubprocessResult {
+        let held = self.attachment_release.take().is_some();
+        let identity = AbortedProcess {
+            pid: self.pid,
+            pgid: self.pgid,
+        };
+        match self.abort_and_reap_inner() {
+            Ok(()) if held => result.aborted_before_attachment = Some(identity),
+            Ok(()) => {}
+            Err(error) => {
+                result.stderr = append_diagnostic(
+                    &result.stderr,
+                    &format!("held-launch cleanup remains unproved: {error}"),
+                );
+            }
+        }
+        result
+    }
+
     /// Wait for the process to finish (or time out) and return the result.
     pub fn wait(self) -> SubprocessResult {
         self.wait_interruptible(|| false)
@@ -2814,6 +2844,7 @@ impl RunningProcess {
                 pid: self.pid,
                 timed_out: false,
                 launcher_refusal: None,
+                aborted_before_attachment: None,
                 output_limit_exceeded: output_limit_exceeded(&out, &err),
                 stdout_truncated: out.truncated,
                 stderr_truncated: err.truncated,
@@ -2887,6 +2918,7 @@ impl RunningProcess {
             pid: self.pid,
             timed_out: false,
             launcher_refusal: None,
+            aborted_before_attachment: None,
             output_limit_exceeded: None,
             stdout_truncated: false,
             stderr_truncated: false,
@@ -2911,6 +2943,7 @@ impl RunningProcess {
             pid: self.pid,
             timed_out: false,
             launcher_refusal: None,
+            aborted_before_attachment: None,
             output_limit_exceeded: output_limit_exceeded(&out, &err),
             stdout_truncated: out.truncated,
             stderr_truncated: err.truncated,
@@ -3077,6 +3110,7 @@ impl RunningProcess {
             pid: self.pid,
             timed_out: true,
             launcher_refusal: None,
+            aborted_before_attachment: None,
             output_limit_exceeded: output_limit_exceeded(&out, &err),
             stdout_truncated: out.truncated,
             stderr_truncated: err.truncated,
@@ -3104,6 +3138,7 @@ impl RunningProcess {
             pid: self.pid,
             timed_out: false,
             launcher_refusal: None,
+            aborted_before_attachment: None,
             output_limit_exceeded: Some(exceeded),
             stdout_truncated: out.truncated,
             stderr_truncated: err.truncated,
@@ -3216,44 +3251,27 @@ pub fn lib_spawn_awaiting_attachment(
         let timeout = request.timeout;
         let running = lib_spawn_with_stdio(request, false, None)?;
         if running.attachment_release.is_none() {
-            let error = spawn_failure(
+            return Err(running.into_spawn_failure(spawn_failure(
                 start,
                 "Failed to spawn awaiting attachment: supervised target attachment boundary disappeared",
-            );
-            running.abort_and_reap_checked().map_err(|cleanup| {
-                spawn_failure(
-                    start,
-                    format!("{}; cleanup failed: {cleanup}", error.stderr),
-                )
-            })?;
-            return Err(error);
+            )));
         }
         let observed_birth = match read_linux_process_birth(running.pid) {
             Ok(birth) => birth,
             Err(error) => {
-                let cleanup = running.abort_and_reap_checked().err();
-                return Err(spawn_failure(
+                return Err(running.into_spawn_failure(spawn_failure(
                     start,
-                    format!(
-                        "Failed to inspect supervised target awaiting attachment: {error}{}",
-                        cleanup
-                            .map_or_else(String::new, |error| format!("; cleanup failed: {error}"))
-                    ),
-                ));
+                    format!("Failed to inspect supervised target awaiting attachment: {error}"),
+                )));
             }
         };
         let pidfd = match open_pidfd(running.pid) {
             Ok(pidfd) => pidfd,
             Err(error) => {
-                let cleanup = running.abort_and_reap_checked().err();
-                return Err(spawn_failure(
+                return Err(running.into_spawn_failure(spawn_failure(
                     start,
-                    format!(
-                        "Failed to pin supervised target awaiting attachment: {error}{}",
-                        cleanup
-                            .map_or_else(String::new, |error| format!("; cleanup failed: {error}"))
-                    ),
-                ));
+                    format!("Failed to pin supervised target awaiting attachment: {error}"),
+                )));
             }
         };
         if let Err(error) = validate_pinned_process_birth(
@@ -3266,14 +3284,10 @@ pub fn lib_spawn_awaiting_attachment(
         .and_then(|_| {
             validate_supervised_attachment_target(running.pid, running.pgid, pidfd.as_raw_fd())
         }) {
-            let cleanup = running.abort_and_reap_checked().err();
-            return Err(spawn_failure(
+            return Err(running.into_spawn_failure(spawn_failure(
                 start,
-                format!(
-                    "Invalid supervised target awaiting attachment: {error}{}",
-                    cleanup.map_or_else(String::new, |error| format!("; cleanup failed: {error}"))
-                ),
-            ));
+                format!("Invalid supervised target awaiting attachment: {error}"),
+            )));
         }
         return Ok(ProcessAwaitingAttachment {
             pid: running.pid,
@@ -3993,7 +4007,7 @@ fn lib_spawn_with_stdio(
         }
     }
 
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return Err(spawn_failure(start, format!("Failed to spawn: {e}"))),
     };
@@ -4019,23 +4033,60 @@ fn lib_spawn_with_stdio(
     let stderr_capture = Arc::new(OutputCapture::default());
     let drain_stop = Arc::new(AtomicBool::new(false));
     let (output_overflow_tx, output_overflow_rx) = std::sync::mpsc::channel();
+    let (status_reader, attachment_release) = match supervised_status.map(|status| status.state) {
+        Some(SupervisedProcessStatusState::Run { reader }) => (Some(reader), None),
+        Some(SupervisedProcessStatusState::AwaitingAttachment {
+            reader,
+            attachment_release,
+        }) => (Some(reader), Some(attachment_release)),
+        None => (None, None),
+    };
+    // The wrapper is already an owned process, even before its target report.
+    // Reuse that owner for every subsequent setup failure instead of reaping
+    // the wrapper first and losing the exact process-group cleanup fence.
+    let mut running = RunningProcess {
+        pid: wrapper_pid,
+        pgid: wrapper_pgid,
+        wrapper_pid,
+        wrapper_pgid,
+        child,
+        stdin_thread: None,
+        stdout_thread: None,
+        stderr_thread: None,
+        status_thread: None,
+        stdout_capture,
+        stderr_capture,
+        stdout_reader_taken: false,
+        drain_stop,
+        output_overflow_rx,
+        start,
+        timeout,
+        attachment_release,
+        groups_terminated: false,
+        wrapper_reaped: false,
+    };
     let (stdout_thread, stderr_thread) = if inherit_stdio {
-        stdout_capture.state.lock().unwrap().closed = true;
-        stderr_capture.state.lock().unwrap().closed = true;
+        running.stdout_capture.state.lock().unwrap().closed = true;
+        running.stderr_capture.state.lock().unwrap().closed = true;
         (thread::spawn(|| {}), thread::spawn(|| {}))
     } else {
-        let mut stdout_handle = child.stdout.take().expect("stdout configured as piped");
-        let mut stderr_handle = child.stderr.take().expect("stderr configured as piped");
+        let mut stdout_handle = running
+            .child
+            .stdout
+            .take()
+            .expect("stdout configured as piped");
+        let mut stderr_handle = running
+            .child
+            .stderr
+            .take()
+            .expect("stderr configured as piped");
         if let Err(error) = configure_nonblocking_fd(&mut stdout_handle)
             .and_then(|_| configure_nonblocking_fd(&mut stderr_handle))
         {
-            kill_process_group_if_safe(wrapper_pgid);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(spawn_failure(
+            return Err(running.into_spawn_failure(spawn_failure(
                 start,
                 format!("Failed to spawn: configure bounded output capture: {error}"),
-            ));
+            )));
         }
         (
             spawn_bounded_drain(
@@ -4047,8 +4098,8 @@ fn lib_spawn_with_stdio(
                         .unwrap_or(DEFAULT_MAX_CAPTURE_BYTES),
                 ),
                 CapturedStream::Stdout,
-                Arc::clone(&stdout_capture),
-                Arc::clone(&drain_stop),
+                Arc::clone(&running.stdout_capture),
+                Arc::clone(&running.drain_stop),
                 output_overflow_tx.clone(),
             ),
             spawn_bounded_drain(
@@ -4060,198 +4111,108 @@ fn lib_spawn_with_stdio(
                         .unwrap_or(DEFAULT_MAX_CAPTURE_BYTES),
                 ),
                 CapturedStream::Stderr,
-                Arc::clone(&stderr_capture),
-                Arc::clone(&drain_stop),
+                Arc::clone(&running.stderr_capture),
+                Arc::clone(&running.drain_stop),
                 output_overflow_tx,
             ),
         )
     };
+    running.stdout_thread = Some(stdout_thread);
+    running.stderr_thread = Some(stderr_thread);
 
     // Never write request input on the spawning thread. A child can stop
     // reading before the pipe buffer is empty; the dedicated writer may then
     // wait on WouldBlock, but it observes the same cleanup flag as the bounded
     // drainers. The request deadline can therefore terminate and join every
     // pipe worker even when the child never consumes the remaining input.
-    let mut stdin_thread =
-        match spawn_stdin_writer(child.stdin.take(), stdin_data, Arc::clone(&drain_stop)) {
-            Ok(thread) => thread,
-            Err(error) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(spawn_failure(
-                    start,
-                    format!("Failed to spawn: configure nonblocking stdin: {error}"),
-                ));
-            }
-        };
+    running.stdin_thread = match spawn_stdin_writer(
+        running.child.stdin.take(),
+        stdin_data,
+        Arc::clone(&running.drain_stop),
+    ) {
+        Ok(thread) => thread,
+        Err(error) => {
+            return Err(running.into_spawn_failure(spawn_failure(
+                start,
+                format!("Failed to spawn: configure nonblocking stdin: {error}"),
+            )));
+        }
+    };
 
-    let (identity, status_thread, attachment_release) = if let Some(status) = supervised_status {
-        let (reader, attachment_release) = match status.state {
-            SupervisedProcessStatusState::Run { reader } => (reader, None),
-            SupervisedProcessStatusState::AwaitingAttachment {
-                reader,
-                attachment_release,
-            } => (reader, Some(attachment_release)),
-        };
+    if let Some(reader) = status_reader {
         let (status_tx, status_rx) = std::sync::mpsc::channel();
         let status_thread = match spawn_supervised_launcher_status_reader(
             reader,
             status_tx,
-            Arc::clone(&drain_stop),
+            Arc::clone(&running.drain_stop),
         ) {
             Ok(handle) => handle,
             Err(error) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                if let Some(handle) = stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(spawn_failure(
+                return Err(running.into_spawn_failure(spawn_failure(
                     start,
                     format!(
                         "Failed to spawn: initialize supervised-launcher status reader: {error}"
                     ),
-                ));
+                )));
             }
         };
+        running.status_thread = Some(status_thread);
         let setup_deadline = supervised_setup_deadline(start, timeout);
         let setup_wait = setup_deadline.saturating_duration_since(Instant::now());
         let reported_pid = match status_rx.recv_timeout(setup_wait) {
             Ok(Ok(InitialLauncherStatus::Target(pid))) => pid,
             Ok(Ok(InitialLauncherStatus::Refused(diagnostic))) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                if let Some(handle) = stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                let _ = status_thread.join();
-                return Err(spawn_failure_with_launcher_refusal(start, diagnostic));
+                return Err(running
+                    .into_spawn_failure(spawn_failure_with_launcher_refusal(start, diagnostic)));
             }
             Ok(Err(error)) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                if let Some(handle) = stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                let _ = status_thread.join();
-                return Err(spawn_failure(
+                let failure = spawn_failure(
                     start,
                     append_captured_stderr(
                         format!("Failed to spawn: supervised launcher refused: {error}"),
-                        &stderr_capture,
+                        &running.stderr_capture,
                     ),
-                ));
+                );
+                return Err(running.into_spawn_failure(failure));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                if let Some(handle) = stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                let _ = status_thread.join();
-                return Err(spawn_failure(
+                let failure = spawn_failure(
                     start,
                     append_captured_stderr(
                         format!(
                             "Failed to spawn: supervised launcher did not report its target PID before the bounded setup/request deadline ({:.3} seconds remaining after launch setup)",
                             setup_wait.as_secs_f64()
                         ),
-                        &stderr_capture,
+                        &running.stderr_capture,
                     ),
-                ));
+                );
+                return Err(running.into_spawn_failure(failure));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                if let Some(handle) = stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                let _ = status_thread.join();
-                return Err(spawn_failure(
+                let failure = spawn_failure(
                     start,
                     append_captured_stderr(
                         "Failed to spawn: supervised-launcher status channel closed before reporting its target PID".to_owned(),
-                        &stderr_capture,
+                        &running.stderr_capture,
                     ),
-                ));
+                );
+                return Err(running.into_spawn_failure(failure));
             }
         };
         let identity = match resolve_supervised_identity(reported_pid, wrapper_pid, wrapper_pgid) {
             Ok(identity) => identity,
             Err(error) => {
-                kill_process_group_if_safe(wrapper_pgid);
-                let _ = child.kill();
-                let _ = child.wait();
-                drain_stop.store(true, Ordering::Release);
-                if let Some(handle) = stdin_thread.take() {
-                    let _ = handle.join();
-                }
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                let _ = status_thread.join();
-                return Err(spawn_failure(
+                return Err(running.into_spawn_failure(spawn_failure(
                     start,
                     format!("Failed to spawn: invalid supervised target identity: {error}"),
-                ));
+                )));
             }
         };
-        (identity, Some(status_thread), attachment_release)
-    } else {
-        (
-            ProcessIdentity {
-                pid: wrapper_pid,
-                pgid: wrapper_pgid,
-            },
-            None,
-            None,
-        )
-    };
+        running.pid = identity.pid;
+        running.pgid = identity.pgid;
+    }
 
-    Ok(RunningProcess {
-        pid: identity.pid,
-        pgid: identity.pgid,
-        wrapper_pid,
-        wrapper_pgid,
-        child,
-        stdin_thread,
-        stdout_thread: Some(stdout_thread),
-        stderr_thread: Some(stderr_thread),
-        status_thread,
-        stdout_capture,
-        stderr_capture,
-        stdout_reader_taken: false,
-        drain_stop,
-        output_overflow_rx,
-        start,
-        timeout,
-        attachment_release,
-        groups_terminated: false,
-        wrapper_reaped: false,
-    })
+    Ok(running)
 }
 
 fn spawn_stdin_writer(
@@ -5453,20 +5414,6 @@ fn kill_owned_process_group(pid: u32, pgid: i64, leader_owned: bool) {
 #[cfg(not(unix))]
 fn kill_owned_process_group(_pid: u32, _pgid: i64, _leader_owned: bool) {}
 
-#[cfg(unix)]
-fn kill_process_group_if_safe(pgid: i64) {
-    let current_pgid = unsafe { libc::getpgrp() } as i64;
-    if pgid <= 1 || pgid == current_pgid || pgid > i32::MAX as i64 {
-        return;
-    }
-    unsafe {
-        libc::kill(-(pgid as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group_if_safe(_pgid: i64) {}
-
 fn take_capture(capture: &SharedCapture) -> BoundedCapture {
     // Drainers have been joined before settlement. A still-live byte reader
     // must retain its bounded bytes/EOF even if the process settles first.
@@ -5542,6 +5489,7 @@ fn spawn_failure(start: Instant, reason: impl Into<String>) -> SubprocessResult 
         pid: 0,
         timed_out: false,
         launcher_refusal: None,
+        aborted_before_attachment: None,
         output_limit_exceeded: None,
         stdout_truncated: false,
         stderr_truncated: false,
@@ -5558,6 +5506,7 @@ fn spawn_failure_with_launcher_refusal(start: Instant, diagnostic: String) -> Su
         pid: 0,
         timed_out: false,
         launcher_refusal: Some(diagnostic),
+        aborted_before_attachment: None,
         output_limit_exceeded: None,
         stdout_truncated: false,
         stderr_truncated: false,

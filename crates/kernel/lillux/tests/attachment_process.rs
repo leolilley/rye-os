@@ -227,6 +227,45 @@ fn normal_spawn_rejects_an_attachment_bearing_supervisor() {
 }
 
 #[test]
+fn held_launcher_setup_failures_return_exact_cleanup_proof() {
+    for response in [
+        Some(r#"{"refused":{"code":"launch_refused","message":"fixture refusal"}}"#),
+        Some("invalid-json"),
+        Some(r#"{"child-pid":0}"#),
+        None,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("executed");
+        let pipe = supervised_launcher_attachment_status_pipe().unwrap();
+        let status_fd = pipe.writer_descriptor().unwrap();
+        let report = response.map_or_else(String::new, |document| {
+            format!("printf '%s\\n' '{document}' >&{status_fd};")
+        });
+        let mut request = shell(format!(
+            "{report} /bin/sleep 30; printf unexpected > {}",
+            marker.display()
+        ));
+        request.timeout = if response.is_none() { 0.2 } else { 5.0 };
+        request.inherited_fds.push(pipe.writer);
+        request.inherited_fds.push(pipe.attachment_release_reader);
+        request
+            .inherited_fds
+            .push(pipe.attachment_release_keepalive_writer);
+        request.supervised_status = Some(pipe.reader);
+        let Err(result) = spawn_awaiting_attachment(request) else {
+            panic!("invalid setup must not return a releasable process");
+        };
+        let proof = result
+            .aborted_before_attachment
+            .expect("checked group cleanup");
+        assert!(proof.pid > 0);
+        assert_eq!(i64::from(proof.pid), proof.pgid);
+        assert!(!is_alive(proof.pid), "owned launcher was not reaped");
+        assert!(!marker.exists());
+    }
+}
+
+#[test]
 fn attachment_spawn_rejects_supervision_without_a_target_boundary() {
     let pipe = supervised_launcher_status_pipe().expect("status pipe");
     let mut request = shell("exit 0".to_string());

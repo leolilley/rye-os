@@ -1706,12 +1706,7 @@ mod imp {
             let source = raw_fd(*source)?;
             let target = RawFd::try_from(*target)
                 .map_err(|_| "target channel descriptor exceeds RawFd".to_string())?;
-            if source != target {
-                syscall_zero(
-                    unsafe { libc::dup3(source, target, 0) },
-                    "place sandbox target channel",
-                )?;
-            }
+            place_target_channel(source, target)?;
             mapped_channels.push(target);
         }
         let mut keep = vec![ready_fd];
@@ -2697,6 +2692,35 @@ mod imp {
             .ok_or_else(|| format!("sandbox path is not UTF-8: {}", path.display()))
     }
 
+    fn place_target_channel(source: RawFd, target: RawFd) -> Result<(), String> {
+        if source == target {
+            // A channel already at its admitted coordinate still has to
+            // survive exec. dup3 rejects equal descriptors instead of clearing
+            // CLOEXEC, so preserve the other flags explicitly in this case.
+            let flags = unsafe { libc::fcntl(source, libc::F_GETFD) };
+            if flags < 0 {
+                return Err(format!(
+                    "inspect sandbox target channel: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            syscall_zero(
+                unsafe { libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+                "retain sandbox target channel across exec",
+            )
+        } else if unsafe { libc::dup3(source, target, 0) } < 0 {
+            Err(format!(
+                "place sandbox target channel: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            // dup3 returns the target descriptor, not zero. Do not send
+            // descriptor-returning syscalls through syscall_zero.
+            Ok(())
+        }
+    }
+
+    /// Only for syscalls whose success value is zero, never descriptor results.
     fn syscall_zero(result: libc::c_int, label: &str) -> Result<(), String> {
         if result == 0 {
             Ok(())
@@ -2714,6 +2738,46 @@ mod imp {
     #[cfg(test)]
     mod namespace_source_tests {
         use super::*;
+
+        #[test]
+        fn target_channel_accepts_nonzero_coordinate_and_survives_exec() {
+            use std::io::{Read as _, Seek as _, Write as _};
+
+            let mut source = tempfile::tempfile().unwrap();
+            source.write_all(b"exact-channel").unwrap();
+            source.rewind().unwrap();
+            let mut target = tempfile::tempfile().unwrap();
+            assert!(target.as_raw_fd() > libc::STDERR_FILENO);
+            place_target_channel(source.as_raw_fd(), target.as_raw_fd()).unwrap();
+            assert_eq!(unsafe { libc::fcntl(target.as_raw_fd(), libc::F_GETFD) }, 0);
+            let mut bytes = String::new();
+            target.read_to_string(&mut bytes).unwrap();
+            assert_eq!(bytes, "exact-channel");
+        }
+
+        #[test]
+        fn target_channel_at_same_coordinate_clears_cloexec() {
+            let channel = tempfile::tempfile().unwrap();
+            let fd = channel.as_raw_fd();
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+            place_target_channel(fd, fd).unwrap();
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, 0);
+        }
+
+        #[test]
+        fn target_channel_invalid_source_preserves_destination() {
+            let target = tempfile::tempfile().unwrap();
+            let flags = unsafe { libc::fcntl(target.as_raw_fd(), libc::F_GETFD) };
+            assert!(place_target_channel(-1, target.as_raw_fd()).is_err());
+            assert_eq!(
+                unsafe { libc::fcntl(target.as_raw_fd(), libc::F_GETFD) },
+                flags
+            );
+            assert!(place_target_channel(-1, -1).is_err());
+        }
 
         #[test]
         fn filesystem_socket_uses_existing_mount_kind_and_exact_identity() {
@@ -2946,6 +3010,18 @@ mod imp {
             );
             if stage == "root" {
                 assert_eq!(unsafe { libc::getpid() }, 1);
+                use std::io::Read as _;
+                let channel_fd: RawFd = std::env::var("LILLUX_PROBE_CHANNEL_FD")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                // This exact test-only channel survived the native target
+                // remapping and exec; unrelated inherited authority did not.
+                assert_eq!(unsafe { libc::fcntl(channel_fd, libc::F_GETFD) }, 0);
+                let channel = unsafe { File::from_raw_fd(channel_fd) };
+                let mut bytes = String::new();
+                channel.take(64).read_to_string(&mut bytes).unwrap();
+                assert_eq!(bytes, "native-target-channel");
                 assert!(
                     std::process::Command::new(executable)
                         .args([
@@ -3001,6 +3077,11 @@ mod imp {
                     unsafe { libc::fcntl(entry.file().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
                 assert!(high >= 200);
                 let sentinel = unsafe { File::from_raw_fd(high) };
+                let channel =
+                    crate::sealed_memfd(c"native-channel-probe", b"native-target-channel").unwrap();
+                // A test coordinate above the unrelated sentinel, not a
+                // production workload-client descriptor allocation rule.
+                let channel_target = u32::try_from(high + 1).unwrap();
                 let retained = libraries
                     .iter()
                     .map(|path| {
@@ -3033,8 +3114,14 @@ mod imp {
                         OsString::from("LILLUX_PROBE_CLOSED_FD"),
                         OsString::from(sentinel.as_raw_fd().to_string()),
                     ),
+                    (
+                        OsString::from("LILLUX_PROBE_CHANNEL_FD"),
+                        OsString::from(channel_target.to_string()),
+                    ),
                 ]
                 .into();
+                request.target_channels =
+                    vec![(channel.inherited_descriptor().unwrap(), channel_target)];
                 request.mounts = libraries
                     .iter()
                     .zip(&retained)

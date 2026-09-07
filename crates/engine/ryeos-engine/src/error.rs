@@ -331,6 +331,14 @@ pub enum EngineError {
     #[error("execution failed: {reason}")]
     ExecutionFailed { reason: String },
 
+    /// Generic held-process launch failure. Preserve Lillux's exact cleanup
+    /// testimony; callers must not manufacture it from diagnostic strings.
+    #[error("subprocess launch failed: {reason}")]
+    SubprocessSpawnFailed {
+        reason: String,
+        aborted_before_attachment: Option<lillux::AbortedProcess>,
+    },
+
     #[error("budget exhausted for thread `{thread_id}`")]
     BudgetExhausted { thread_id: String },
 

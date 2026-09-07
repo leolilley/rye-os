@@ -702,6 +702,11 @@ fn typed_launcher_refusal_is_retained_without_starting_a_target() {
         panic!("a launcher refusal must prevent target execution");
     };
 
+    assert!(
+        result.aborted_before_attachment.is_none(),
+        "an ordinary launch has no held-target proof, regardless of its diagnostic"
+    );
+
     assert_eq!(
         result.launcher_refusal.as_deref(),
         Some("{\"code\":\"launch_refused\",\"message\":\"policy refused\",\"details\":{}}")
