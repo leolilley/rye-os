@@ -822,7 +822,21 @@ fn run() -> Result<()> {
     // threads retain the listener and protected channel; this guard documents
     // that their endpoint is scoped to this bridge boot.
     let _workload_client_broker = workload_client_broker;
-    app.initialize()?;
+    if let Err(error) = app.initialize() {
+        // Upstream stderr can contain credentials and must stay private.
+        // Report only the exact child's OS status, never its output. This is
+        // diagnostic context, not daemon-owned cleanup/settlement testimony.
+        return Err(match app.child.try_wait() {
+            Ok(Some(status)) => error.context(format!(
+                "structured workload initialization failed; child status: {status}"
+            )),
+            Ok(None) => error
+                .context("structured workload initialization failed; child exit not yet observed"),
+            Err(_) => {
+                error.context("structured workload initialization failed; child status unavailable")
+            }
+        });
+    }
     protect_profile_home(std::path::Path::new(&workload_home))?;
     let mut workload_termination = Some(
         lillux::CooperativeChildTermination::for_child(&app.child)
@@ -1554,10 +1568,13 @@ impl StructuredWorkload {
                 );
             }
             if let Some(notification) = step.notification {
-                self.send(&json!({"method":notification,"params":step.params}))?;
+                self.send(&json!({"method":notification,"params":step.params}))
+                    .context("send admitted initialization notification")?;
                 continue;
             }
-            let result = self.call_raw(&step.method, step.params, Duration::from_secs(30))?;
+            let result = self
+                .call_raw(&step.method, step.params, Duration::from_secs(30))
+                .context("exchange admitted initialization request")?;
             if result.get("error").is_some() {
                 bail!("structured-session workload rejected initialization");
             }
