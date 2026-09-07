@@ -18,11 +18,7 @@ fn manifest_dir() -> std::path::PathBuf {
 }
 
 fn workspace_root() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .find(|p| p.join("bundles").is_dir())
-        .expect("workspace root with bundles/ directory")
-        .to_path_buf()
+    ryeos_engine::test_support::workspace_root()
 }
 
 fn build_test_engine() -> ryeos_engine::engine::Engine {
