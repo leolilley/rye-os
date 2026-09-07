@@ -52,12 +52,10 @@ pub(super) fn prepare_for_dedicated_boot(
         || session.placement_thread_id != root_thread.thread_id
         || session.chain_root_id != root_thread.chain_root_id
         || session.owner_principal != root_thread.requested_by.as_deref().unwrap_or_default()
-        || session.state != "admitted"
-        || session.worker_instance_id.is_some()
-        || session.worker_boot_epoch.is_some()
     {
         bail!("workload-client boot contradicts the admitted root/session state");
     }
+    require_reserved_boot(&session, identity)?;
     let owner_principal = session.owner_principal.as_str();
     let session_capsule_hash = session.admitted_capsule_hash.as_str();
     let capsule = state
@@ -309,6 +307,27 @@ pub(super) fn prepare_for_dedicated_boot(
         }
     }
     setup.map(Some)
+}
+
+/// Admission already reserves the pending boot before any process exists.
+/// Require that exact tuple, not empty worker fields: clearing it would erase
+/// the pre-contact cleanup fence established by ordinary session admission and
+/// recovery. `worker_process` attachment later proves liveness separately.
+fn require_reserved_boot(
+    session: &ryeos_app::runtime_db::DedicatedSessionRecord,
+    identity: &ExclusivePersistentSessionIdentity,
+) -> Result<()> {
+    if session.state != "admitted"
+        || session.send_boundary != "none"
+        || session.placement_thread_id != identity.placement_thread_id
+        || session.worker_instance_id.as_deref() != Some(identity.worker_instance_id.as_str())
+        || session.worker_boot_epoch != Some(identity.boot_epoch)
+        || identity.boot_epoch == 0
+        || session.credential_generation != identity.lifecycle_generation
+    {
+        bail!("workload-client boot differs from the admitted pending worker reservation");
+    }
+    Ok(())
 }
 
 fn require_private_workload_client_isolation(state: &AppState) -> Result<()> {
@@ -689,4 +708,79 @@ fn bounded_error(error: &anyhow::Error) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     ryeos_runtime::workload_client::bounded_error_message(&normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ryeos_app::runtime_db::{
+        DedicatedCandidateDisposition, NewCredentialProfile, NewDedicatedSession, RuntimeDb,
+    };
+
+    #[test]
+    fn workload_client_requires_the_real_pending_session_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RuntimeDb::open(&temp.path().join("runtime.sqlite3")).unwrap();
+        db.create_credential_profile(NewCredentialProfile {
+            profile_id: "P-test",
+            owner_principal: "fp:operator",
+            home_id: "home-test",
+        })
+        .unwrap();
+        db.admit_dedicated_session(NewDedicatedSession {
+            placement_thread_id: "T-test",
+            chain_root_id: "T-test",
+            owner_principal: "fp:operator",
+            admitted_capsule_hash: &"a".repeat(64),
+            workspace_id: "W-test",
+            candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
+            credential_profile_id: "P-test",
+            credential_generation: 1,
+            credential_lock_owner: "worker-test",
+        })
+        .unwrap();
+        let session = db.dedicated_session("T-test").unwrap().unwrap();
+        let identity = ExclusivePersistentSessionIdentity {
+            placement_thread_id: "T-test".to_owned(),
+            worker_instance_id: "worker-test".to_owned(),
+            boot_identity_hash: "b".repeat(64),
+            boot_epoch: 1,
+            lifecycle_generation: 1,
+            control_channel_identity: "channel-test".to_owned(),
+        };
+        // The production transaction supplies the tuple before worker_process
+        // exists. Empty fields cannot stand in for this pending authority.
+        assert!(db.worker_process("worker-test").unwrap().is_none());
+        require_reserved_boot(&session, &identity).unwrap();
+        let mut missing = session.clone();
+        missing.worker_instance_id = None;
+        missing.worker_boot_epoch = None;
+        assert!(require_reserved_boot(&missing, &identity).is_err());
+        for field in ["placement", "worker", "epoch", "generation"] {
+            let mut wrong = identity.clone();
+            match field {
+                "placement" => wrong.placement_thread_id = "T-other".to_owned(),
+                "worker" => wrong.worker_instance_id = "worker-other".to_owned(),
+                "epoch" => wrong.boot_epoch += 1,
+                "generation" => wrong.lifecycle_generation += 1,
+                _ => unreachable!(),
+            }
+            assert!(require_reserved_boot(&session, &wrong).is_err(), "{field}");
+        }
+        let mut advanced = session.clone();
+        advanced.state = "binding".to_owned();
+        assert!(require_reserved_boot(&advanced, &identity).is_err());
+        let mut contacting = session.clone();
+        contacting.send_boundary = "contacting".to_owned();
+        assert!(require_reserved_boot(&contacting, &identity).is_err());
+        let mut successor = session;
+        let mut next = identity;
+        successor.worker_instance_id = Some("worker-recovered".to_owned());
+        successor.worker_boot_epoch = Some(2);
+        assert!(require_reserved_boot(&successor, &next).is_err());
+        next.worker_instance_id = "worker-recovered".to_owned();
+        next.boot_epoch = 2;
+        require_reserved_boot(&successor, &next).unwrap();
+    }
 }

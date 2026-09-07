@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T01:28:01Z:ca3f311f2835137c7aa04ef63fa7ddbaa25f99336866d8c2f7f0c2b20a83380e:xo/1160sUhYSTrUX8A9rMfDvCAmgLLTZcZGvO3t6IRygn3A3/uirM/FKIOWD7NsMn4JlJNl0FSdJwZcFO6dRBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T01:45:53Z:711f17cbd9b5d0f30436f1df48a04cc426f8ea3ecbab8ebd89dc1da0ab1865af:tA4+ylEzzsl7rcDN34bo9FdTFx4lZviXRMagfuaCCBmJS0G079OP2eigiIUTIS2G3/rHfLVBIH8yfbFuOMveBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.2"
+version: "1.7.3"
 ```
 
 # Worker-Hosted Execution
@@ -22,6 +22,13 @@ fabricate a second root admission, borrow the enclosing runtime's composition,
 or silently use node defaults because that dependency has no root thread.
 Subject identity, enclosing restrictions and retained protocol narrowing remain
 mandatory before the plan is sealed; recovery consumes that sealed plan.
+
+Session admission reserves the exact pending worker ID and boot epoch before
+process contact, including after recovery. Boot-local workload-client admission
+must match that reserved tuple and credential generation; empty worker fields
+are not an admissible pre-start state. This reservation fences cleanup but is
+not liveness evidence: the separate held-process attachment still owns that
+transition. Do not clear the pending identity to make client setup pass.
 
 This is installed RyeOS runtime knowledge shipped by the standard bundle. It
 describes the authority visible to operators and authored integrations; it is
