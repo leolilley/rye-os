@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-04T08:52:01Z:c7eec0af7e0c327897234724e081fd1a59e1a72f48a25efd9a7d50e5638f6e84:2tPCGY9pS4xv/0zdRly2t6fNzNFL3ahPwQuKXuo4a7Xs8tTkj79LXzGE+djVJXHTz5nDdcgKMklmtSNQmsuBDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T10:12:26Z:0108120e5f5bd0f55473ed37239a89720d9b2f5bf246acbacad3c51a29ac8967:Z1rHsjULVB7aEzHLTpBJfjAyoT+vYLt+uLs2M9+ckJUvDHjMlz8gjUg2bIdSr+4v6k5eqwlrmFHtMXRqA8K2DQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/remote
 tags: [remote, cli, reference, manpage, capabilities]
@@ -241,10 +241,9 @@ scope explicitly. It is create-only: `/authorize-key` cannot replace or
 reclassify any existing local-client, remote-node, remote-operator, bootstrap,
 or configured-operator grant. Admission claims are likewise create-only.
 
-Configured-operator continuity is provisioned only by an offline target-node
-action, not by remote delegation. With the target daemon stopped, its local
-operator installs the source operator's public key in an origin-bound,
-exact-scope grant:
+Configured-operator continuity is provisioned only by the target's configured
+local operator, not by remote delegation. Its node-owned authorization service
+installs the source operator's public key in an origin-bound, exact-scope grant:
 
 ```bash
 RYEOS_APP_ROOT=/path/to/target-app-root ryeos authorize-client \
@@ -253,6 +252,14 @@ RYEOS_APP_ROOT=/path/to/target-app-root ryeos authorize-client \
   --origin-site-id "site:<source>" \
   --scopes "<comma-separated exact scopes>"
 ```
+
+The command uses retained node signing authority through the same service
+online or standalone; it does not launch a Tool with access to node keys.
+Pass `--merge-scopes` to add exact capabilities while retaining existing ones.
+Keep the same `--origin-site-id` when updating a remote operator. Changing an
+incumbent principal's class or origin requires explicit
+`--allow-semantic-conversion` and stopped-node authority held through grant
+publication. Same-class scope updates need neither conversion nor a copied key.
 
 Before installing that grant, admit the source node key with the exact
 `ryeos.attest.request.forwarded-operator` scope. The source site ID is the

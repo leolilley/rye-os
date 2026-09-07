@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T09:01:08Z:656b801fb4d9723c97c6d264bae3bb9b2367983934b50df0ec54938ad1b5a848:tRJp0DfkFn9/y00ogYFVxnJjODpgmAXfKzeqyDurjBuxQQEgsSTFQf22XPE7nfq1cTheiIF5QZql8j37YkmdBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T10:12:26Z:9d4e73243fe1e462e4c313913e6d3c89ab1b5b03c11a930766b27d3982f417d8:EFWGnUrOcGlkviKjpKcmq24lHEdoaPUhIpYS5m+ABXYMquL8bbXzWgW+CUYFd36zRVVn1LCPVtkuTACUbckKCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -107,6 +107,15 @@ non-policy state. Fresh nodes and nodes already on schema 2 omit the reset
 flag. There is no schema-1 decoder or implicit migration.
 
 ## Repository project bundle
+
+Node grant reconciliation is not project production. The ordinary
+`ryeos authorize-client` command belongs to the configured-local-operator
+`identity/authorize-client` service and shares the existing canonical grant
+writer with the explicit external bootstrap entry. Do not restore a confined
+Tool wrapper that reopens node identity files, mount private node directories
+into a Tool, or treat this service as a worker grant. Exact remote origin,
+same-class scope reconciliation and stopped-node semantic-conversion fencing
+remain enforced by the existing identity owner.
 
 The repository-root `.ai` tree is also the source-local `ryeos` project
 bundle. Its signed `.ai/manifest.yaml` is generated from

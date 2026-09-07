@@ -1,9 +1,9 @@
-# ryeos:signed:2026-08-24T16:46:23Z:5c543f426cb6c97187e42114a90ec4e5f86e7163bff4893d50c1a92a458987e5:5Kcq9G3Avn4Jx1GY4UG0bSp6urPZ4aNncjEiacNT3BTYErYciPOrmFqYcVXVTzCDK9rw2QTsoNH3dnlJOsZ4DA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T10:12:26Z:54d01f4106133500eec2fb5c19eb6b317f3832a27297dcb22629bd12f35263d5:ypn2sR5EIi3yc1VK8Y06O1yA39QifRIZ0qLTZWOTELRidQhCHTgC3yNjcmdvB2WvE7aAz29r/BplgYOuhmxuDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 kind: service
 endpoint: identity.authorize-client
-availability: local
+availability: both
+state_access: read_only_existing
 record_thread: false
-local_execute: tool:ryeos/core/authorize-client
 required_caps: ["ryeos.execute.service.identity/authorize-client"]
 schema:
   public_key: string
@@ -12,4 +12,4 @@ schema:
   merge_scopes: boolean?
   origin_site_id: string?
   allow_semantic_conversion: boolean?
-description: "Reconcile one exact authorized-key grant with node-signed local authority. Semantic class or origin conversion additionally requires and holds stopped-node authority through publication."
+description: "Configured-local-operator reconciliation of one exact authorized-key grant using retained node signing authority. Uses the node-owned service online or standalone, never a confined Tool. Semantic class or origin conversion additionally requires and holds stopped-node authority through publication."

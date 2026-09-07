@@ -19,6 +19,66 @@ use rand::RngCore;
 
 use crate::actions::hosted_policy::load_hosted_policy;
 
+/// Shared input for node-owned grant reconciliation. The target app root and
+/// signing authority come from the host entrypoint, never from this payload.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizeClientRequest {
+    pub public_key: String,
+    pub scopes: String,
+    #[serde(default = "default_authorize_client_label")]
+    pub label: String,
+    #[serde(default)]
+    pub merge_scopes: bool,
+    #[serde(default)]
+    pub origin_site_id: Option<String>,
+    #[serde(default)]
+    pub allow_semantic_conversion: bool,
+}
+
+fn default_authorize_client_label() -> String {
+    "cli-authorized".into()
+}
+
+impl AuthorizeClientRequest {
+    pub fn into_params(self, app_root: PathBuf) -> Result<AuthorizeClientParams> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.public_key)
+            .context("invalid base64 public key")?;
+        let public_key = VerifyingKey::from_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .context("public key must be 32 bytes (ed25519)")?,
+        )
+        .context("invalid ed25519 public key")?;
+        let scopes: Vec<String> = self
+            .scopes
+            .split(',')
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if scopes.is_empty() {
+            bail!("scopes must not be empty");
+        }
+        for scope in &scopes {
+            ryeos_runtime::authorizer::validate_scope_pattern(scope)
+                .map_err(|error| anyhow::anyhow!("invalid scope: {error}"))?;
+        }
+        Ok(AuthorizeClientParams {
+            app_root,
+            public_key,
+            scopes,
+            label: self.label,
+            allow_wildcard: false,
+            merge: self.merge_scopes,
+            origin_site_id: self.origin_site_id,
+            allow_semantic_conversion: self.allow_semantic_conversion,
+        })
+    }
+}
+
 /// Parameters for the authorize-client action.
 pub struct AuthorizeClientParams {
     /// App root directory (contains `.ai/node/identity/`).
@@ -50,7 +110,7 @@ pub struct AuthorizeClientParams {
 }
 
 /// Result of a successful authorize-client run.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct AuthorizeClientResult {
     /// Fingerprint of the authorized key.
     pub fingerprint: String,
@@ -154,29 +214,35 @@ struct AdmissionTokenFile<'a> {
 /// Delegates to the canonical writer in `ryeos_app::identity` so the
 /// TOML format is identical to what the daemon's own handler produces.
 pub fn run_authorize_client(params: AuthorizeClientParams) -> Result<AuthorizeClientResult> {
-    if params.origin_site_id.is_some() && params.allow_wildcard {
-        bail!("remote-operator grants require exact, non-wildcard scopes");
-    }
-    let node_key_path = params
-        .app_root
-        .join(".ai")
-        .join("node")
-        .join("identity")
-        .join("private_key.pem");
+    // Explicit pre-node bootstrap entry only. A confined Tool must never
+    // reopen node private state; normal CLI use goes through the node-owned
+    // identity/authorize-client service and its retained identity instead.
+    let _stopped_node_lock = acquire_semantic_conversion_lock(&params)?;
+    let root = ryeos_engine::roots::RuntimeRoot::new(params.app_root.clone());
+    let node_identity = ryeos_app::identity::NodeIdentity::load(&root.node_signing_key_path())?;
+    reconcile_client_grant(params, &node_identity, &root.authorized_keys_dir())
+}
 
-    if !node_key_path.exists() {
-        bail!(
-            "node identity key not found at {} — run `ryeos init` first",
-            node_key_path.display()
-        );
-    }
+/// Reuse the canonical grant writer with the selected node's retained
+/// authority. This is a local operator operation, not a worker permission.
+pub fn run_authorize_client_with_authority(
+    params: AuthorizeClientParams,
+    node_identity: &ryeos_app::identity::NodeIdentity,
+    auth_dir: &std::path::Path,
+) -> Result<AuthorizeClientResult> {
+    let _stopped_node_lock = acquire_semantic_conversion_lock(&params)?;
+    reconcile_client_grant(params, node_identity, auth_dir)
+}
 
+fn acquire_semantic_conversion_lock(
+    params: &AuthorizeClientParams,
+) -> Result<Option<ryeos_app::state_lock::StateLock>> {
     // Principal-class and origin changes alter the meaning of an existing
     // fingerprint. Prove stopped-node ownership and retain it through the
     // read/verify/sign/publish transaction instead of treating the CLI flag
     // as sufficient authority on its own. Ordinary same-class provisioning
     // remains usable for bootstrap and release tooling while the daemon runs.
-    let _stopped_node_lock = params
+    params
         .allow_semantic_conversion
         .then(|| {
             let lock_path = ryeos_app::state_lock::default_lock_path(&params.app_root);
@@ -184,19 +250,19 @@ pub fn run_authorize_client(params: AuthorizeClientParams) -> Result<AuthorizeCl
                 || "semantic authorized-key conversion requires stopped-node authority",
             )
         })
-        .transpose()?;
+        .transpose()
+}
 
-    let node_identity = ryeos_app::identity::NodeIdentity::load(&node_key_path)?;
-
+fn reconcile_client_grant(
+    params: AuthorizeClientParams,
+    node_identity: &ryeos_app::identity::NodeIdentity,
+    auth_dir: &std::path::Path,
+) -> Result<AuthorizeClientResult> {
+    if params.origin_site_id.is_some() && params.allow_wildcard {
+        bail!("remote-operator grants require exact, non-wildcard scopes");
+    }
     let fp = lillux::crypto::fingerprint(&params.public_key);
     let key_b64 = base64::engine::general_purpose::STANDARD.encode(params.public_key.as_bytes());
-
-    let auth_dir = params
-        .app_root
-        .join(".ai")
-        .join("node")
-        .join("auth")
-        .join("authorized_keys");
 
     let now = lillux::time::iso8601_now();
 
@@ -211,14 +277,14 @@ pub fn run_authorize_client(params: AuthorizeClientParams) -> Result<AuthorizeCl
     // merge can therefore never silently lose scopes.
     let (path, dropped_scopes, transition) =
         ryeos_app::identity::reconcile_authorized_key_toml_scopes(
-            &auth_dir,
+            auth_dir,
             &fp,
             &key_b64,
             &params.scopes,
             &params.label,
             "cli-authorize-key",
             &now,
-            &node_identity,
+            node_identity,
             wildcard,
             params.merge,
             params.origin_site_id.as_deref(),

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-07-28T23:56:25Z:910f7a90559c18d2cd746ac5e5f9f16b0274c8bb3c8f76cae1096a2751109edc:5tYX8PHj2OxTUavUK1MBPX5wtxN12vRGHLo417EwiSp9S0Ac0fDwxLQbzPEcG1HLLbPhubJqGJHgsrPZoc/PAQ==:8faa64a253fbe14970a4ef4f65ed9725c5163ba4defd74591599424c412efb96 -->
+<!-- ryeos:signed:2026-09-07T10:12:26Z:8680e751f363a7ca383ea9a7adc93b74e5af5f759927c6c0aa937f178aeb447e:AIFNLMq1wV4THVvhGFcNndW8Lf2m6zTNoLlIb0ZD2qIk8v3oO8ah8Hst8VuSLZ/bcMaHTlEH0Q4WjcCG6YAlDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "signing"
@@ -117,13 +117,24 @@ canonical `.ai/graphs/` location.
 ## Authorized-key scopes
 
 `authorize-client` writes one authorized-key file per fingerprint and, by
-default, **replaces** its scope set (dropped scopes are warned). To add scopes
+default, **replaces** its scope set (the result reports dropped scopes). To add scopes
 without losing existing ones, pass `--merge-scopes` (it unions with the file's
 current scopes):
 
 ```bash
-ryeos-core-tools authorize-client --public-key <b64> --scopes <a,b> --merge-scopes
+ryeos authorize-client --public-key <b64> --scopes <a,b> --merge-scopes
 ```
+
+Normal CLI use dispatches to the node-owned `identity/authorize-client`
+service, online or standalone against existing node state. It requires the
+exact configured local operator and reuses the canonical locked grant writer
+with the node's retained identity and configured authorization directory.
+There is no worker Tool for this operation and no key mount into a subprocess.
+The external core-tools entry remains only for explicit host bootstrap; it
+shares request validation and the same writer, not a second grant protocol.
+Remote-operator grants require an exact origin site and reject wildcards.
+Class/origin conversion still needs explicit stopped-node authority; ordinary
+same-class scope merging does not convert or copy any identity.
 
 ## Do not do these
 

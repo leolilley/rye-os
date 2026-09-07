@@ -17,6 +17,7 @@ pub mod admission_attestations_for_subject;
 pub mod admission_claim;
 pub mod admission_status;
 pub mod admission_submit;
+pub mod authorize_client;
 pub mod authorize_key;
 pub mod bundle_export;
 pub mod bundle_install;
@@ -216,6 +217,7 @@ pub const ALL: &[ServiceDescriptor] = &[
     rebuild::VERIFY_DESCRIPTOR,
     rebuild::REBUILD_DESCRIPTOR,
     authorize_key::DESCRIPTOR,
+    authorize_client::DESCRIPTOR,
     scheduler_register::DESCRIPTOR,
     scheduler_deregister::DESCRIPTOR,
     scheduler_explain::DESCRIPTOR,

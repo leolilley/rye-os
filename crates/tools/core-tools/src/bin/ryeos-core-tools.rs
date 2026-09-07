@@ -1723,9 +1723,8 @@ fn run_authorize_client(
     allow_semantic_conversion: bool,
     stdin_json: bool,
 ) -> anyhow::Result<()> {
-    use lillux::crypto::VerifyingKey;
     use ryeos_core_tools::actions::authorize::{
-        AuthorizeClientParams, run_authorize_client as run,
+        AuthorizeClientRequest, run_authorize_client as run,
     };
 
     let params = if stdin_json {
@@ -1768,44 +1767,15 @@ fn run_authorize_client(
 
     let app_root = resolve_app_root(app_root)?;
 
-    let pk_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&pk_b64)
-        .map_err(|e| anyhow::anyhow!("invalid base64 public key: {e}"))?;
-    let verifying_key = VerifyingKey::from_bytes(
-        pk_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("public key must be 32 bytes (ed25519)"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("invalid ed25519 public key: {e}"))?;
-
-    let scopes: Vec<String> = scopes_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if scopes.is_empty() {
-        anyhow::bail!("--scopes must not be empty");
-    }
-
-    // Validate each scope is in canonical form. core-tools is not the
-    // bootstrap path, so wildcard '*' is rejected at the writer below.
-    for scope in &scopes {
-        ryeos_runtime::authorizer::validate_scope_pattern(scope)
-            .map_err(|e| anyhow::anyhow!("invalid scope: {e}"))?;
-    }
-
-    let result = run(AuthorizeClientParams {
-        app_root,
-        public_key: verifying_key,
-        scopes,
+    let result = run(AuthorizeClientRequest {
+        public_key: pk_b64,
+        scopes: scopes_str,
         label,
-        allow_wildcard: false, // core-tools is not the bootstrap path
-        merge: merge_scopes,
+        merge_scopes,
         origin_site_id,
         allow_semantic_conversion,
-    })?;
+    }
+    .into_params(app_root)?)?;
 
     if !result.dropped_scopes.is_empty() {
         eprintln!(
