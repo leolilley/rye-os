@@ -1,7 +1,7 @@
-# ryeos:signed:2026-09-06T22:54:05Z:f2b5d1ac8eb6fc01aeb230076f2523810c2874bcf4ba65e452a2ba89e5f517ca:I7HK/1n2TkaHyIkXNBzBG1PaILjUA7wYM8ZSdwSFC6bXP7nbxoFfBVbhC7YB1Lo+sCXMX5s72VKdK05eyPQtCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-07T04:35:59Z:3e82dcb0c0e0c0eb2bcfe3fb06498ac3dd145d136223913bb18135134714f716:Tp4nxWLIL8CyuPpP1qwJ1scJFl5tX+6u6kCFKSFEWcfH7hK+RrEcZDkHnuB3UnE0jt9KuRdWMCThTJyCYUJTAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: ryeos/development
 name: cargo-test
-version: "1.0.0"
+version: "1.0.1"
 description: Bounded offline Cargo test for the selected RyeOS library packages
 executor_id: "@subprocess"
 execution_protocol: protocol:ryeos/core/opaque
@@ -68,6 +68,9 @@ config:
     RUSTDOC: /ryeos/realizations/platform/rust/bin/rustdoc
     LIBRARY_PATH: /ryeos/realizations/platform/lib
     COMPILER_PATH: /ryeos/realizations/platform/native/bin
+    # The flat platform's libc.so is the verified DSO, not the publisher's
+    # absolute-path linker script. Preserve its nonshared link input explicitly;
+    # the archive already belongs to the exact platform manifest (no host libc).
     RUSTFLAGS: >-
       -C linker=/ryeos/realizations/platform/native/bin/gcc
       -C link-arg=-B/ryeos/realizations/platform/native/bin/
@@ -78,6 +81,7 @@ config:
       -C link-arg=-Wl,--dynamic-linker,/ryeos/realizations/platform/lib/ld-linux-x86-64.so.2
       -C link-arg=-Wl,-rpath,/ryeos/realizations/platform/lib:/ryeos/realizations/platform/rust/lib:/ryeos/realizations/platform/rust/lib/rustlib/x86_64-unknown-linux-gnu/lib
       -C link-arg=-Wl,-z,nodefaultlib
+      -C link-arg=/ryeos/realizations/platform/lib/libc_nonshared.a
 config_schema:
   type: object
   properties:

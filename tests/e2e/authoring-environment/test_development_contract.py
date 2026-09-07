@@ -99,6 +99,7 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
 
     def test_cargo_operations_are_bounded_offline_children_not_ambient_builds(self):
         execution = load(".ai/config/execution/execution.yaml")["items"]["tool"]
+        linker_flags = []
         for operation in ("check", "build", "test"):
             ref = "ryeos/development/cargo-" + operation
             tool = load(".ai/tools/" + ref + ".yaml")
@@ -124,11 +125,19 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
             self.assertFalse(tool["config_schema"]["additionalProperties"])
             self.assertEqual(tool["config"]["env"]["CARGO_TARGET_DIR"], "/tmp/target")
             self.assertEqual(tool["env_config"]["env"]["PATH"], "")
+            flags = tool["config"]["env"]["RUSTFLAGS"]
+            self.assertIn("-C link-arg=/ryeos/realizations/platform/lib/libc_nonshared.a", flags)
+            linker_flags.append(flags)
             self.assertEqual(execution[ref]["timeout"], tool["config"]["timeout_secs"])
             if operation == "test":
                 self.assertIn("--exact", args)
                 self.assertIn("${params.test}", args)
                 self.assertEqual(tool["config_schema"]["properties"]["test"]["minLength"], 1)
+        self.assertEqual(len(set(linker_flags)), 1)
+        # The independent bootstrap probe must exercise the same link input;
+        # merely having the archive in an inventory does not prove it is used.
+        probe = (ROOT / "scripts/release/fixtures/development-toolchain-stage0/probe.sh").read_text()
+        self.assertIn("-C link-arg=$platform/lib/libc_nonshared.a", probe)
 
     def test_complete_distribution_has_its_own_nonexecutable_retention_consumer(self):
         distribution = load(".ai/config/development/ryeos/authoring-distribution.yaml")
