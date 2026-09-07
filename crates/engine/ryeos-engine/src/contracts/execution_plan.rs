@@ -194,6 +194,10 @@ pub struct EngineContext {
         crate::isolation::IsolationFilesystemAuthorityCeiling,
     pub isolation_network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     pub isolation_live_access_authority: Option<crate::isolation::IsolationLiveAccessAuthority>,
+    /// Exact daemon-admitted private state for this launch, not ambient node
+    /// state or an item-authored path. Isolation pins it beneath the node's
+    /// state root and refuses that root itself. Captured execution retains
+    /// this explicit grant while excluding node-policy filesystem mounts.
     pub isolation_state_root: Option<PathBuf>,
     pub isolation_checkpoint_dir: Option<PathBuf>,
     /// Exact daemon-created checkpoint directory paired with

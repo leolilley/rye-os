@@ -2079,8 +2079,11 @@ impl IsolationRuntime {
                     self.inspection.filesystem.readable, self.inspection.filesystem.writable
                 )));
             }
+            // An explicit state_root is not ambient node policy. The common
+            // state-root path below requires one strict node-state child,
+            // pins its descriptor and mounts only that exact directory. Do
+            // not erase this grant or treat it as blanket node-state access.
             if context.live_access.is_some()
-                || context.state_root.is_some()
                 || context.checkpoint_dir.is_some()
                 || context.checkpoint_authority.is_some()
                 || context.daemon_socket_path.is_some()
@@ -3401,7 +3404,12 @@ impl IsolationRuntime {
             }
             for (index, mount) in readable_mounts
                 .iter()
-                .filter(|mount| mount.layer == 30)
+                // Both realization inputs (30) and exact private-state
+                // overlays (40) are admitted read-only mounts. Filtering to
+                // layer 30 silently dropped baseline protection after it
+                // passed authority checks. Verified code has its own owner
+                // below and must not be emitted twice.
+                .filter(|mount| mount.layer >= 30 && !verified_code_mounts.contains(mount))
                 .enumerate()
             {
                 add_mount(
@@ -6227,68 +6235,150 @@ mod tests {
             runtime_destination.clone(),
             content.inherited_descriptor_authority().unwrap(),
         );
-        let applied = runtime
-            .apply_with_provenance(
-                lillux::SubprocessRequest {
-                    cmd: "/bin/true".to_string(),
-                    argv0: None,
-                    args: Vec::new(),
-                    cwd: Some(project.path().to_string_lossy().into_owned()),
-                    envs: Vec::new(),
-                    stdin_data: None,
-                    timeout: 1.0,
-                    limits: None,
-                    inherited_fds: Vec::new(),
-                    inherited_fd_mappings: Vec::new(),
-                    supervised_status: None,
-                },
-                IsolationLaunchContext {
-                    workspace_view: None,
-                    project_path: project.path(),
-                    project_authority: IsolationProjectAuthority::EphemeralScratch,
-                    filesystem_authority_ceiling:
-                        IsolationFilesystemAuthorityCeiling::CapturedExecution,
-                    network_authority_ceiling: IsolationNetworkAuthorityCeiling::Isolated,
-                    live_access: None,
-                    state_root: None,
-                    checkpoint_dir: None,
-                    checkpoint_authority: None,
-                    daemon_socket_path: None,
-                    bundle_roots: &[],
-                    node_trusted_keys_dir: None,
-                    verified_code: &[],
-                    verified_command: Some(&command),
-                    external_read_only_mounts: &[runtime_mount],
-                    target_channels: &[],
-                    item_ref: "worker:tests/captured-plan",
-                    thread_id: "T-captured-plan",
-                },
-            )
-            .unwrap();
-        let (request_bytes, _) = applied
-            .request
-            .inherited_fds
-            .last()
+        let node_state = app_root.path().join(crate::AI_DIR).join("state");
+        let private_state = node_state.join("captured-state");
+        std::fs::create_dir(&private_state).unwrap();
+        let sibling_state = node_state.join("unrelated-state");
+        std::fs::create_dir(&sibling_state).unwrap();
+        std::fs::write(content.path().join("baseline"), b"admitted = true\n").unwrap();
+        let baseline = content
+            .open_pinned_regular(std::ffi::OsStr::new("baseline"), false)
             .unwrap()
-            .read_regular_file_stable_bounded(ryeos_isolation_protocol::MAX_REQUEST_BYTES as u64)
             .unwrap();
-        let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
-        assert_eq!(request["plan"]["network"], "isolated");
-        let mounts = request["plan"]["mounts"].as_array().unwrap();
-        assert!(
-            mounts
-                .iter()
-                .any(|mount| mount["destination"].as_str() == runtime_destination.to_str())
-        );
-        for mount in mounts {
-            let destination = mount["destination"].as_str().unwrap();
+        let request = || lillux::SubprocessRequest {
+            cmd: "/bin/true".to_string(),
+            argv0: None,
+            args: Vec::new(),
+            cwd: Some(project.path().to_string_lossy().into_owned()),
+            envs: Vec::new(),
+            stdin_data: None,
+            timeout: 1.0,
+            limits: None,
+            inherited_fds: Vec::new(),
+            inherited_fd_mappings: Vec::new(),
+            supervised_status: None,
+        };
+        for exact_state in [None, Some(private_state.as_path())] {
+            let mut external_mounts = vec![runtime_mount.clone()];
+            if let Some(state_root) = exact_state {
+                external_mounts.push(IsolationReadOnlyMountAuthority::new_state_overlay(
+                    baseline.path().to_path_buf(),
+                    state_root.join("baseline"),
+                    baseline.inherited_descriptor_authority().unwrap(),
+                ));
+            }
+            let context = IsolationLaunchContext {
+                workspace_view: None,
+                project_path: project.path(),
+                project_authority: IsolationProjectAuthority::EphemeralScratch,
+                filesystem_authority_ceiling:
+                    IsolationFilesystemAuthorityCeiling::CapturedExecution,
+                network_authority_ceiling: IsolationNetworkAuthorityCeiling::Isolated,
+                live_access: None,
+                state_root: exact_state,
+                checkpoint_dir: None,
+                checkpoint_authority: None,
+                daemon_socket_path: None,
+                bundle_roots: &[],
+                node_trusted_keys_dir: None,
+                verified_code: &[],
+                verified_command: Some(&command),
+                external_read_only_mounts: &external_mounts,
+                target_channels: &[],
+                item_ref: "worker:tests/captured-plan",
+                thread_id: "T-captured-plan",
+            };
+            if exact_state.is_some() {
+                for invalid_root in [node_state.as_path(), content.path()] {
+                    let error = runtime
+                        .apply_with_provenance(
+                            request(),
+                            IsolationLaunchContext {
+                                state_root: Some(invalid_root),
+                                ..context
+                            },
+                        )
+                        .err()
+                        .expect("broad/outside state root must refuse");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("not one exact daemon-owned child"),
+                        "{error}"
+                    );
+                }
+                let error = runtime
+                    .apply_with_provenance(
+                        request(),
+                        IsolationLaunchContext {
+                            state_root: Some(&sibling_state),
+                            ..context
+                        },
+                    )
+                    .err()
+                    .expect("overlay outside its exact private root must refuse");
+                assert!(
+                    error.to_string().contains("read-only state overlay"),
+                    "{error}"
+                );
+                let error = runtime
+                    .apply_with_provenance(
+                        request(),
+                        IsolationLaunchContext {
+                            node_trusted_keys_dir: Some(app_root.path()),
+                            ..context
+                        },
+                    )
+                    .err()
+                    .expect("an exact private root must not admit ambient trust state");
+                assert!(
+                    error.to_string().contains("ambient filesystem authority"),
+                    "{error}"
+                );
+            }
+            let applied = runtime.apply_with_provenance(request(), context).unwrap();
+            let (request_bytes, _) = applied
+                .request
+                .inherited_fds
+                .last()
+                .unwrap()
+                .read_regular_file_stable_bounded(
+                    ryeos_isolation_protocol::MAX_REQUEST_BYTES as u64,
+                )
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
+            assert_eq!(request["plan"]["network"], "isolated");
+            let mounts = request["plan"]["mounts"].as_array().unwrap();
             assert!(
-                !["/usr", "/bin", "/lib", "/lib64", "/etc"]
+                mounts
                     .iter()
-                    .any(|ambient| destination == *ambient
-                        || destination.starts_with(&format!("{ambient}/"))),
-                "captured plan exposed ambient system mount {destination}"
+                    .any(|mount| mount["destination"].as_str() == runtime_destination.to_str())
             );
+            assert_eq!(
+                mounts.iter().any(|mount| {
+                    mount["destination"].as_str() == private_state.to_str()
+                        && mount["access"] == "writable"
+                }),
+                exact_state.is_some()
+            );
+            if exact_state.is_some() {
+                assert!(mounts.iter().any(|mount| {
+                    mount["destination"].as_str() == private_state.join("baseline").to_str()
+                        && mount["access"] == "read_only"
+                }));
+            }
+            for mount in mounts {
+                let destination = mount["destination"].as_str().unwrap();
+                assert_ne!(Some(destination), node_state.to_str());
+                assert_ne!(Some(destination), sibling_state.to_str());
+                assert!(
+                    !["/usr", "/bin", "/lib", "/lib64", "/etc"]
+                        .iter()
+                        .any(|ambient| destination == *ambient
+                            || destination.starts_with(&format!("{ambient}/"))),
+                    "captured plan exposed ambient system mount {destination}"
+                );
+            }
         }
     }
 
@@ -6478,7 +6568,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_execution_refuses_ambient_node_filesystem_policy() {
+    fn captured_execution_refuses_ambient_context_authority() {
         let app_root = tempfile::tempdir().unwrap();
         write_policy(app_root.path(), &IsolationPolicy::disabled_for_authoring());
         let mut runtime = IsolationRuntime::load(app_root.path()).unwrap();
@@ -6513,7 +6603,7 @@ mod tests {
                 checkpoint_authority: None,
                 daemon_socket_path: None,
                 bundle_roots: &[],
-                node_trusted_keys_dir: None,
+                node_trusted_keys_dir: Some(app_root.path()),
                 verified_code: &[],
                 verified_command: None,
                 external_read_only_mounts: &[],
@@ -6528,7 +6618,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("captured execution admits only {verified_code} readable")
+                .contains("captured execution context carries ambient filesystem authority")
         );
     }
 

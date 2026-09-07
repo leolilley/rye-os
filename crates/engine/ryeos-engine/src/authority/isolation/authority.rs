@@ -49,8 +49,10 @@ pub enum IsolationProjectAuthority {
 /// Launch-owned ceiling over the node filesystem policy. Ordinary tools may
 /// consume every node-policy mount they otherwise qualify for. Captured
 /// execution is narrower: only its descriptor-bound verified command,
-/// daemon-owned scratch workspace, and separately admitted realization mounts
-/// may enter the namespace.
+/// daemon-owned workspace, separately admitted realization mounts, and an
+/// explicitly granted exact daemon-private state root may enter the namespace.
+/// That private state is independently bounded/pinned launch authority, never
+/// an ambient mount inherited from the node's filesystem policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IsolationFilesystemAuthorityCeiling {

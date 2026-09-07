@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T02:16:41Z:784b6d1693d2489ba84ee5e7471df0b5653de95d9a3e8bf3f5ea13ad70e7c98f:J8MvRSzaOGMtDZTXnHiVso9ZQ0D4oBbHN/A7gX2MAOgMxD69Blkj/p4j2ligjJq+iORGFhpQdtbHsVHItrElAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-07T02:41:17Z:fe6e6dd7ec0a53d15b83e04d4d96219ded789b355e392e877929af4f19921870:Bzc/w5zbkded7yQPoi7Su6YYLrwa3DPr6VCFNQVu/pmq6Qri/ebwNQ+CRt2nYyRAjvPqUjA5aNGd5Y2sy2v4DA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.5"
+version: "1.7.6"
 ```
 
 # Worker-Hosted Execution
@@ -44,6 +44,18 @@ starting the workload; it does not rewrite it after isolation has mounted it
 read-only. Missing or divergent bytes refuse launch in every isolation mode.
 The source mount's file mode is not a replacement for mount or immutable-argv
 authority. Do not add a bridge-side seed repair or mount-error fallback.
+
+Captured execution excludes ambient node-policy filesystem mounts, not the
+session's explicit private-state grant. Both ordinary and held dispatch retain
+that exact launch root. Isolation independently pins it as a strict child of
+node state, rejects the node-state root itself and outside paths, and bounds
+any read-only baseline overlay to that exact private root. No caller-selected
+path, sibling profile, bundle root, trust directory, or daemon socket follows
+from this grant. The same credential-generation and worker cleanup fences
+continue to control which private home the daemon may supply.
+Plan emission retains both admitted realization mounts and state-overlay
+mounts with their ordered layers; validating an overlay without emitting it
+does not enforce read-only protection. Verified code is emitted separately.
 
 This is installed RyeOS runtime knowledge shipped by the standard bundle. It
 describes the authority visible to operators and authored integrations; it is

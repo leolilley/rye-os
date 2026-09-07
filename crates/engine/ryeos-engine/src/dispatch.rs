@@ -597,10 +597,10 @@ fn isolation_plan_request(
                 .isolation_network_authority_ceiling
                 .intersect(network_authority_ceiling),
             live_access: ctx.isolation_live_access_authority.as_ref(),
-            state_root: ctx
-                .isolation_state_root
-                .as_deref()
-                .filter(|_| node_filesystem),
+            // This is one explicit daemon-admitted state root, not a node
+            // policy mount. Isolation pins and bounds it independently even
+            // under captured_execution (e.g. a session-private home).
+            state_root: ctx.isolation_state_root.as_deref(),
             checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
             checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
             daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
@@ -655,10 +655,9 @@ fn isolation_plan_request_awaiting_attachment(
                 .isolation_network_authority_ceiling
                 .intersect(network_authority_ceiling),
             live_access: ctx.isolation_live_access_authority.as_ref(),
-            state_root: ctx
-                .isolation_state_root
-                .as_deref()
-                .filter(|_| node_filesystem),
+            // Keep the exact launch-owned state authority on the held path
+            // too; only ambient node-policy mounts are removed by this ceiling.
+            state_root: ctx.isolation_state_root.as_deref(),
             checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
             checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
             daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
