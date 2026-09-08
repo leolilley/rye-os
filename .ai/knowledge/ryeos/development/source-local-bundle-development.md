@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-08T22:11:29Z:71ed5edfe7129b635abf7901aead4f2165539bcdbf0c442afd05cacc90c0e110:Pu/c2BvUZs3yQTIg3Rodg+1rT2t+MyE3M1TFl8za8Yi2o68KqVIdmpDRPac/rVHjlnT/NvSM4q10+9S/nsCIDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T23:22:09Z:0a84df213ea1ae176db59bf27509c0a5a9c2c4ee1e7fda4a536d8e1fed1b6c9b:KDbi6BC2x1xGvGuVUAdBgZ6k0bMfJMVuYOb3Pq82U7T7ZS/KHBS8whKzoZgVmq+M7yo+mSZn5iYIo5KNDBC1AQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
 title: Source-Local Bundle Development
 description: Source-local workflow, project-bundle, realization, and confinement contracts
 entry_type: reference
-version: "1.13.0"
+version: "1.14.0"
 ```
 
 # Source-Local Bundle Development
@@ -359,6 +359,14 @@ controls; native root launch is refused. See Standard execution-isolation
 knowledge for this policy/threat boundary. Host supervision must provision an
 unprivileged controller with actual delegated scope authority; worker tests
 and worker turns must not depend on an operator entering a sudo password.
+
+Prospective bundle initialization validates signed definitions and runs their
+ordinary validators under enforcement, but is not process-scope execution
+admission. It retains the exact policy without opening/probing the supervised
+controller's scope facility from the CLI. Its snapshot grants no scope
+capabilities; actual execution still needs a separately qualified generation.
+Do not fix this ordering by weakening policy, skipping bundle preflight, or
+making ordinary initialization require a privileged supervisor placement.
 
 Writable runtime workspaces use one detached view created and transferred by
 the trusted backend before its creator exits. Each child attaches a clone of

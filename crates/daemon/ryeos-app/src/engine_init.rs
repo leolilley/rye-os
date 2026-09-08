@@ -331,6 +331,9 @@ pub fn resolve_isolation_backend(
 /// Compose the exact isolation generation that would be selected from a
 /// prospective installed-root set. Enforced policy captures and inspects the
 /// candidate adapter and artifacts; disabled policy never resolves them.
+/// This validates definitions, not the installer's placement as a controller.
+/// It grants no process-scope capabilities; execution admission must qualify
+/// those from its actual supervised process instead of reusing this snapshot.
 pub fn load_prospective_isolation(
     app_root: &std::path::Path,
     bundle_roots: &[PathBuf],
@@ -374,7 +377,7 @@ pub fn load_prospective_isolation(
             "prospective ",
         )?)
     };
-    ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy(
+    ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy_for_definition_validation(
         app_root,
         policy.clone(),
         crate::node_policy::generation::policy_directory(app_root).join("isolation.yaml"),
@@ -845,9 +848,9 @@ fn build_engine_for_roots_with_isolation(
 /// Admit a prospective node bundle-root set without constructing an Engine.
 ///
 /// Install and replace handlers call this against the exact post-operation
-/// graph before activation. Daemon boot calls the same private constructor and
-/// consumes the admitted registries, so the two admission surfaces cannot
-/// silently drift.
+/// graph before activation. Daemon boot shares the private registry constructor,
+/// but separately qualifies its host execution facilities from its supervised
+/// placement. Do not retain this definition-only snapshot for live execution.
 pub fn admit_node_bundle_roots(
     app_root: &std::path::Path,
     bundle_roots: &[PathBuf],

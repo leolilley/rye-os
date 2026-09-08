@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-08T22:52:46Z:9b75de899e74efd7037a340afc50cf59794f26527aa5ac982a9b9daad3bb9bc5:IhaeQdOxQNCiXxTz2qgXaBFML6YtjexIX+a4m75WuYrapOOM4DMRjjIhwio5WPX5lxQC03+D4So3gMhj7/+eDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T23:22:09Z:da010017f13beb5afa5deaf126862678ab31ef2a15ee3be94c37d2a195a388d6:LHvlEUooewe0YAHLOzcJHB4mvJA25FxAG0GflLg4nskEbmCM41NSjznYHEWTD/zsU69zq4muceaYitbb7zZjCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.19.0"
+version: "1.20.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -521,6 +521,16 @@ Host delegation is installation/supervision authority, never an interactive
 sudo step during a worker turn. The node controller must already have a
 qualified unprivileged placement. A container image cannot manufacture a
 writable host delegation where the platform supplies only a read-only one.
+
+Prospective bundle validation is not controller placement. It preserves the
+complete signed policy and adapter checks and runs definition validators under
+enforced ordinary subprocess isolation, but does not open, qualify or allocate
+the node's process scopes from the installer/CLI process. This prospective
+snapshot advertises no scope capabilities and refuses scoped launch. Execution
+admission resolves a separate fully qualified generation from its supervised
+placement; an execution failure never retries through the validation-only
+constructor. Initialization therefore does not require a running daemon or
+pretend that the installer's process placement proves daemon readiness.
 
 Lillux configuration v3 selects the stable delegation location, not its
 reboot-ephemeral inode. Generation admission captures the exact live directory;

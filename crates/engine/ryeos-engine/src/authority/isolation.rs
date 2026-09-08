@@ -600,6 +600,16 @@ struct IsolationRuntimeResolution {
     app_root_destination: Option<PathBuf>,
     daemon_socket: Option<PinnedDaemonSocket>,
     backend: Option<Arc<ResolvedIsolationBackend>>,
+    scope_admission: ProcessScopeAdmission,
+}
+
+/// Prospective definition validators use enforced ordinary subprocesses, but
+/// are not a node controller and cannot qualify or allocate its process scopes.
+/// This is an explicit construction boundary, never a retry after host refusal.
+#[derive(Clone, Copy)]
+enum ProcessScopeAdmission {
+    Execution,
+    DefinitionValidation,
 }
 
 #[derive(Clone, Copy)]
@@ -1387,7 +1397,38 @@ impl IsolationRuntime {
         digest: String,
         backend: Option<Arc<ResolvedIsolationBackend>>,
     ) -> Result<Self, EngineError> {
-        Self::resolve_compiled_policy_inner(app_root, policy, source, digest, None, backend)
+        Self::resolve_compiled_policy_inner(
+            app_root,
+            policy,
+            source,
+            digest,
+            None,
+            backend,
+            ProcessScopeAdmission::Execution,
+        )
+    }
+
+    /// Enforced prospective definition validation, not execution admission.
+    /// Retains the exact signed policy and adapter checks without opening or
+    /// probing the controller's scope facility from an installer/CLI process.
+    /// The resulting snapshot advertises no scope capabilities and refuses
+    /// scope allocation. Daemon execution must resolve its own full generation.
+    pub fn resolve_compiled_policy_for_definition_validation(
+        app_root: &Path,
+        policy: IsolationPolicy,
+        source: PathBuf,
+        digest: String,
+        backend: Option<Arc<ResolvedIsolationBackend>>,
+    ) -> Result<Self, EngineError> {
+        Self::resolve_compiled_policy_inner(
+            app_root,
+            policy,
+            source,
+            digest,
+            None,
+            backend,
+            ProcessScopeAdmission::DefinitionValidation,
+        )
     }
 
     /// Daemon form of [`Self::resolve_compiled_policy`] retaining the exact
@@ -1440,7 +1481,15 @@ impl IsolationRuntime {
             name: socket_name.to_os_string(),
             entry,
         };
-        Self::resolve_compiled_policy_inner(app_root, policy, source, digest, Some(socket), backend)
+        Self::resolve_compiled_policy_inner(
+            app_root,
+            policy,
+            source,
+            digest,
+            Some(socket),
+            backend,
+            ProcessScopeAdmission::Execution,
+        )
     }
 
     fn resolve_compiled_policy_inner(
@@ -1450,6 +1499,7 @@ impl IsolationRuntime {
         digest: String,
         daemon_socket: Option<PinnedDaemonSocket>,
         backend: Option<Arc<ResolvedIsolationBackend>>,
+        scope_admission: ProcessScopeAdmission,
     ) -> Result<Self, EngineError> {
         Self::validate_policy(&policy)?;
         validate_namespace_destination("app root", app_root)?;
@@ -1466,6 +1516,7 @@ impl IsolationRuntime {
             app_root_destination: Some(app_root.to_path_buf()),
             daemon_socket,
             backend,
+            scope_admission,
         })
     }
 
@@ -1485,6 +1536,7 @@ impl IsolationRuntime {
             app_root_destination: Some(app_root.to_path_buf()),
             daemon_socket,
             backend,
+            scope_admission: ProcessScopeAdmission::Execution,
         })
     }
 
@@ -3920,6 +3972,7 @@ impl IsolationRuntime {
             app_root_destination,
             daemon_socket,
             backend,
+            scope_admission,
         } = resolution;
         if policy.version != ISOLATION_POLICY_VERSION {
             return Err(refused(format!(
@@ -4028,20 +4081,28 @@ impl IsolationRuntime {
         } else {
             Vec::new()
         };
-        let (process_scope_provider, process_scope_capabilities) = match &policy.process_scopes {
-            IsolationProcessScopePolicy::Unconfigured {} => (None, BTreeSet::new()),
-            IsolationProcessScopePolicy::Configured {
-                configuration,
-                control_timeout_ms,
-                ..
-            } => {
-                let provider =
-                    lillux::ProcessScopeProvider::open(configuration).map_err(refused)?;
-                let timeout = lillux::time::Duration::from_millis(*control_timeout_ms);
-                let capabilities = provider.qualify(timeout).map_err(refused)?;
-                (Some(Arc::new(provider)), capabilities)
-            }
-        };
+        let (process_scope_provider, process_scope_capabilities) =
+            match (&policy.process_scopes, scope_admission) {
+                (_, ProcessScopeAdmission::DefinitionValidation)
+                | (
+                    IsolationProcessScopePolicy::Unconfigured {},
+                    ProcessScopeAdmission::Execution,
+                ) => (None, BTreeSet::new()),
+                (
+                    IsolationProcessScopePolicy::Configured {
+                        configuration,
+                        control_timeout_ms,
+                        ..
+                    },
+                    ProcessScopeAdmission::Execution,
+                ) => {
+                    let provider =
+                        lillux::ProcessScopeProvider::open(configuration).map_err(refused)?;
+                    let timeout = lillux::time::Duration::from_millis(*control_timeout_ms);
+                    let capabilities = provider.qualify(timeout).map_err(refused)?;
+                    (Some(Arc::new(provider)), capabilities)
+                }
+            };
         Ok(Self {
             inspection: IsolationInspection {
                 source,
@@ -4412,6 +4473,7 @@ impl IsolationRuntime {
             app_root_destination: None,
             daemon_socket: None,
             backend: None,
+            scope_admission: ProcessScopeAdmission::DefinitionValidation,
         })
         .expect("compiled disabled isolation fixture policy is valid")
     }
@@ -7484,6 +7546,89 @@ mod tests {
             error
                 .to_string()
                 .contains("requires signed bundle `example-isolation-backend`")
+        );
+    }
+
+    #[test]
+    fn prospective_validation_preserves_policy_without_granting_controller_scopes() {
+        let app_root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(resolved_backend());
+        let mut policy = IsolationPolicy::disabled_for_authoring();
+        policy.mode = IsolationMode::Enforce;
+        policy.backend = Some(backend.selection.clone());
+        policy.process_scopes = serde_json::from_value(serde_json::json!({
+            "mode": "configured", "control_timeout_ms": 1000,
+            "nested_sandbox": false,
+            "configuration": {"version": 3, "backend": {
+                "implementation": "linux_cgroup_v2",
+                "parent": app_root.path().join("absent-host-delegation"),
+            }},
+        }))
+        .unwrap();
+        let source = app_root.path().join("isolation.yaml");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let prospective = IsolationRuntime::resolve_compiled_policy_for_definition_validation(
+            app_root.path(),
+            policy.clone(),
+            source.clone(),
+            digest.clone(),
+            Some(Arc::clone(&backend)),
+        )
+        .unwrap();
+        assert_eq!(prospective.mode(), IsolationMode::Enforce);
+        assert_eq!(prospective.digest(), Some(digest.as_str()));
+        assert_eq!(
+            prospective.inspection().process_scopes,
+            policy.process_scopes
+        );
+        assert!(
+            prospective
+                .inspection()
+                .process_scope_capabilities
+                .is_empty()
+        );
+        assert!(
+            prospective
+                .launch_provenance(None)
+                .process_scope_capabilities
+                .is_empty()
+        );
+        assert!(prospective.process_scope_control_timeout().is_err());
+        assert!(prospective.plan_process_scope("not-a-controller").is_err());
+        assert!(!app_root.path().join("absent-host-delegation").exists());
+
+        // Ordinary execution still requires the real facility, not a retry
+        // through prospective validation when host admission fails.
+        let error = IsolationRuntime::resolve_compiled_policy(
+            app_root.path(),
+            policy.clone(),
+            source.clone(),
+            digest.clone(),
+            Some(Arc::clone(&backend)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("delegation is absent"));
+
+        // Prospective validation does not waive signed backend capabilities.
+        if let IsolationProcessScopePolicy::Configured { nested_sandbox, .. } =
+            &mut policy.process_scopes
+        {
+            *nested_sandbox = true;
+        }
+        policy.filesystem.proc_filesystem =
+            ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespaceNested;
+        let error = IsolationRuntime::resolve_compiled_policy_for_definition_validation(
+            app_root.path(),
+            policy,
+            source,
+            digest,
+            Some(backend),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has not qualified nested-sandbox")
         );
     }
 

@@ -548,7 +548,7 @@ fn run_init_internal(
         isolation_policy,
         prospective_policy.generation_digest(),
     )
-    .context("prospective init source set would fail node boot")?;
+    .context("prospective init source set failed definition admission")?;
 
     // Re-init inherits the existing immutable node policy, but resolves its
     // selected backend and all supporting kinds through the prospective source
@@ -556,7 +556,11 @@ fn run_init_internal(
     // make a clean schema cut impossible: an obsolete bundle could prevent the
     // very init transaction that atomically replaces it. The prospective
     // admission above still fails closed on the signed policy and proves the
-    // exact generation that will become active before any installed tree moves.
+    // exact signed definition generation before any installed tree moves.
+    // The installer is not the supervised node controller. It must not probe
+    // or allocate that controller's process scopes here. Validators still use
+    // enforced ordinary subprocess isolation; daemon startup separately owns
+    // complete host qualification before accepting scoped execution.
     let isolation = Arc::clone(&prospective_isolation);
 
     if !opts.skip_preflight {
@@ -1203,7 +1207,9 @@ fn validate_prospective_staging(
         isolation_policy,
         policy_snapshot.generation_digest(),
     )
-    .with_context(|| format!("completed `{bundle_name}` staging tree would fail next boot"))?;
+    .with_context(|| {
+        format!("completed `{bundle_name}` staging tree failed definition admission")
+    })?;
     Ok(())
 }
 
