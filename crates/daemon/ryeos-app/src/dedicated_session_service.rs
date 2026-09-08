@@ -4753,8 +4753,9 @@ pub fn canonical_terminal_session_projection(
 }
 
 /// Retire one exact durable worker identity without treating registry absence
-/// as process-death proof. The process identity is the final authority when
-/// the in-memory registry cannot prove that it reaped the owned group.
+/// as process-death proof. Durable identity recovery is permitted only when
+/// the registry owner is absent, never to overrule a current owner's pending
+/// attachment or unproved reap obligation.
 pub fn retire_worker_process(
     state: &AppState,
     placement_thread_id: &str,
@@ -4763,9 +4764,6 @@ pub fn retire_worker_process(
     let registry_outcome = state
         .persistent_sessions
         .retire_exclusive(placement_thread_id)?;
-    if registry_outcome == ExclusiveRetirementOutcome::Reaped {
-        return Ok("reaped");
-    }
     let prove_from_identity = || match execution_group_liveness(&worker.process_identity) {
         IdentityLiveness::DeadOrStale => true,
         IdentityLiveness::Alive => {
@@ -4776,11 +4774,29 @@ pub fn retire_worker_process(
         }
         IdentityLiveness::Unavailable => false,
     };
-    Ok(if prove_from_identity() {
-        "reaped"
-    } else {
-        "unproved"
-    })
+    Ok(resolve_worker_retirement(
+        registry_outcome,
+        prove_from_identity,
+    ))
+}
+
+fn resolve_worker_retirement(
+    registry_outcome: ExclusiveRetirementOutcome,
+    prove_from_identity: impl FnOnce() -> bool,
+) -> &'static str {
+    match registry_outcome {
+        ExclusiveRetirementOutcome::Reaped => "reaped",
+        // The current owner still has an attachment or a failed reap duty.
+        // An empty scope/absent group cannot overrule that positive evidence.
+        ExclusiveRetirementOutcome::Reserved | ExclusiveRetirementOutcome::Unproved => "unproved",
+        ExclusiveRetirementOutcome::Absent => {
+            if prove_from_identity() {
+                "reaped"
+            } else {
+                "unproved"
+            }
+        }
+    }
 }
 
 fn validate_hosted_command_completion_fence(
@@ -5259,6 +5275,33 @@ pub fn abort_session_for_root_stop(state: &AppState, placement_thread_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_recovery_cannot_overrule_a_retained_process_owner() {
+        for outcome in [
+            ExclusiveRetirementOutcome::Reserved,
+            ExclusiveRetirementOutcome::Unproved,
+        ] {
+            assert_eq!(
+                resolve_worker_retirement(outcome, || {
+                    panic!("a current owner must not be overridden by identity-based recovery")
+                }),
+                "unproved"
+            );
+        }
+        assert_eq!(
+            resolve_worker_retirement(ExclusiveRetirementOutcome::Reaped, || {
+                panic!("proved owner settlement must not signal a potentially reused process")
+            }),
+            "reaped"
+        );
+        for (proved, expected) in [(true, "reaped"), (false, "unproved")] {
+            assert_eq!(
+                resolve_worker_retirement(ExclusiveRetirementOutcome::Absent, || proved),
+                expected
+            );
+        }
+    }
 
     fn bounded_command(
         attempt: u32,

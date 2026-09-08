@@ -1,4 +1,4 @@
-//! Descriptor-pinned control of an exact Linux process group.
+//! Descriptor-pinned control of exact Linux processes and namespace lifetime.
 //!
 //! Higher layers may retain durable process coordinates, but `/proc`
 //! enumeration, birth-identity verification, pidfds, group signalling, and
@@ -6,6 +6,20 @@
 //! application service from growing a second, numeric-PID process authority.
 
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+mod cgroup;
+// This is the diagnostic witness that a namespace can outlive a process
+// group. It is not a second production lifecycle backend: membership scans
+// cannot provide the kernel freeze barrier required by workspace capture.
+#[cfg(all(test, target_os = "linux"))]
+mod pid_namespace;
+mod scope;
+pub use scope::{
+    ProcessHostLifetime, ProcessScope, ProcessScopeAllocation, ProcessScopeCapability,
+    ProcessScopeConfiguration, ProcessScopeLaunchError, ProcessScopeProvider, ProcessScopeRecovery,
+    QuiescedProcessScope,
+};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -18,6 +32,56 @@ pub struct ExactProcessIdentity {
     pub target_start_time_ticks: u64,
     pub group_leader_pid: u32,
     pub group_leader_start_time_ticks: u64,
+}
+
+/// One completed process barrier, retaining whichever exact lifecycle
+/// authority admission selected. Applications need no backend or OS branch.
+pub struct QuiescedProcesses {
+    authority: QuiescedAuthority,
+}
+
+enum QuiescedAuthority {
+    Group(QuiescedProcessGroup),
+    Scope(QuiescedProcessScope),
+}
+
+impl From<QuiescedProcessGroup> for QuiescedProcesses {
+    fn from(authority: QuiescedProcessGroup) -> Self {
+        Self {
+            authority: QuiescedAuthority::Group(authority),
+        }
+    }
+}
+
+impl From<QuiescedProcessScope> for QuiescedProcesses {
+    fn from(authority: QuiescedProcessScope) -> Self {
+        Self {
+            authority: QuiescedAuthority::Scope(authority),
+        }
+    }
+}
+
+impl QuiescedProcesses {
+    pub fn resume(self, timeout: Duration) -> Result<(), String> {
+        match self.authority {
+            QuiescedAuthority::Group(group) => group.resume(),
+            QuiescedAuthority::Scope(scope) => scope.resume(timeout),
+        }
+    }
+
+    pub fn resume_or_terminate(self, timeout: Duration) -> Result<(), String> {
+        match self.authority {
+            QuiescedAuthority::Group(group) => group.resume_or_terminate(timeout),
+            QuiescedAuthority::Scope(scope) => scope.resume_or_terminate(timeout),
+        }
+    }
+
+    pub fn terminate(self, timeout: Duration) -> Result<(), String> {
+        match self.authority {
+            QuiescedAuthority::Group(group) => group.terminate(timeout),
+            QuiescedAuthority::Scope(scope) => scope.terminate(timeout),
+        }
+    }
 }
 
 /// A descriptor-pinned set whose live members have all crossed the stop
@@ -56,9 +120,47 @@ impl ExactProcessIdentity {
     }
 }
 
+/// Prepare this controller for the existing exact process-group lifecycle.
+/// This is a startup operation, not a read-only health check: it establishes
+/// the caller's own group when necessary, then probes group signaling through
+/// a retained pidfd with signal zero. No workload or foreign group is signaled.
+///
+/// This does NOT provision or qualify whole-execution scopes. Those require
+/// an explicitly authorized `ProcessScopeProvider` and its placement probe;
+/// group support can never stand in for unavailable scope capabilities.
+pub fn prepare_process_group_controller() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = unsafe { libc::getpid() };
+        if unsafe { libc::getpgrp() } != pid {
+            if unsafe { libc::setpgid(0, 0) } != 0 {
+                return Err(format!(
+                    "place process controller in its own group: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if unsafe { libc::getpgrp() } != pid {
+                return Err("process controller did not acquire its exact own group".to_owned());
+            }
+        }
+        let pidfd = linux::open_pidfd(pid as u32)?;
+        linux::pidfd_signal(pidfd.as_raw_fd(), 0, libc::PIDFD_SIGNAL_PROCESS_GROUP)
+            .map_err(|error| format!("exact process-group signaling is unavailable: {error}"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("exact process-group control is unavailable on this OS".to_owned())
+    }
+}
+
 /// Stop the exact process group and return only after every live member is
 /// descriptor-pinned and observably stopped. Signal delivery alone is not a
 /// filesystem-freeze barrier.
+///
+/// This is NOT a descendant-tree primitive. Its callers must retain the
+/// admitted no-group-escape contract; a private PID namespace does not make
+/// group membership complete. Escapable groups require the admitted
+/// [`ProcessScope`] kernel barrier, never a namespace-membership scan.
 pub fn quiesce_exact_process_group(
     identity: &ExactProcessIdentity,
     timeout: Duration,
@@ -219,10 +321,10 @@ mod linux {
     const QUIESCE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
     #[derive(Debug, Clone, Copy)]
-    struct ProcessStat {
-        state: char,
-        process_group: i64,
-        start_time_ticks: u64,
+    pub(super) struct ProcessStat {
+        pub(super) state: char,
+        pub(super) process_group: i64,
+        pub(super) start_time_ticks: u64,
     }
 
     pub(super) fn quiesce(
@@ -444,13 +546,13 @@ mod linux {
         Ok(PinnedMember { pid, pidfd })
     }
 
-    fn read_boot_id() -> Result<String, String> {
+    pub(super) fn read_boot_id() -> Result<String, String> {
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map(|value| value.trim().to_owned())
             .map_err(|error| format!("read Linux boot identity: {error}"))
     }
 
-    fn read_process_stat(pid: u32) -> std::io::Result<ProcessStat> {
+    pub(super) fn read_process_stat(pid: u32) -> std::io::Result<ProcessStat> {
         let raw = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let close = raw.rfind(')').ok_or_else(|| {
             std::io::Error::new(
@@ -492,7 +594,7 @@ mod linux {
         })
     }
 
-    fn open_pidfd(pid: u32) -> Result<OwnedFd, String> {
+    pub(super) fn open_pidfd(pid: u32) -> Result<OwnedFd, String> {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) } as i32;
         if raw < 0 {
             return Err(format!(
@@ -572,5 +674,38 @@ mod tests {
     #[test]
     fn libc_process_group_pidfd_flag_matches_linux_uapi() {
         assert_eq!(libc::PIDFD_SIGNAL_PROCESS_GROUP, 1_u32 << 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_controller_preparation_is_idempotent_and_child_local() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "LILLUX_TEST_CONTROLLER_PREPARATION";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let pid = std::process::id() as i32;
+            assert_eq!(unsafe { libc::getpgrp() } == pid, mode == "leader");
+            prepare_process_group_controller().unwrap();
+            assert_eq!(unsafe { libc::getpgrp() }, pid);
+            prepare_process_group_controller().unwrap();
+            assert_eq!(unsafe { libc::getpgrp() }, pid);
+            return;
+        }
+        let caller_group = unsafe { libc::getpgrp() };
+        for mode in ["inherited", "leader"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "process_control::tests::process_group_controller_preparation_is_idempotent_and_child_local",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, mode);
+            if mode == "leader" {
+                command.process_group(0);
+            }
+            assert!(command.status().unwrap().success(), "{mode}");
+            assert_eq!(unsafe { libc::getpgrp() }, caller_group);
+        }
     }
 }

@@ -25,6 +25,10 @@ pub struct IsolationLaunchProvenance {
     pub adapter_protocol: Option<IsolationAdapterProtocolVersion>,
     pub payloads: BTreeMap<IsolationArtifactRole, InspectedArtifact>,
     pub effective_capabilities: BTreeSet<IsolationCapability>,
+    /// Actually qualified node-generation guarantees, not merely implemented
+    /// backend features. The policy digest binds the selected configuration;
+    /// process attachment separately retains the exact allocated scope.
+    pub process_scope_capabilities: BTreeSet<lillux::ProcessScopeCapability>,
     /// Sealed target-local network inputs in this resolved node generation.
     /// These are local admission facts, not portable program dependencies.
     /// An isolated-network launch receives none of these files; its concrete
@@ -66,18 +70,32 @@ pub struct AppliedIsolationLaunch {
 /// The inner request is intentionally private: callers must explicitly consume
 /// this type when handing it to Lillux's attachment-aware spawn path instead of
 /// accidentally passing it to an ordinary spawn API.
-pub struct IsolationRequestAwaitingAttachment(lillux::SubprocessRequest);
+pub struct IsolationRequestAwaitingAttachment {
+    request: lillux::SubprocessRequest,
+    scope: Option<lillux::ProcessScope>,
+}
 
 impl IsolationRequestAwaitingAttachment {
-    pub(super) fn new(request: lillux::SubprocessRequest) -> Self {
-        Self(request)
+    pub(super) fn new(
+        request: lillux::SubprocessRequest,
+        scope: Option<lillux::ProcessScope>,
+    ) -> Self {
+        Self { request, scope }
     }
 
     /// Consume the typed isolation result through Lillux's matching lifecycle
     /// operation. The raw request is never exposed, so a disabled-isolation
     /// direct launch cannot be silently downgraded to ordinary spawn.
     pub fn spawn(self) -> Result<lillux::ProcessAwaitingAttachment, lillux::SubprocessResult> {
-        lillux::spawn_awaiting_attachment(self.0)
+        // The concrete scope was validated and retained BEFORE compiling the
+        // plan. It cannot be swapped or omitted at this last launch seam.
+        // Its higher owner separately journals recovery through any error.
+        match self.scope {
+            Some(scope) => scope
+                .spawn_awaiting_attachment(self.request)
+                .map_err(|error| error.result),
+            None => lillux::spawn_awaiting_attachment(self.request),
+        }
     }
 }
 

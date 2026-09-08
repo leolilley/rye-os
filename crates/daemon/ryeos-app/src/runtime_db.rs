@@ -191,6 +191,9 @@ pub struct ChainRecoveryPins {
     pub runtime_membership_conflicts: u64,
     pub in_process_handler_reservations: u64,
     pub live_processes: u64,
+    /// Whole-execution resources remain owned until their existing session
+    /// retirement journal settles, even after the last observed PID exits.
+    pub process_scope_obligations: u64,
     pub launch_claims: u64,
     /// Active launch claims whose persisted launch contract is resume- or
     /// continuation-capable. This is deliberately derived from an owning claim;
@@ -219,6 +222,7 @@ impl ChainRecoveryPins {
         self.runtime_membership_conflicts == 0
             && self.in_process_handler_reservations == 0
             && self.live_processes == 0
+            && self.process_scope_obligations == 0
             && self.launch_claims == 0
             && self.recovery_capable_launch_claims == 0
             && self.required_checkpoint_consumers == 0
@@ -1006,6 +1010,24 @@ impl FollowWaiterSummary {
     }
 }
 
+// Stable offline lifetime fence, independent of execution-row schema epochs.
+// It is ONE conservative host witness, not a second per-worker registry. The
+// existing session/retirement transactions own when it is set and cleared.
+// Keep this contract readable across future execution schema cuts; do not
+// replace it with the best-effort daemon PID/exit marker or a cgroup path scan.
+const SCOPE_LIFETIME_FENCE_FIRST_EPOCH: u32 = 30;
+const SCOPE_LIFETIME_FENCE_SQL: &str = r#"CREATE TABLE execution_lifetime_fence (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    host_lifetime TEXT
+)"#;
+
+fn runtime_schema_sql() -> String {
+    format!(
+        "{SCOPE_LIFETIME_FENCE_SQL};\nINSERT INTO execution_lifetime_fence VALUES(1,1,NULL);\n{SCHEMA_SQL}"
+    )
+}
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS thread_runtime (
     thread_id TEXT PRIMARY KEY,
@@ -1333,6 +1355,8 @@ CREATE TABLE IF NOT EXISTS dedicated_session (
     admitted_capsule_hash TEXT NOT NULL,
     worker_instance_id TEXT,
     worker_boot_epoch INTEGER,
+    worker_scope TEXT,
+    scope_retirement TEXT,
     workspace_id TEXT NOT NULL,
     candidate_required INTEGER NOT NULL CHECK (candidate_required IN (0, 1)),
     candidate_disposition TEXT NOT NULL CHECK (candidate_disposition IN ('owner_decision', 'retained_for_review')),
@@ -1586,7 +1610,9 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // coordinating fixed-parent confinement cut. No ambient-kind recovery substitution.
 // Epoch 28 records exact per-launch shared-view membership and creator
 // attachment. No predecessor row can imply borrower absence or mount ownership.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 28;
+// Epoch 30 retains pre-contact scope authority in the existing session owner,
+// explicit attached scope presence/absence and the stable offline lifetime fence.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 30;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -1599,6 +1625,29 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
     sqlite_schema::SchemaSpec {
         application_id: RUNTIME_APP_ID,
         tables: &[
+            sqlite_schema::TableSpec {
+                name: "execution_lifetime_fence",
+                columns: &[
+                    sqlite_schema::ColumnSpec {
+                        name: "singleton",
+                        col_type: "INTEGER",
+                        pk: true,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "schema_version",
+                        col_type: "INTEGER",
+                        pk: false,
+                        not_null: true,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "host_lifetime",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                ],
+            },
             sqlite_schema::TableSpec {
                 name: "thread_runtime",
                 columns: &[
@@ -2631,6 +2680,18 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                         not_null: false,
                     },
                     sqlite_schema::ColumnSpec {
+                        name: "worker_scope",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "scope_retirement",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
                         name: "workspace_id",
                         col_type: "TEXT",
                         pk: false,
@@ -3645,10 +3706,72 @@ fn encode_current_launch_metadata(metadata: &RuntimeLaunchMetadata) -> Result<St
     lillux::canonical_json(&value).context("canonicalize current launch metadata")
 }
 
+fn read_scope_lifetime_fence(conn: &Connection) -> Result<Option<lillux::ProcessHostLifetime>> {
+    let schema: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='execution_lifetime_fence'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if schema.as_deref() != Some(SCOPE_LIFETIME_FENCE_SQL) {
+        bail!(
+            "runtime scope lifetime fence is absent or not its exact stable contract; refusing to infer cleanup"
+        );
+    }
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM execution_lifetime_fence", [], |row| {
+            row.get(0)
+        })?;
+    if count != 1 {
+        bail!("runtime scope lifetime fence must have exactly one explicit row");
+    }
+    // Bounded kernel witness, not a policy-selected workload input.
+    let (version, bytes): (i64, Option<i64>) = conn.query_row(
+        "SELECT schema_version, length(CAST(host_lifetime AS BLOB)) FROM execution_lifetime_fence WHERE singleton=1",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if version != 1 || bytes.is_some_and(|bytes| !(1..=1024).contains(&bytes)) {
+        bail!("runtime scope lifetime fence has an unsupported version or size");
+    }
+    let raw: Option<String> = conn.query_row(
+        "SELECT host_lifetime FROM execution_lifetime_fence WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    raw.map(|raw| {
+        let lifetime: lillux::ProcessHostLifetime = serde_json::from_str(&raw)?;
+        lifetime.validate().map_err(anyhow::Error::msg)?;
+        if lillux::canonical_json(&serde_json::to_value(&lifetime)?)? != raw {
+            bail!("runtime scope lifetime witness is not canonical");
+        }
+        Ok(lifetime)
+    })
+    .transpose()
+}
+
+fn ensure_scope_lifetime_resettable(conn: &Connection, stored_epoch: u32) -> Result<()> {
+    // The coarse owner starts with the first scope-capable runtime cut. Older
+    // owned epochs could not allocate these resources; never decode their
+    // execution rows. Every epoch from this cut onward requires the witness,
+    // even when its execution tables are no longer understood by this binary.
+    if stored_epoch < SCOPE_LIFETIME_FENCE_FIRST_EPOCH {
+        return Ok(());
+    }
+    if let Some(lifetime) = read_scope_lifetime_fence(conn)? {
+        if !lifetime.has_ended().map_err(anyhow::Error::msg)? {
+            bail!(
+                "execution-history reset retains unsettled process-scope lifetime authority; settle all workspaces with the owning runtime before upgrading, or end that host lifetime; restarting only the daemon is not cleanup proof"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn initialize_current_runtime_schema(conn: &Connection, path: &Path) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin atomic runtime schema initialization")?;
-    sqlite_schema::init_owned(&tx, &runtime_schema_spec(), SCHEMA_SQL, path)?;
+    sqlite_schema::init_owned(&tx, &runtime_schema_spec(), &runtime_schema_sql(), path)?;
     assert_current_runtime_schema(&tx, path)?;
     tx.commit()
         .context("commit atomic runtime schema initialization")
@@ -3663,6 +3786,7 @@ fn validate_current_runtime_store(conn: &Connection, path: &Path) -> Result<()> 
         return Err(incompatible_runtime_operator_schema(stored_epoch));
     }
     assert_current_runtime_schema(&tx, path)?;
+    read_scope_lifetime_fence(&tx)?;
     let rows = {
         let mut statement = tx.prepare(
             "SELECT 'thread_runtime', thread_id, launch_metadata
@@ -3824,10 +3948,12 @@ fn discard_predecessor_runtime_schema(tx: &Transaction<'_>) -> Result<()> {
 /// Destructively replace an owned predecessor runtime schema with the exact
 /// current empty schema. This is not an open-time migration: the only caller is
 /// the explicitly confirmed offline all-thread-history reset. Ownership and
-/// the outer epoch are proven before mutation; no predecessor schema object,
-/// row, or embedded authority is interpreted or carried forward.
+/// the outer epoch and independent stable lifetime fence are proven before
+/// mutation. No predecessor execution row or embedded launch authority is
+/// interpreted or carried forward; the fence is not an execution-schema decoder.
 fn reset_owned_runtime_schema(conn: &Connection, path: &Path) -> Result<()> {
     let operator_epoch = runtime_operator_schema_epoch(conn, path)?;
+    ensure_scope_lifetime_resettable(conn, operator_epoch)?;
     if operator_epoch >= RUNTIME_OPERATOR_SCHEMA_EPOCH {
         bail!(
             "runtime database operator schema epoch is {operator_epoch}, expected a proven predecessor of {RUNTIME_OPERATOR_SCHEMA_EPOCH}; refusing explicit reset of {}",
@@ -3850,7 +3976,7 @@ fn reset_owned_runtime_schema(conn: &Connection, path: &Path) -> Result<()> {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
             .context("begin atomic explicit runtime reset")?;
         discard_predecessor_runtime_schema(&tx)?;
-        sqlite_schema::init_owned(&tx, &runtime_schema_spec(), SCHEMA_SQL, path)?;
+        sqlite_schema::init_owned(&tx, &runtime_schema_spec(), &runtime_schema_sql(), path)?;
         tx.execute("DELETE FROM sqlite_sequence", [])
             .context("clear runtime sequence state during explicit reset")?;
         assert_current_runtime_schema(&tx, path)?;
@@ -4031,6 +4157,53 @@ pub struct CredentialProfileReservationRecord {
     pub state: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Pre-contact authority retained inside the existing session row. Coordinates
+/// remain auditable after a proved failed start clears its active worker slot;
+/// these repeated fields must match that slot while the attempt is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedWorkerScopeReservation {
+    pub worker_instance_id: String,
+    pub boot_epoch: u64,
+    pub daemon_generation_id: String,
+    pub allocation: lillux::ProcessScopeAllocation,
+    // Required explicit null means resource creation has not been bound. A
+    // missing field is not predecessor-compatible launch authority.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub recovery: Option<lillux::ProcessScopeRecovery>,
+}
+
+impl DedicatedWorkerScopeReservation {
+    fn validate(&self) -> Result<()> {
+        self.allocation.validate().map_err(anyhow::Error::msg)?;
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| !recovery.matches_allocation(&self.allocation))
+        {
+            bail!("worker scope binding contradicts its planned allocation");
+        }
+        Ok(())
+    }
+}
+
+/// Removal intent on the existing closed session owner, not a new process
+/// registry. Historical worker/process identities are never rewritten into
+/// absence evidence when their kernel resources are retired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DedicatedScopeRetirement {
+    pub state: ScopeRetirementState,
+    pub scopes: Vec<lillux::ProcessScopeRecovery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScopeRetirementState {
+    Reserved,
+    Retired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4338,7 +4511,7 @@ fn assert_current_runtime_schema(conn: &Connection, path: &Path) -> Result<()> {
     }
     sqlite_schema::assert_owned(conn, &runtime_schema_spec(), path)
         .context("runtime database is not the exact current owned schema")?;
-    sqlite_schema::assert_complete_schema_sql(conn, SCHEMA_SQL, path)
+    sqlite_schema::assert_complete_schema_sql(conn, &runtime_schema_sql(), path)
         .context("runtime database SQL does not match the exact current format")
 }
 
@@ -5516,7 +5689,8 @@ impl RuntimeDb {
         let epoch = i64::try_from(worker_boot_epoch)?;
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
-        // `cleanup_proved` is the caller's exact held-launch/reap testimony.
+        // `cleanup_proved` is the caller's exact held-launch/reap testimony
+        // or Lillux proof that the recorded host lifetime has ended.
         // A missing row is never that proof; a retained row must independently
         // agree with the same attempt and its settled cleanup state.
         if cleanup_proved {
@@ -5709,6 +5883,7 @@ impl RuntimeDb {
                     workspace_id=?5, worker_instance_id=?4, worker_boot_epoch=?6
               WHERE placement_thread_id=?1 AND state='recovering'
                 AND worker_instance_id IS NULL AND worker_boot_epoch IS NULL
+                AND worker_scope IS NULL AND scope_retirement IS NULL
                 AND send_boundary='none'
                 AND EXISTS(SELECT 1 FROM credential_profile
                   WHERE profile_id=dedicated_session.credential_profile_id
@@ -8768,6 +8943,371 @@ impl RuntimeDb {
         Ok(())
     }
 
+    /// Reserve removal only after the workspace is closed and every worker
+    /// epoch is proved settled. The retained scope set is derived from the
+    /// existing attachment and pre-contact journals, never a filesystem scan.
+    pub(crate) fn reserve_closed_worker_scope_retirement(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<(String, DedicatedScopeRetirement)>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let session: Option<(
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = tx
+            .query_row(
+                "SELECT s.placement_thread_id, s.worker_instance_id, s.worker_boot_epoch,
+                    s.state, s.send_boundary, s.worker_scope, s.scope_retirement, w.state
+               FROM dedicated_session s JOIN execution_workspace w
+                 ON w.workspace_id=s.workspace_id AND w.thread_id=s.placement_thread_id
+              WHERE s.workspace_id=?1",
+                [workspace_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            placement,
+            active_worker,
+            active_epoch,
+            state,
+            boundary,
+            pending,
+            incumbent,
+            workspace_state,
+        )) = session
+        else {
+            return Ok(None);
+        };
+        if workspace_state != WorkspaceState::Closed.as_str() {
+            bail!("worker scope retirement requires a closed workspace");
+        }
+        let unsettled_action: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_action_intent
+              WHERE workspace_id=?1 AND workspace_operation_phase!='released')",
+            [workspace_id],
+            |row| row.get(0),
+        )?;
+        if unsettled_action {
+            bail!("worker scope retirement retains a workspace borrower");
+        }
+        let ids = {
+            let mut statement = tx.prepare(
+                "SELECT worker_instance_id FROM worker_process WHERE placement_thread_id=?1 ORDER BY worker_instance_id"
+            )?;
+            statement
+                .query_map([&placement], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut scopes = BTreeMap::new();
+        let mut active_found = false;
+        for id in ids {
+            let worker = self
+                .worker_process(&id)?
+                .ok_or_else(|| anyhow!("retirement worker disappeared"))?;
+            if worker.state != WorkerProcessState::Dead || worker.cleanup_state != "reaped" {
+                bail!("worker scope retirement retains an unsettled process owner");
+            }
+            if active_worker.as_deref() == Some(id.as_str()) {
+                if active_epoch != Some(i64::try_from(worker.boot_epoch)?) {
+                    bail!("scope retirement active epoch contradicts its worker");
+                }
+                active_found = true;
+            }
+            if let Some(scope) = worker.process_identity.process_scope {
+                scopes.insert(
+                    lillux::canonical_json(&serde_json::to_value(&scope)?)?,
+                    scope,
+                );
+            }
+        }
+        if active_worker.is_some() && !active_found {
+            bail!("scope retirement lacks its active worker settlement");
+        }
+        if active_worker.is_none()
+            && (active_epoch.is_some() || state != "terminal" || boundary == "outcome_unknown")
+        {
+            bail!("scope retirement lacks explicit failed-start settlement");
+        }
+        if let Some(raw) = pending {
+            let reservation: DedicatedWorkerScopeReservation = serde_json::from_str(&raw)?;
+            reservation.validate()?;
+            if reservation.boot_epoch == 0
+                || reservation.worker_instance_id.is_empty()
+                || reservation.daemon_generation_id.is_empty()
+                || lillux::canonical_json(&serde_json::to_value(&reservation)?)? != raw
+            {
+                bail!("scope retirement has a noncanonical pre-contact reservation");
+            }
+            if active_found {
+                let worker = self
+                    .worker_process(&reservation.worker_instance_id)?
+                    .ok_or_else(|| anyhow!("scope retirement reservation has no attached owner"))?;
+                if active_worker.as_deref() != Some(reservation.worker_instance_id.as_str())
+                    || active_epoch != Some(i64::try_from(reservation.boot_epoch)?)
+                    || worker.daemon_generation_id != reservation.daemon_generation_id
+                    || reservation.recovery.is_none()
+                    || worker.process_identity.process_scope.as_ref()
+                        != reservation.recovery.as_ref()
+                {
+                    bail!("scope retirement reservation contradicts its attached owner");
+                }
+            }
+            if let Some(recovery) = reservation.recovery {
+                scopes.insert(
+                    lillux::canonical_json(&serde_json::to_value(&recovery)?)?,
+                    recovery,
+                );
+            }
+        }
+        let scopes: Vec<_> = scopes.into_values().collect();
+        let retirement = match incumbent {
+            Some(raw) => {
+                let retained: DedicatedScopeRetirement = serde_json::from_str(&raw)?;
+                if retained.scopes != scopes
+                    || lillux::canonical_json(&serde_json::to_value(&retained)?)? != raw
+                {
+                    bail!("scope retirement differs from the settled owner journals");
+                }
+                retained
+            }
+            None => {
+                let retirement = DedicatedScopeRetirement {
+                    state: ScopeRetirementState::Reserved,
+                    scopes,
+                };
+                let encoded = lillux::canonical_json(&serde_json::to_value(&retirement)?)?;
+                if tx.execute("UPDATE dedicated_session SET scope_retirement=?2 WHERE placement_thread_id=?1 AND scope_retirement IS NULL",
+                    params![placement, encoded])? != 1 {
+                    bail!("scope retirement lost its closed session reservation");
+                }
+                retirement
+            }
+        };
+        tx.commit()?;
+        Ok(Some((placement, retirement)))
+    }
+
+    pub(crate) fn complete_closed_worker_scope_retirement(
+        &self,
+        placement: &str,
+        reserved: &DedicatedScopeRetirement,
+    ) -> Result<()> {
+        if reserved.state != ScopeRetirementState::Reserved {
+            bail!("scope retirement completion requires a reserved intent");
+        }
+        let expected = lillux::canonical_json(&serde_json::to_value(reserved)?)?;
+        let mut settled = reserved.clone();
+        settled.state = ScopeRetirementState::Retired;
+        let completed = lillux::canonical_json(&serde_json::to_value(&settled)?)?;
+        let tx = self.conn.unchecked_transaction()?;
+        if tx.execute(
+            "UPDATE dedicated_session SET scope_retirement=?3
+              WHERE placement_thread_id=?1 AND scope_retirement=?2
+                AND EXISTS(SELECT 1 FROM execution_workspace
+                  WHERE workspace_id=dedicated_session.workspace_id AND state='closed')",
+            params![placement, expected, completed],
+        )? != 1
+        {
+            let exact: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM dedicated_session WHERE placement_thread_id=?1 AND scope_retirement=?2)",
+                params![placement, completed], |row| row.get(0),
+            )?;
+            if !exact {
+                bail!("scope retirement completion lost its exact intent");
+            }
+        }
+        if self.unsettled_process_scope_count(None)? == 0 {
+            // Clear the coarse fence in the SAME commit as the last exact
+            // retirement. A crash may retain excess evidence, never erase it
+            // before its existing per-worker/workspace owner is settled.
+            tx.execute(
+                "UPDATE execution_lifetime_fence SET host_lifetime=NULL WHERE singleton=1",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn closed_worker_scope_retirement_workspaces(&self) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.workspace_id FROM dedicated_session s JOIN execution_workspace w
+               ON w.workspace_id=s.workspace_id AND w.thread_id=s.placement_thread_id
+              WHERE w.state='closed' AND (s.scope_retirement IS NULL OR json_extract(s.scope_retirement,'$.state')!='retired')
+              ORDER BY s.placement_thread_id"
+        )?;
+        Ok(statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Retain allocation intent before kernel resource creation. The existing
+    /// session attempt is the owner, including the crash gap before a held
+    /// process can supply its complete identity. This is deliberately not an
+    /// upsert: replay must not grant a second launch in the same scope.
+    pub fn reserve_dedicated_worker_scope(
+        &self,
+        placement_thread_id: &str,
+        worker_instance_id: &str,
+        boot_epoch: u64,
+        allocation: &lillux::ProcessScopeAllocation,
+    ) -> Result<()> {
+        allocation.validate().map_err(anyhow::Error::msg)?;
+        if boot_epoch == 0 {
+            bail!("scope reservation requires a positive epoch");
+        }
+        let reservation = DedicatedWorkerScopeReservation {
+            worker_instance_id: worker_instance_id.to_owned(),
+            boot_epoch,
+            daemon_generation_id: daemon_generation_id().to_owned(),
+            allocation: allocation.clone(),
+            recovery: None,
+        };
+        let scope_json = lillux::canonical_json(&serde_json::to_value(&reservation)?)?;
+        let lifetime = allocation.host_lifetime().map_err(anyhow::Error::msg)?;
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(incumbent) = read_scope_lifetime_fence(&tx)? {
+            if incumbent != lifetime && !incumbent.has_ended().map_err(anyhow::Error::msg)? {
+                bail!("scope reservation requires retirement of the previous host-lifetime fence");
+            }
+        }
+        let encoded_lifetime = lillux::canonical_json(&serde_json::to_value(&lifetime)?)?;
+        tx.execute(
+            "UPDATE execution_lifetime_fence SET host_lifetime=?1 WHERE singleton=1",
+            [&encoded_lifetime],
+        )?;
+        let changed = tx.execute(
+            "UPDATE dedicated_session SET worker_scope=?4, updated_at_ms=?5
+              WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3
+                AND state='admitted' AND worker_scope IS NULL AND scope_retirement IS NULL
+                AND NOT EXISTS(SELECT 1 FROM worker_process WHERE worker_instance_id=?2)
+                AND NOT EXISTS(SELECT 1 FROM runtime_action_intent
+                  WHERE chain_root_id=dedicated_session.chain_root_id AND workspace_id IS NOT NULL
+                    AND workspace_operation_phase!='released')
+                AND EXISTS(SELECT 1 FROM credential_profile
+                  WHERE profile_id=dedicated_session.credential_profile_id
+                    AND credential_generation=dedicated_session.credential_generation
+                    AND lock_owner=?2
+                    AND state IN ('unauthenticated','enrolling','confirming','active'))",
+            params![
+                placement_thread_id,
+                worker_instance_id,
+                i64::try_from(boot_epoch)?,
+                scope_json,
+                lillux::time::timestamp_millis() as i64
+            ],
+        )?;
+        if changed != 1 {
+            bail!("worker scope reservation lost its uncontacted session/credential fence");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bind the exact allocation result before any process may be spawned.
+    /// This is a one-shot CAS on the existing attempt, not a recoverable
+    /// instruction to create or launch again after a daemon restart.
+    pub fn bind_dedicated_worker_scope(
+        &self,
+        placement_thread_id: &str,
+        worker_instance_id: &str,
+        boot_epoch: u64,
+        recovery: &lillux::ProcessScopeRecovery,
+    ) -> Result<()> {
+        let mut reservation = self
+            .dedicated_worker_scope(placement_thread_id, worker_instance_id, boot_epoch)?
+            .ok_or_else(|| anyhow!("scope binding has no allocation intent"))?;
+        if reservation.recovery.is_some()
+            || reservation.daemon_generation_id != daemon_generation_id()
+            || !recovery.matches_allocation(&reservation.allocation)
+        {
+            bail!("scope binding lost its original unbound allocation");
+        }
+        let expected = lillux::canonical_json(&serde_json::to_value(&reservation)?)?;
+        reservation.recovery = Some(recovery.clone());
+        let bound = lillux::canonical_json(&serde_json::to_value(&reservation)?)?;
+        let changed = self.conn.execute(
+            "UPDATE dedicated_session SET worker_scope=?5, updated_at_ms=?6
+             WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3
+               AND worker_scope=?4 AND state='admitted' AND scope_retirement IS NULL
+               AND NOT EXISTS(SELECT 1 FROM worker_process WHERE worker_instance_id=?2)
+               AND NOT EXISTS(SELECT 1 FROM runtime_action_intent
+                 WHERE chain_root_id=dedicated_session.chain_root_id AND workspace_id IS NOT NULL
+                   AND workspace_operation_phase!='released')
+               AND EXISTS(SELECT 1 FROM credential_profile
+                 WHERE profile_id=dedicated_session.credential_profile_id
+                   AND credential_generation=dedicated_session.credential_generation
+                   AND lock_owner=?2
+                   AND state IN ('unauthenticated','enrolling','confirming','active'))",
+            params![
+                placement_thread_id,
+                worker_instance_id,
+                i64::try_from(boot_epoch)?,
+                expected,
+                bound,
+                lillux::time::timestamp_millis() as i64
+            ],
+        )?;
+        if changed != 1 {
+            bail!("scope binding lost its uncontacted session/credential fence");
+        }
+        Ok(())
+    }
+
+    /// Exact pending attempt lookup, not a latest-process query. A missing
+    /// attempt is an error; a present attempt without scope remains distinct
+    /// from proof that its process never contacted the workspace.
+    pub fn dedicated_worker_scope(
+        &self,
+        placement_thread_id: &str,
+        worker_instance_id: &str,
+        boot_epoch: u64,
+    ) -> Result<Option<DedicatedWorkerScopeReservation>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT worker_scope FROM dedicated_session
+              WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3",
+                params![
+                    placement_thread_id,
+                    worker_instance_id,
+                    i64::try_from(boot_epoch)?
+                ],
+                |row| row.get(0),
+            )
+            .context("worker scope lookup lost its exact session attempt")?;
+        raw.map(|raw| {
+            let reservation: DedicatedWorkerScopeReservation = serde_json::from_str(&raw)?;
+            reservation.validate()?;
+            if reservation.worker_instance_id != worker_instance_id
+                || reservation.boot_epoch != boot_epoch
+                || reservation.daemon_generation_id.is_empty()
+                || lillux::canonical_json(&serde_json::to_value(&reservation)?)? != raw
+            {
+                bail!("retained worker scope is not canonical");
+            }
+            Ok(reservation)
+        })
+        .transpose()
+    }
+
     /// Atomically publish the operational owner of one held exclusive process
     /// and activate its already-constructed workspace. The caller may release
     /// the held child only after this transaction commits.
@@ -8777,11 +9317,27 @@ impl RuntimeDb {
             bail!("new worker process must enter as attached and owned");
         }
         let tx = self.conn.unchecked_transaction()?;
+        let reserved_scope = self.dedicated_worker_scope(
+            &record.placement_thread_id,
+            &record.worker_instance_id,
+            record.boot_epoch,
+        )?;
+        if reserved_scope
+            .as_ref()
+            .and_then(|reservation| reservation.recovery.as_ref())
+            != record.process_identity.process_scope.as_ref()
+            || reserved_scope.as_ref().is_some_and(|reservation| {
+                reservation.daemon_generation_id != record.daemon_generation_id
+                    || reservation.recovery.is_none()
+            })
+        {
+            bail!("held worker scope differs from its pre-contact reservation");
+        }
         let session: Option<(String, String, String, String, i64, String)> = tx
             .query_row(
                 "SELECT admitted_capsule_hash, workspace_id, state,
                         credential_profile_id, credential_generation, chain_root_id
-                 FROM dedicated_session WHERE placement_thread_id = ?1",
+                 FROM dedicated_session WHERE placement_thread_id = ?1 AND scope_retirement IS NULL",
                 [&record.placement_thread_id],
                 |row| {
                     Ok((
@@ -9200,7 +9756,7 @@ impl RuntimeDb {
         let session_changed = if cleanup_state == "reaped" {
             tx.execute(
                 "UPDATE dedicated_session
-                    SET worker_instance_id=NULL, worker_boot_epoch=NULL, state=?4,
+                    SET worker_instance_id=NULL, worker_boot_epoch=NULL, worker_scope=NULL, state=?4,
                         send_boundary=?5, current_turn_id=NULL, updated_at_ms=?6
                   WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3
                     AND state NOT IN ('terminal','frozen','publish_ready')",
@@ -10535,6 +11091,15 @@ impl RuntimeDb {
         &self,
         dry_run: bool,
     ) -> Result<RuntimeThreadHistoryDiscardReport> {
+        // Offline daemon exclusion is not process settlement. Preserve the
+        // existing scope/workspace recovery owner even if every PID is dead.
+        // The outer reset calls this inspection before publishing its intent.
+        if self.unsettled_process_scope_count(None)? != 0 {
+            bail!(
+                "execution-history reset requires completed process-scope retirement; preserve the runtime and settle its workspaces first"
+            );
+        }
+        ensure_scope_lifetime_resettable(&self.conn, RUNTIME_OPERATOR_SCHEMA_EPOCH)?;
         fn count(conn: &Connection, table: &str) -> Result<usize> {
             let rows: i64 =
                 conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -11668,6 +12233,9 @@ impl RuntimeDb {
                 }
                 return Err(error);
             }
+            if mode.explicit_history_reset() {
+                ensure_scope_lifetime_resettable(&conn, stored_epoch)?;
+            }
             if stored_epoch < RUNTIME_OPERATOR_SCHEMA_EPOCH {
                 let error = incompatible_runtime_operator_schema(stored_epoch);
                 if !mode.explicit_history_reset() {
@@ -12716,6 +13284,34 @@ impl RuntimeDb {
         )? > 0)
     }
 
+    /// The same lifetime obligation gates ordinary GC and offline current-
+    /// schema history discard. Never reinterpret a predecessor schema here;
+    /// its reset still needs independent node-lifecycle settlement authority.
+    fn unsettled_process_scope_count(&self, chain_root_id: Option<&str>) -> Result<u64> {
+        // Keep per-chain GC indexable; an optional-parameter OR would turn
+        // repeated chain inspection into whole-session-table scans. Only
+        // these compiler-owned clauses enter SQL; identity stays a parameter.
+        let selection = if chain_root_id.is_some() {
+            "s.chain_root_id=?1"
+        } else {
+            "?1 IS NULL"
+        };
+        let value: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM dedicated_session s
+             WHERE {selection}
+               AND (s.worker_scope IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM worker_process w
+                 WHERE w.placement_thread_id=s.placement_thread_id
+                   AND json_type(w.process_identity, '$.process_scope') IS NOT 'null'))
+               AND COALESCE(json_extract(s.scope_retirement, '$.state'), '') != 'retired'"
+            ),
+            [chain_root_id],
+            |row| row.get(0),
+        )?;
+        u64::try_from(value).context("negative process-scope obligation count")
+    }
+
     pub fn inspect_chain_recovery_pins(
         &self,
         chain_root_id: &str,
@@ -12749,6 +13345,7 @@ impl RuntimeDb {
              WHERE child_chain_root_id=?1 AND cancelled_at_ms IS NOT NULL",
         )?;
         let mut pins = ChainRecoveryPins {
+            process_scope_obligations: self.unsettled_process_scope_count(Some(chain_root_id))?,
             // A parent follow waiter owns the graph checkpoint until its
             // successor is durably resumed or the waiter is otherwise settled.
             required_checkpoint_consumers: parent_follow_waiters,
@@ -16295,6 +16892,64 @@ mod tests {
         (tmp, db)
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_lifetime_reset_gate_never_decodes_execution_rows() {
+        // Deliberately not the current runtime schema. Only the independent
+        // coarse fence is understood; arbitrary execution rows stay opaque.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCOPE_LIFETIME_FENCE_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO execution_lifetime_fence VALUES(1,1,NULL);
+            CREATE TABLE unknown_execution_authority (opaque BLOB);
+            INSERT INTO unknown_execution_authority VALUES(X'FF00');",
+        )
+        .unwrap();
+        ensure_scope_lifetime_resettable(&conn, SCOPE_LIFETIME_FENCE_FIRST_EPOCH).unwrap();
+        let current = lillux::ProcessHostLifetime::capture_current().unwrap();
+        let raw = lillux::canonical_json(&serde_json::to_value(&current).unwrap()).unwrap();
+        conn.execute(
+            "UPDATE execution_lifetime_fence SET host_lifetime=?1",
+            [&raw],
+        )
+        .unwrap();
+        assert!(
+            ensure_scope_lifetime_resettable(&conn, SCOPE_LIFETIME_FENCE_FIRST_EPOCH)
+                .unwrap_err()
+                .to_string()
+                .contains("restarting only the daemon")
+        );
+        assert_eq!(read_scope_lifetime_fence(&conn).unwrap(), Some(current));
+        let before: Vec<u8> = conn
+            .query_row(
+                "SELECT opaque FROM unknown_execution_authority",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, [255, 0]);
+
+        let mut ended: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        ended["backend"]["boot_id"] = "00000000-0000-4000-8000-000000000000".into();
+        let ended = lillux::canonical_json(&ended).unwrap();
+        conn.execute(
+            "UPDATE execution_lifetime_fence SET host_lifetime=?1",
+            [&ended],
+        )
+        .unwrap();
+        ensure_scope_lifetime_resettable(&conn, SCOPE_LIFETIME_FENCE_FIRST_EPOCH).unwrap();
+
+        conn.execute("UPDATE execution_lifetime_fence SET host_lifetime='{}'", [])
+            .unwrap();
+        assert!(ensure_scope_lifetime_resettable(&conn, SCOPE_LIFETIME_FENCE_FIRST_EPOCH).is_err());
+        conn.execute("DELETE FROM execution_lifetime_fence", [])
+            .unwrap();
+        assert!(ensure_scope_lifetime_resettable(&conn, SCOPE_LIFETIME_FENCE_FIRST_EPOCH).is_err());
+        conn.execute("DROP TABLE execution_lifetime_fence", [])
+            .unwrap();
+        assert!(ensure_scope_lifetime_resettable(&conn, SCOPE_LIFETIME_FENCE_FIRST_EPOCH).is_err());
+    }
+
     fn in_process_launch_metadata() -> RuntimeLaunchMetadata {
         RuntimeLaunchMetadata::default()
             .with_launch_driver(ryeos_state::objects::ExecutionLaunchDriver::InProcessHandler)
@@ -16941,6 +17596,108 @@ mod tests {
 
     #[test]
     fn dedicated_worker_attachment_atomically_owns_process_workspace_and_session() {
+        check_dedicated_worker_attachment(false, false, false);
+    }
+
+    #[test]
+    fn dedicated_scope_is_reserved_once_and_attachment_requires_exact_evidence() {
+        check_dedicated_worker_attachment(true, false, false);
+    }
+
+    #[test]
+    fn dedicated_precontact_scope_survives_quarantine_and_failed_start_settlement() {
+        check_dedicated_worker_attachment(true, true, false);
+    }
+
+    #[test]
+    fn dedicated_unbound_scope_survives_restart_without_granting_contact() {
+        check_dedicated_worker_attachment(true, true, true);
+    }
+
+    #[test]
+    fn scope_lifetime_fence_survives_retirement_of_only_one_owner() {
+        let (_tmp, db) = fresh_db();
+        let mut retirements = Vec::new();
+        for suffix in ["first", "second"] {
+            let placement = format!("T-{suffix}");
+            let workspace = format!("W-{suffix}");
+            let worker = format!("worker-{suffix}");
+            let profile = format!("P-{suffix}");
+            create_locked_profile(&db, &profile, &worker);
+            db.conn
+                .execute(
+                    "INSERT INTO execution_workspace (
+                    workspace_id, thread_id, launch_owner, backend_id,
+                    base_snapshot, root_path, state, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'dedicated_worker_session', 'fixture',
+                           'a', '/fixture/workspace', 'ready', 1, 1)",
+                    params![workspace, placement],
+                )
+                .unwrap();
+            db.admit_dedicated_session(NewDedicatedSession {
+                placement_thread_id: &placement,
+                chain_root_id: &placement,
+                owner_principal: "fp:operator",
+                admitted_capsule_hash: &"a".repeat(64),
+                workspace_id: &workspace,
+                candidate_required: false,
+                candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
+                credential_profile_id: &profile,
+                credential_generation: 1,
+                credential_lock_owner: &worker,
+            })
+            .unwrap();
+            // Inert journal fixture: no kernel resource or process is created.
+            let allocation: lillux::ProcessScopeAllocation =
+                serde_json::from_value(serde_json::json!({
+                    "version": 2, "control_timeout": {"secs": 1, "nanos": 0},
+                    "configuration": {"version": 3, "backend": {
+                        "implementation": "linux_cgroup_v2", "parent": "/fixture/delegation"
+                    }},
+                    "backend": {"implementation": "linux_cgroup_v2",
+                        "boot_id": "00000000-0000-4000-8000-000000000000",
+                        "parent": {"containing_device": 1, "inode": 2}, "name": worker}
+                }))
+                .unwrap();
+            db.reserve_dedicated_worker_scope(&placement, &worker, 1, &allocation)
+                .unwrap();
+            db.fail_dedicated_session_start(
+                &placement,
+                &worker,
+                1,
+                "fixture unlaunched cleanup",
+                true,
+            )
+            .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE execution_workspace SET state='closed' WHERE workspace_id=?1",
+                    [&workspace],
+                )
+                .unwrap();
+            retirements.push(
+                db.reserve_closed_worker_scope_retirement(&workspace)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let witness = read_scope_lifetime_fence(&db.conn).unwrap();
+        assert!(witness.is_some());
+        let (first, reserved) = &retirements[0];
+        db.complete_closed_worker_scope_retirement(first, reserved)
+            .unwrap();
+        db.complete_closed_worker_scope_retirement(first, reserved)
+            .unwrap();
+        assert_eq!(read_scope_lifetime_fence(&db.conn).unwrap(), witness);
+        assert_eq!(db.unsettled_process_scope_count(None).unwrap(), 1);
+        let (second, reserved) = &retirements[1];
+        db.complete_closed_worker_scope_retirement(second, reserved)
+            .unwrap();
+        assert_eq!(db.unsettled_process_scope_count(None).unwrap(), 0);
+        assert!(read_scope_lifetime_fence(&db.conn).unwrap().is_none());
+    }
+
+    fn check_dedicated_worker_attachment(scoped: bool, abandoned: bool, unbound: bool) {
         let (_tmp, db) = fresh_db();
         create_locked_profile(&db, "P-one", "worker-one");
         db.conn
@@ -16966,7 +17723,7 @@ mod tests {
             credential_lock_owner: "worker-one",
         })
         .unwrap();
-        let record = WorkerProcessRecord {
+        let mut record = WorkerProcessRecord {
             worker_instance_id: "worker-one".to_owned(),
             boot_identity_hash: "b".repeat(64),
             session_capsule_hash: "a".repeat(64),
@@ -16981,6 +17738,226 @@ mod tests {
             created_at_ms: 2,
             updated_at_ms: 2,
         };
+        if scoped {
+            // Pure durable-contract fixture: these inert coordinates never
+            // grant a live control handle or contact the host backend.
+            let boot = "00000000-0000-4000-8000-000000000000";
+            let scope: lillux::ProcessScopeRecovery = serde_json::from_value(serde_json::json!({
+                "version": 4, "control_timeout": {"secs": 1, "nanos": 0},
+                "configuration": {"version": 3, "backend": {
+                    "implementation": "linux_cgroup_v2", "parent": "/fixture/delegation"
+                }},
+                "backend": {"implementation": "linux_cgroup_v2", "boot_id": boot,
+                    "parent": {"containing_device": 1, "inode": 2},
+                    "directory": {"containing_device": 1, "inode": 3},
+                    "name": "worker-one"}
+            }))
+            .unwrap();
+            record.process_identity.boot_id = boot.to_owned();
+            record.daemon_generation_id = daemon_generation_id().to_owned();
+            record.process_identity.process_scope = Some(scope.clone());
+            let mut planned = serde_json::to_value(&scope).unwrap();
+            planned["version"] = 2.into();
+            planned["backend"]
+                .as_object_mut()
+                .unwrap()
+                .remove("directory");
+            let allocation: lillux::ProcessScopeAllocation =
+                serde_json::from_value(planned).unwrap();
+            assert!(
+                db.attach_worker_process(&record).is_err(),
+                "scope must precede contact"
+            );
+            assert!(
+                db.reserve_dedicated_worker_scope("T-one", "worker-other", 1, &allocation)
+                    .is_err()
+            );
+            assert!(
+                db.reserve_dedicated_worker_scope("T-one", "worker-one", 2, &allocation)
+                    .is_err()
+            );
+            assert!(
+                read_scope_lifetime_fence(&db.conn).unwrap().is_none(),
+                "failed reservation must roll back the coarse fence as well as the session"
+            );
+            db.reserve_dedicated_worker_scope("T-one", "worker-one", 1, &allocation)
+                .unwrap();
+            assert_eq!(
+                read_scope_lifetime_fence(&db.conn).unwrap(),
+                Some(allocation.host_lifetime().unwrap())
+            );
+            assert!(db.worker_process("worker-one").unwrap().is_none());
+            assert!(
+                db.dedicated_worker_scope("T-one", "worker-one", 1)
+                    .unwrap()
+                    .unwrap()
+                    .recovery
+                    .is_none()
+            );
+            assert!(
+                db.attach_worker_process(&record).is_err(),
+                "plan alone cannot authorize process contact"
+            );
+            if unbound {
+                let retained = db
+                    .dedicated_worker_scope("T-one", "worker-one", 1)
+                    .unwrap()
+                    .unwrap();
+                let mut former = retained.clone();
+                former.daemon_generation_id = "former-daemon".to_owned();
+                let former_json =
+                    lillux::canonical_json(&serde_json::to_value(&former).unwrap()).unwrap();
+                db.conn.execute("UPDATE dedicated_session SET worker_scope=?1 WHERE placement_thread_id='T-one'", [&former_json]).unwrap();
+                assert_eq!(
+                    db.dedicated_worker_scope("T-one", "worker-one", 1).unwrap(),
+                    Some(former)
+                );
+                assert!(
+                    db.bind_dedicated_worker_scope("T-one", "worker-one", 1, &scope)
+                        .is_err(),
+                    "restart cannot bind the previous creator's allocation"
+                );
+                assert!(db.attach_worker_process(&record).is_err());
+                let mut group = record.clone();
+                group.process_identity.process_scope = None;
+                assert!(
+                    db.attach_worker_process(&group).is_err(),
+                    "planned scope cannot fall back to group attachment"
+                );
+                // Stand-in for the recovery owner's explicit successful
+                // unlaunched-slot discard, never inferred from a missing row.
+                db.fail_dedicated_session_start(
+                    "T-one",
+                    "worker-one",
+                    1,
+                    "unbound allocation discarded",
+                    true,
+                )
+                .unwrap();
+                assert!(
+                    db.credential_profile("P-one")
+                        .unwrap()
+                        .unwrap()
+                        .lock_owner
+                        .is_none()
+                );
+                assert!(db.worker_process("worker-one").unwrap().is_none());
+                check_closed_worker_scope_retirement(&db, 0);
+                return;
+            }
+            let mut wrong_binding = serde_json::to_value(&scope).unwrap();
+            wrong_binding["backend"]["name"] = "worker-other".into();
+            assert!(
+                db.bind_dedicated_worker_scope(
+                    "T-one",
+                    "worker-one",
+                    1,
+                    &serde_json::from_value(wrong_binding).unwrap()
+                )
+                .is_err()
+            );
+            db.bind_dedicated_worker_scope("T-one", "worker-one", 1, &scope)
+                .unwrap();
+            assert!(
+                db.bind_dedicated_worker_scope("T-one", "worker-one", 1, &scope)
+                    .is_err(),
+                "binding replay cannot grant another spawn"
+            );
+            assert_eq!(
+                db.dedicated_worker_scope("T-one", "worker-one", 1)
+                    .unwrap()
+                    .unwrap()
+                    .recovery,
+                Some(scope.clone())
+            );
+            assert!(db.dedicated_worker_scope("T-one", "worker-one", 2).is_err());
+            assert!(
+                db.reserve_dedicated_worker_scope("T-one", "worker-one", 1, &allocation)
+                    .is_err(),
+                "reservation replay cannot create a second launch right"
+            );
+            let mut wrong = record.clone();
+            wrong.process_identity.process_scope = None;
+            assert!(
+                db.attach_worker_process(&wrong).is_err(),
+                "no group fallback after scope reservation"
+            );
+            let mut different = serde_json::to_value(&scope).unwrap();
+            different["backend"]["directory"]["inode"] = 4.into();
+            wrong.process_identity.process_scope = Some(serde_json::from_value(different).unwrap());
+            assert!(
+                db.attach_worker_process(&wrong).is_err(),
+                "replacement scope is not the reservation"
+            );
+        }
+        if abandoned {
+            let reservation = db
+                .dedicated_worker_scope("T-one", "worker-one", 1)
+                .unwrap()
+                .unwrap();
+            let (quarantined, released) =
+                db.reconcile_unattached_credential_profile_locks().unwrap();
+            assert_eq!((quarantined, released), (1, 0));
+            assert_eq!(
+                db.dedicated_worker_scope("T-one", "worker-one", 1).unwrap(),
+                Some(reservation.clone())
+            );
+            assert!(db.attach_worker_process(&record).is_err());
+            db.fail_dedicated_session_start(
+                "T-one",
+                "worker-one",
+                1,
+                "fixture unknown cleanup",
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                db.credential_profile("P-one")
+                    .unwrap()
+                    .unwrap()
+                    .lock_owner
+                    .as_deref(),
+                Some("worker-one")
+            );
+            assert_eq!(
+                db.dedicated_worker_scope("T-one", "worker-one", 1).unwrap(),
+                Some(reservation.clone())
+            );
+            // Only explicit launch/reap testimony may take this edge. The
+            // test supplies it; no missing row or empty scope is its source.
+            db.fail_dedicated_session_start(
+                "T-one",
+                "worker-one",
+                1,
+                "fixture proved cleanup",
+                true,
+            )
+            .unwrap();
+            let session = db.dedicated_session("T-one").unwrap().unwrap();
+            assert_eq!(session.state, "terminal");
+            assert!(session.worker_instance_id.is_none());
+            assert!(
+                db.credential_profile("P-one")
+                    .unwrap()
+                    .unwrap()
+                    .lock_owner
+                    .is_none()
+            );
+            let retained: String = db
+                .conn
+                .query_row(
+                    "SELECT worker_scope FROM dedicated_session WHERE placement_thread_id='T-one'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<DedicatedWorkerScopeReservation>(&retained).unwrap(),
+                reservation
+            );
+            check_closed_worker_scope_retirement(&db, 1);
+            return;
+        }
         db.attach_worker_process(&record).unwrap();
         assert_eq!(db.worker_process("worker-one").unwrap(), Some(record));
         let workspace_state: String = db
@@ -17016,6 +17993,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session_state, "idle");
+        db.conn
+            .execute(
+                "UPDATE execution_workspace SET state='closed' WHERE workspace_id='W-one'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.reserve_closed_worker_scope_retirement("W-one").is_err(),
+            "closed workspace must not hide a live worker owner"
+        );
+        db.conn
+            .execute(
+                "UPDATE execution_workspace SET state='active' WHERE workspace_id='W-one'",
+                [],
+            )
+            .unwrap();
         db.settle_worker_process("worker-one", "T-one", 1, "reaped", "fixture restart")
             .unwrap();
         let settled = db.worker_process("worker-one").unwrap().unwrap();
@@ -17031,6 +18024,128 @@ mod tests {
         let login_terminal = db.dedicated_session("T-one").unwrap().unwrap();
         assert_eq!(login_terminal.state, "terminal");
         assert!(login_terminal.candidate_snapshot_hash.is_none());
+        check_closed_worker_scope_retirement(&db, usize::from(scoped));
+    }
+
+    fn check_closed_worker_scope_retirement(db: &RuntimeDb, expected_scopes: usize) {
+        let has_reservation: bool = db.conn.query_row(
+            "SELECT worker_scope IS NOT NULL FROM dedicated_session WHERE placement_thread_id='T-one'",
+            [], |row| row.get(0),
+        ).unwrap();
+        let expected_pins = u64::from(has_reservation || expected_scopes != 0);
+        let pins = db.inspect_chain_recovery_pins("T-root", &[]).unwrap();
+        assert_eq!(pins.process_scope_obligations, expected_pins);
+        if expected_pins != 0 {
+            assert!(
+                !pins.is_empty(),
+                "terminal/reaped does not settle resource retirement"
+            );
+            for dry_run in [true, false] {
+                assert!(
+                    db.discard_all_thread_history(dry_run)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("completed process-scope retirement")
+                );
+            }
+        }
+        if expected_scopes != 0 && db.worker_process("worker-one").unwrap().is_some() {
+            let retained: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT worker_scope FROM dedicated_session WHERE placement_thread_id='T-one'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            db.conn.execute("UPDATE dedicated_session SET worker_scope=NULL WHERE placement_thread_id='T-one'", []).unwrap();
+            assert_eq!(
+                db.inspect_chain_recovery_pins("T-root", &[])
+                    .unwrap()
+                    .process_scope_obligations,
+                1,
+                "historical attached scope remains pinned when the current attempt slot is cleared"
+            );
+            db.conn.execute("UPDATE dedicated_session SET worker_scope=?1 WHERE placement_thread_id='T-one'", [retained]).unwrap();
+        }
+        assert!(
+            db.reserve_closed_worker_scope_retirement("W-one").is_err(),
+            "reaped processes do not authorize removal before workspace close"
+        );
+        db.conn
+            .execute(
+                "UPDATE execution_workspace SET state='closed' WHERE workspace_id='W-one'",
+                [],
+            )
+            .unwrap();
+        let worker_history = db.worker_process("worker-one").unwrap();
+        let (placement, reserved) = db
+            .reserve_closed_worker_scope_retirement("W-one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(placement, "T-one");
+        assert_eq!(reserved.state, ScopeRetirementState::Reserved);
+        assert_eq!(reserved.scopes.len(), expected_scopes);
+        if expected_pins != 0 {
+            assert!(
+                db.discard_all_thread_history(true).is_err(),
+                "reserved retirement is not completed retirement"
+            );
+        }
+        assert_eq!(
+            db.inspect_chain_recovery_pins("T-root", &[])
+                .unwrap()
+                .process_scope_obligations,
+            expected_pins,
+            "a reserved removal is still a retention pin"
+        );
+        // Model restart after durable intent, including removal before final
+        // SQLite completion. Neither retry invents a new scope set or launch.
+        assert_eq!(
+            db.reserve_closed_worker_scope_retirement("W-one").unwrap(),
+            Some((placement.clone(), reserved.clone()))
+        );
+        let mut wrong = reserved.clone();
+        wrong.state = ScopeRetirementState::Retired;
+        assert!(
+            db.complete_closed_worker_scope_retirement(&placement, &wrong)
+                .is_err()
+        );
+        if expected_scopes != 0 {
+            wrong = reserved.clone();
+            wrong.scopes.clear();
+            assert!(
+                db.complete_closed_worker_scope_retirement(&placement, &wrong)
+                    .is_err()
+            );
+        }
+        db.complete_closed_worker_scope_retirement(&placement, &reserved)
+            .unwrap();
+        db.complete_closed_worker_scope_retirement(&placement, &reserved)
+            .unwrap();
+        let (_, completed) = db
+            .reserve_closed_worker_scope_retirement("W-one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, ScopeRetirementState::Retired);
+        assert!(read_scope_lifetime_fence(&db.conn).unwrap().is_none());
+        db.discard_all_thread_history(true).unwrap();
+        assert_eq!(
+            db.inspect_chain_recovery_pins("T-root", &[])
+                .unwrap()
+                .process_scope_obligations,
+            0
+        );
+        assert!(
+            db.closed_worker_scope_retirement_workspaces()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.worker_process("worker-one").unwrap(),
+            worker_history,
+            "retirement must preserve immutable attached process coordinates"
+        );
     }
 
     #[test]
@@ -20721,6 +21836,7 @@ mod tests {
     fn fake_process_identity(pid: i64, pgid: i64) -> ExecutionProcessIdentity {
         ExecutionProcessIdentity {
             schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_string(),
             target_pid: pid,
             target_start_time_ticks: 10,
@@ -22460,6 +23576,7 @@ mod tests {
             .unwrap();
         let identity = ExecutionProcessIdentity {
             schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_owned(),
             target_pid: 12345,
             target_start_time_ticks: 10,
@@ -22544,6 +23661,7 @@ mod tests {
             &claim.claimed_by,
             &ExecutionProcessIdentity {
                 schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: "test-boot".to_owned(),
                 target_pid: 12345,
                 target_start_time_ticks: 10,

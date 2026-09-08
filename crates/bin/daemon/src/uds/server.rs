@@ -3422,6 +3422,7 @@ mod tests {
                 pgid: 424242,
                 process_identity: Some(ryeos_app::process::ExecutionProcessIdentity {
                     schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                    process_scope: None,
                     boot_id: "test-boot".to_string(),
                     target_pid: 424242,
                     target_start_time_ticks: 10,

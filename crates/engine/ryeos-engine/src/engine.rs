@@ -3411,6 +3411,20 @@ impl Engine {
         })
     }
 
+    /// Spawn through a scope already retained by the caller's durable launch
+    /// owner. It is not selected by
+    /// executable name, kind, or a fallback after ordinary spawn fails.
+    pub fn spawn_plan_in_scope(
+        &self,
+        ctx: &EngineContext,
+        plan: &ExecutionPlan,
+        scope: lillux::ProcessScope,
+    ) -> Result<crate::dispatch::SpawnedExecutionAwaitingAttachment, EngineError> {
+        self.checked_bundle_generation(|| {
+            crate::dispatch::spawn_plan_with_scope(plan, ctx, Some(scope))
+        })
+    }
+
     /// Build resolution roots for a given project root (project-first order).
     pub fn resolution_roots(&self, project_root: Option<PathBuf>) -> ResolutionRoots {
         if !self.registered_bundle_roots.is_empty() {

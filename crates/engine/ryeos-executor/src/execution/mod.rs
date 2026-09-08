@@ -1679,29 +1679,44 @@ pub(crate) fn assert_workspace_capture_processes_settled(
 /// One capture guard can cover multiple process groups borrowing the same
 /// created view. The individual Lillux guards remain the signal/death owners.
 pub(crate) struct QuiescedExecutionGroup {
-    authorities: Vec<lillux::QuiescedProcessGroup>,
+    authorities: Vec<lillux::QuiescedProcesses>,
 }
 
-/// A group may appear as both root membership and the workspace process. A
-/// numeric PGID alone is never sufficient to deduplicate their authorities.
+/// Local capture inventory only, never another durable process registry.
+/// Whole scopes may contain several groups; deduplicating them by PGID would
+/// either omit a scope or try to acquire its freeze barrier twice.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum WorkspaceCaptureOwner {
+    Group(i64),
+    Scope(String),
+}
+
+/// A group or scope may appear as both membership and workspace owner. Scope
+/// identity is the complete Lillux token, not its original target/group PID.
 fn register_workspace_capture_group(
-    groups: &mut std::collections::BTreeMap<i64, (String, i64)>,
+    groups: &mut std::collections::BTreeMap<WorkspaceCaptureOwner, Option<(String, i64)>>,
     identity: &ryeos_app::process::ExecutionProcessIdentity,
 ) -> Result<bool> {
     ryeos_app::process::validate_execution_process_identity_shape(identity)?;
+    if let Some(scope) = &identity.process_scope {
+        let key =
+            WorkspaceCaptureOwner::Scope(lillux::canonical_json(&serde_json::to_value(scope)?)?);
+        return Ok(groups.insert(key, None).is_none());
+    }
+    let key = WorkspaceCaptureOwner::Group(identity.group_leader_pid);
     let incarnation = (&identity.boot_id, identity.group_leader_start_time_ticks);
-    if let Some((boot, birth)) = groups.get(&identity.group_leader_pid) {
+    if let Some(Some((boot, birth))) = groups.get(&key) {
         if (boot, *birth) != incarnation {
             anyhow::bail!("workspace members name conflicting process-group incarnations");
         }
         return Ok(false);
     }
     groups.insert(
-        identity.group_leader_pid,
-        (
+        key,
+        Some((
             identity.boot_id.clone(),
             identity.group_leader_start_time_ticks,
-        ),
+        )),
     );
     Ok(true)
 }
@@ -1710,7 +1725,7 @@ impl QuiescedExecutionGroup {
     fn stop_once(
         &mut self,
         identity: &ryeos_app::process::ExecutionProcessIdentity,
-        groups: &mut std::collections::BTreeMap<i64, (String, i64)>,
+        groups: &mut std::collections::BTreeMap<WorkspaceCaptureOwner, Option<(String, i64)>>,
     ) -> Result<()> {
         let first = register_workspace_capture_group(groups, identity)?;
         // Even another target in an already-stopped group must still match
@@ -1802,7 +1817,7 @@ impl Drop for ExclusiveWorkspaceQuiescence {
 impl Drop for QuiescedExecutionGroup {
     fn drop(&mut self) {
         for authority in self.authorities.drain(..) {
-            if let Err(error) = authority.resume() {
+            if let Err(error) = authority.resume(lillux::time::Duration::from_secs(5)) {
                 tracing::error!(%error, "failed to resume an exact quiesced execution group");
             }
         }
@@ -1871,6 +1886,7 @@ mod pinned_child_authority_tests {
     fn workspace_capture_group_deduplication_requires_exact_group_birth() {
         let identity = ryeos_app::process::ExecutionProcessIdentity {
             schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "fixture-boot".to_owned(),
             target_pid: 40,
             target_start_time_ticks: 200,
@@ -1900,9 +1916,46 @@ mod pinned_child_authority_tests {
     }
 
     #[test]
+    fn workspace_capture_deduplicates_scope_across_distinct_process_groups() {
+        let boot = "00000000-0000-4000-8000-000000000000";
+        let scope: lillux::ProcessScopeRecovery = serde_json::from_value(serde_json::json!({
+            "version": 4, "control_timeout": {"secs": 1, "nanos": 0}, "configuration": {"version": 3, "backend": {
+                "implementation": "linux_cgroup_v2", "parent": "/fixture/delegation"
+            }},
+            "backend": {"implementation": "linux_cgroup_v2", "boot_id": boot,
+                "parent": {"containing_device": 1, "inode": 2},
+                "directory": {"containing_device": 1, "inode": 3}, "name": "fixture-scope"}
+        }))
+        .unwrap();
+        let mut identity = ryeos_app::process::ExecutionProcessIdentity {
+            schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: Some(scope),
+            boot_id: boot.to_owned(),
+            target_pid: 40,
+            target_start_time_ticks: 200,
+            group_leader_pid: 39,
+            group_leader_start_time_ticks: 190,
+        };
+        let mut groups = BTreeMap::new();
+        assert!(register_workspace_capture_group(&mut groups, &identity).unwrap());
+        identity.target_pid = 51;
+        identity.target_start_time_ticks = 301;
+        identity.group_leader_pid = 50;
+        identity.group_leader_start_time_ticks = 300;
+        assert!(!register_workspace_capture_group(&mut groups, &identity).unwrap());
+        assert_eq!(groups.len(), 1);
+        // A strict group is a different control owner, even with the same
+        // numeric leader as a target retained inside an admitted scope.
+        identity.process_scope = None;
+        assert!(register_workspace_capture_group(&mut groups, &identity).unwrap());
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
     fn workspace_capture_group_inventory_refuses_incomplete_identity() {
         let identity = ryeos_app::process::ExecutionProcessIdentity {
             schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "fixture-boot".to_owned(),
             target_pid: 40,
             target_start_time_ticks: 200,

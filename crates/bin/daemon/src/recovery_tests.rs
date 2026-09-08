@@ -15,6 +15,122 @@ use ryeos_engine::contracts::{
     EffectivePrincipal, ExecutionHints, NativeResumeSpec, Principal, ProjectContext,
 };
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unattached_scope_recovery_settles_only_an_ended_host_lifetime() {
+    let (_tmp, state) = build_test_state();
+    // Reuse the state owner. Opening a second RuntimeDb here would wait on
+    // the exclusive namespace lock deliberately retained by the first one.
+    let db = &state.state_store;
+    let current =
+        serde_json::to_value(lillux::ProcessHostLifetime::capture_current().unwrap()).unwrap();
+    for (suffix, boot) in [
+        ("ended", "00000000-0000-4000-8000-000000000000"),
+        ("current", current["backend"]["boot_id"].as_str().unwrap()),
+    ] {
+        let placement = format!("T-{suffix}");
+        let worker = format!("worker-{suffix}");
+        let profile = format!("profile-{suffix}");
+        db.create_credential_profile(NewCredentialProfile {
+            profile_id: &profile,
+            owner_principal: "fp:test",
+            home_id: &format!("home-{suffix}"),
+        })
+        .unwrap();
+        let generation = db
+            .acquire_credential_profile(&profile, "fp:test", &worker)
+            .unwrap();
+        db.admit_dedicated_session(NewDedicatedSession {
+            placement_thread_id: &placement,
+            chain_root_id: &placement,
+            owner_principal: "fp:test",
+            admitted_capsule_hash: &"a".repeat(64),
+            workspace_id: &format!("W-{suffix}"),
+            candidate_required: false,
+            candidate_disposition: DedicatedCandidateDisposition::OwnerDecision,
+            credential_profile_id: &profile,
+            credential_generation: generation,
+            credential_lock_owner: &worker,
+        })
+        .unwrap();
+        // Persistent journal fixture only. Neither these paths nor these
+        // directory identities name live authority. The current-boot branch
+        // must retain uncertainty when it cannot recover the exact scope.
+        let planned = serde_json::json!({
+            "version": 2, "control_timeout": {"secs": 1, "nanos": 0},
+            "configuration": {"version": 3, "backend": {
+                "implementation": "linux_cgroup_v2", "parent": "/fixture/delegation"
+            }},
+            "backend": {"implementation": "linux_cgroup_v2", "boot_id": boot,
+                "parent": {"containing_device": 1, "inode": 2}, "name": worker}
+        });
+        let allocation = serde_json::from_value(planned.clone()).unwrap();
+        let mut bound = planned;
+        bound["version"] = 4.into();
+        bound["backend"]["directory"] = serde_json::json!({"containing_device": 1, "inode": 3});
+        let recovery = serde_json::from_value(bound).unwrap();
+        let retained = ryeos_app::runtime_db::DedicatedWorkerScopeReservation {
+            worker_instance_id: worker.clone(),
+            boot_epoch: 1,
+            daemon_generation_id: "former-daemon".to_owned(),
+            allocation,
+            recovery: Some(recovery),
+        };
+        let raw = lillux::canonical_json(&serde_json::to_value(retained).unwrap()).unwrap();
+        rusqlite::Connection::open(&state.config.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE dedicated_session SET worker_scope=?1 WHERE placement_thread_id=?2",
+                rusqlite::params![raw, placement],
+            )
+            .unwrap();
+    }
+    rusqlite::Connection::open(&state.config.db_path)
+        .unwrap()
+        .execute(
+            "UPDATE execution_lifetime_fence SET host_lifetime=?1 WHERE singleton=1",
+            [lillux::canonical_json(&current).unwrap()],
+        )
+        .unwrap();
+    super::reconcile::reconcile_dedicated_worker_startup(&state)
+        .await
+        .unwrap();
+    super::reconcile::reconcile_dedicated_worker_startup(&state)
+        .await
+        .unwrap();
+    let ended = db.dedicated_session("T-ended").unwrap().unwrap();
+    assert_eq!(ended.state, "terminal");
+    assert!(ended.worker_instance_id.is_none());
+    assert!(
+        db.credential_profile("profile-ended")
+            .unwrap()
+            .unwrap()
+            .lock_owner
+            .is_none()
+    );
+    let retained = db.dedicated_session("T-current").unwrap().unwrap();
+    assert_eq!(retained.state, "outcome_unknown");
+    assert_eq!(
+        retained.worker_instance_id.as_deref(),
+        Some("worker-current")
+    );
+    assert_eq!(
+        db.credential_profile("profile-current")
+            .unwrap()
+            .unwrap()
+            .lock_owner
+            .as_deref(),
+        Some("worker-current")
+    );
+    assert!(
+        db.dedicated_worker_scope("T-current", "worker-current", 1)
+            .unwrap()
+            .unwrap()
+            .recovery
+            .is_some()
+    );
+}
+
 fn build_test_state() -> (tempfile::TempDir, AppState) {
     let tmpdir = tempfile::TempDir::new().unwrap();
     let runtime_state_dir = tmpdir.path().join(".ai/state");
@@ -1326,6 +1442,7 @@ async fn hosted_startup_replays_root_outboxes_before_detaching_the_old_worker_ep
             lifecycle_generation: 1,
             process_identity: ryeos_app::process::ExecutionProcessIdentity {
                 schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: "fixture-dead-boot".to_owned(),
                 target_pid: 999_999,
                 target_start_time_ticks: 1,

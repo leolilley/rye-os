@@ -393,6 +393,10 @@ impl SpawnedExecutionAwaitingAttachment {
         self.pending.pgid()
     }
 
+    pub fn scope_recovery(&self) -> Option<&lillux::ProcessScopeRecovery> {
+        self.pending.scope_recovery()
+    }
+
     #[cfg(target_os = "linux")]
     pub fn pidfd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.pending.pidfd()
@@ -442,7 +446,8 @@ impl RunningExecution {
     }
 
     /// Settle a process that exits naturally within `timeout`, or return the
-    /// still-running execution with ownership intact.
+    /// execution with ownership intact if it is live or cleanup is unproved.
+    /// Target exit alone must not grant the caller completed-cleanup authority.
     pub fn wait_for_natural_exit(
         self,
         timeout: std::time::Duration,
@@ -516,6 +521,16 @@ pub fn spawn_plan(
     plan: &ExecutionPlan,
     ctx: &EngineContext,
 ) -> Result<SpawnedExecutionAwaitingAttachment, EngineError> {
+    spawn_plan_with_scope(plan, ctx, None)
+}
+
+/// The scope is allocated and durably retained by the existing launch owner,
+/// not inferred from a kind name or provider-specific executable.
+pub(crate) fn spawn_plan_with_scope(
+    plan: &ExecutionPlan,
+    ctx: &EngineContext,
+    scope: Option<lillux::ProcessScope>,
+) -> Result<SpawnedExecutionAwaitingAttachment, EngineError> {
     if let Some(node) = plan.nodes.first() {
         match node {
             PlanNode::DispatchSubprocess { spec, .. } => {
@@ -526,6 +541,7 @@ pub fn spawn_plan(
                     plan.filesystem_authority_ceiling,
                     plan.network_authority_ceiling,
                     ctx,
+                    scope,
                 );
             }
             PlanNode::Complete { .. } => {
@@ -545,6 +561,7 @@ fn spawn_subprocess(
     filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     ctx: &EngineContext,
+    scope: Option<lillux::ProcessScope>,
 ) -> Result<SpawnedExecutionAwaitingAttachment, EngineError> {
     let request = isolation_plan_request_awaiting_attachment(
         spec,
@@ -552,16 +569,15 @@ fn spawn_subprocess(
         filesystem_authority_ceiling,
         network_authority_ceiling,
         ctx,
+        scope,
     )?;
     let debug = debug_raw.then(|| DebugCapture::from_spec(spec));
 
-    match request.spawn() {
-        Ok(pending) => Ok(SpawnedExecutionAwaitingAttachment { pending, debug }),
-        Err(err_result) => Err(subprocess_spawn_error(err_result)),
-    }
+    let pending = request.spawn().map_err(subprocess_spawn_error)?;
+    Ok(SpawnedExecutionAwaitingAttachment { pending, debug })
 }
 
-fn subprocess_spawn_error(result: lillux::SubprocessResult) -> EngineError {
+pub(crate) fn subprocess_spawn_error(result: lillux::SubprocessResult) -> EngineError {
     // Lillux retains the bounded, structured launcher refusal separately from
     // workload stderr. Preserve it just as handler/preparer launch does; the
     // generic stderr placeholder is not an actionable isolation diagnosis.
@@ -638,6 +654,7 @@ fn isolation_plan_request_awaiting_attachment(
     filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
     network_authority_ceiling: crate::isolation::IsolationNetworkAuthorityCeiling,
     ctx: &EngineContext,
+    scope: Option<lillux::ProcessScope>,
 ) -> Result<crate::isolation::IsolationRequestAwaitingAttachment, EngineError> {
     let (request, project_path, verified_code) = isolation_plan_request_parts(spec, ctx)?;
     let filesystem_authority_ceiling = ctx
@@ -645,48 +662,51 @@ fn isolation_plan_request_awaiting_attachment(
         .intersect(filesystem_authority_ceiling);
     let node_filesystem = filesystem_authority_ceiling
         == crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy;
-    ctx.isolation.apply_awaiting_attachment(
-        request,
-        crate::isolation::IsolationLaunchContext {
-            project_path,
-            project_authority: ctx.isolation_project_authority,
-            workspace_view: ctx.isolation_workspace_view.as_ref(),
-            filesystem_authority_ceiling,
-            network_authority_ceiling: ctx
-                .isolation_network_authority_ceiling
-                .intersect(network_authority_ceiling),
-            live_access: ctx.isolation_live_access_authority.as_ref(),
-            // Keep the exact launch-owned state authority on the held path
-            // too; only ambient node-policy mounts are removed by this ceiling.
-            state_root: ctx.isolation_state_root.as_deref(),
-            checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
-            checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
-            daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
-            bundle_roots: if node_filesystem {
-                &ctx.isolation_bundle_roots
-            } else {
-                &[]
+    ctx.isolation
+        .apply_awaiting_attachment_in_scope_with_provenance(
+            request,
+            crate::isolation::IsolationLaunchContext {
+                project_path,
+                project_authority: ctx.isolation_project_authority,
+                workspace_view: ctx.isolation_workspace_view.as_ref(),
+                filesystem_authority_ceiling,
+                network_authority_ceiling: ctx
+                    .isolation_network_authority_ceiling
+                    .intersect(network_authority_ceiling),
+                live_access: ctx.isolation_live_access_authority.as_ref(),
+                // Keep the exact launch-owned state authority on the held path
+                // too; only ambient node-policy mounts are removed by this ceiling.
+                state_root: ctx.isolation_state_root.as_deref(),
+                checkpoint_dir: ctx.isolation_checkpoint_dir.as_deref(),
+                checkpoint_authority: ctx.isolation_checkpoint_authority.as_deref(),
+                daemon_socket_path: ctx.isolation_daemon_socket_path.as_deref(),
+                bundle_roots: if node_filesystem {
+                    &ctx.isolation_bundle_roots
+                } else {
+                    &[]
+                },
+                node_trusted_keys_dir: ctx
+                    .isolation_node_trusted_keys_dir
+                    .as_deref()
+                    .filter(|_| node_filesystem),
+                verified_code: &verified_code,
+                verified_command: ctx
+                    .isolation_verified_command
+                    .as_ref()
+                    .map(|command| command as &dyn crate::isolation::IsolationCommandAuthority)
+                    .or_else(|| {
+                        spec.verified_command.as_ref().map(|command| {
+                            command.code() as &dyn crate::isolation::IsolationCommandAuthority
+                        })
+                    }),
+                external_read_only_mounts: &ctx.isolation_external_read_only_mounts,
+                target_channels: &ctx.isolation_target_channels,
+                item_ref,
+                thread_id: &ctx.thread_id,
             },
-            node_trusted_keys_dir: ctx
-                .isolation_node_trusted_keys_dir
-                .as_deref()
-                .filter(|_| node_filesystem),
-            verified_code: &verified_code,
-            verified_command: ctx
-                .isolation_verified_command
-                .as_ref()
-                .map(|command| command as &dyn crate::isolation::IsolationCommandAuthority)
-                .or_else(|| {
-                    spec.verified_command.as_ref().map(|command| {
-                        command.code() as &dyn crate::isolation::IsolationCommandAuthority
-                    })
-                }),
-            external_read_only_mounts: &ctx.isolation_external_read_only_mounts,
-            target_channels: &ctx.isolation_target_channels,
-            item_ref,
-            thread_id: &ctx.thread_id,
-        },
-    )
+            scope,
+        )
+        .map(|applied| applied.request)
 }
 
 fn isolation_plan_request_parts<'a>(

@@ -2160,6 +2160,7 @@ fn reconcile_runtime_workspace_operations_before_thread_recovery(
 /// through every root-backed projection repair and detached only afterward.
 #[doc(hidden)]
 pub async fn reconcile_dedicated_worker_startup(state: &AppState) -> Result<()> {
+    quiesce_unattached_worker_scopes(state)?;
     quiesce_dedicated_workers(state)?;
     ryeos_app::dedicated_session_service::reconcile_command_outboxes(state)
         .context("reconcile hosted command testimony before worker detachment")?;
@@ -2206,6 +2207,10 @@ pub async fn reconcile_dedicated_worker_startup(state: &AppState) -> Result<()> 
             "quarantined unattached hosted attempts and released unadmitted credential reservations"
         );
     }
+    state
+        .state_store
+        .resume_closed_worker_scope_retirements()
+        .context("resume exactly journaled closed-worker scope retirement")?;
     Ok(())
 }
 
@@ -2370,6 +2375,87 @@ fn reconcile_dedicated_candidate_bindings(state: &AppState) -> Result<usize> {
         repaired += 1;
     }
     Ok(repaired)
+}
+
+/// Startup runs before opening new launch admission. A pre-contact reservation
+/// can outlive its daemon without ever reaching WorkerProcessRecord. Stop its
+/// exact scope before root replay, but do not infer wrapper reap from scope
+/// emptiness: the existing unattached-attempt quarantine retains that separate
+/// obligation and the credential/workspace fences.
+fn quiesce_unattached_worker_scopes(state: &AppState) -> Result<()> {
+    for phase in ["admitted", "outcome_unknown"] {
+        for session in state.state_store.dedicated_sessions_in_state(phase)? {
+            let (Some(worker_id), Some(epoch)) = (
+                session.worker_instance_id.as_deref(),
+                session.worker_boot_epoch,
+            ) else {
+                continue;
+            };
+            if state.state_store.worker_process(worker_id)?.is_some() {
+                continue;
+            }
+            let Some(reservation) = state.state_store.dedicated_worker_scope(
+                &session.placement_thread_id,
+                worker_id,
+                epoch,
+            )?
+            else {
+                continue;
+            };
+            if reservation.daemon_generation_id == ryeos_app::runtime_db::daemon_generation_id() {
+                continue;
+            }
+            if reservation
+                .allocation
+                .host_lifetime()
+                .and_then(|lifetime| lifetime.has_ended())
+                .map_err(anyhow::Error::msg)?
+            {
+                // An ended host lifetime proves absence of BOTH a possible
+                // pre-attachment wrapper and its descendants. An empty scope
+                // or daemon restart alone cannot settle that independent
+                // wrapper obligation. Do not reopen a replacement host scope.
+                state.state_store.fail_dedicated_session_start(
+                    &session.placement_thread_id,
+                    worker_id,
+                    epoch,
+                    "unattached process scope and launcher belonged to an ended host lifetime",
+                    true,
+                )?;
+                continue;
+            }
+            let Some(recovery) = reservation.recovery else {
+                // The former daemon cannot bind this planned record, and no
+                // spawn is permitted before binding. Unlike a bound scope,
+                // this journal phase proves there is no wrapper/reap owner.
+                match reservation.allocation.discard_unlaunched() {
+                    Ok(()) => state.state_store.fail_dedicated_session_start(
+                        &session.placement_thread_id,
+                        worker_id,
+                        epoch,
+                        "discarded unbound process-scope allocation before worker contact",
+                        true,
+                    )?,
+                    Err(error) => tracing::warn!(
+                        placement_thread_id = %session.placement_thread_id,
+                        worker_instance_id = worker_id, error,
+                        "unbound allocation cleanup remains unproved"
+                    ),
+                }
+                continue;
+            };
+            let result = recovery.terminate_and_wait(recovery.control_timeout());
+            tracing::warn!(
+                placement_thread_id = %session.placement_thread_id,
+                worker_instance_id = worker_id,
+                boot_epoch = epoch,
+                scope_empty = result.is_ok(),
+                error = ?result.err(),
+                "retained unattached worker scope; independent launch/reap obligation remains quarantined"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn reconcile_dedicated_workers(state: &AppState) -> Result<()> {
@@ -2855,7 +2941,7 @@ fn reconcile_execution_workspaces(
                 let mut quiesced_group = None;
                 if liveness == IdentityLiveness::Alive {
                     let identity = identity.expect("alive liveness implies process identity");
-                    let Ok(authority) = ryeos_app::process::quiesce_exact_process_group(
+                    let Ok(authority) = ryeos_app::process::recover_quiesced_execution(
                         identity,
                         lillux::time::Duration::from_secs(2),
                     ) else {

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T22:34:48Z:56def06c93e56724f7083aa4a78868274813c0147e7761dc0298519b945d85c4:oXoqCbrRWI8LzFMOUPy6A7q0cOt8wUTyHEhZsdDgUodCE8oVmvVXObZX+D+k9wZk6pjTYkLsxgQBtc+A0Z1KAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T22:30:26Z:4ade0bd342d15f781de960118f7252a5268d9a5b03d5b536f55eaf11cc1a17f8:8S03K9tw+Mav1dqjrL73tQ6ul/9GgPwuq0EbMKBFcVNzV0fKK9T+Jq/lH6NGmVWrBp6LS4jYoVtuhSsuSYb3DQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -34,12 +34,12 @@ The current clean-cut execution formats include:
 - project snapshot schema 5;
 - admitted launch capsule schema 25;
 - persistent-session capsule schema 8;
-- runtime launch metadata epoch 31;
+- runtime launch metadata epoch 32;
 - the standalone runtime project-authority envelope epoch 4; and
-- the owned runtime SQLite operator schema epoch 28 (encoded in the RyeOS
+- the owned runtime SQLite operator schema epoch 30 (encoded in the RyeOS
   `PRAGMA application_id` family).
 
-Isolation policy v4 requires explicit `network.runtime_files` (including an
+The isolation policy v4 cut required explicit `network.runtime_files` (including an
 explicit empty list). Launch metadata 31 binds the sealed input digests in the
 node isolation admission class. Missing predecessor fields are not defaulted;
 older launch metadata is classified before nested decoding. This cut does not
@@ -92,6 +92,70 @@ contact, including recovery into the current workspace. An admitted attempt
 without an attached process row remains quarantined after restart; neither
 missing attachment nor an older reaped boot releases its credential fence.
 Only exact failed-start cleanup testimony can settle an unattached attempt.
+
+The process-scope cut uses isolation policy v5, launch metadata v32 and runtime
+epoch30. Policy explicitly selects an unconfigured facility or a Lillux-owned
+configuration and node control budget. Launch provenance records actually
+qualified scope capabilities. Process identity v2 requires explicit nullable
+scope recovery evidence: null is the separate strict-group contract, never a
+missing-field fallback. Runtime admission retains pre-contact scope authority
+in the existing dedicated-session attempt, including worker/boot and daemon
+generation fences. WorkerProcessRecord still requires complete attachment
+identity. Scope absence after a failed lookup is not proof of cleanup, and
+scope emptiness does not substitute for a separately owed wrapper reap. Old
+metadata remains opaque history; old runtime state requires explicit reset.
+
+The epoch30 cut also splits pre-contact reservation into planned
+allocation and bound resource phases on that existing session row. A Lillux
+allocation v2 is journaled before kernel creation; exact Lillux recovery v4 is
+bound before spawn. Both retain the original admitted control ceiling; restart
+cannot extend it. Lillux configuration v3 selects a stable host location;
+allocation and recovery retain its captured boot/directory incarnation. An
+ephemeral cgroup inode is not authored into reboot-stable node policy. Required explicit null
+recovery means unbound, not an older compatible shape. Recovery may discard a
+fenced unbound allocation, but may never bind or replay its creation to launch
+a new worker. A bound resource still retains its separate wrapper-reap duty.
+Startup may settle that duty using Lillux proof that the recorded host lifetime
+ended, without reopening a same-named resource on the new host lifetime. A
+same-host empty or unavailable scope continues to retain the independent duty.
+
+Isolation compilation consumes the actual retained scope into its private
+attachment-required request. Ordinary launches retain strict-group containment;
+configured scope capability alone cannot relax it. The exact scope cannot be
+substituted or dropped between compilation and spawn. This cut
+uses strict adapter protocol v8: every plan includes `nested_sandbox`, and
+`pid_namespace_nested` is a separate explicit proc ceiling. Configured scope
+policy must explicitly include its nested permission. Native generation
+inspection, actual retained scope, and node permission must all agree; an
+ordinary launch cannot acquire the relaxed plan from configuration alone.
+There is no missing-field default or v7 compatibility decoder.
+
+Closed-workspace scope retirement is recorded on that existing session row.
+Its reserved/retired intent contains the canonical scope set derived from all
+settled worker epochs and any settled pre-contact reservation. Kernel removal
+runs outside the StateStore lock and can be resumed after a crash. Only this
+already-reserved removal operation may treat an absent resource as removed;
+passive liveness and process recovery must still refuse same-boot absence.
+Ordinary chain retention counts unsettled scope retirement separately from
+PID/group liveness, including prior attached epochs after the active attempt's
+scope field has been cleared. Terminal status or a reserved-but-incomplete
+removal cannot release that pin. Current-schema offline history discard uses
+the same obligation query before publishing destructive intent and refuses
+until retirement completes; it does not equate daemon exclusion with cleanup.
+An independent singleton `execution_lifetime_fence` v1 row is created with the
+scope-capable runtime cut. Reservation writes its opaque Lillux host-lifetime
+witness in the same transaction as the existing session allocation. The last
+exact scope retirement clears it in the same transaction; no separate worker
+registry or second scope-control owner exists. Across execution-schema changes,
+offline reset reads only this stable bounded contract, never obsolete launch
+rows. It requires either a settled/null witness or Lillux proof that the former
+host lifetime ended. Daemon restart, a missing PID, an instantaneous empty scope,
+or the diagnostic lifecycle marker cannot replace that proof. Missing/malformed
+fences in scope-capable stores are refusals, not null defaults. A reservation
+after host reboot may advance an ended witness while preserving old per-worker
+history. Current-schema reset still requires exact workspace/scope retirement.
+The attachment history is retained unchanged, and scopes remain allocated
+while a workspace or borrower can still use their live cleanup evidence.
 
 Authoritative readers must inspect the outer object kind and numeric epoch from
 generic JSON before deserializing nested typed data. Only after that gate may

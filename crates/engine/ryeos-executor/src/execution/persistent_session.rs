@@ -1711,6 +1711,9 @@ fn admit_session_capsule(
     evidence_attachments: &[PreparedEvidenceAttachment],
     content_target_contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
 ) -> Result<(String, Vec<ryeos_state::PendingCasPublication>)> {
+    let session = validate_persistent_session_protocol(&protocol.descriptor)
+        .map_err(|error| anyhow!(error))?;
+    validate_session_process_control(state, session)?;
     let roots = engine.resolution_roots(None);
     let mut resolution = dependency.resolution.clone();
     let mut publication = None;
@@ -1948,6 +1951,7 @@ fn verify_session_capsule(
     content_target_contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
 ) -> Result<AdmittedPersistentSessionCapsule> {
     let capsule = load_capsule(state, capsule_hash)?;
+    validate_session_process_control(state, &retained_session_protocol(engine, &capsule)?)?;
     let exact: PersistentSessionExactProgram =
         serde_json::from_value(capsule.exact_program.clone())?;
     let retained_dependency =
@@ -2077,6 +2081,22 @@ where
     )
 }
 
+/// This is node admission of a retained protocol, not portable document
+/// parsing. Refuse an unsupported dedicated lifecycle before creating its
+/// worker reservation or spending an upstream model contact.
+fn validate_session_process_control(
+    state: &AppState,
+    session: &ryeos_engine::protocols::descriptor::PersistentSessionProtocol,
+) -> Result<()> {
+    if session.process_mode == PersistentSessionProcessMode::ExclusiveSession {
+        state
+            .isolation
+            .process_scope_control_timeout()
+            .context("exclusive session requires qualified node process-scope support")?;
+    }
+    Ok(())
+}
+
 fn retained_session_protocol(
     engine: &ryeos_engine::engine::Engine,
     capsule: &AdmittedPersistentSessionCapsule,
@@ -2157,6 +2177,7 @@ fn start_capsule_process(
         None,
         &BTreeMap::new(),
         Vec::new(),
+        None,
     )?;
     held.lifelines.push(Box::new(workspace_lifeline));
     // The fixed pool becomes the process owner as soon as this constructor
@@ -2251,6 +2272,7 @@ fn spawn_capsule_process_held(
     state_root: Option<&Path>,
     runtime_environment: &BTreeMap<String, String>,
     mut extra_target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
+    process_scope: Option<lillux::ProcessScope>,
 ) -> Result<HeldPersistentSession> {
     let resolution = exact.resolution_output.restore();
     super::source_closure::validate_external_mount_separation(state, &resolution)?;
@@ -2442,6 +2464,7 @@ fn spawn_capsule_process_held(
         session_protocol.network_authority,
         state_root,
         &format!("session-{}", &capsule_hash[..24]),
+        process_scope,
     )?;
     let mut lifelines: Vec<Box<dyn Send + Sync>> = Vec::with_capacity(leases.len());
     // The pool owns the exact worker epoch/process; retain its alias in the
@@ -2531,6 +2554,48 @@ pub fn start_exclusive_capsule(
     } else {
         bail!("exclusive persistent-session protocol requires a readiness identity slot");
     }
+    // Reserve against the admitted attempt before possible process contact.
+    // This owner (not a provider/kind switch) requires whole-execution control.
+    // Pooled request workers retain their separately admitted strict-group
+    // contract; an unavailable scope here must never select that other path.
+    let control_timeout = state.isolation.process_scope_control_timeout()?;
+    let allocation = state
+        .isolation
+        .plan_process_scope(&identity.worker_instance_id)?;
+    state.state_store.reserve_dedicated_worker_scope(
+        &identity.placement_thread_id,
+        &identity.worker_instance_id,
+        identity.boot_epoch,
+        &allocation,
+    )?;
+    // A restart may discard this unused allocation, but may not retry it to
+    // launch. A concrete result must be bound before possible process contact.
+    let scope = state
+        .isolation
+        .allocate_process_scope(&allocation)
+        .map_err(|error| {
+            let error = anyhow::Error::from(error);
+            match allocation.discard_unlaunched() {
+                Ok(()) => error,
+                Err(cleanup) => error
+                    .context(format!("unlaunched allocation cleanup unproved: {cleanup}"))
+                    .context(ExclusiveWorkerCleanupUnproved),
+            }
+        })?;
+    let scope_recovery = scope.recovery().clone();
+    if let Err(error) = state.state_store.bind_dedicated_worker_scope(
+        &identity.placement_thread_id,
+        &identity.worker_instance_id,
+        identity.boot_epoch,
+        &scope_recovery,
+    ) {
+        return Err(match scope.retire_unlaunched(control_timeout) {
+            Ok(()) => error,
+            Err(retirement) => error.context(format!(
+                "unlaunched scope retirement failed: {retirement}; retained evidence: {scope_recovery:?}"
+            )).context(ExclusiveWorkerCleanupUnproved),
+        });
+    }
     let mut held = spawn_capsule_process_held(
         state,
         capsule_hash,
@@ -2542,8 +2607,22 @@ pub fn start_exclusive_capsule(
         state_root,
         &runtime_environment,
         extra_target_channels,
+        Some(scope),
     )
     .map_err(|error| {
+        // Preparation itself can fail after reservation but before spawn.
+        // Settle the recorded scope even on that path. An empty scope does
+        // not erase an independent unproved wrapper/reap obligation.
+        let error = match scope_recovery.terminate_and_wait(control_timeout) {
+            Ok(()) => error,
+            Err(cleanup) => {
+                return error
+                    .context(format!(
+                        "reserved process scope cleanup remains unproved: {cleanup}"
+                    ))
+                    .context(ExclusiveWorkerCleanupUnproved);
+            }
+        };
         if error
             .downcast_ref::<ryeos_app::persistent_session::PersistentSessionCleanupUnproved>()
             .is_some()

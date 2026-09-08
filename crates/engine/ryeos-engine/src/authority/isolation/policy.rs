@@ -1,7 +1,7 @@
 use ryeos_isolation_protocol::{FixedParentViewLimits, IsolationBackendSelection};
 use serde::{Deserialize, Serialize};
 
-pub const ISOLATION_POLICY_VERSION: u32 = 4;
+pub const ISOLATION_POLICY_VERSION: u32 = 5;
 #[cfg(any(test, feature = "test-support"))]
 pub const TEST_ISOLATION_POLICY_RELATIVE_PATH: &str = "test-fixtures/isolation-policy.yaml";
 
@@ -11,6 +11,7 @@ pub struct IsolationPolicy {
     pub version: u32,
     pub mode: IsolationMode,
     pub backend: Option<IsolationBackendSelection>,
+    pub process_scopes: IsolationProcessScopePolicy,
     pub filesystem: IsolationFilesystemPolicy,
     pub network: IsolationNetworkPolicy,
     pub environment: IsolationEnvironmentPolicy,
@@ -25,6 +26,7 @@ impl IsolationPolicy {
             version: ISOLATION_POLICY_VERSION,
             mode: IsolationMode::Disabled,
             backend: None,
+            process_scopes: IsolationProcessScopePolicy::Unconfigured {},
             filesystem: IsolationFilesystemPolicy {
                 proc_filesystem: ryeos_isolation_protocol::IsolationProcFilesystem::Empty,
                 // Values for this explicit non-enforcing authoring fixture
@@ -62,6 +64,27 @@ impl IsolationPolicy {
             },
         }
     }
+}
+
+/// Node authority for the optional host facility, not permission to downgrade
+/// an execution which requires it. Unconfigured nodes must refuse scope-backed
+/// launch; ordinary shared-group launches retain their no-group-escape contract.
+/// Backend-specific paths/identities are compiled and opened only by Lillux.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IsolationProcessScopePolicy {
+    // Keep this an empty struct variant: serde's internally-tagged unit
+    // variant accepts unknown fields even with deny_unknown_fields.
+    Unconfigured {},
+    Configured {
+        configuration: lillux::ProcessScopeConfiguration,
+        control_timeout_ms: u64,
+        /// Node permission, not evidence that a particular launch has a scope.
+        /// Requires the explicit pid_namespace_nested proc ceiling and a
+        /// qualified adapter capability. Ordinary unscoped launches still
+        /// receive only read-only task-only proc, not this broader surface.
+        nested_sandbox: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

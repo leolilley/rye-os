@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T10:12:26Z:9d4e73243fe1e462e4c313913e6d3c89ab1b5b03c11a930766b27d3982f417d8:EFWGnUrOcGlkviKjpKcmq24lHEdoaPUhIpYS5m+ABXYMquL8bbXzWgW+CUYFd36zRVVn1LCPVtkuTACUbckKCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T22:11:29Z:71ed5edfe7129b635abf7901aead4f2165539bcdbf0c442afd05cacc90c0e110:Pu/c2BvUZs3yQTIg3Rodg+1rT2t+MyE3M1TFl8za8Yi2o68KqVIdmpDRPac/rVHjlnT/NvSM4q10+9S/nsCIDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -337,7 +337,7 @@ for the exact supported filesystem and symlink boundaries. Policy or runtime
 history from the prior authority contract requires explicit scoped retirement,
 not a decoder fallback or automatic install-time reset.
 
-The v7 plan carries bounded fixed-parent views, a sorted collection of
+The v8 plan carries bounded fixed-parent views, a sorted collection of
 daemon-created target channels and explicit PID-namespace and proc-filesystem
 choices. The development profile selects fresh PID-local, read-only procfs for
 ordinary compiler/executable self lookup, never the host proc mount. Lillux owns namespace, mount,
@@ -348,6 +348,17 @@ release script, project tool, Python bootstrap, or compiler-specific wrapper.
 The same source-to-target descriptor mapping is enforced when isolation is
 disabled, and the daemon side remains a typed Lillux byte-stream endpoint.
 There is no raw Unix-socket conversion escape hatch.
+
+The scope-backed nested-sandbox cut adds explicit node permission and a
+generation-qualified capability, not a workload-specific exemption. Only a
+held launch retaining its journaled whole-execution scope can use the broader
+`pid_namespace_nested` proc surface and construct child sandboxes. Ordinary
+Tools/preparers remain strict-group, read-only task-only proc launches. The
+broader mode exposes non-task kernel metadata, but no host processes or scope
+controls; native root launch is refused. See Standard execution-isolation
+knowledge for this policy/threat boundary. Host supervision must provision an
+unprivileged controller with actual delegated scope authority; worker tests
+and worker turns must not depend on an operator entering a sudo password.
 
 Writable runtime workspaces use one detached view created and transferred by
 the trusted backend before its creator exits. Each child attaches a clone of
@@ -407,9 +418,11 @@ allowlist. Development compiler/build/test tools select callback-free
 daemon callback or thread-auth bearer for build scripts to inherit. Tools that
 need callbacks select `tool_callback` explicitly; command names never decide.
 
-The native backend intentionally refuses aggregate resource isolation until a
-typed delegated cgroup-v2 authority is carried to Lillux. Per-process rlimits
-must not be represented as aggregate containment.
+The native backend intentionally refuses aggregate resource isolation until
+Lillux supplies a separately qualified aggregate-quota authority. Whole-execution
+scope freeze/termination/recovery does not establish CPU, memory or process-count
+ceilings. OS controller mechanics stay in Lillux; neither the presence of a
+scope nor per-process rlimits may be represented as aggregate containment.
 
 Initial confined build/test tools use the backend's existing private writable
 `/tmp` for Cargo home, target output and compiler temporaries. Their exact

@@ -1235,6 +1235,7 @@ impl PreparedItemPlan {
         network_authority: ryeos_engine::protocols::descriptor::PersistentSessionNetworkAuthority,
         state_root: Option<&Path>,
         session_identity: &str,
+        process_scope: Option<lillux::ProcessScope>,
     ) -> Result<SpawnedPersistentSessionAwaitingAttachment> {
         if session_identity.is_empty() || session_identity.len() > 128 {
             bail!("persistent-session process identity is not canonical");
@@ -1312,10 +1313,13 @@ impl PreparedItemPlan {
             project_context: ProjectContext::None,
             launch_mode: LaunchMode::Wait,
         };
-        let spawned = state
-            .engine
-            .spawn_plan(&context, &self.plan)
-            .map_err(persistent_session_spawn_error)?;
+        let spawned = match process_scope {
+            Some(scope) => state
+                .engine
+                .spawn_plan_in_scope(&context, &self.plan, scope),
+            None => state.engine.spawn_plan(&context, &self.plan),
+        }
+        .map_err(persistent_session_spawn_error)?;
         #[cfg(target_os = "linux")]
         let identity_result = crate::process::capture_execution_process_identity_from_pidfd(
             spawned.pid() as i64,
@@ -1330,7 +1334,10 @@ impl PreparedItemPlan {
         )
         .context("capture held persistent-session identity");
         let process_identity = match identity_result {
-            Ok(identity) => identity,
+            Ok(mut identity) => {
+                identity.process_scope = spawned.scope_recovery().cloned();
+                identity
+            }
             Err(error) => {
                 let cleanup = spawned.abort_and_reap().err();
                 return Err(match cleanup {

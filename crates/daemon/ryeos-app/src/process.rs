@@ -20,7 +20,7 @@ const POST_SIGKILL_WAIT_MS: u64 = 200;
 /// escalating the exact process group.
 pub const MAX_GRACEFUL_SHUTDOWN_GRACE_SECS: u64 = 5;
 
-pub const PROCESS_IDENTITY_SCHEMA_VERSION: u32 = 1;
+pub const PROCESS_IDENTITY_SCHEMA_VERSION: u32 = 2;
 
 /// Durable identity for the exact target and its retained process-group leader.
 ///
@@ -39,6 +39,11 @@ pub struct ExecutionProcessIdentity {
     /// The process-group leader PID, equal to the signalable PGID.
     pub group_leader_pid: i64,
     pub group_leader_start_time_ticks: i64,
+    /// Exact whole-execution authority when one was reserved at admission.
+    /// Absence explicitly denotes the enforced no-group-escape contract, not
+    /// permission to downgrade a failed scoped launch or recovery.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub process_scope: Option<lillux::ProcessScopeRecovery>,
 }
 
 impl ExecutionProcessIdentity {
@@ -61,6 +66,12 @@ pub fn validate_execution_process_identity_shape(
     }
     validate_pid(identity.target_pid).context("invalid process identity target PID")?;
     validate_pid(identity.group_leader_pid).context("invalid process identity group-leader PID")?;
+    if let Some(scope) = &identity.process_scope {
+        scope
+            .validate_for_process(&lillux_process_identity(identity)?)
+            .map_err(anyhow::Error::msg)
+            .context("invalid execution scope identity")?;
+    }
     Ok(())
 }
 
@@ -289,52 +300,12 @@ pub fn daemon_pgid() -> i64 {
     unsafe { libc::getpgid(0) as i64 }
 }
 
-/// Probe the exact kernel primitives required by durable runtime attachment and
-/// race-free process-group cancellation. RyeOS intentionally has no numeric-PID
-/// fallback: a node without these capabilities must fail before launching work.
-pub fn validate_durable_process_control_support() -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("durable process control requires Linux 6.9 or newer");
-
-    #[cfg(target_os = "linux")]
-    {
-        let self_pid = unsafe { libc::getpid() };
-        let self_pgid = unsafe { libc::getpgrp() };
-        if self_pgid != self_pid {
-            // PIDFD_SIGNAL_PROCESS_GROUP is valid only when the pidfd refers
-            // to a process-group leader. Lifecycle launchers do not guarantee
-            // that topology, so isolate ryeosd before probing or supervising
-            // any workload groups.
-            if unsafe { libc::setpgid(0, 0) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("place ryeosd in its own process group");
-            }
-            let isolated_pgid = unsafe { libc::getpgrp() };
-            if isolated_pgid != self_pid {
-                anyhow::bail!(
-                    "ryeosd process-group isolation returned PGID {isolated_pgid}, expected {self_pid}"
-                );
-            }
-        }
-        let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self_pid, 0u32) } as i32;
-        if raw_pidfd < 0 {
-            return Err(std::io::Error::last_os_error()).context("pidfd_open is unavailable");
-        }
-        // SAFETY: pidfd_open returned a new owned descriptor.
-        let self_pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
-        if pidfd_send_signal_raw(self_pidfd.as_raw_fd(), 0, libc::PIDFD_SIGNAL_PROCESS_GROUP)
-            != SignalResult::Delivered
-        {
-            anyhow::bail!(
-                "PIDFD_SIGNAL_PROCESS_GROUP is unavailable; RyeOS requires Linux 6.9 or newer"
-            );
-        }
-
-        lillux::local_ipc::validate_peer_process_control_support()
-            .context("SO_PEERPIDFD is unavailable; RyeOS requires Linux 6.9 or newer")?;
-        Ok(())
-    }
-}
+// Controller preparation and host capability probes belong to Lillux's
+// process_control/local_ipc owners, not this application policy module. In
+// particular, do not reintroduce a `validate` helper which secretly changes the
+// daemon's process group or couples unrelated guarantees to a kernel version.
+// The isolation generation must admit its actual lifecycle capabilities;
+// group support and peer authentication are not whole-scope qualification.
 
 /// Capture the exact target and group-leader incarnations before persisting a
 /// runtime attachment. The expected PGID is mandatory for in-process spawns;
@@ -427,6 +398,7 @@ fn capture_execution_process_identity_from_pin(
 
     Ok(ExecutionProcessIdentity {
         schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+        process_scope: None,
         boot_id,
         target_pid,
         target_start_time_ticks: target_stat.start_time_ticks,
@@ -474,6 +446,32 @@ pub fn resolve_shutdown_action(
 /// launcher group leader alive while the target uses its declared grace. If the
 /// target/group survives the deadline, the already-pinned group is killed.
 pub fn kill_by_action(identity: &ExecutionProcessIdentity, action: ShutdownAction) -> KillResult {
+    if let Some(scope) = &identity.process_scope {
+        if validate_execution_process_identity_shape(identity).is_err() {
+            return KillResult {
+                success: false,
+                method: "identity_unavailable",
+            };
+        }
+        if let ShutdownAction::Graceful(grace) = action {
+            let delivered = signal_exact_target(identity, libc::SIGTERM);
+            if delivered == SignalResult::Delivered && scope.wait_empty(grace).is_ok() {
+                return KillResult {
+                    success: true,
+                    method: "scope_graceful",
+                };
+            }
+        }
+        let success = scope.terminate_and_wait(scope.control_timeout()).is_ok();
+        return KillResult {
+            success,
+            method: if success {
+                "scope_terminated"
+            } else {
+                "scope_cleanup_unproved"
+            },
+        };
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (identity, action);
@@ -583,6 +581,18 @@ pub fn signal_exact_target(identity: &ExecutionProcessIdentity, signal: i32) -> 
 /// Send one signal to the exact, verified process group. Used by cascade hard
 /// cancellation; graceful cascade targets only the runtime PID.
 pub fn signal_exact_group(identity: &ExecutionProcessIdentity, signal: i32) -> SignalResult {
+    if let Some(scope) = &identity.process_scope {
+        // Scope-wide cancellation has a kernel-backed termination operation,
+        // not an arbitrary numeric group signal. Cooperative policy still
+        // addresses the exact runtime target through signal_exact_target.
+        if signal != libc::SIGKILL || validate_execution_process_identity_shape(identity).is_err() {
+            return SignalResult::IdentityUnavailable;
+        }
+        return match scope.terminate_and_wait(scope.control_timeout()) {
+            Ok(()) => SignalResult::Delivered,
+            Err(_) => SignalResult::IdentityUnavailable,
+        };
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (identity, signal);
@@ -609,8 +619,40 @@ pub fn signal_exact_group(identity: &ExecutionProcessIdentity, signal: i32) -> S
 pub fn quiesce_exact_process_group(
     identity: &ExecutionProcessIdentity,
     timeout: lillux::time::Duration,
-) -> Result<lillux::QuiescedProcessGroup> {
+) -> Result<lillux::QuiescedProcesses> {
     validate_execution_process_identity_shape(identity)?;
+    if let Some(scope) = &identity.process_scope {
+        return scope
+            .quiesce(timeout)
+            .map(Into::into)
+            .map_err(anyhow::Error::msg);
+    }
+    lillux::quiesce_exact_process_group(&lillux_process_identity(identity)?, timeout)
+        .map(Into::into)
+        .map_err(anyhow::Error::msg)
+}
+
+/// Recover an already-committed capture barrier under the workspace owner's
+/// existing recovery fence. A scoped execution must still carry the kernel
+/// freeze request: reissuing a new freeze would hide a lost barrier. The
+/// strict-group backend retains its existing exact stop/identity protocol.
+pub fn recover_quiesced_execution(
+    identity: &ExecutionProcessIdentity,
+    timeout: lillux::time::Duration,
+) -> Result<lillux::QuiescedProcesses> {
+    validate_execution_process_identity_shape(identity)?;
+    if let Some(scope) = &identity.process_scope {
+        return scope
+            .recover_quiesced(timeout)
+            .map(Into::into)
+            .map_err(anyhow::Error::msg);
+    }
+    quiesce_exact_process_group(identity, timeout)
+}
+
+fn lillux_process_identity(
+    identity: &ExecutionProcessIdentity,
+) -> Result<lillux::ExactProcessIdentity> {
     let target_pid = u32::try_from(identity.target_pid)
         .context("exact execution target PID is outside the Lillux coordinate range")?;
     let target_start_time_ticks = u64::try_from(identity.target_start_time_ticks)
@@ -619,17 +661,13 @@ pub fn quiesce_exact_process_group(
         .context("exact execution group leader is outside the Lillux coordinate range")?;
     let group_leader_start_time_ticks = u64::try_from(identity.group_leader_start_time_ticks)
         .context("exact execution group birth is outside the Lillux coordinate range")?;
-    lillux::quiesce_exact_process_group(
-        &lillux::ExactProcessIdentity {
-            boot_id: identity.boot_id.clone(),
-            target_pid,
-            target_start_time_ticks,
-            group_leader_pid,
-            group_leader_start_time_ticks,
-        },
-        timeout,
-    )
-    .map_err(anyhow::Error::msg)
+    Ok(lillux::ExactProcessIdentity {
+        boot_id: identity.boot_id.clone(),
+        target_pid,
+        target_start_time_ticks,
+        group_leader_pid,
+        group_leader_start_time_ticks,
+    })
 }
 
 /// Whether the persisted target still names the exact live incarnation.
@@ -655,6 +693,16 @@ pub fn execution_liveness(identity: &ExecutionProcessIdentity) -> IdentityLivene
 /// gone and either the host boot ended or the whole numeric group is absent.
 /// Unavailable evidence never authorizes clearing a durable attachment.
 pub fn assert_reaped_process_group_absent(identity: &ExecutionProcessIdentity) -> Result<()> {
+    if let Some(scope) = &identity.process_scope {
+        validate_execution_process_identity_shape(identity)?;
+        scope
+            .wait_empty(scope.control_timeout())
+            .map_err(anyhow::Error::msg)?;
+        if execution_liveness(identity) != IdentityLiveness::DeadOrStale {
+            anyhow::bail!("owned subprocess wait did not prove exact target absence");
+        }
+        return Ok(());
+    }
     if execution_liveness(identity) != IdentityLiveness::DeadOrStale
         || (execution_identity_is_current_boot(identity)?
             && process_group_presence(identity.pgid()) != IdentityLiveness::DeadOrStale)
@@ -673,6 +721,16 @@ pub fn execution_group_alive(identity: &ExecutionProcessIdentity) -> bool {
 }
 
 pub fn execution_group_liveness(identity: &ExecutionProcessIdentity) -> IdentityLiveness {
+    if let Some(scope) = &identity.process_scope {
+        if validate_execution_process_identity_shape(identity).is_err() {
+            return IdentityLiveness::Unavailable;
+        }
+        return match scope.is_empty(scope.control_timeout()) {
+            Ok(true) => IdentityLiveness::DeadOrStale,
+            Ok(false) => IdentityLiveness::Alive,
+            Err(_) => IdentityLiveness::Unavailable,
+        };
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = identity;
@@ -830,7 +888,7 @@ fn pin_process(
     identity: &ExecutionProcessIdentity,
     pid: i64,
     expected_start_time_ticks: i64,
-    expected_pgrp: i64,
+    expected_pgrp: Option<i64>,
 ) -> std::result::Result<PinnedProcess, IdentityPinError> {
     validate_identity_shape(identity)?;
     let pin = open_pidfd(pid)?;
@@ -839,7 +897,9 @@ fn pin_process(
         return Err(IdentityPinError::Stale);
     }
     let stat = read_verified_process_stat(pid, pin.pidfd.as_fd())?;
-    if stat.start_time_ticks != expected_start_time_ticks || stat.pgrp != expected_pgrp {
+    if stat.start_time_ticks != expected_start_time_ticks
+        || expected_pgrp.is_some_and(|group| stat.pgrp != group)
+    {
         return Err(IdentityPinError::Stale);
     }
     Ok(pin)
@@ -853,7 +913,10 @@ fn pin_target(
         identity,
         identity.target_pid,
         identity.target_start_time_ticks,
-        identity.group_leader_pid,
+        identity
+            .process_scope
+            .is_none()
+            .then_some(identity.group_leader_pid),
     )
 }
 
@@ -865,7 +928,7 @@ fn pin_group_leader(
         identity,
         identity.group_leader_pid,
         identity.group_leader_start_time_ticks,
-        identity.group_leader_pid,
+        Some(identity.group_leader_pid),
     )
 }
 
@@ -1151,6 +1214,24 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use tempfile::TempDir;
+
+    #[test]
+    fn process_identity_requires_explicit_scope_contract() {
+        let mut value = serde_json::json!({
+            "schema_version": PROCESS_IDENTITY_SCHEMA_VERSION,
+            "boot_id": "fixture-boot", "target_pid": 40,
+            "target_start_time_ticks": 200, "group_leader_pid": 39,
+            "group_leader_start_time_ticks": 190, "process_scope": null,
+        });
+        let identity: ExecutionProcessIdentity = serde_json::from_value(value.clone()).unwrap();
+        validate_execution_process_identity_shape(&identity).unwrap();
+        value.as_object_mut().unwrap().remove("process_scope");
+        assert!(serde_json::from_value::<ExecutionProcessIdentity>(value.clone()).is_err());
+        value["process_scope"] = serde_json::Value::Null;
+        value["schema_version"] = (PROCESS_IDENTITY_SCHEMA_VERSION - 1).into();
+        let old: ExecutionProcessIdentity = serde_json::from_value(value).unwrap();
+        assert!(validate_execution_process_identity_shape(&old).is_err());
+    }
 
     #[test]
     fn stale_socket_cleanup_never_unlinks_a_live_listener() {

@@ -352,6 +352,7 @@ fn seed_completed_turn_fixture(
             lifecycle_generation: 1,
             process_identity: ExecutionProcessIdentity {
                 schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: format!("test-boot-{root}"),
                 target_pid: 101,
                 target_start_time_ticks: 10,
@@ -663,6 +664,7 @@ async fn completed_termination_requires_the_exact_immutable_turn_fence_and_front
             lifecycle_generation: 2,
             process_identity: ExecutionProcessIdentity {
                 schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: "test-boot-recovered-2".to_owned(),
                 target_pid: 102,
                 target_start_time_ticks: 20,
@@ -839,6 +841,7 @@ async fn terminal_root_replays_only_exact_authoritatively_settled_command() {
             lifecycle_generation: 1,
             process_identity: ExecutionProcessIdentity {
                 schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: "test-boot".to_owned(),
                 target_pid: 101,
                 target_start_time_ticks: 10,

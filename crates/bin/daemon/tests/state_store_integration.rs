@@ -682,6 +682,7 @@ mod integration_tests {
                 67890,
                 &ryeos_app::process::ExecutionProcessIdentity {
                     schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                    process_scope: None,
                     boot_id: "test-boot".to_string(),
                     target_pid: 12345,
                     target_start_time_ticks: 10,
@@ -2393,6 +2394,7 @@ mod integration_tests {
                 99999,
                 &ryeos_app::process::ExecutionProcessIdentity {
                     schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                    process_scope: None,
                     boot_id: "test-boot".to_string(),
                     target_pid: 99999,
                     target_start_time_ticks: 10,

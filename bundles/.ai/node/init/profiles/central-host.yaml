@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-07T22:34:46Z:d6cf8de2156273d3bd546f5a2a2347eae0c7b73e7d839d2229e2c3cef3b52de2:KQbfGFv7y1d3ZiglU+ob94fgnTGIe1m72RAvl4NYXmqXT6L8OBPYAkMNuIl6UwGUctWLXQJ0lJCyboJ9Jn5SAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T22:52:45Z:73683a0794457009f2c77e617e2d7e20bf53d7ec9c899e42fa647241cb4d7ba1:tJS2fzV4w2JWs6rE93mzK7XrfU32g/O6BQU7kfjXVuKg+G30mZiCBFcy12hoq0sWVAaPHS7MPWTxJuMdD30wBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - central-auth
@@ -147,7 +147,9 @@ policies:
   isolation:
     schema: 1
     policy:
-      version: 4
+      version: 5
+      process_scopes:
+        mode: unconfigured
       mode: disabled
       backend: null
       filesystem:

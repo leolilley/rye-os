@@ -4985,7 +4985,10 @@ impl StateStore {
     ) -> Result<()> {
         let g = self.lock()?;
         g.runtime_db
-            .terminalize_unattached_dedicated_session(placement_thread_id, reason)
+            .terminalize_unattached_dedicated_session(placement_thread_id, reason)?;
+        drop(g);
+        self.note_closed_worker_scope_retirement_for_session(placement_thread_id);
+        Ok(())
     }
 
     pub fn fail_dedicated_session_start(
@@ -5003,7 +5006,12 @@ impl StateStore {
             worker_boot_epoch,
             reason,
             cleanup_proved,
-        )
+        )?;
+        drop(g);
+        if cleanup_proved {
+            self.note_closed_worker_scope_retirement_for_session(placement_thread_id);
+        }
+        Ok(())
     }
 
     pub fn bind_dedicated_remote_thread(
@@ -5874,6 +5882,154 @@ impl StateStore {
         )
     }
 
+    /// Existing session/workspace journals authorize removal before Lillux
+    /// touches the kernel resource. No StateStore lock spans OS operations;
+    /// restart replays the same exact intent after a removal/commit crash.
+    pub fn retire_closed_worker_scopes_for_workspace(&self, workspace_id: &str) -> Result<()> {
+        let _permit = self.acquire_write_permit()?;
+        let reserved = self
+            .lock()?
+            .runtime_db
+            .reserve_closed_worker_scope_retirement(workspace_id)?;
+        let Some((placement, retirement)) = reserved else {
+            return Ok(());
+        };
+        if retirement.state == runtime_db::ScopeRetirementState::Retired {
+            return Ok(());
+        }
+        for scope in &retirement.scopes {
+            scope
+                .retire_after_settlement()
+                .map_err(anyhow::Error::msg)
+                .context("retire exactly settled worker scope; durable intent retained")?;
+        }
+        self.lock()?
+            .runtime_db
+            .complete_closed_worker_scope_retirement(&placement, &retirement)
+    }
+
+    /// Startup recovery only, not a recurring SQLite poll. Ordinary closure
+    /// drives retirement directly; failed removals keep their exact intents.
+    pub fn resume_closed_worker_scope_retirements(&self) -> Result<()> {
+        let workspaces = self
+            .lock()?
+            .runtime_db
+            .closed_worker_scope_retirement_workspaces()?;
+        for workspace in workspaces {
+            self.note_closed_worker_scope_retirement(&workspace);
+        }
+        Ok(())
+    }
+
+    fn note_closed_worker_scope_retirement(&self, workspace_id: &str) {
+        if let Err(error) = self.retire_closed_worker_scopes_for_workspace(workspace_id) {
+            // A retained resource is not failed candidate capture, nor is a
+            // failed removal proof of process death. Preserve the closed
+            // workspace and the retryable resource obligation independently.
+            tracing::warn!(workspace_id, error = %error, "closed worker scope retirement remains pending");
+        }
+    }
+
+    fn note_closed_worker_scope_retirement_for_session(&self, placement: &str) {
+        // Failed-start settlement can follow workspace closure. Drive that
+        // ordering from the settlement event too; do not wait for a restart
+        // or introduce a timer. The reservation rechecks every owner below.
+        let workspace = (|| -> Result<Option<String>> {
+            let g = self.lock()?;
+            let Some(session) = g.runtime_db.dedicated_session(placement)? else {
+                return Ok(None);
+            };
+            Ok(g.runtime_db
+                .workspace(&session.workspace_id)?
+                .filter(|workspace| workspace.state == runtime_db::WorkspaceState::Closed)
+                .map(|workspace| workspace.workspace_id))
+        })();
+        match workspace {
+            Ok(Some(workspace)) => self.note_closed_worker_scope_retirement(&workspace),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(placement, error = %error, "closed worker scope retirement lookup remains pending")
+            }
+        }
+    }
+
+    /// Scope reservation uses the same workspace/shutdown admission owner as
+    /// attachment. No child may be spawned until this pre-contact write commits.
+    pub fn reserve_dedicated_worker_scope(
+        &self,
+        placement_thread_id: &str,
+        worker_instance_id: &str,
+        boot_epoch: u64,
+        scope: &lillux::ProcessScopeAllocation,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        if !self
+            .process_attachment_admission_open
+            .load(Ordering::Acquire)
+        {
+            bail!("worker scope admission is closed for daemon shutdown");
+        }
+        let session = g
+            .runtime_db
+            .dedicated_session(placement_thread_id)?
+            .ok_or_else(|| anyhow!("worker scope has no admitted dedicated session"))?;
+        self.authorize_dedicated_workspace_contact_locked(
+            &g,
+            placement_thread_id,
+            &session.workspace_id,
+        )?;
+        g.runtime_db.reserve_dedicated_worker_scope(
+            placement_thread_id,
+            worker_instance_id,
+            boot_epoch,
+            scope,
+        )
+    }
+
+    pub fn bind_dedicated_worker_scope(
+        &self,
+        placement_thread_id: &str,
+        worker_instance_id: &str,
+        boot_epoch: u64,
+        recovery: &lillux::ProcessScopeRecovery,
+    ) -> Result<()> {
+        let g = self.lock()?;
+        if !self
+            .process_attachment_admission_open
+            .load(Ordering::Acquire)
+        {
+            bail!("worker scope binding is closed for daemon shutdown");
+        }
+        let session = g
+            .runtime_db
+            .dedicated_session(placement_thread_id)?
+            .ok_or_else(|| anyhow!("worker scope has no admitted dedicated session"))?;
+        self.authorize_dedicated_workspace_contact_locked(
+            &g,
+            placement_thread_id,
+            &session.workspace_id,
+        )?;
+        g.runtime_db.bind_dedicated_worker_scope(
+            placement_thread_id,
+            worker_instance_id,
+            boot_epoch,
+            recovery,
+        )
+    }
+
+    pub fn dedicated_worker_scope(
+        &self,
+        placement_thread_id: &str,
+        worker_instance_id: &str,
+        boot_epoch: u64,
+    ) -> Result<Option<runtime_db::DedicatedWorkerScopeReservation>> {
+        self.lock()?.runtime_db.dedicated_worker_scope(
+            placement_thread_id,
+            worker_instance_id,
+            boot_epoch,
+        )
+    }
+
     pub fn attach_worker_process(&self, record: &WorkerProcessRecord) -> Result<()> {
         let g = self.lock()?;
         if !self
@@ -6084,7 +6240,10 @@ impl StateStore {
             worker_instance_id,
             boot_epoch,
             reason,
-        )
+        )?;
+        drop(g);
+        self.note_closed_worker_scope_retirement_for_session(placement_thread_id);
+        Ok(())
     }
 
     pub fn bind_dedicated_session_candidate(
@@ -14604,7 +14763,13 @@ impl StateStore {
         let _permit = self.acquire_write_permit()?;
         let g = self.lock()?;
         g.runtime_db
-            .transition_workspace(workspace_id, expected, next, process_identity)
+            .transition_workspace(workspace_id, expected, next, process_identity)?;
+        drop(g);
+        drop(_permit);
+        if next == runtime_db::WorkspaceState::Closed {
+            self.note_closed_worker_scope_retirement(workspace_id);
+        }
+        Ok(())
     }
 
     pub fn transition_execution_workspace_owned(
@@ -14633,7 +14798,14 @@ impl StateStore {
             expected,
             next,
             process_identity,
-        )
+        )?;
+        drop(_admission);
+        drop(g);
+        drop(_permit);
+        if next == runtime_db::WorkspaceState::Closed {
+            self.note_closed_worker_scope_retirement(workspace_id);
+        }
+        Ok(())
     }
 
     pub fn rebind_execution_workspace_for_recovery(
@@ -14778,7 +14950,13 @@ impl StateStore {
             expected,
             next,
             None,
-        )
+        )?;
+        drop(g);
+        drop(_permit);
+        if next == runtime_db::WorkspaceState::Closed {
+            self.note_closed_worker_scope_retirement(workspace_id);
+        }
+        Ok(())
     }
 
     /// Publish a callback-frozen generation under the same StateStore lock as
@@ -17346,6 +17524,7 @@ mod tests {
     ) -> crate::process::ExecutionProcessIdentity {
         let identity = crate::process::ExecutionProcessIdentity {
             schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_owned(),
             target_pid: 12345,
             target_start_time_ticks: 10,
@@ -17779,6 +17958,7 @@ mod tests {
         store.bind_thread_workspace(child, &binding).unwrap();
         let identity = crate::process::ExecutionProcessIdentity {
             schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_owned(),
             target_pid: 12345,
             target_start_time_ticks: 10,
@@ -21245,6 +21425,7 @@ mod tests {
             lifecycle_generation: 1,
             process_identity: crate::process::ExecutionProcessIdentity {
                 schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: "test-boot".to_owned(),
                 target_pid: 12345,
                 target_start_time_ticks: 10,
@@ -21863,6 +22044,7 @@ mod tests {
                 67890,
                 &crate::process::ExecutionProcessIdentity {
                     schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                    process_scope: None,
                     boot_id: "test-boot".to_string(),
                     target_pid: 12345,
                     target_start_time_ticks: 10,
@@ -21893,6 +22075,7 @@ mod tests {
             .expect("create attachment fixture");
         let identity = crate::process::ExecutionProcessIdentity {
             schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_string(),
             target_pid: 12345,
             target_start_time_ticks: 10,
@@ -21942,6 +22125,7 @@ mod tests {
             .expect("create attachment fixture");
         let identity = crate::process::ExecutionProcessIdentity {
             schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_string(),
             target_pid: 12346,
             target_start_time_ticks: 11,
@@ -22056,6 +22240,7 @@ mod tests {
         let thread_id = "T-attached-process-reopen";
         let process_identity = crate::process::ExecutionProcessIdentity {
             schema_version: crate::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+            process_scope: None,
             boot_id: "test-boot".to_string(),
             target_pid: 12347,
             target_start_time_ticks: 12,

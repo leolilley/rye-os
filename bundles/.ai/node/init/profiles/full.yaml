@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-07T22:34:46Z:44fe32690e7cfaf1b429daf2da510681ad2f8ca3717b7d61be686413d1c7628f:LelskEA4pwfqLEQ/ykhGF3uF04nbB4hrrCQmIbcrkmFbej7H4cxZCcni+ZjFuQP16gsAGItj+6gxneRJ43ICCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T22:52:46Z:56bfb5e9c50b93c40a4d1a69d684d76d74dbb0e00242c24e460eb533767c2480:MyAmKXE6a5QxzT1ihjQgyy1m22fPDKp1bpxpkHjektuAOTKkdKXi1KCssXVKEHGiME7liIpijqrgQemu8F4RDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -161,7 +161,9 @@ policies:
   isolation:
     schema: 1
     policy:
-      version: 4
+      version: 5
+      process_scopes:
+        mode: unconfigured
       mode: disabled
       backend: null
       filesystem:

@@ -16,10 +16,11 @@ use crate::trust::TrustStore;
 use ryeos_isolation_protocol::{
     AdapterLaunchLifecycle, AdapterLaunchRequest, AdapterWorkspaceRequest,
     AdapterWorkspaceResponse, IsolationAdapterProtocolVersion, IsolationAuthority,
-    IsolationAuthorityId, IsolationAuthorityPurpose, IsolationDeviceSurface, IsolationEnvironment,
-    IsolationFixedParentView, IsolationMount, IsolationMountAccess, IsolationNetwork,
-    IsolationPath, IsolationPidNamespace, IsolationPlan, IsolationProjectWorkspace,
-    IsolationTarget, IsolationTargetChannel, MAX_AUTHORITIES, WorkspaceLifecycleOperation,
+    IsolationAuthorityId, IsolationAuthorityPurpose, IsolationCapability, IsolationDeviceSurface,
+    IsolationEnvironment, IsolationFixedParentView, IsolationMount, IsolationMountAccess,
+    IsolationNetwork, IsolationPath, IsolationPidNamespace, IsolationPlan,
+    IsolationProjectWorkspace, IsolationTarget, IsolationTargetChannel, MAX_AUTHORITIES,
+    WorkspaceLifecycleOperation,
 };
 
 mod authority;
@@ -46,6 +47,7 @@ pub use policy::{
     ISOLATION_POLICY_VERSION, IsolationEnvironmentPolicy, IsolationFilesystemPolicy,
     IsolationLimitsPolicy, IsolationLiveProjectPolicy, IsolationMode, IsolationNetworkMode,
     IsolationNetworkPolicy, IsolationNetworkRuntimeFile, IsolationPolicy,
+    IsolationProcessScopePolicy,
 };
 use provenance::redacted_plan_digest;
 pub use provenance::{
@@ -107,6 +109,7 @@ pub struct IsolationRuntime {
     /// Disabled snapshots always carry `None`.
     backend_capture: Option<Arc<ResolvedIsolationBackend>>,
     network_runtime_files: Vec<network_inputs::CapturedNetworkFile>,
+    process_scope_provider: Option<Arc<lillux::ProcessScopeProvider>>,
     /// Optional higher-level generation guard retained by standalone
     /// composition roots. Daemon bootstrap owns its guard outside this value.
     _generation_lifeline: Option<Arc<dyn IsolationGenerationLifeline>>,
@@ -1275,6 +1278,39 @@ impl IsolationRuntime {
             )));
         }
         validate_policy_semantics(policy)?;
+        if policy.filesystem.proc_filesystem
+            == ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespaceNested
+            && !matches!(
+                policy.process_scopes,
+                IsolationProcessScopePolicy::Configured {
+                    nested_sandbox: true,
+                    ..
+                }
+            )
+        {
+            return Err(refused(
+                "nested proc requires explicit scoped nested-sandbox policy".to_owned(),
+            ));
+        }
+        if let IsolationProcessScopePolicy::Configured {
+            configuration,
+            control_timeout_ms,
+            nested_sandbox,
+        } = &policy.process_scopes
+        {
+            if policy.mode != IsolationMode::Enforce || *control_timeout_ms == 0 {
+                return Err(refused("configured process scopes require enforced isolation and a positive control deadline".to_owned()));
+            }
+            configuration.validate().map_err(refused)?;
+            if *nested_sandbox
+                && policy.filesystem.proc_filesystem
+                    != ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespaceNested
+            {
+                return Err(refused(
+                    "nested sandbox policy requires pid_namespace_nested proc".to_owned(),
+                ));
+            }
+        }
         if policy.mode == IsolationMode::Enforce {
             validate_enforced_limits(&policy.limits)?;
         }
@@ -1470,6 +1506,76 @@ impl IsolationRuntime {
 
     pub fn inspection(&self) -> &IsolationInspection {
         &self.inspection
+    }
+
+    /// Node-owned control budget, distinct from a workload request deadline.
+    pub fn process_scope_control_timeout(&self) -> Result<lillux::time::Duration, EngineError> {
+        self.ensure_registered_generation_current()?;
+        for capability in [
+            lillux::ProcessScopeCapability::Quiescence,
+            lillux::ProcessScopeCapability::Termination,
+            lillux::ProcessScopeCapability::Recovery,
+        ] {
+            if !self
+                .inspection
+                .process_scope_capabilities
+                .contains(&capability)
+            {
+                return Err(refused(format!(
+                    "node has not qualified required process-scope capability {capability:?}"
+                )));
+            }
+        }
+        match &self.inspection.process_scopes {
+            IsolationProcessScopePolicy::Configured {
+                control_timeout_ms, ..
+            } => Ok(lillux::time::Duration::from_millis(*control_timeout_ms)),
+            IsolationProcessScopePolicy::Unconfigured {} => Err(refused(
+                "this execution requires a configured node process-scope provider".to_owned(),
+            )),
+        }
+    }
+
+    /// Prepare the allocation intent without creating a kernel resource.
+    /// The existing launch owner must commit this before allocation, then
+    /// bind the exact result before spawn and attach the held child before
+    /// release. Unavailable authority never selects a group-only fallback.
+    pub fn plan_process_scope(
+        &self,
+        allocation: &str,
+    ) -> Result<lillux::ProcessScopeAllocation, EngineError> {
+        self.ensure_registered_generation_current()?;
+        let timeout = self.process_scope_control_timeout()?;
+        let provider = self
+            .process_scope_provider
+            .as_ref()
+            .ok_or_else(|| refused("node process-scope qualification is unavailable".to_owned()))?;
+        let planned = provider
+            .plan_allocation(allocation, timeout)
+            .map_err(refused)?;
+        self.ensure_registered_generation_current()?;
+        Ok(planned)
+    }
+
+    pub fn allocate_process_scope(
+        &self,
+        allocation: &lillux::ProcessScopeAllocation,
+    ) -> Result<lillux::ProcessScope, EngineError> {
+        self.ensure_registered_generation_current()?;
+        let timeout = self.process_scope_control_timeout()?;
+        let provider = self
+            .process_scope_provider
+            .as_ref()
+            .ok_or_else(|| refused("node process-scope qualification is unavailable".to_owned()))?;
+        let scope = provider.allocate(allocation).map_err(refused)?;
+        if let Err(error) = self.ensure_registered_generation_current() {
+            let retirement = provider.retire(scope.recovery(), timeout);
+            return Err(refused(format!(
+                "process-scope reservation lost its generation: {error}; retirement: {retirement:?}; recovery: {:?}",
+                scope.recovery()
+            )));
+        }
+        Ok(scope)
     }
 
     /// Return the exact node isolation class retained by this runtime without
@@ -1954,8 +2060,12 @@ impl IsolationRuntime {
         context: IsolationLaunchContext<'_>,
     ) -> Result<AppliedIsolationLaunch, EngineError> {
         self.ensure_registered_generation_current()?;
-        let applied =
-            self.apply_with_provenance_current(request, context, RequestedLaunchLifecycle::Run)?;
+        let applied = self.apply_with_provenance_current(
+            request,
+            context,
+            RequestedLaunchLifecycle::Run,
+            None,
+        )?;
         self.ensure_registered_generation_current()?;
         Ok(AppliedIsolationLaunch {
             request: applied.request,
@@ -1981,15 +2091,40 @@ impl IsolationRuntime {
         request: lillux::SubprocessRequest,
         context: IsolationLaunchContext<'_>,
     ) -> Result<AppliedIsolationLaunchAwaitingAttachment, EngineError> {
+        self.apply_awaiting_attachment_in_scope_with_provenance(request, context, None)
+    }
+
+    /// The existing owner has durably bound this scope before calling. Keep
+    /// it in the typed result so plan compilation and spawn cannot disagree
+    /// about the lifetime authority; configured support alone is insufficient.
+    pub fn apply_awaiting_attachment_in_scope_with_provenance(
+        &self,
+        request: lillux::SubprocessRequest,
+        context: IsolationLaunchContext<'_>,
+        scope: Option<lillux::ProcessScope>,
+    ) -> Result<AppliedIsolationLaunchAwaitingAttachment, EngineError> {
         self.ensure_registered_generation_current()?;
+        if let Some(scope) = scope.as_ref() {
+            let timeout = self.process_scope_control_timeout()?;
+            let provider = self.process_scope_provider.as_ref().ok_or_else(|| {
+                refused("retained scope has no admitted provider generation".to_owned())
+            })?;
+            provider.validate_scope(scope).map_err(refused)?;
+            if scope.recovery().control_timeout() != timeout {
+                return Err(refused(
+                    "retained process scope differs from the admitted control budget".to_owned(),
+                ));
+            }
+        }
         let applied = self.apply_with_provenance_current(
             request,
             context,
             RequestedLaunchLifecycle::AwaitAttachment,
+            scope.as_ref().map(|scope| scope.recovery()),
         )?;
         self.ensure_registered_generation_current()?;
         Ok(AppliedIsolationLaunchAwaitingAttachment {
-            request: IsolationRequestAwaitingAttachment::new(applied.request),
+            request: IsolationRequestAwaitingAttachment::new(applied.request, scope),
             provenance: applied.provenance,
         })
     }
@@ -1999,6 +2134,7 @@ impl IsolationRuntime {
         request: lillux::SubprocessRequest,
         context: IsolationLaunchContext<'_>,
         lifecycle: RequestedLaunchLifecycle,
+        process_scope: Option<&lillux::ProcessScopeRecovery>,
     ) -> Result<CompiledIsolationLaunch, EngineError> {
         // Keep this seam backend-neutral. The engine may compile only the
         // signed generic isolation policy/protocol and retain exact descriptor
@@ -3629,9 +3765,30 @@ impl IsolationRuntime {
             },
             devices: IsolationDeviceSurface::Minimal,
             private_tmp: true,
-            proc_filesystem: self.inspection.filesystem.proc_filesystem,
+            // Intersect the node's broader ceiling with this exact launch's
+            // retained lifetime authority. Ordinary preparers/Tools retain
+            // read-only task-only proc even on a nested-capable node.
+            proc_filesystem: match (
+                self.inspection.filesystem.proc_filesystem,
+                process_scope.is_some(),
+            ) {
+                (ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespaceNested, false) => {
+                    ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespace
+                }
+                (selected, _) => selected,
+            },
             pid_namespace: IsolationPidNamespace::Isolated,
-            shared_process_group: true,
+            // Only a concrete retained scope replaces the strict group
+            // contract. Node capability/configuration alone cannot do so.
+            shared_process_group: process_scope.is_none(),
+            nested_sandbox: process_scope.is_some()
+                && matches!(
+                    self.inspection.process_scopes,
+                    IsolationProcessScopePolicy::Configured {
+                        nested_sandbox: true,
+                        ..
+                    }
+                ),
         };
         let required_capabilities = plan
             .validate(&authorities)
@@ -3736,6 +3893,7 @@ impl IsolationRuntime {
 
     fn launch_provenance(&self, plan_digest: Option<String>) -> IsolationLaunchProvenance {
         IsolationLaunchProvenance {
+            process_scope_capabilities: self.inspection.process_scope_capabilities.clone(),
             policy_digest: self.inspection.digest.clone(),
             mode: self.inspection.mode,
             backend: self.inspection.backend.selection.clone(),
@@ -3769,7 +3927,7 @@ impl IsolationRuntime {
                 policy.version, ISOLATION_POLICY_VERSION
             )));
         }
-        validate_policy_semantics(&policy)?;
+        Self::validate_policy(&policy)?;
 
         let state = match policy.mode {
             IsolationMode::Disabled => IsolationRuntimeState::Disabled,
@@ -3849,6 +4007,18 @@ impl IsolationRuntime {
             .as_ref()
             .map(|backend| backend.effective_capabilities.clone())
             .unwrap_or_default();
+        if matches!(
+            policy.process_scopes,
+            IsolationProcessScopePolicy::Configured {
+                nested_sandbox: true,
+                ..
+            }
+        ) && !effective_capabilities.contains(&IsolationCapability::ProcessNestedSandbox)
+        {
+            return Err(refused(
+                "selected node backend has not qualified nested-sandbox capability".to_owned(),
+            ));
+        }
         let inspected_artifacts = captured_backend
             .as_ref()
             .map(|backend| backend.inspected_artifacts.clone())
@@ -3858,12 +4028,28 @@ impl IsolationRuntime {
         } else {
             Vec::new()
         };
+        let (process_scope_provider, process_scope_capabilities) = match &policy.process_scopes {
+            IsolationProcessScopePolicy::Unconfigured {} => (None, BTreeSet::new()),
+            IsolationProcessScopePolicy::Configured {
+                configuration,
+                control_timeout_ms,
+                ..
+            } => {
+                let provider =
+                    lillux::ProcessScopeProvider::open(configuration).map_err(refused)?;
+                let timeout = lillux::time::Duration::from_millis(*control_timeout_ms);
+                let capabilities = provider.qualify(timeout).map_err(refused)?;
+                (Some(Arc::new(provider)), capabilities)
+            }
+        };
         Ok(Self {
             inspection: IsolationInspection {
                 source,
                 version: policy.version,
                 mode: policy.mode,
                 digest,
+                process_scopes: policy.process_scopes,
+                process_scope_capabilities,
                 backend: IsolationBackendInspection {
                     selection: policy.backend,
                     status: if state == IsolationRuntimeState::Enforced {
@@ -3893,6 +4079,7 @@ impl IsolationRuntime {
             verified_artifacts,
             backend_capture: captured_backend,
             network_runtime_files,
+            process_scope_provider,
             _generation_lifeline: None,
             registered_generation_identity: None,
             generation_node_trust: None,
@@ -6121,6 +6308,7 @@ mod tests {
             IsolationCapability::FilesystemOrderedOverlays,
             IsolationCapability::FilesystemFixedParentViews,
             IsolationCapability::FilesystemPrivateTmp,
+            IsolationCapability::FilesystemPidNamespaceProc,
             IsolationCapability::DevicesMinimal,
             IsolationCapability::EnvironmentExact,
             IsolationCapability::NetworkIsolated,
@@ -6131,8 +6319,14 @@ mod tests {
             IsolationCapability::LifecycleSharedProcessGroup,
         ]);
         backend.declaration.capabilities = backend.effective_capabilities.clone();
-        let runtime =
+        let mut runtime =
             IsolationRuntime::load_with_backend(app_root.path(), Some(Arc::new(backend))).unwrap();
+
+        // Exercise compilation against the broader node ceiling without
+        // provisioning a native provider in this unit fixture. This is not
+        // generation qualification; the separate refusal/native tests own it.
+        runtime.inspection.filesystem.proc_filesystem =
+            ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespaceNested;
 
         let project = tempfile::tempdir().unwrap();
         let tool = project.path().join(".ai/tools/probe/tool.py");
@@ -6202,6 +6396,12 @@ mod tests {
             .read_regular_file_stable_bounded(ryeos_isolation_protocol::MAX_REQUEST_BYTES as u64)
             .unwrap();
         let request: serde_json::Value = serde_json::from_slice(&request_bytes).unwrap();
+        assert_eq!(
+            request["plan"]["shared_process_group"], true,
+            "ordinary compilation must retain strict-group containment"
+        );
+        assert_eq!(request["plan"]["nested_sandbox"], false);
+        assert_eq!(request["plan"]["proc_filesystem"], "pid_namespace");
         let handoff = request["plan"]["environment"]["values"][VERIFIED_CODE_MAP_ENV]
             .as_str()
             .expect("enforced plan carries verified-code loader handoff");
@@ -7207,6 +7407,7 @@ mod tests {
             proc_filesystem: ryeos_isolation_protocol::IsolationProcFilesystem::Empty,
             pid_namespace: IsolationPidNamespace::Isolated,
             shared_process_group: true,
+            nested_sandbox: false,
         };
         let digest = redacted_plan_digest(&plan).unwrap();
 
@@ -7283,6 +7484,65 @@ mod tests {
             error
                 .to_string()
                 .contains("requires signed bundle `example-isolation-backend`")
+        );
+    }
+
+    #[test]
+    fn process_scope_policy_is_explicit_and_cannot_advertise_unqualified_support() {
+        let policy = IsolationPolicy::disabled_for_authoring();
+        IsolationRuntime::validate_policy(&policy).unwrap();
+        let mut value = serde_json::to_value(&policy).unwrap();
+        value.as_object_mut().unwrap().remove("process_scopes");
+        assert!(serde_json::from_value::<IsolationPolicy>(value).is_err());
+        let mut value = serde_json::to_value(&policy).unwrap();
+        value["process_scopes"]["implicit_delegation"] = true.into();
+        assert!(serde_json::from_value::<IsolationPolicy>(value).is_err());
+        let runtime = IsolationRuntime::disabled_for_authoring();
+        assert!(runtime.inspection().process_scope_capabilities.is_empty());
+        assert!(
+            runtime
+                .launch_provenance(None)
+                .process_scope_capabilities
+                .is_empty()
+        );
+        assert!(runtime.process_scope_control_timeout().is_err());
+        assert!(runtime.plan_process_scope("unconfigured-fixture").is_err());
+        let mut value = serde_json::to_value(&policy).unwrap();
+        value["mode"] = "enforce".into();
+        value["backend"] = serde_json::to_value(resolved_backend().selection).unwrap();
+        value["process_scopes"] = serde_json::json!({
+            "mode":"configured", "control_timeout_ms":1000,
+            "configuration":{"version":3,"backend":{"implementation":"linux_cgroup_v2",
+                "parent":"/fixture/explicit-delegation"}}
+        });
+        assert!(
+            serde_json::from_value::<IsolationPolicy>(value.clone()).is_err(),
+            "nested authority must be explicit, not defaulted"
+        );
+        value["process_scopes"]["nested_sandbox"] = true.into();
+        let parsed: IsolationPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            IsolationRuntime::validate_policy(&parsed)
+                .unwrap_err()
+                .to_string()
+                .contains("pid_namespace_nested")
+        );
+        value["filesystem"]["proc_filesystem"] = "pid_namespace_nested".into();
+        let parsed: IsolationPolicy = serde_json::from_value(value).unwrap();
+        IsolationRuntime::validate_policy(&parsed).unwrap();
+        // Refuse before opening the deliberately inert provider path. A signed
+        // declaration/configuration is not native capability qualification.
+        let app_root = tempfile::tempdir().unwrap();
+        write_policy(app_root.path(), &parsed);
+        let error = IsolationRuntime::load_with_backend(
+            app_root.path(),
+            Some(Arc::new(resolved_backend())),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has not qualified nested-sandbox")
         );
     }
 

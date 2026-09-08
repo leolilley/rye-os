@@ -6,7 +6,7 @@ runtime_authority:
   project_snapshots: [status, log, show, create]
 isolation_backends:
   - id: linux-lillux
-    protocol: ryeos.isolation-adapter/v7
+    protocol: ryeos.isolation-adapter/v8
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
@@ -29,4 +29,5 @@ isolation_backends:
       - process.isolated_pid_namespace
       - process.target_pid_reporting
       - lifecycle.shared_process_group
+      - process.nested_sandbox
       - ipc.target_unix_stream

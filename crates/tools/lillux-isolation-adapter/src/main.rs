@@ -264,14 +264,19 @@ fn translate_launch(request: &AdapterLaunchRequest) -> Result<lillux::LinuxSandb
             ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespace => {
                 lillux::LinuxSandboxProcFilesystem::PidNamespace
             }
+            ryeos_isolation_protocol::IsolationProcFilesystem::PidNamespaceNested => {
+                lillux::LinuxSandboxProcFilesystem::PidNamespaceNested
+            }
         },
         minimal_devices: true,
         target_channels,
         lifecycle,
         contain_process_group: request.plan.shared_process_group,
-        // No signed cgroup delegation exists in this protocol. Lillux exposes an
-        // explicit fail-closed integration point rather than treating the
-        // adapter process's rlimits as aggregate child-tree containment.
+        nested_sandbox: request.plan.nested_sandbox,
+        // Aggregate resource limits are separate from the launch owner's
+        // retained whole-execution lifetime scope. Scope control authority
+        // stays outside this adapter/target namespace. The current protocol
+        // admits no aggregate-limit request; ordinary rlimits do not supply it.
         aggregate_limits: None,
     })
 }
@@ -491,6 +496,9 @@ fn supported_capabilities(
     }
     if inspection.pid_namespace_proc {
         capabilities.insert(IsolationCapability::FilesystemPidNamespaceProc);
+    }
+    if inspection.nested_sandbox {
+        capabilities.insert(IsolationCapability::ProcessNestedSandbox);
     }
     if inspection.minimal_devices {
         capabilities.insert(IsolationCapability::DevicesMinimal);

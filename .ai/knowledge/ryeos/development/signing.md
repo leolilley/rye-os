@@ -1,11 +1,11 @@
-<!-- ryeos:signed:2026-09-07T10:12:26Z:8680e751f363a7ca383ea9a7adc93b74e5af5f759927c6c0aa937f178aeb447e:AIFNLMq1wV4THVvhGFcNndW8Lf2m6zTNoLlIb0ZD2qIk8v3oO8ah8Hst8VuSLZ/bcMaHTlEH0Q4WjcCG6YAlDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T21:59:10Z:64763068acb0126ff08902aa9c2194fe8c27a1e307265a6113e7b9d8a4a6b206:9uGmXuaJW6+eS3vUV0nCthovm/lrlhf/c80DGtCN5ZLD3dmxmphONEPWWqQ4sk+RBxXg90Buo9UCG8JkMQKXAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "signing"
 title: "Signing Rules"
 description: "Short rules for bundle signing, project item signing, keys, and recovery"
 entry_type: reference
-version: "1.2.0"
+version: "1.3.0"
 ```
 
 # Signing Rules
@@ -87,6 +87,29 @@ target/release/ryeos init \
 If that system space has a running daemon, restart it around init.
 
 ## Project item signing
+
+### Repository-local development bundle
+
+This repository's root `.ai/` is the RyeOS development bundle, not an ordinary
+operator-authored end-user project. Its authored items use the deliberately
+public development publisher fixture, as specified in
+`source-local-bundle-development.md`. Sign selected edited items in place:
+
+```bash
+scripts/dev/sign-dev.sh .ai/knowledge/ryeos/development/<entry>.md
+```
+
+This existing source-authoring entry does not need an installed node, runtime
+history reset, operator key or vault. Do not route these publisher-owned items
+through an unrelated installed operator merely because they live under a
+project `.ai/` directory. Source ownership selects the signer. Validate the
+result through normal resolution/admission; the fixture grants no operational
+authority. It is not a substitute for private project signing or combined
+`bundles/` payload publication. Never publish the entire live checkout through
+a whole-directory bundle exchange; use the detached-tree procedure described
+by the source-local development knowledge.
+
+### Ordinary operator-authored projects
 
 Project `.ai/` items are different from bundle items. They are signed with the
 operator/user key, not the publisher key.

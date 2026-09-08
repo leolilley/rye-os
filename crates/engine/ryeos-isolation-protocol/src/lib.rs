@@ -8,7 +8,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAcc
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v7";
+pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v8";
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -151,7 +151,7 @@ impl<'de> Visitor<'de> for StrictJsonValueVisitor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IsolationAdapterProtocolVersion {
-    #[serde(rename = "ryeos.isolation-adapter/v7")]
+    #[serde(rename = "ryeos.isolation-adapter/v8")]
     Current,
 }
 
@@ -223,6 +223,8 @@ pub enum IsolationCapability {
     ProcessTargetPidReporting,
     #[serde(rename = "lifecycle.shared_process_group")]
     LifecycleSharedProcessGroup,
+    #[serde(rename = "process.nested_sandbox")]
+    ProcessNestedSandbox,
     #[serde(rename = "ipc.target_unix_stream")]
     IpcTargetUnixStream,
 }
@@ -513,6 +515,9 @@ pub enum IsolationDeviceSurface {
 pub enum IsolationProcFilesystem {
     Empty,
     PidNamespace,
+    /// Explicit broader kernel metadata and writable namespace maps. Host
+    /// tasks remain invisible; requires the scoped nested-sandbox contract.
+    PidNamespaceNested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,6 +551,9 @@ pub struct IsolationPlan {
     pub proc_filesystem: IsolationProcFilesystem,
     pub pid_namespace: IsolationPidNamespace,
     pub shared_process_group: bool,
+    /// Explicit child-sandbox authority. Requires external whole-execution
+    /// containment and PID-local proc; permits child namespace maps there.
+    pub nested_sandbox: bool,
 }
 
 impl IsolationPlan {
@@ -559,10 +567,26 @@ impl IsolationPlan {
         if self.mounts.len() > MAX_MOUNTS {
             return Err(ProtocolValidationError::new("too many mounts"));
         }
+        if self.nested_sandbox
+            && (self.shared_process_group
+                || self.proc_filesystem != IsolationProcFilesystem::PidNamespaceNested
+                || self.pid_namespace != IsolationPidNamespace::Isolated)
+        {
+            return Err(ProtocolValidationError::new(
+                "nested sandbox requires external whole-execution containment and isolated PID proc",
+            ));
+        }
+        if !self.nested_sandbox
+            && self.proc_filesystem == IsolationProcFilesystem::PidNamespaceNested
+        {
+            return Err(ProtocolValidationError::new(
+                "nested proc requires explicit nested sandbox authority",
+            ));
+        }
         if self.fixed_parent_views.len() > MAX_MOUNTS {
             return Err(ProtocolValidationError::new("too many fixed-parent views"));
         }
-        if self.proc_filesystem == IsolationProcFilesystem::PidNamespace
+        if self.proc_filesystem != IsolationProcFilesystem::Empty
             && self.pid_namespace != IsolationPidNamespace::Isolated
         {
             return Err(ProtocolValidationError::new(
@@ -868,7 +892,7 @@ impl IsolationPlan {
         if self.private_tmp {
             capabilities.insert(IsolationCapability::FilesystemPrivateTmp);
         }
-        if self.proc_filesystem == IsolationProcFilesystem::PidNamespace {
+        if self.proc_filesystem != IsolationProcFilesystem::Empty {
             capabilities.insert(IsolationCapability::FilesystemPidNamespaceProc);
         }
         capabilities.insert(match self.network {
@@ -881,6 +905,9 @@ impl IsolationPlan {
         });
         if self.shared_process_group {
             capabilities.insert(IsolationCapability::LifecycleSharedProcessGroup);
+        }
+        if self.nested_sandbox {
+            capabilities.insert(IsolationCapability::ProcessNestedSandbox);
         }
         capabilities
     }
@@ -1626,6 +1653,7 @@ mod tests {
                 proc_filesystem: IsolationProcFilesystem::Empty,
                 pid_namespace: IsolationPidNamespace::Host,
                 shared_process_group: true,
+                nested_sandbox: false,
             },
             vec![
                 authority("target", 3, IsolationAuthorityPurpose::Executable),
@@ -1812,8 +1840,8 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_duplicate_keys_at_every_depth() {
-        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v7","protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
-        let nested = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
+        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v8","protocol":"ryeos.isolation-adapter/v8","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let nested = r#"{"protocol":"ryeos.isolation-adapter/v8","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
         for document in [top_level, nested] {
             let error = from_json_str_strict::<AdapterInspectionRequest>(document).unwrap_err();
             assert!(error.to_string().contains("duplicate JSON object key"));
@@ -1822,7 +1850,7 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_unknown_fields_trailing_data_and_excessive_depth() {
-        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
+        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v8","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(unknown)
                 .unwrap_err()
@@ -1830,7 +1858,7 @@ mod tests {
                 .contains("unknown field")
         );
 
-        let valid = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let valid = r#"{"protocol":"ryeos.isolation-adapter/v8","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(&format!("{valid} true"))
                 .unwrap_err()
@@ -1888,6 +1916,38 @@ mod tests {
                 max_depth: 4,
             },
         }
+    }
+
+    #[test]
+    fn nested_sandbox_requires_explicit_scoped_pid_contract() {
+        let (mut plan, authorities) = complete_plan();
+        let mut missing = serde_json::to_value(&plan).unwrap();
+        missing.as_object_mut().unwrap().remove("nested_sandbox");
+        assert!(serde_json::from_value::<IsolationPlan>(missing).is_err());
+        plan.nested_sandbox = true;
+        assert!(plan.validate(&authorities).is_err());
+        plan.pid_namespace = IsolationPidNamespace::Isolated;
+        plan.proc_filesystem = IsolationProcFilesystem::PidNamespaceNested;
+        assert!(
+            plan.validate(&authorities).is_err(),
+            "a shared group cannot contain nested execution"
+        );
+        plan.shared_process_group = false;
+        assert!(
+            plan.validate(&authorities)
+                .unwrap()
+                .contains(&IsolationCapability::ProcessNestedSandbox)
+        );
+        plan.nested_sandbox = false;
+        assert!(plan.validate(&authorities).is_err());
+        plan.proc_filesystem = IsolationProcFilesystem::PidNamespace;
+        assert!(
+            !plan
+                .validate(&authorities)
+                .unwrap()
+                .contains(&IsolationCapability::ProcessNestedSandbox),
+            "scope containment alone does not permit nested sandboxing"
+        );
     }
 
     #[test]
@@ -2453,7 +2513,7 @@ mod tests {
         let request = workspace_request(WorkspaceLifecycleOperation::Create);
         request.validate().unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v7");
+        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v8");
         let purposes = encoded["authorities"]
             .as_array()
             .unwrap()

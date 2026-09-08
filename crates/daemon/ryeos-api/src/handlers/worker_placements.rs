@@ -5201,6 +5201,7 @@ mod authority_tests {
             lifecycle_generation: 7,
             process_identity: ryeos_app::process::ExecutionProcessIdentity {
                 schema_version: ryeos_app::process::PROCESS_IDENTITY_SCHEMA_VERSION,
+                process_scope: None,
                 boot_id: "boot:test".to_owned(),
                 target_pid: 41,
                 target_start_time_ticks: 101,

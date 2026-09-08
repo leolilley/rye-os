@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-07T22:35:43Z:0bfdbfca684001bd065cdf3661c9d40025ab02b5e64e5e2ad2cd62efc6754a72:lTrSoXDSgAQv+wXxlb1qJM9tftk4WK71PJ3UuWTSWqXZkTHPtmQu/uivTvQ+7NYbIo3ieRUMVLeEiWlz7ksJBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T22:52:46Z:9b75de899e74efd7037a340afc50cf59794f26527aa5ac982a9b9daad3bb9bc5:IhaeQdOxQNCiXxTz2qgXaBFML6YtjexIX+a4m75WuYrapOOM4DMRjjIhwio5WPX5lxQC03+D4So3gMhj7/+eDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.18.0"
+version: "1.19.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -24,7 +24,7 @@ compilation. Core ships the self-contained `linux-lillux` implementation as
 available signed data. The explicit development profile selects enforced
 execution; the general installation profiles retain their explicit disabled choice.
 
-Durable execution workspaces use the isolation-adapter v7 contract. RyeOS owns
+Durable execution workspaces use the isolation-adapter v8 contract. RyeOS owns
 one canonical private `project/` generation. Disabled/native execution creates
 no other workspace directory and uses Lillux descriptor-relative filesystem
 mechanics directly. Enforced execution additionally grants the selected signed
@@ -104,7 +104,7 @@ reproof happens before the private root obscures host locations.
 
 ### Confined live projects
 
-Signed node isolation policy v4 selects `filesystem.live_project.mode:
+Signed node isolation policy v5 selects `filesystem.live_project.mode:
 fixed_parents` and supplies its construction `limits.max_entries` and
 `limits.max_depth`. Protected relative paths come from State's existing central
 project control-path classification, not another adapter-specific list.
@@ -206,9 +206,11 @@ The policy has two modes:
 ```yaml
 schema: 1
 policy:
-  version: 4
+  version: 5
   mode: disabled
   backend: null
+  process_scopes:
+    mode: unconfigured
   filesystem:
     proc_filesystem: empty
     live_project:
@@ -277,7 +279,7 @@ refusal is not an executed workload's nonzero exit result.
 
 ## Strict schema
 
-- `version` must be `1`, the first published strict-policy schema. Other
+- The outer member `schema` is `1`; `policy.version` must be `5`. Other
   versions and unknown fields are rejected without aliases or translation.
 - `backend` is null when no backend is selected and must be present in enforce
   mode.
@@ -458,8 +460,9 @@ The native Lillux backend uses a private root and new user, mount, PID, IPC, and
 UTS namespaces. An isolated network plan also creates a network namespace; host
 mode deliberately keeps host networking. The sandbox target is PID 1 inside
 its namespace, while the adapter reports its exact host PID to daemon lifecycle
-ownership. Signed `filesystem.proc_filesystem` explicitly selects `empty` or
-`pid_namespace`; omission refuses admission. The latter requires the inspected
+ownership. Signed `filesystem.proc_filesystem` explicitly selects `empty`,
+`pid_namespace`, or the separately admitted `pid_namespace_nested` ceiling;
+omission refuses admission. The task-only `pid_namespace` mode requires the inspected
 `filesystem.pid_namespace_proc` capability and an isolated PID namespace.
 It mounts a new procfs with `subset=pid` and read-only, nosuid, nodev, noexec
 flags. No host procfs is bound: that would let a same-UID workload traverse
@@ -474,13 +477,116 @@ installs confinement, and only then reports readiness and accepts release.
 Merely unsharing `CLONE_NEWPID` in the adapter parent does not move that parent
 into the new PID namespace. Mounting after old-root detachment can also fail
 Linux's unprivileged filesystem-visibility check. This construction exposes
-only namespace tasks, not `/proc/sys` or other non-task top-level entries.
+only namespace tasks in `pid_namespace` mode, not `/proc/sys` or other non-task top-level entries.
 Positive mounts and workspaces cannot replace the selected proc surface.
 No workload-specific executable wrapper or host-path extension is involved.
 The kernel's [PID namespace documentation](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
 and [mount visibility check](https://github.com/torvalds/linux/blob/master/fs/namespace.c)
 describe these mounting constraints; actual backend qualification remains
 required on the selected host.
+
+### Scope-backed nested sandboxes
+
+The node must explicitly configure `process_scopes.nested_sandbox: true` and
+`filesystem.proc_filesystem: pid_namespace_nested` together. A signed backend
+declaration alone is insufficient: the selected generation must qualify
+`process.nested_sandbox` and whole-execution scope control on the actual host.
+Unconfigured nodes refuse scope-required launch; there is no weaker fallback.
+
+Only a concrete scope retained by the attachment-required launch can compile
+the nested plan. Its allocation is journaled before resource creation and its
+exact recovery identity is bound before held spawn. Ordinary unscoped Tools
+and preparers still receive strict process-group confinement and read-only,
+task-only proc, even on a node whose ceiling permits nested sandboxes.
+
+Nested mode permits child user, mount and PID namespace construction after
+the outer target has irreversibly dropped setup capabilities. Its proc mount
+contains only the isolated namespace's processes, but deliberately includes
+non-task kernel metadata and writable task UID/GID maps. It is **not** the
+task-only privacy surface. The native backend refuses a root launch identity;
+dropping capabilities alone does not remove root's file-owner permissions.
+Before release and during generation qualification it checks that selected
+global proc control files cannot be opened for writing. No control value is
+written by these checks.
+
+Fresh child namespaces cannot promote inherited read-only mounts or reveal
+masked lower mounts. Targets receive no scope-control descriptors or mounts;
+scope namespace creation and process-migration escape interfaces remain
+restricted by Lillux. Process groups may change inside this mode because the
+retained whole-execution scope, not the original group, owns quiescence and
+termination. OS implementation details stay in Lillux; RyeOS retains the
+semantic policy, exact lifetime evidence and workspace/recovery obligations.
+
+Host delegation is installation/supervision authority, never an interactive
+sudo step during a worker turn. The node controller must already have a
+qualified unprivileged placement. A container image cannot manufacture a
+writable host delegation where the platform supplies only a read-only one.
+
+Lillux configuration v3 selects the stable delegation location, not its
+reboot-ephemeral inode. Generation admission captures the exact live directory;
+allocation v2 and recovery v4 retain that incarnation and boot. Allocation,
+cleanup and compilation reject a different incarnation at the same path.
+
+For a supervisor that owns host installation, `lillux exec scope-controller`
+is the explicit bootstrap entry. It requires an already privileged caller and
+an explicitly selected non-root UID/GID. It creates or verifies one selected
+delegation beneath an administrator-owned cgroup parent, keeps parent lifecycle
+controls administrator-owned, places itself in a separate private controller
+leaf, drops credentials and execs the selected command with an exact environment.
+Occupied or frozen controller leaves refuse startup. It does not become a
+setuid helper, stay resident as a privileged service, mount host facilities,
+enable resource controllers, install a supervisor, or sign node policy.
+Its delegation and account selections must come from the administrator-owned
+supervisor configuration. Do not let worker input or a node-writable policy
+file select a privileged provisioning target. The node's signed policy must
+agree with that installed host selection; it cannot amend the host grant.
+
+For example, a root-owned supervisor entry can supply these **operator-chosen**
+values (the names below are placeholders, not automatic node discovery):
+
+```sh
+exec /usr/bin/lillux exec scope-controller \
+  --configuration "$NODE_SCOPE_CONFIGURATION" \
+  --uid "$NODE_UID" --gid "$NODE_GID" \
+  --cmd /usr/bin/ryeosd --cwd "$NODE_APP_ROOT" \
+  --arg=--app-root --arg "$NODE_APP_ROOT" \
+  --env "HOME=$NODE_HOME" --env 'PATH=/usr/bin:/bin'
+```
+
+`NODE_SCOPE_CONFIGURATION` is the same complete Lillux configuration selected
+by the node's signed isolation member, for example
+`{"version":3,"backend":{"implementation":"linux_cgroup_v2","parent":"/sys/fs/cgroup/ryeos-example"}}`.
+The node member separately selects its control deadline and nested permission.
+Initialize that ordinary app root under its own unprivileged account and apply
+its complete policies through the existing node CLI before activation. Verify
+that the installed host Lillux binary supplies this entry; it is not injected
+into worker environments. Direct `ryeos node start` does not secretly obtain
+administrator authority or discover/replace a supervisor. Supervised service
+start/stop remains owned by the chosen host supervisor, as for container service
+lifecycle; the node CLI still reports and controls the node itself.
+
+The node's runtime store retains one independent host-lifetime reset fence
+before scope allocation. Exact last retirement clears it. If execution schemas
+have changed while that fence remains unsettled, reset requires proof that the
+original host lifetime ended; daemon restart alone is insufficient. Stop and
+settle work before upgrading rather than discarding live recovery authority.
+Startup uses that same Lillux lifetime evidence to settle a former daemon's
+unattached attempt after its host lifetime ended. Same-host scope emptiness
+does not independently prove that a pre-attachment launcher was reaped, so
+that case retains its credential and workspace fences.
+These are local recovery facts under the node's exclusive state ownership,
+not transferable evidence that another machine stopped. Copying a live
+runtime database or its lifetime witness to another host is not a supported
+handoff. Cross-site execution uses its existing source-settlement and target-
+admission authorities; it must not import local process coordinates as cleanup
+proof.
+
+Native host qualification is available as the isolated
+`.github/workflows/lillux-native.yml` job in the RyeOS source repository.
+It provisions only a disposable test VM and runs exact Lillux lifecycle and
+namespace fixtures; it is neither a release job nor evidence that another
+deployment host supplies the same capabilities. Worker turns never invoke
+this provisioning entry or request administrator credentials.
 
 Process attachment is orthogonal to this isolation mode. Every daemon-owned
 launch is created awaiting attachment, its exact target identity is persisted,
@@ -497,15 +603,16 @@ termination, and bounded settle waits. No workspace-freeze executor or daemon
 caller supplies raw signal numbers or treats a numeric PID/PGID as process
 authority.
 
-Lillux creates a new session before it executes the adapter, and the target
+For ordinary strict-group launches, Lillux creates a new session before it executes the adapter, and the target
 inherits the retained wrapper's process group. The wrapper remains unreaped
 while Lillux terminates that group, which keeps the PGID reserved even if the
 initial target exits while descendants are still running. Timeout,
 cancellation, output overflow, attachment failure, release failure, and wait
-failure all use that stable group ownership. A descendant that deliberately
-creates another session remains outside this local process-group guarantee;
-hostile aggregate containment requires the separately delegated cgroup-v2 or
-VM boundary described below and is not claimed by this native backend.
+failure all use that stable group ownership. The strict native sandbox denies
+group/session escape; it does not silently relax this restriction to accommodate
+a nested sandbox. Scope-backed launches use the separate containment contract
+above. Resource accounting limits still require their own admitted capabilities;
+whole-execution termination alone is not proof of aggregate resource limiting.
 
 Offline tools that inherit terminal stdin/stdout/stderr use the same Lillux
 session, target-status, timeout, group-cleanup, and refusal contract. They do
@@ -629,8 +736,11 @@ machine, does not defend against kernel vulnerabilities, and does not yet set
 CPU, memory, or per-isolation process quotas. Do not model a process quota with
 `RLIMIT_NPROC`: it is scoped to the daemon's real UID rather than one isolation.
 The native backend does not yet claim aggregate cgroup resource containment;
-requests for aggregate CPU, memory, or process ceilings fail closed until a
-typed delegated cgroup-v2 authority is carried into Lillux. Transitive imports,
+requests for aggregate CPU, memory, or process ceilings fail closed until
+Lillux supplies a separately qualified aggregate-quota authority. The scoped
+lifecycle implementation above establishes freeze/termination/recovery, not
+these resource ceilings; no OS controller mechanics move into RyeOS policy
+or execution code merely because a scope exists. Transitive imports,
 libraries, and assets remain live read-only unless separately content-pinned.
 Disabled means no OS isolation, not unverified execution; resolution, signature,
 authorization, and capability checks remain active.
