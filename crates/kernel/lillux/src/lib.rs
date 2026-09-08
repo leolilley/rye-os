@@ -44,7 +44,13 @@ pub use locks::{
     ExactExclusiveFileLock, ExclusiveFileLock, SharedFileLock, with_exclusive_file_lock,
 };
 pub use process_control::{
-    ExactProcessIdentity, QuiescedProcessGroup, quiesce_exact_process_group,
+    ExactProcessIdentity, QuiescedProcessGroup, QuiescedProcesses,
+    prepare_process_group_controller, quiesce_exact_process_group,
+};
+pub use process_control::{
+    ProcessHostLifetime, ProcessScope, ProcessScopeAllocation, ProcessScopeCapability,
+    ProcessScopeConfiguration, ProcessScopeLaunchError, ProcessScopeProvider, ProcessScopeRecovery,
+    QuiescedProcessScope,
 };
 
 #[cfg(target_os = "linux")]

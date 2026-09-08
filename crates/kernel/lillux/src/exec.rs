@@ -1868,10 +1868,16 @@ impl Drop for ForkSensitiveDescriptorLease {
     }
 }
 
-struct QuiescedForkSensitiveDescriptors;
+// Kernel-only probes which fork without exec must use this same barrier and
+// child-close inventory. CLOEXEC alone cannot keep them from retaining a
+// daemon lock, release pipe, or transferred authority for their lifetime.
+pub(crate) struct QuiescedForkSensitiveDescriptors;
 
 impl QuiescedForkSensitiveDescriptors {
-    fn fork_child_close_fds(&self, preserved: &BTreeSet<i32>) -> Result<Vec<i32>, String> {
+    pub(crate) fn fork_child_close_fds(
+        &self,
+        preserved: &BTreeSet<i32>,
+    ) -> Result<Vec<i32>, String> {
         let barrier = direct_attachment_fork_barrier();
         let state = barrier
             .state
@@ -2120,7 +2126,7 @@ fn retained_descriptor_scope_diagnostic(state: &DescriptorForkBarrierState) -> S
     }
 }
 
-fn quiesce_fork_sensitive_descriptors(
+pub(crate) fn quiesce_fork_sensitive_descriptors(
     deadline: Instant,
 ) -> Result<QuiescedForkSensitiveDescriptors, String> {
     let barrier = direct_attachment_fork_barrier();
@@ -2131,7 +2137,7 @@ fn quiesce_fork_sensitive_descriptors(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.retained_scope_owners.contains_key(&owner) {
         return Err(format!(
-            "direct attachment fork requested while the calling thread retains fork-sensitive descriptor authority ({})",
+            "process-control fork requested while the calling thread retains fork-sensitive descriptor authority ({})",
             retained_descriptor_scope_diagnostic(&state)
         ));
     }
@@ -2188,6 +2194,10 @@ struct AttachmentWorkerGate {
 
 /// A running subprocess that can be waited on later.
 pub struct RunningProcess {
+    // Platform ownership stays here. Applications retain the opaque recovery
+    // evidence; they must not add OS handles to generic subprocess requests.
+    process_scope: Option<crate::ProcessScope>,
+    scope_cleanup_error: Option<String>,
     /// Identity of the supervised command. For a direct launch this is the
     /// spawned child; for a trusted launcher it is the target reported over
     /// the status channel. Supervised targets share the outer launcher's PGID,
@@ -2226,6 +2236,7 @@ pub struct RunningProcess {
 /// nor the underlying child handle. Callers must consume it by releasing only
 /// after attachment, or by explicitly aborting and reaping it.
 pub struct ProcessAwaitingAttachment {
+    process_scope: Option<crate::ProcessScope>,
     pid: u32,
     pgid: i64,
     owner: Option<AttachmentPendingOwner>,
@@ -2295,6 +2306,13 @@ impl std::fmt::Display for AttachmentAbortError {
 impl std::error::Error for AttachmentAbortError {}
 
 impl ProcessAwaitingAttachment {
+    /// Bind this evidence into the same durable attachment as the target.
+    /// Only the configured Lillux provider may interpret it during recovery.
+    pub fn scope_recovery(&self) -> Option<&crate::ProcessScopeRecovery> {
+        self.process_scope
+            .as_ref()
+            .map(crate::ProcessScope::recovery)
+    }
     /// Exact PID reported while the child was held after session creation.
     pub fn pid(&self) -> u32 {
         self.pid
@@ -2397,6 +2415,7 @@ impl ProcessAwaitingAttachment {
                             self.pid,
                             self.pgid,
                             self.pidfd.as_raw_fd(),
+                            self.process_scope.as_ref(),
                         );
                         let detail = self.cleanup_failure_detail(cleanup);
                         Err(AttachmentReleaseError {
@@ -2454,6 +2473,7 @@ impl ProcessAwaitingAttachment {
     pub fn abort_and_reap(mut self) -> Result<AbortedProcess, AttachmentAbortError> {
         match self.abort_and_reap_inner() {
             Ok(aborted) => Ok(aborted),
+            Err(error) if self.process_scope.is_some() => Err(error),
             Err(_error) => {
                 #[cfg(target_os = "linux")]
                 {
@@ -2475,6 +2495,25 @@ impl ProcessAwaitingAttachment {
 
     #[cfg(target_os = "linux")]
     fn cleanup_failure_detail(&self, cleanup: Result<(), String>) -> String {
+        if let Some(scope) = &self.process_scope {
+            // A pidfd/group proof never replaces the explicitly selected scope
+            // proof, including exec failure and a panicked spawn worker. Keep
+            // recovery evidence with the attachment if either duty is unproved.
+            let scope_cleanup = scope.terminate_and_wait(ATTACHMENT_ABORT_SETTLE_TIMEOUT);
+            let errors: Vec<_> = cleanup
+                .err()
+                .into_iter()
+                .chain(scope_cleanup.err())
+                .collect();
+            return if errors.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; scoped attachment cleanup remains unproved: {}",
+                    errors.join("; ")
+                )
+            };
+        }
         match cleanup {
             Ok(()) => String::new(),
             Err(error) => {
@@ -2517,6 +2556,27 @@ impl ProcessAwaitingAttachment {
             }
             AttachmentPendingOwner::Supervised { running } => running.abort_and_reap_checked(),
         };
+        if let Some(scope) = &self.process_scope {
+            // The scope includes all descendants; the structured owner also
+            // owes wrapper reap. Never turn a failed scope settlement into a
+            // successful group-only AbortedProcess testimony.
+            let scope_result = scope.terminate_and_wait(ATTACHMENT_ABORT_SETTLE_TIMEOUT);
+            return match (result, scope_result) {
+                (Ok(()), Ok(())) => Ok(AbortedProcess {
+                    pid: self.pid,
+                    pgid: self.pgid,
+                }),
+                (result, scope_result) => Err(AttachmentAbortError {
+                    pid: self.pid,
+                    detail: result
+                        .err()
+                        .into_iter()
+                        .chain(scope_result.err())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }),
+            };
+        }
         match result {
             Ok(()) => {
                 // The structured owner proves both group quiescence and
@@ -2566,6 +2626,16 @@ impl ProcessAwaitingAttachment {
     #[cfg(target_os = "linux")]
     fn check_exact_process_alive(&self) -> Result<(), String> {
         pidfd_send_signal(self.pidfd.as_raw_fd(), 0)?;
+        if let Some(scope) = &self.process_scope {
+            let timeout =
+                self.request_deadline
+                    .map_or(SUPERVISED_STATUS_SETUP_TIMEOUT, |deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(SUPERVISED_STATUS_SETUP_TIMEOUT)
+                    });
+            scope.require_held_member(self.pid, timeout)?;
+        }
         let pid = i32::try_from(self.pid).map_err(|_| "PID exceeds pid_t".to_string())?;
         let observed_pgid = unsafe { libc::getpgid(pid) };
         if observed_pgid < 0 {
@@ -2605,7 +2675,7 @@ impl ProcessAwaitingAttachment {
 
 impl Drop for ProcessAwaitingAttachment {
     fn drop(&mut self) {
-        if self.abort_and_reap_inner().is_err() {
+        if self.abort_and_reap_inner().is_err() && self.process_scope.is_none() {
             #[cfg(target_os = "linux")]
             {
                 // Drop is also a linear lifecycle boundary. Never let an
@@ -2618,6 +2688,11 @@ impl Drop for ProcessAwaitingAttachment {
 }
 
 impl RunningProcess {
+    pub fn scope_recovery(&self) -> Option<&crate::ProcessScopeRecovery> {
+        self.process_scope
+            .as_ref()
+            .map(crate::ProcessScope::recovery)
+    }
     /// Observe raw stdout from its first byte, including bytes already captured
     /// before this call. Available once, after the attachment/release boundary.
     /// The process must be waited or aborted concurrently with blocking reads
@@ -2662,7 +2737,9 @@ impl RunningProcess {
     }
 
     /// Wait up to `timeout` for a natural process exit without terminating a
-    /// still-running process. Ownership is returned unchanged on timeout.
+    /// still-running process. Ownership is returned on timeout, failed
+    /// observation, or unproved cleanup. An Ok result proves both descendant
+    /// settlement and launcher reap, not just the original target's exit.
     ///
     /// Protocols with a separate control channel use this after channel EOF:
     /// a naturally exited child can be settled with its captured output,
@@ -2675,19 +2752,26 @@ impl RunningProcess {
         loop {
             match poll_wrapper(&mut self.child) {
                 Ok(WrapperPoll::ExitedUnreaped) => {
-                    self.kill_supervised_processes();
+                    // Readiness callers treat Ok as completed cleanup. Do
+                    // not turn a failed scope/group barrier into that proof
+                    // merely by attaching a diagnostic to an exit result.
+                    // Keep the typed owner available for checked abort/retry.
+                    if self.settle_processes_before_drains().is_err() {
+                        return Err(self);
+                    }
+                    // Child retains its reaped status; this does not reap a
+                    // second process or reopen a numeric PID.
                     return match self.child.wait() {
-                        Ok(status) => {
-                            self.wrapper_reaped = true;
-                            Ok(self.completed_result(status))
-                        }
-                        Err(error) => Ok(self.wait_error_result(error)),
+                        Ok(status) => Ok(self.completed_result(status)),
+                        Err(_) => Err(self),
                     };
                 }
                 #[cfg(not(target_os = "linux"))]
                 Ok(WrapperPoll::ExitedReaped(status)) => {
                     self.wrapper_reaped = true;
-                    self.kill_supervised_processes();
+                    if self.settle_processes_before_drains().is_err() {
+                        return Err(self);
+                    }
                     return Ok(self.completed_result(status));
                 }
                 Ok(WrapperPoll::Running) => {
@@ -2696,7 +2780,7 @@ impl RunningProcess {
                     }
                     thread::sleep(PROCESS_POLL_INTERVAL);
                 }
-                Err(error) => return Ok(self.wait_error_result(error)),
+                Err(_) => return Err(self),
             }
         }
     }
@@ -2782,7 +2866,13 @@ impl RunningProcess {
             pid: self.pid,
             pgid: self.pgid,
         };
-        match self.abort_and_reap_inner() {
+        let settlement = self.settle_processes_before_drains();
+        let (_, stderr) = self.finish_drains();
+        // Launcher status and stderr are independent pipes. Read diagnostics
+        // only after the existing bounded drain has settled; an EOF on status
+        // does not imply the stderr drainer has observed the final bytes.
+        result.stderr = append_captured_stderr(result.stderr, &stderr);
+        match settlement {
             Ok(()) if held => result.aborted_before_attachment = Some(identity),
             Ok(()) => {}
             Err(error) => {
@@ -2934,9 +3024,9 @@ impl RunningProcess {
             return self.output_limit_result(out, err, exceeded);
         }
         SubprocessResult {
-            success: code == 0,
+            success: code == 0 && self.scope_cleanup_error.is_none(),
             stdout: String::from_utf8_lossy(&out.bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&err.bytes).into_owned(),
+            stderr: self.with_scope_cleanup_diagnostic(&String::from_utf8_lossy(&err.bytes)),
             exit_code: code,
             duration_ms: self.start.elapsed().as_secs_f64() * 1000.0,
             pid: self.pid,
@@ -2978,6 +3068,15 @@ impl RunningProcess {
         if self.groups_terminated {
             return;
         }
+        if let Some(scope) = &self.process_scope {
+            self.scope_cleanup_error = scope
+                .terminate_and_wait(ATTACHMENT_ABORT_SETTLE_TIMEOUT)
+                .err();
+            self.groups_terminated = self.scope_cleanup_error.is_none();
+            // An explicitly selected scope never degrades to numeric group
+            // cleanup. Retain failed scope evidence for the durable owner.
+            return;
+        }
         #[cfg(unix)]
         {
             debug_assert_eq!(self.wrapper_pgid, self.wrapper_pid as i64);
@@ -3005,7 +3104,7 @@ impl RunningProcess {
     }
 
     fn reap_wrapper(&mut self) {
-        if self.wrapper_reaped {
+        if self.wrapper_reaped || self.scope_cleanup_error.is_some() {
             return;
         }
         if self.child.wait().is_ok() {
@@ -3014,9 +3113,24 @@ impl RunningProcess {
     }
 
     fn abort_and_reap_inner(&mut self) -> Result<(), String> {
+        let result = self.settle_processes_before_drains();
+        let _ = self.finish_drains();
+        result
+    }
+
+    fn settle_processes_before_drains(&mut self) -> Result<(), String> {
         self.kill_supervised_processes();
+        if let Some(error) = self.scope_cleanup_error.clone() {
+            return Err(format!("execution scope cleanup remains unproved: {error}"));
+        }
         #[cfg(target_os = "linux")]
-        let group_result = self.settle_owned_group_before_wrapper_reap();
+        let group_result = if self.process_scope.is_some() {
+            // The scope's completed termination includes every descendant and
+            // the wrapper. Reaping remains a separate owned-child obligation.
+            Ok(())
+        } else {
+            self.settle_owned_group_before_wrapper_reap()
+        };
         #[cfg(not(target_os = "linux"))]
         let group_result = Ok(());
         // The unreaped wrapper is the process-group identity fence. Reaping
@@ -3026,7 +3140,6 @@ impl RunningProcess {
             Ok(()) => self.reap_wrapper_checked(),
             Err(_) => Ok(()),
         };
-        let _ = self.finish_drains();
         match (group_result, reap_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(group), Ok(())) => Err(group),
@@ -3125,10 +3238,10 @@ impl RunningProcess {
         SubprocessResult {
             success: false,
             stdout: String::from_utf8_lossy(&out.bytes).into_owned(),
-            stderr: append_diagnostic(
+            stderr: self.with_scope_cleanup_diagnostic(&append_diagnostic(
                 &String::from_utf8_lossy(&err.bytes),
                 &format!("Command timed out after {} seconds", self.timeout),
-            ),
+            )),
             exit_code: -1,
             duration_ms: self.start.elapsed().as_secs_f64() * 1000.0,
             pid: self.pid,
@@ -3150,13 +3263,13 @@ impl RunningProcess {
         SubprocessResult {
             success: false,
             stdout: String::from_utf8_lossy(&out.bytes).into_owned(),
-            stderr: append_diagnostic(
+            stderr: self.with_scope_cleanup_diagnostic(&append_diagnostic(
                 &String::from_utf8_lossy(&err.bytes),
                 &format!(
-                    "Command exceeded the node-owned {} output retention limit and was terminated",
+                    "Command exceeded the node-owned {} output retention limit; termination was requested",
                     exceeded.as_str()
                 ),
-            ),
+            )),
             exit_code: -1,
             duration_ms: self.start.elapsed().as_secs_f64() * 1000.0,
             pid: self.pid,
@@ -3166,6 +3279,16 @@ impl RunningProcess {
             output_limit_exceeded: Some(exceeded),
             stdout_truncated: out.truncated,
             stderr_truncated: err.truncated,
+        }
+    }
+
+    fn with_scope_cleanup_diagnostic(&self, stderr: &str) -> String {
+        match &self.scope_cleanup_error {
+            Some(error) => append_diagnostic(
+                stderr,
+                &format!("execution scope cleanup remains unproved: {error}"),
+            ),
+            None => stderr.to_owned(),
         }
     }
 }
@@ -3227,7 +3350,7 @@ pub fn lib_spawn(request: SubprocessRequest) -> Result<RunningProcess, Subproces
             "Failed to spawn: attachment-bearing supervision requires spawn_awaiting_attachment",
         ));
     }
-    lib_spawn_with_stdio(request, false, None)
+    lib_spawn_with_stdio(request, false, None, None)
 }
 
 /// Spawn with inherited terminal stdio while retaining the same session,
@@ -3247,7 +3370,7 @@ pub fn lib_spawn_inherited_stdio(
             "Failed to spawn: attachment-bearing supervision requires spawn_awaiting_attachment",
         ));
     }
-    lib_spawn_with_stdio(request, true, None)
+    lib_spawn_with_stdio(request, true, None, None)
 }
 
 /// Spawn a Linux subprocess whose final trusted setup completes before the
@@ -3259,9 +3382,20 @@ pub fn lib_spawn_inherited_stdio(
 /// ownership before any target code can run.
 #[cfg(target_os = "linux")]
 pub fn lib_spawn_awaiting_attachment(
+    request: SubprocessRequest,
+) -> Result<ProcessAwaitingAttachment, SubprocessResult> {
+    lib_spawn_awaiting_attachment_in_scope(request, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn lib_spawn_awaiting_attachment_in_scope(
     mut request: SubprocessRequest,
+    process_scope: Option<crate::ProcessScope>,
 ) -> Result<ProcessAwaitingAttachment, SubprocessResult> {
     let start = Instant::now();
+    let attachment_scope = process_scope
+        .as_ref()
+        .map(crate::ProcessScope::control_authority);
     if let Some(status) = request.supervised_status.as_ref() {
         if !matches!(
             status.state,
@@ -3273,7 +3407,7 @@ pub fn lib_spawn_awaiting_attachment(
             ));
         }
         let timeout = request.timeout;
-        let running = lib_spawn_with_stdio(request, false, None)?;
+        let running = lib_spawn_with_stdio(request, false, None, process_scope)?;
         if running.attachment_release.is_none() {
             return Err(running.into_spawn_failure(spawn_failure(
                 start,
@@ -3313,16 +3447,21 @@ pub fn lib_spawn_awaiting_attachment(
                 format!("Invalid supervised target awaiting attachment: {error}"),
             )));
         }
-        return Ok(ProcessAwaitingAttachment {
-            pid: running.pid,
-            pgid: running.pgid,
-            owner: Some(AttachmentPendingOwner::Supervised {
-                running: Box::new(running),
-            }),
-            pidfd,
-            request_deadline: request_timeout_duration(timeout)
-                .and_then(|duration| start.checked_add(duration)),
-        });
+        return verify_scoped_attachment(
+            ProcessAwaitingAttachment {
+                process_scope: attachment_scope,
+                pid: running.pid,
+                pgid: running.pgid,
+                owner: Some(AttachmentPendingOwner::Supervised {
+                    running: Box::new(running),
+                }),
+                pidfd,
+                request_deadline: request_timeout_duration(timeout)
+                    .and_then(|duration| start.checked_add(duration)),
+            },
+            start,
+            supervised_setup_deadline(start, timeout),
+        );
     }
     let timeout = request.timeout;
     let setup_deadline = supervised_setup_deadline(start, timeout);
@@ -3392,7 +3531,7 @@ pub fn lib_spawn_awaiting_attachment(
     // inherit an advisory lock and deadlock the owner's durable attach path.
     let worker = thread::Builder::new()
         .name("lillux-attachment-spawn".to_string())
-        .spawn(move || lib_spawn_with_stdio(request, false, Some(gate)))
+        .spawn(move || lib_spawn_with_stdio(request, false, Some(gate), process_scope))
         .map_err(|error| {
             spawn_failure(
                 start,
@@ -3515,17 +3654,49 @@ pub fn lib_spawn_awaiting_attachment(
         fork_sensitive_descriptors.register_pending_fork_control(release_writer);
     drop(fork_sensitive_descriptors);
 
-    Ok(ProcessAwaitingAttachment {
-        pid: ready.pid,
-        pgid: ready.pgid,
-        owner: Some(AttachmentPendingOwner::Direct {
-            worker,
-            release_registration,
-        }),
-        pidfd,
-        request_deadline: request_timeout_duration(timeout)
-            .and_then(|duration| start.checked_add(duration)),
-    })
+    verify_scoped_attachment(
+        ProcessAwaitingAttachment {
+            process_scope: attachment_scope,
+            pid: ready.pid,
+            pgid: ready.pgid,
+            owner: Some(AttachmentPendingOwner::Direct {
+                worker,
+                release_registration,
+            }),
+            pidfd,
+            request_deadline: request_timeout_duration(timeout)
+                .and_then(|duration| start.checked_add(duration)),
+        },
+        start,
+        setup_deadline,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_scoped_attachment(
+    pending: ProcessAwaitingAttachment,
+    start: Instant,
+    deadline: Instant,
+) -> Result<ProcessAwaitingAttachment, SubprocessResult> {
+    let membership = match &pending.process_scope {
+        Some(scope) => scope.require_held_member(
+            pending.pid,
+            deadline.saturating_duration_since(Instant::now()),
+        ),
+        None => Ok(()),
+    };
+    if let Err(error) = membership {
+        let cleanup = pending.abort_and_reap();
+        let mut result = spawn_failure(start, format!("invalid scoped attachment: {error}"));
+        match cleanup {
+            Ok(aborted) => result.aborted_before_attachment = Some(aborted),
+            Err(error) => result
+                .stderr
+                .push_str(&format!("; cleanup remains unproved: {error}")),
+        }
+        return Err(result);
+    }
+    Ok(pending)
 }
 
 #[cfg(target_os = "linux")]
@@ -3741,6 +3912,7 @@ fn lib_spawn_with_stdio(
     inherit_stdio: bool,
     #[cfg(target_os = "linux")] mut attachment_gate: Option<AttachmentWorkerGate>,
     #[cfg(not(target_os = "linux"))] _attachment_gate: Option<()>,
+    process_scope: Option<crate::ProcessScope>,
 ) -> Result<RunningProcess, SubprocessResult> {
     let start = Instant::now();
     let SubprocessRequest {
@@ -3886,6 +4058,14 @@ fn lib_spawn_with_stdio(
     } else {
         Stdio::piped()
     });
+    // Placement must precede inherited-descriptor remapping, final attachment
+    // hold and exec. Platform code owns the exact operation and closes its
+    // controls at exec; they never enter workload channel/mount authority.
+    if let Some(scope) = &process_scope {
+        scope
+            .configure_command(&mut command)
+            .map_err(|error| spawn_failure(start, format!("configure process scope: {error}")))?;
+    }
     // `inherited_fds` remains owned in this scope through `Command::spawn`.
     // Descriptors stay CLOEXEC in the multithreaded parent and are made
     // inheritable only in the forked child, preventing unrelated concurrent
@@ -4069,6 +4249,8 @@ fn lib_spawn_with_stdio(
     // Reuse that owner for every subsequent setup failure instead of reaping
     // the wrapper first and losing the exact process-group cleanup fence.
     let mut running = RunningProcess {
+        process_scope,
+        scope_cleanup_error: None,
         pid: wrapper_pid,
         pgid: wrapper_pgid,
         wrapper_pid,
@@ -4192,22 +4374,16 @@ fn lib_spawn_with_stdio(
             Ok(Err(error)) => {
                 let failure = spawn_failure(
                     start,
-                    append_captured_stderr(
-                        format!("Failed to spawn: supervised launcher refused: {error}"),
-                        &running.stderr_capture,
-                    ),
+                    format!("Failed to spawn: supervised launcher refused: {error}"),
                 );
                 return Err(running.into_spawn_failure(failure));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let failure = spawn_failure(
                     start,
-                    append_captured_stderr(
-                        format!(
-                            "Failed to spawn: supervised launcher did not report its target PID before the bounded setup/request deadline ({:.3} seconds remaining after launch setup)",
-                            setup_wait.as_secs_f64()
-                        ),
-                        &running.stderr_capture,
+                    format!(
+                        "Failed to spawn: supervised launcher did not report its target PID before the bounded setup/request deadline ({:.3} seconds remaining after launch setup)",
+                        setup_wait.as_secs_f64()
                     ),
                 );
                 return Err(running.into_spawn_failure(failure));
@@ -4215,10 +4391,7 @@ fn lib_spawn_with_stdio(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let failure = spawn_failure(
                     start,
-                    append_captured_stderr(
-                        "Failed to spawn: supervised-launcher status channel closed before reporting its target PID".to_owned(),
-                        &running.stderr_capture,
-                    ),
+                    "Failed to spawn: supervised-launcher status channel closed before reporting its target PID",
                 );
                 return Err(running.into_spawn_failure(failure));
             }
@@ -5253,8 +5426,14 @@ fn cleanup_direct_after_release_worker_panic(
     pid: u32,
     pgid: i64,
     pidfd: i32,
+    scope: Option<&crate::ProcessScope>,
 ) -> Result<(), String> {
-    kill_owned_process_group(pid, pgid, true);
+    // A panicked spawn thread does not change the admitted lifecycle owner.
+    // In particular, scope cleanup must never fall through to the old group
+    // signal/scan path merely because RunningProcess was not returned.
+    if scope.is_none() {
+        kill_owned_process_group(pid, pgid, true);
+    }
     let signal = match pidfd_send_signal_io(pidfd, ATTACHMENT_ABORT_SIGNAL) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
@@ -5262,8 +5441,11 @@ fn cleanup_direct_after_release_worker_panic(
             "pidfd_send_signal({ATTACHMENT_ABORT_SIGNAL}): {error}"
         )),
     };
+    let group = match scope {
+        Some(scope) => scope.terminate_and_wait(ATTACHMENT_ABORT_SETTLE_TIMEOUT),
+        None => wait_owned_process_group_quiescent(pgid, pid, ATTACHMENT_ABORT_SETTLE_TIMEOUT),
+    };
     let exit = wait_pidfd_exit(pidfd, ATTACHMENT_ABORT_SETTLE_TIMEOUT);
-    let group = wait_owned_process_group_quiescent(pgid, pid, ATTACHMENT_ABORT_SETTLE_TIMEOUT);
     let mut failures = Vec::new();
     if exit.is_ok() && group.is_ok() {
         if let Err(error) = reap_exact_child_pid(pid) {
@@ -5477,13 +5659,8 @@ fn append_diagnostic(existing: &str, diagnostic: &str) -> String {
     }
 }
 
-fn append_captured_stderr(reason: String, capture: &SharedCapture) -> String {
+fn append_captured_stderr(reason: String, capture: &BoundedCapture) -> String {
     const DIAGNOSTIC_BYTES: usize = 4 * 1024;
-
-    let capture = capture
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     if capture.bytes.is_empty() {
         return reason;
     }
@@ -5503,7 +5680,7 @@ fn append_captured_stderr(reason: String, capture: &SharedCapture) -> String {
     append_diagnostic(&reason, &diagnostic)
 }
 
-fn spawn_failure(start: Instant, reason: impl Into<String>) -> SubprocessResult {
+pub(crate) fn spawn_failure(start: Instant, reason: impl Into<String>) -> SubprocessResult {
     SubprocessResult {
         success: false,
         stdout: String::new(),
@@ -5746,6 +5923,24 @@ pub fn lib_is_alive(pid: u32) -> bool {
 
 #[derive(Subcommand)]
 pub enum ExecAction {
+    /// Host-supervisor bootstrap: provision one explicit delegation and exec
+    /// an unprivileged controller. Not a worker command or setuid entrypoint.
+    ScopeController {
+        #[arg(long)]
+        configuration: String,
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        gid: u32,
+        #[arg(long)]
+        cmd: std::path::PathBuf,
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        #[arg(long)]
+        cwd: std::path::PathBuf,
+        #[arg(long = "env")]
+        envs: Vec<String>,
+    },
     /// Run a command, wait for completion, capture output
     Run {
         #[arg(long)]
@@ -5861,6 +6056,34 @@ fn setup_log(command: &mut process::Command, log: Option<&str>) -> Result<(), St
 
 pub fn run(action: ExecAction) -> serde_json::Value {
     match action {
+        ExecAction::ScopeController {
+            configuration,
+            uid,
+            gid,
+            cmd,
+            args,
+            cwd,
+            envs,
+        } => {
+            let outcome = (|| -> Result<std::convert::Infallible, String> {
+                let configuration: crate::ProcessScopeConfiguration =
+                    serde_json::from_str(&configuration).map_err(|error| error.to_string())?;
+                let environment: Vec<(String, String)> = envs
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                            .ok_or_else(|| "controller environment requires NAME=VALUE".to_owned())
+                    })
+                    .collect::<Result<_, _>>()?;
+                configuration.exec_controller(uid, gid, &cmd, &args, &cwd, &environment)
+            })();
+            match outcome {
+                Ok(never) => match never {},
+                Err(error) => serde_json::json!({"error": error}),
+            }
+        }
         ExecAction::Run {
             cmd,
             args,

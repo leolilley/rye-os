@@ -192,10 +192,10 @@ fn run_installs_max_open_files_before_exec() {
 
 #[test]
 fn run_installs_memory_cpu_and_process_limits_before_exec() {
-    let mut request = sh(&[
-        "-c",
-        "printf '%s\\n' \"$(ulimit -v)\" \"$(ulimit -t)\" \"$(ulimit -u)\"",
-    ]);
+    // Inspect installed limits using shell builtins, without command-substitution
+    // forks. RLIMIT_NPROC counts this UID's other host tasks too; observing the
+    // installed value must not depend on the developer's current process count.
+    let mut request = sh(&["-c", "ulimit -v; ulimit -t; ulimit -u"]);
     request.limits = Some(SubprocessLimits {
         max_address_space_bytes: Some(256 * 1024 * 1024),
         max_cpu_seconds: Some(3),

@@ -96,6 +96,9 @@ pub enum LinuxSandboxNetwork {
 pub enum LinuxSandboxProcFilesystem {
     Empty,
     PidNamespace,
+    /// Writable process maps and kernel metadata for nested runtimes. Tasks
+    /// remain PID-local; non-task visibility is broader than PidNamespace.
+    PidNamespaceNested,
 }
 
 /// Final target-release boundary. EOF is refusal, never permission to run.
@@ -137,6 +140,10 @@ pub struct LinuxSandboxRequest {
     pub target_channels: Vec<(u32, u32)>,
     pub lifecycle: LinuxSandboxLifecycle,
     pub contain_process_group: bool,
+    /// Explicitly admitted nested sandboxing. The outer launch owner MUST
+    /// retain whole-execution containment; a shared group is insufficient.
+    /// PID-local proc becomes writable for child UID/GID maps, never host proc.
+    pub nested_sandbox: bool,
     pub aggregate_limits: Option<LinuxSandboxAggregateLimits>,
 }
 
@@ -153,6 +160,7 @@ pub struct LinuxSandboxInspection {
     pub isolated_pid_namespace: bool,
     pub pid_namespace_proc: bool,
     pub process_group_containment: bool,
+    pub nested_sandbox: bool,
     pub aggregate_resource_isolation: bool,
 }
 
@@ -174,6 +182,7 @@ impl LinuxSandboxInspection {
             isolated_pid_namespace: true,
             pid_namespace_proc: true,
             process_group_containment: true,
+            nested_sandbox: true,
             aggregate_resource_isolation: false,
         }
     }
@@ -477,75 +486,90 @@ mod imp {
             crate::secure_fs::pin_canonical_mount_source(std::path::Path::new(ROOT))
                 .map_err(|error| format!("pin inherited namespace probe: {error}"))?;
         let inherited_bytes = crate::sealed_memfd(c"lillux-mount-probe", b"exact sealed bytes")?;
-        let mut report = [0; 2];
-        syscall_zero(
-            unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
-            "create sandbox probe report",
-        )?;
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            close_fd(report[0]);
-            close_fd(report[1]);
-            return Err(format!(
-                "fork native sandbox inspection: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if pid == 0 {
-            close_fd(report[0]);
-            let result = (|| {
-                // The shared-view probe reaps its creator before starting
-                // sibling borrowers. Run before CLONE_NEWPID makes that first
-                // child PID 1 of our pending namespace; its exit would make
-                // subsequent forks fail instead of probing view reuse.
-                probe_overlay()?;
-                enter_namespaces(LinuxSandboxNetwork::Isolated)?;
-                let directory = reanchor_mount_source(inherited_directory.file().as_raw_fd())?;
-                mount_private_root()?;
-                create_minimal_devices()?;
-                create_private_tmp()?;
-                let staging = SealedSourceStaging::create()?;
-                let bytes = materialize_sealed_mount_source(
-                    inherited_bytes.file().as_raw_fd(),
-                    &staging.content,
-                )?;
-                probe_inherited_descriptor_mounts(directory.file(), bytes.file())?;
-                staging.detach()?;
-                probe_descriptor_mount()?;
-                fixed_parents::probe()?;
-                probe_isolated_pid_child()?;
-                Ok::<(), String>(())
-            })();
-            match &result {
-                Ok(()) => {
-                    let _ = write_all_fd(report[1], &[CHILD_READY]);
-                }
-                Err(error) => {
-                    let _ = write_child_error(report[1], error);
-                }
+        let mut available = LinuxSandboxInspection::declared_native_contract();
+        for nested in [false, true] {
+            if nested && unsafe { libc::geteuid() } == 0 {
+                available.nested_sandbox = false;
+                continue;
             }
-            unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+            let mut report = [0; 2];
+            syscall_zero(
+                unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
+                "create sandbox probe report",
+            )?;
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                close_fd(report[0]);
+                close_fd(report[1]);
+                return Err(format!(
+                    "fork native sandbox inspection: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if pid == 0 {
+                close_fd(report[0]);
+                let result = (|| {
+                    // The shared-view probe reaps its creator before starting
+                    // sibling borrowers. Run before CLONE_NEWPID makes that first
+                    // child PID 1 of our pending namespace; its exit would make
+                    // subsequent forks fail instead of probing view reuse.
+                    probe_overlay()?;
+                    enter_namespaces(LinuxSandboxNetwork::Isolated)?;
+                    let directory = reanchor_mount_source(inherited_directory.file().as_raw_fd())?;
+                    mount_private_root()?;
+                    create_minimal_devices()?;
+                    create_private_tmp()?;
+                    let staging = SealedSourceStaging::create()?;
+                    let bytes = materialize_sealed_mount_source(
+                        inherited_bytes.file().as_raw_fd(),
+                        &staging.content,
+                    )?;
+                    probe_inherited_descriptor_mounts(directory.file(), bytes.file())?;
+                    staging.detach()?;
+                    probe_descriptor_mount()?;
+                    fixed_parents::probe()?;
+                    probe_isolated_pid_child(nested)?;
+                    Ok::<(), String>(())
+                })();
+                match &result {
+                    Ok(()) => {
+                        let _ = write_all_fd(report[1], &[CHILD_READY]);
+                    }
+                    Err(error) => {
+                        let _ = write_child_error(report[1], error);
+                    }
+                }
+                unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+            }
+            close_fd(report[1]);
+            let outcome = read_child_ready(report[0]);
+            close_fd(report[0]);
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+                return Err(format!(
+                    "wait for native sandbox inspection: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                if nested {
+                    available.nested_sandbox = false;
+                    continue;
+                }
+                return Err(format!(
+                    "native sandbox kernel probe refused: {}",
+                    outcome.err().unwrap_or_else(|| {
+                        "probe child terminated without a failure report".to_string()
+                    })
+                ));
+            }
+            if nested && outcome.is_err() {
+                available.nested_sandbox = false;
+            } else {
+                outcome?;
+            }
         }
-        close_fd(report[1]);
-        let outcome = read_child_ready(report[0]);
-        close_fd(report[0]);
-        let mut status = 0;
-        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
-            return Err(format!(
-                "wait for native sandbox inspection: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-            return Err(format!(
-                "native sandbox kernel probe refused: {}",
-                outcome.err().unwrap_or_else(
-                    || "probe child terminated without a failure report".to_string()
-                )
-            ));
-        }
-        outcome?;
-        Ok(LinuxSandboxInspection::declared_native_contract())
+        Ok(available)
     }
 
     pub fn launch(mut request: LinuxSandboxRequest) -> Result<LinuxSandboxProcess, String> {
@@ -638,6 +662,20 @@ mod imp {
     }
 
     fn validate_request(request: &LinuxSandboxRequest) -> Result<(), String> {
+        if request.nested_sandbox && unsafe { libc::geteuid() } == 0 {
+            return Err(
+                "nested sandbox requires an unprivileged launch identity, not node root".to_owned(),
+            );
+        }
+        if request.nested_sandbox
+            != (request.proc_filesystem == LinuxSandboxProcFilesystem::PidNamespaceNested)
+            || (request.nested_sandbox && request.contain_process_group)
+        {
+            return Err(
+                "nested sandbox requires external whole-execution containment and PID-local proc"
+                    .to_owned(),
+            );
+        }
         let staging_path = PathBuf::from(format!("/{SEALED_STAGING_NAME}"));
         if request
             .mounts
@@ -762,6 +800,14 @@ mod imp {
         Ok(())
     }
 
+    // A private namespace coordinate, NOT a host account or project identity.
+    // Only the invoking host UID/GID is mapped. Keep the inner coordinate
+    // nonzero: after dropping setup capabilities, mapping parent UID 0 into a
+    // nested user namespace would require retaining CAP_SETFCAP in the outer
+    // namespace (Linux 5.12+). Ordinary nested sandboxing must not need that.
+    const NAMESPACE_USER_ID: libc::uid_t = 1;
+    const NAMESPACE_GROUP_ID: libc::gid_t = 1;
+
     fn enter_mapped_user_namespace() -> Result<(), String> {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -770,14 +816,22 @@ mod imp {
             "create user namespace",
         )?;
         write_proc_mapping("/proc/self/setgroups", "deny\n", true)?;
-        write_proc_mapping("/proc/self/uid_map", &format!("0 {uid} 1\n"), false)?;
-        write_proc_mapping("/proc/self/gid_map", &format!("0 {gid} 1\n"), false)?;
+        write_proc_mapping(
+            "/proc/self/uid_map",
+            &format!("{NAMESPACE_USER_ID} {uid} 1\n"),
+            false,
+        )?;
+        write_proc_mapping(
+            "/proc/self/gid_map",
+            &format!("{NAMESPACE_GROUP_ID} {gid} 1\n"),
+            false,
+        )?;
         syscall_zero(
-            unsafe { libc::setresgid(0, 0, 0) },
+            unsafe { libc::setresgid(NAMESPACE_GROUP_ID, NAMESPACE_GROUP_ID, NAMESPACE_GROUP_ID) },
             "enter mapped sandbox gid",
         )?;
         syscall_zero(
-            unsafe { libc::setresuid(0, 0, 0) },
+            unsafe { libc::setresuid(NAMESPACE_USER_ID, NAMESPACE_USER_ID, NAMESPACE_USER_ID) },
             "enter mapped sandbox uid",
         )
     }
@@ -1542,7 +1596,7 @@ mod imp {
         )
     }
 
-    fn probe_isolated_pid_child() -> Result<(), String> {
+    fn probe_isolated_pid_child(nested: bool) -> Result<(), String> {
         let mut report = [0; 2];
         syscall_zero(
             unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
@@ -1564,20 +1618,23 @@ mod imp {
                 if unsafe { libc::getpid() } != 1 {
                     return Err("sandbox child is not PID 1 in its isolated namespace".to_string());
                 }
-                mount_pid_namespace_proc()?;
+                mount_pid_namespace_proc(nested)?;
                 pivot_into_private_root()?;
                 if std::fs::read_link("/proc/self").map_err(|error| error.to_string())?
                     != PathBuf::from("1")
                     || std::path::Path::new(&format!("/proc/{parent_pid}")).exists()
-                    || std::path::Path::new("/proc/sys").exists()
-                    || std::path::Path::new("/proc/meminfo").exists()
+                    || (!nested
+                        && (std::path::Path::new("/proc/sys").exists()
+                            || std::path::Path::new("/proc/meminfo").exists()))
                 {
                     return Err("PID procfs exposes a foreign or non-task surface".to_string());
                 }
                 let flags = std::fs::OpenOptions::new()
                     .write(true)
                     .open("/proc/self/oom_score_adj");
-                if !matches!(flags, Err(ref error) if error.raw_os_error() == Some(libc::EROFS)) {
+                if !nested
+                    && !matches!(flags, Err(ref error) if error.raw_os_error() == Some(libc::EROFS))
+                {
                     return Err("PID procfs is not read-only".to_string());
                 }
                 let descendant = unsafe { libc::fork() };
@@ -1587,7 +1644,18 @@ mod imp {
                 if descendant == 0 {
                     let own = unsafe { libc::getpid() }.to_string();
                     let visible = std::fs::read_link("/proc/self").ok() == Some(PathBuf::from(own));
-                    unsafe { libc::_exit(if visible { 0 } else { 125 }) };
+                    let strict_filter = syscall_zero(
+                        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                        "probe strict NNP",
+                    )
+                    .and_then(|()| install_confinement_filter(true, false));
+                    unsafe {
+                        libc::_exit(if visible && strict_filter.is_ok() {
+                            0
+                        } else {
+                            125
+                        })
+                    };
                 }
                 let visible = std::path::Path::new(&format!("/proc/{descendant}")).exists();
                 let mut status = 0;
@@ -1602,7 +1670,13 @@ mod imp {
                     unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
                     "set no_new_privs during sandbox probe",
                 )?;
-                install_confinement_filter(true)
+                drop_target_namespace_capabilities()?;
+                install_confinement_filter(!nested, nested)?;
+                if nested {
+                    probe_nested_sandbox()
+                } else {
+                    Ok(())
+                }
             })();
             match &result {
                 Ok(()) => {
@@ -1634,6 +1708,94 @@ mod imp {
                     .unwrap_or_else(|| "child exited without failure report".to_string())
             ))
         }
+    }
+
+    // Kernel-only generation inspection, not a workload executable or a
+    // provider-specific preflight. The explicit nested mode admits non-task
+    // kernel metadata, unlike task-only proc. A fresh namespace must still
+    // exclude host PIDs and global write authority after gaining child caps.
+    fn probe_nested_sandbox() -> Result<(), String> {
+        verify_nested_host_controls_unavailable()?;
+        enter_mapped_user_namespace()?;
+        verify_nested_host_controls_unavailable()?;
+        syscall_zero(
+            unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID) },
+            "probe nested namespaces",
+        )?;
+        if unsafe { libc::unshare(libc::CLONE_NEWCGROUP) } != -1
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+        {
+            return Err("nested sandbox did not refuse scope namespace creation".to_owned());
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!(
+                "fork nested namespace probe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            let result = (|| {
+                if unsafe { libc::getpid() } != 1 {
+                    return Err("nested probe did not enter its PID namespace".to_owned());
+                }
+                mount_raw(
+                    Some("proc"),
+                    "/proc",
+                    Some("proc"),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    None,
+                )
+                .map_err(|error| format!("mount nested isolated proc: {error}"))?;
+                if std::fs::read_link("/proc/self").map_err(|error| error.to_string())?
+                    != PathBuf::from("1")
+                {
+                    return Err("nested proc lost its PID-local surface".to_owned());
+                }
+                verify_nested_host_controls_unavailable()?;
+                Ok::<(), String>(())
+            })();
+            unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+        }
+        let mut status = 0;
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+            || !libc::WIFEXITED(status)
+            || libc::WEXITSTATUS(status) != 0
+        {
+            return Err("nested PID/proc generation probe refused".to_owned());
+        }
+        Ok(())
+    }
+
+    /// These are Linux kernel-control interfaces, not configurable project
+    /// files. Check opening only: qualification NEVER writes a host control.
+    /// Child user-namespace capabilities must not grant initial-namespace
+    /// control, even when fresh procfs is mounted by the nested runtime.
+    fn verify_nested_host_controls_unavailable() -> Result<(), String> {
+        for path in [
+            "/proc/sys/kernel/overflowuid",
+            "/proc/sys/kernel/overflowgid",
+            "/proc/sysrq-trigger",
+        ] {
+            match std::fs::OpenOptions::new().write(true).open(path) {
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::EROFS)
+                    ) => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "nested sandbox can open host kernel control {path}"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot qualify kernel control denial {path}: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn spawn_target(request: LinuxSandboxRequest) -> Result<LinuxSandboxProcess, String> {
@@ -1697,8 +1859,8 @@ mod imp {
         // An outside-namespace parent appears as PID 0 here, so getppid
         // cannot prove adapter liveness. The exact readiness pipe refuses a
         // missing parent even if it died before PDEATHSIG was installed.
-        if request.proc_filesystem == LinuxSandboxProcFilesystem::PidNamespace {
-            mount_pid_namespace_proc()?;
+        if request.proc_filesystem != LinuxSandboxProcFilesystem::Empty {
+            mount_pid_namespace_proc(request.nested_sandbox)?;
         }
         pivot_into_private_root()?;
         let mut mapped_channels = Vec::with_capacity(request.target_channels.len());
@@ -1728,7 +1890,11 @@ mod imp {
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
             "set no_new_privs for sandbox target",
         )?;
-        install_confinement_filter(request.contain_process_group)?;
+        drop_target_namespace_capabilities()?;
+        if request.nested_sandbox {
+            verify_nested_host_controls_unavailable()?;
+        }
+        install_confinement_filter(request.contain_process_group, request.nested_sandbox)?;
         write_all_fd(ready_fd, &[CHILD_READY])?;
         if let LinuxSandboxLifecycle::AwaitRelease {
             release_fd,
@@ -1769,7 +1935,7 @@ mod imp {
     /// this setup boundary. Immediately pivot/detach the old root afterwards,
     /// before descriptor closure, confinement, readiness or untrusted exec.
     /// No host procfs is bound into the target view.
-    fn mount_pid_namespace_proc() -> Result<(), String> {
+    fn mount_pid_namespace_proc(nested_sandbox: bool) -> Result<(), String> {
         if unsafe { libc::getpid() } != 1 {
             return Err("PID procfs must be mounted by the isolated namespace init".to_string());
         }
@@ -1780,11 +1946,18 @@ mod imp {
                     c"proc".as_ptr(),
                     target.as_ptr(),
                     c"proc".as_ptr(),
-                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-                    c"subset=pid".as_ptr().cast(),
+                    (if nested_sandbox { 0 } else { libc::MS_RDONLY })
+                        | libc::MS_NOSUID
+                        | libc::MS_NODEV
+                        | libc::MS_NOEXEC,
+                    if nested_sandbox {
+                        std::ptr::null()
+                    } else {
+                        c"subset=pid".as_ptr().cast()
+                    },
                 )
             },
-            "mount isolated PID-only procfs",
+            "mount isolated PID namespace procfs",
         )
     }
 
@@ -1828,10 +2001,147 @@ mod imp {
         ))
     }
 
-    fn install_confinement_filter(contain_process_group: bool) -> Result<(), String> {
+    // Linux capability ABI v3, from <linux/capability.h>. libc exposes the
+    // syscalls but not these wire structs. Keep OS ABI details inside Lillux;
+    // this is not a configurable workload privilege inventory.
+    const CAPABILITY_VERSION: u32 = 0x2008_0522;
+    const CAPABILITY_WORDS: usize = 2;
+
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    const TARGET_SECUREBITS: libc::c_int = libc::SECBIT_NOROOT
+        | libc::SECBIT_NOROOT_LOCKED
+        | libc::SECBIT_NO_SETUID_FIXUP
+        | libc::SECBIT_NO_SETUID_FIXUP_LOCKED
+        | libc::SECBIT_KEEP_CAPS_LOCKED
+        | libc::SECBIT_NO_CAP_AMBIENT_RAISE
+        | libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+
+    fn capability_count() -> Result<u32, String> {
+        // Discover the kernel inventory, not a remembered CAP_LAST_CAP. Refuse
+        // a kernel beyond the ABI we can clear, rather than truncate its sets.
+        for capability in 0..=CAPABILITY_WORDS as u32 * u32::BITS {
+            match unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } {
+                0 | 1 => {}
+                -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+                    && capability > 0 =>
+                {
+                    return Ok(capability);
+                }
+                _ => {
+                    return Err(format!(
+                        "inspect capability bounding set: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+        }
+        Err("kernel capabilities exceed the supported capability ABI".to_string())
+    }
+
+    /// Irreversibly give up setup authority in the user namespace which owns
+    /// the outer mounts/PID namespace, before readiness or any untrusted exec.
+    /// The single-ID mapping is not a privilege grant. Lock exec/UID capability
+    /// fixups as well as clearing the sets: NNP alone does not remove the
+    /// setup capabilities acquired when creating a user namespace.
+    ///
+    /// Do not replace the syscall filter with this step. A later nested user
+    /// namespace has its own capabilities/securebits; permitting it separately
+    /// requires locked inherited mounts and whole-execution lifecycle proof.
+    fn drop_target_namespace_capabilities() -> Result<(), String> {
+        let count = capability_count()?;
+        syscall_zero(
+            unsafe { libc::prctl(libc::PR_SET_SECUREBITS, TARGET_SECUREBITS, 0, 0, 0) },
+            "lock target namespace privilege reduction",
+        )?;
+        syscall_zero(
+            unsafe {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                    0,
+                    0,
+                    0,
+                )
+            },
+            "clear target ambient capabilities",
+        )?;
+        for capability in 0..count {
+            syscall_zero(
+                unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) },
+                "drop target capability bounding set",
+            )?;
+        }
+        let header = CapabilityHeader {
+            version: CAPABILITY_VERSION,
+            pid: 0,
+        };
+        let empty = [CapabilityData::default(); CAPABILITY_WORDS];
+        if unsafe { libc::syscall(libc::SYS_capset, &header, empty.as_ptr()) } != 0 {
+            return Err(format!(
+                "clear target capability sets: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        verify_target_namespace_capabilities()
+    }
+
+    fn verify_target_namespace_capabilities() -> Result<(), String> {
+        let mut header = CapabilityHeader {
+            version: CAPABILITY_VERSION,
+            pid: 0,
+        };
+        let mut observed = [CapabilityData::default(); CAPABILITY_WORDS];
+        if unsafe { libc::syscall(libc::SYS_capget, &mut header, observed.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "read target capability sets: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if header.version != CAPABILITY_VERSION
+            || observed != [CapabilityData::default(); CAPABILITY_WORDS]
+            || unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) } != TARGET_SECUREBITS
+            || unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1
+        {
+            return Err("target retained namespace setup privileges".to_string());
+        }
+        for capability in 0..capability_count()? {
+            if unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } != 0
+                || unsafe {
+                    libc::prctl(
+                        libc::PR_CAP_AMBIENT,
+                        libc::PR_CAP_AMBIENT_IS_SET,
+                        capability,
+                        0,
+                        0,
+                    )
+                } != 0
+            {
+                return Err("target retained bounding or ambient capabilities".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn install_confinement_filter(
+        contain_process_group: bool,
+        nested_sandbox: bool,
+    ) -> Result<(), String> {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            let _ = contain_process_group;
+            let _ = (contain_process_group, nested_sandbox);
             return Err("native sandbox seccomp is unsupported on this architecture".to_string());
         }
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1868,20 +2178,7 @@ mod imp {
             // namespace/root mutation and cross-process authority-stealing
             // surfaces.
             let denied = [
-                libc::SYS_setns,
-                libc::SYS_unshare,
-                libc::SYS_mount,
-                libc::SYS_umount2,
-                libc::SYS_pivot_root,
-                libc::SYS_chroot,
                 libc::SYS_open_by_handle_at,
-                libc::SYS_open_tree,
-                libc::SYS_move_mount,
-                libc::SYS_mount_setattr,
-                libc::SYS_fsopen,
-                libc::SYS_fsconfig,
-                libc::SYS_fsmount,
-                libc::SYS_fspick,
                 libc::SYS_ptrace,
                 libc::SYS_process_vm_readv,
                 libc::SYS_process_vm_writev,
@@ -1908,6 +2205,44 @@ mod imp {
                     SECCOMP_RET_ERRNO | libc::EPERM as u32,
                 ));
             }
+            // Nested mutation is confined by the dropped/locked outer
+            // capabilities and inherited less-privileged mount locks. It is
+            // NEVER enabled merely because group escape was permitted.
+            if !nested_sandbox {
+                for syscall in [
+                    libc::SYS_setns,
+                    libc::SYS_unshare,
+                    libc::SYS_mount,
+                    libc::SYS_umount2,
+                    libc::SYS_pivot_root,
+                    libc::SYS_chroot,
+                    libc::SYS_open_tree,
+                    libc::SYS_move_mount,
+                    libc::SYS_mount_setattr,
+                    libc::SYS_fsopen,
+                    libc::SYS_fsconfig,
+                    libc::SYS_fsmount,
+                    libc::SYS_fspick,
+                ] {
+                    filter.push(instruction(BPF_JMP_JEQ_K, 0, 1, syscall as u32));
+                    filter.push(instruction(
+                        BPF_RET_K,
+                        0,
+                        0,
+                        SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                    ));
+                }
+            } else {
+                // Scope control and migration never enter the target's
+                // authority. Also deny cgroup namespace creation explicitly.
+                filter.extend([
+                    instruction(BPF_JMP_JEQ_K, 0, 3, libc::SYS_unshare as u32),
+                    instruction(BPF_LD_W_ABS, 0, 0, 16),
+                    instruction(BPF_JMP_JSET_K, 0, 1, libc::CLONE_NEWCGROUP as u32),
+                    instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+                    instruction(BPF_LD_W_ABS, 0, 0, 0),
+                ]);
+            }
             filter.push(instruction(BPF_JMP_JEQ_K, 0, 1, libc::SYS_clone3 as u32));
             filter.push(instruction(
                 BPF_RET_K,
@@ -1933,14 +2268,18 @@ mod imp {
                     BPF_JMP_JSET_K,
                     0,
                     1,
-                    (libc::CLONE_NEWCGROUP
-                        | libc::CLONE_NEWIPC
-                        | libc::CLONE_NEWNET
-                        | libc::CLONE_NEWNS
-                        | libc::CLONE_NEWPID
-                        | libc::CLONE_NEWUSER
-                        | libc::CLONE_NEWUTS
-                        | libc::CLONE_UNTRACED) as u32,
+                    (if nested_sandbox {
+                        libc::CLONE_NEWCGROUP | libc::CLONE_UNTRACED
+                    } else {
+                        libc::CLONE_NEWCGROUP
+                            | libc::CLONE_NEWIPC
+                            | libc::CLONE_NEWNET
+                            | libc::CLONE_NEWNS
+                            | libc::CLONE_NEWPID
+                            | libc::CLONE_NEWUSER
+                            | libc::CLONE_NEWUTS
+                            | libc::CLONE_UNTRACED
+                    }) as u32,
                 ),
                 instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | libc::EPERM as u32),
                 instruction(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW),
@@ -2950,6 +3289,15 @@ mod imp {
             inspect().unwrap();
         }
 
+        #[test]
+        #[ignore = "requires the supported unprivileged nested namespace floor"]
+        fn nested_sandbox_generation_is_actually_qualified() {
+            // An ordinary inspection may legitimately report nested support
+            // unavailable. This test must not pass merely because that weaker
+            // capability set was successfully inspected.
+            assert!(inspect().unwrap().nested_sandbox);
+        }
+
         // Invoked only by the isolated test-harness exec below. Ordinary test
         // runs do nothing here; no host executable discovery enters production.
         #[test]
@@ -2957,6 +3305,24 @@ mod imp {
             let Ok(stage) = std::env::var("LILLUX_PROC_EXEC_PROBE") else {
                 return;
             };
+            verify_target_namespace_capabilities().unwrap();
+            assert_eq!(unsafe { libc::getuid() }, NAMESPACE_USER_ID);
+            // Exec and same-UID transitions may not regain setup authority. This
+            // runs in both the initial target and its fresh-exec descendant.
+            assert_eq!(
+                unsafe { libc::setresuid(NAMESPACE_USER_ID, NAMESPACE_USER_ID, NAMESPACE_USER_ID) },
+                0
+            );
+            assert_eq!(unsafe { libc::setresuid(0, 0, 0) }, -1);
+            verify_target_namespace_capabilities().unwrap();
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_SECUREBITS, 0, 0, 0, 0) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
             let executable = std::env::current_exe().unwrap();
             assert_eq!(executable, PathBuf::from("/probe"));
             assert!(std::fs::File::open(&executable).is_ok());
@@ -2965,12 +3331,17 @@ mod imp {
                 .write(true)
                 .open(&executable)
                 .unwrap_err();
-            // Linux may report ETXTBSY before testing mount writeability for
-            // the currently executing inode. Verify the mount flag as well.
-            assert!(matches!(
-                write.raw_os_error(),
-                Some(libc::EROFS) | Some(libc::ETXTBSY)
-            ));
+            // Linux may reject the executing inode (ETXTBSY) or its sealed
+            // copy's mode (EACCES, now that DAC override is dropped) before
+            // checking mount writeability. Independently require ST_RDONLY;
+            // an arbitrary failed write alone is not confinement evidence.
+            assert!(
+                matches!(
+                    write.raw_os_error(),
+                    Some(libc::EROFS) | Some(libc::ETXTBSY) | Some(libc::EACCES)
+                ),
+                "unexpected executable write refusal: {write}"
+            );
             let mut filesystem = std::mem::MaybeUninit::<libc::statvfs>::uninit();
             assert_eq!(
                 unsafe { libc::statvfs(c"/probe".as_ptr(), filesystem.as_mut_ptr()) },
@@ -2981,8 +3352,19 @@ mod imp {
                 0
             );
             assert!(!std::path::Path::new("/.lillux-old-root").exists());
-            assert!(!std::path::Path::new("/proc/sys").exists());
-            assert!(!std::path::Path::new("/proc/meminfo").exists());
+            if std::env::var_os("LILLUX_PROBE_NESTED").is_some() {
+                verify_nested_host_controls_unavailable().unwrap();
+                assert!(
+                    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+                        .unwrap()
+                        .trim()
+                        .parse::<u32>()
+                        .is_ok()
+                );
+            } else {
+                assert!(!std::path::Path::new("/proc/sys").exists());
+                assert!(!std::path::Path::new("/proc/meminfo").exists());
+            }
             let authority_fd: RawFd = std::env::var("LILLUX_PROBE_CLOSED_FD")
                 .unwrap()
                 .parse()
@@ -3037,7 +3419,125 @@ mod imp {
             } else {
                 assert_eq!(stage, "child");
                 assert!(unsafe { libc::getpid() } > 1);
+                if std::env::var_os("LILLUX_PROBE_NESTED").is_some() {
+                    // Namespace transitions run in a fresh single-threaded
+                    // descendant, not in the multithreaded Rust test harness.
+                    let pid = unsafe { libc::fork() };
+                    assert!(pid >= 0);
+                    if pid == 0 {
+                        let result = std::panic::catch_unwind(check_exec_nested_sandbox);
+                        unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+                    }
+                    let mut status = 0;
+                    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                    assert!(libc::WIFEXITED(status));
+                    assert_eq!(libc::WEXITSTATUS(status), 0);
+                    if let Ok(arguments) = std::env::var("LILLUX_PROBE_GUEST_ARGUMENTS") {
+                        let arguments: Vec<String> = serde_json::from_str(&arguments).unwrap();
+                        assert!(
+                            std::process::Command::new("/guest")
+                                .args(arguments)
+                                .status()
+                                .unwrap()
+                                .success(),
+                            "exact external sandbox guest failed"
+                        );
+                        assert_eq!(
+                            std::fs::read("/tmp/guest-result").unwrap(),
+                            b"guest wrote private workspace"
+                        );
+                    }
+                } else {
+                    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWUSER) }, -1);
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::EPERM)
+                    );
+                }
             }
+        }
+
+        // Optional third-party guest for this generic native fixture. Caller
+        // supplies exact bytes/digest/arguments; no provider dependency enters
+        // Lillux or the ordinary test run.
+        #[test]
+        fn guest_after_exec_target() {
+            if std::env::var_os("LILLUX_PROBE_GUEST_ARGUMENTS").is_none() {
+                return;
+            }
+            assert!(!std::path::Path::new("/sys/fs/cgroup").exists());
+            verify_nested_host_controls_unavailable().unwrap();
+            assert!(!std::path::Path::new("/.lillux-old-root").exists());
+            let mut filesystem = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            assert_eq!(
+                unsafe { libc::statvfs(c"/probe".as_ptr(), filesystem.as_mut_ptr()) },
+                0
+            );
+            assert_ne!(
+                unsafe { filesystem.assume_init() }.f_flag & libc::ST_RDONLY,
+                0
+            );
+            std::fs::write("/tmp/guest-result", b"guest wrote private workspace").unwrap();
+        }
+
+        fn check_exec_nested_sandbox() {
+            assert_eq!(unsafe { libc::setsid() } < 0, false);
+            enter_mapped_user_namespace().unwrap();
+            syscall_zero(
+                unsafe { libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID) },
+                "nested mount/PID namespaces",
+            )
+            .unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWCGROUP) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            assert!(!std::path::Path::new("/sys/fs/cgroup").exists());
+            // The new namespace has its own capabilities, but inherited
+            // read-only mounts cannot be promoted to writable aliases.
+            assert_eq!(
+                mount_raw(None, "/probe", None, libc::MS_REMOUNT | libc::MS_BIND, None)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+            std::fs::create_dir("/tmp/nested-proc").unwrap();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let result = std::panic::catch_unwind(|| {
+                    assert_eq!(unsafe { libc::getpid() }, 1);
+                    mount_raw(
+                        Some("proc"),
+                        "/tmp/nested-proc",
+                        Some("proc"),
+                        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                        Some("subset=pid"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        std::fs::read_link("/tmp/nested-proc/self").unwrap(),
+                        PathBuf::from("1")
+                    );
+                    assert!(!std::path::Path::new("/tmp/nested-proc/sys").exists());
+                    assert!(!std::path::Path::new("/tmp/nested-proc/meminfo").exists());
+                    mount_raw(
+                        Some("tmpfs"),
+                        "/tmp",
+                        Some("tmpfs"),
+                        libc::MS_NOSUID | libc::MS_NODEV,
+                        Some("mode=0700"),
+                    )
+                    .unwrap();
+                    std::fs::write("/tmp/private", b"nested writable scratch").unwrap();
+                });
+                unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
         }
 
         #[test]
@@ -3066,7 +3566,7 @@ mod imp {
             libraries.insert(PathBuf::from("/lib64/ld-linux-x86-64.so.2"));
             #[cfg(target_arch = "aarch64")]
             libraries.insert(PathBuf::from("/lib/ld-linux-aarch64.so.1"));
-            for sealed in [false, true] {
+            for (sealed, nested) in [(false, false), (true, false), (false, true)] {
                 let entry = if sealed {
                     crate::sealed_memfd(c"proc-exec-test", &std::fs::read(&executable).unwrap())
                         .unwrap()
@@ -3092,10 +3592,28 @@ mod imp {
                     })
                     .collect::<Vec<_>>();
                 let mut request = super::super::tests::minimal_request();
+                let guest = if nested {
+                    std::env::var_os("LILLUX_PROBE_GUEST_FILE").map(|path| {
+                        let bytes = std::fs::read(path).unwrap();
+                        assert_eq!(
+                            crate::sha256_hex(&bytes),
+                            std::env::var("LILLUX_PROBE_GUEST_SHA256").unwrap()
+                        );
+                        crate::sealed_memfd(c"exact-native-guest", &bytes).unwrap()
+                    })
+                } else {
+                    None
+                };
                 request.executable = PathBuf::from("/probe");
                 request.argv0 = OsString::from("probe");
                 request.cwd = PathBuf::from("/");
-                request.proc_filesystem = LinuxSandboxProcFilesystem::PidNamespace;
+                request.proc_filesystem = if nested {
+                    LinuxSandboxProcFilesystem::PidNamespaceNested
+                } else {
+                    LinuxSandboxProcFilesystem::PidNamespace
+                };
+                request.contain_process_group = !nested;
+                request.nested_sandbox = nested;
                 request.arguments = [
                     "--exact",
                     "sandbox::imp::namespace_source_tests::pid_proc_after_exec_target",
@@ -3120,6 +3638,11 @@ mod imp {
                     ),
                 ]
                 .into();
+                if nested {
+                    request
+                        .environment
+                        .insert(OsString::from("LILLUX_PROBE_NESTED"), OsString::from("1"));
+                }
                 request.target_channels =
                     vec![(channel.inherited_descriptor().unwrap(), channel_target)];
                 request.mounts = libraries
@@ -3138,6 +3661,19 @@ mod imp {
                     access: LinuxSandboxMountAccess::ReadOnly,
                     layer: 0,
                 });
+                if let Some(guest) = &guest {
+                    request.mounts.push(LinuxSandboxMount {
+                        source_fd: guest.inherited_descriptor().unwrap(),
+                        destination: PathBuf::from("/guest"),
+                        access: LinuxSandboxMountAccess::ReadOnly,
+                        layer: 0,
+                    });
+                    request.environment.insert(
+                        OsString::from("LILLUX_PROBE_GUEST_ARGUMENTS"),
+                        std::env::var_os("LILLUX_PROBE_GUEST_ARGUMENTS")
+                            .expect("explicit guest arguments"),
+                    );
+                }
                 let pid = unsafe { libc::fork() };
                 assert!(pid >= 0);
                 if pid == 0 {
@@ -3156,8 +3692,155 @@ mod imp {
                 let mut status = 0;
                 assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
                 assert!(libc::WIFEXITED(status));
-                assert_eq!(libc::WEXITSTATUS(status), 0, "sealed={sealed}");
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    0,
+                    "sealed={sealed}, nested={nested}"
+                );
             }
+        }
+
+        #[test]
+        #[ignore = "qualifies kernel mount locks in disposable nested user/mount namespaces"]
+        fn nested_mounts_cannot_reacquire_outer_setup_authority() {
+            // Like the exec fixture above, namespace setup runs in a fresh
+            // single-threaded child, never a thread of the Rust test harness.
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_str().unwrap().to_owned();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let result = std::panic::catch_unwind(|| check_nested_mount_privileges(&root));
+                unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            // Every mount was private to the disposable child. The host
+            // directory is still empty, with no test mount to clean up.
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+
+        fn check_nested_mount_privileges(root: &str) {
+            enter_mapped_user_namespace().unwrap();
+            syscall_zero(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                "test mount namespace",
+            )
+            .unwrap();
+            mount_raw(None, "/", None, libc::MS_PRIVATE | libc::MS_REC, None).unwrap();
+            mount_raw(
+                Some("tmpfs"),
+                root,
+                Some("tmpfs"),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some("mode=0755"),
+            )
+            .unwrap();
+            let protected = format!("{root}/protected");
+            let alias = format!("{root}/alias");
+            let masked = format!("{root}/masked");
+            let scratch = format!("{root}/scratch");
+            for path in [&protected, &alias, &masked, &scratch] {
+                std::fs::create_dir(path).unwrap();
+            }
+            std::fs::write(format!("{protected}/baseline"), b"exact baseline").unwrap();
+            std::fs::write(format!("{masked}/hidden"), b"must remain hidden").unwrap();
+            mount_raw(Some(&protected), &protected, None, libc::MS_BIND, None).unwrap();
+            mount_raw(
+                None,
+                &protected,
+                None,
+                libc::MS_REMOUNT
+                    | libc::MS_BIND
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV,
+                None,
+            )
+            .unwrap();
+            mount_raw(
+                Some("tmpfs"),
+                &masked,
+                Some("tmpfs"),
+                libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                None,
+            )
+            .unwrap();
+            syscall_zero(
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                "test NNP",
+            )
+            .unwrap();
+            drop_target_namespace_capabilities().unwrap();
+            // This fixture intentionally installs NO seccomp filter. Refusal
+            // must come from lost outer capability and inherited mount locks,
+            // not our still-strict production syscall rules or host masking.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            let remount = || {
+                mount_raw(
+                    None,
+                    &protected,
+                    None,
+                    libc::MS_REMOUNT | libc::MS_BIND,
+                    None,
+                )
+                .unwrap_err()
+            };
+            assert_eq!(remount().raw_os_error(), Some(libc::EPERM));
+
+            // Nonzero outer identity permits a child mapping without retaining
+            // CAP_SETFCAP. The child gains privileges only in its NEW namespace.
+            enter_mapped_user_namespace().unwrap();
+            syscall_zero(
+                unsafe { libc::unshare(libc::CLONE_NEWNS) },
+                "test nested mount namespace",
+            )
+            .unwrap();
+            assert_eq!(remount().raw_os_error(), Some(libc::EPERM));
+            mount_raw(Some(&protected), &alias, None, libc::MS_BIND, None).unwrap();
+            assert_eq!(
+                mount_raw(None, &alias, None, libc::MS_REMOUNT | libc::MS_BIND, None)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+            for directory in [&protected, &alias] {
+                assert_eq!(
+                    std::fs::write(format!("{directory}/baseline"), b"changed")
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::EROFS)
+                );
+                assert_eq!(
+                    std::fs::read(format!("{directory}/baseline")).unwrap(),
+                    b"exact baseline"
+                );
+            }
+            let masked_c = CString::new(masked.clone()).unwrap();
+            for flags in [0, libc::MNT_DETACH] {
+                assert_eq!(unsafe { libc::umount2(masked_c.as_ptr(), flags) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINVAL)
+                );
+            }
+            assert!(!std::path::Path::new(&format!("{masked}/hidden")).exists());
+            let options = format!("mode=0700,uid={NAMESPACE_USER_ID},gid={NAMESPACE_GROUP_ID}");
+            mount_raw(
+                Some("tmpfs"),
+                &scratch,
+                Some("tmpfs"),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some(&options),
+            )
+            .unwrap();
+            std::fs::write(format!("{scratch}/private"), b"nested scratch works").unwrap();
         }
     }
 }
@@ -3186,6 +3869,7 @@ mod tests {
             target_channels: Vec::new(),
             lifecycle: LinuxSandboxLifecycle::Run,
             contain_process_group: true,
+            nested_sandbox: false,
             aggregate_limits: None,
         }
     }
