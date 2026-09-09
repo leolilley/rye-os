@@ -107,6 +107,34 @@
     "diagnosis": "exact worker boot is dead/reaped, but cleared-pointer outcome_unknown delivery was not accepted as settled process cleanup",
     "disposition": "target stopped; history and candidate workspace preserved; focused source correction awaiting matched install"
   },
+  "source_correction": {
+    "source_revision": "be91327f3bd5f0c17c38af97acee9deb2c083439",
+    "contract": [
+      "Public command admission checks the selected frozen route and its audience before reservation or worker contact.",
+      "Exact reaped process history permits workspace capture independently of unknown command delivery; unknown commands are not automatically replayed."
+    ],
+    "focused_checks": {
+      "public_command_surface": "passed",
+      "workspace_capture_pending_unknown_and_reaped": "passed",
+      "dedicated_session_service": "20 passed",
+      "hosted_command_terminal_replay": "5 passed",
+      "formatting_and_diff": "passed"
+    },
+    "reviews": "Independent ownership and safety reviews found no remaining blocker in these focused corrections.",
+    "package": {
+      "outcome": "full_bundle_publication_succeeded",
+      "selected_crates": ["ryeosd"],
+      "cargo_offline": true,
+      "jobs": 2,
+      "release_build_elapsed": "13m07s",
+      "publication_elapsed": "14m00s",
+      "embedded_daemon_revision": "be91327f3bd5",
+      "daemon_sha256": "37694e37200bd28c63eece3047a096bda01a6f53e0ebb9992977b5959f362c05",
+      "retained_static_worker_payloads": true,
+      "installation": "pending_privileged_install",
+      "installed_recovery_qualification": "not_run"
+    }
+  },
   "real_remote_read_only_probe": {
     "project": "d3a43ad8-6122-4f94-8b09-d106a782eb8d",
     "service": "ryeos",
