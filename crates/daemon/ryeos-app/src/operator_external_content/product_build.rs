@@ -58,7 +58,7 @@ pub fn accept_terminal(
         .requested_by
         .as_deref()
         .context("accepted producer has no operator owner")?;
-    let context = current_local_context(state, operator, &root.origin_site_id)?;
+    let context = current_operator_context(state, operator, &root.origin_site_id)?;
     let snapshot_hash = terminal
         .result_project_snapshot_hash
         .as_deref()
@@ -173,7 +173,7 @@ pub fn verify_current(
     let owner = sealed
         .requested_by()
         .context("accepted result producer has no operator owner")?;
-    current_local_context(state, owner, sealed.origin_site_id())?;
+    current_operator_context(state, owner, sealed.origin_site_id())?;
     sealed.validate_current_operator_authority(state)?;
     let result = ProductBuildAcceptedResult::from_value(value)?;
     if result.owner_principal != owner {
@@ -284,7 +284,7 @@ pub(super) fn verified_root_producer(
         .requested_by
         .as_deref()
         .context("product producer root has no owner")?;
-    current_local_context(state, owner, &root.origin_site_id)?;
+    current_operator_context(state, owner, &root.origin_site_id)?;
     let result = terminal
         .result_project_snapshot_hash
         .as_deref()
@@ -364,7 +364,7 @@ pub(super) fn verified_root_producer(
     Ok((admitted_product_producer(&capsule)?, capsule))
 }
 
-fn current_local_context(
+fn current_operator_context(
     state: &AppState,
     owner: &str,
     origin: &str,
@@ -372,7 +372,9 @@ fn current_local_context(
     let context =
         crate::operator_authority::retained_admitted_operator_authority(state, owner, origin)?
             .handler_context();
-    crate::operator_authority::require_local_configured_operator(state, &context)?;
+    // The existing retained authority owner checks the live grant and exact
+    // origin before reconstructing this context; never substitute a local key.
+    crate::operator_authority::require_admitted_operator(state, &context)?;
     Ok(context)
 }
 

@@ -504,6 +504,7 @@ pub fn prepare_pinned_project_external_consumer(
         Some(project_context),
         principal_fingerprint,
         principal_scopes,
+        state.threads.site_id().to_owned(),
     )
 }
 
@@ -522,6 +523,7 @@ pub fn prepare_installed_bundle_external_consumer(
         None,
         principal_fingerprint,
         principal_scopes,
+        state.threads.site_id().to_owned(),
     )
 }
 
@@ -535,7 +537,7 @@ pub fn prepare_external_product_consumer(
     checkout_id: &str,
 ) -> anyhow::Result<PreparedExternalProductConsumer> {
     request.validate()?;
-    ryeos_app::operator_authority::require_local_configured_operator(state, context)?;
+    ryeos_app::operator_authority::require_admitted_operator(state, context)?;
     let project = if let Some(project) = &request.project_context {
         let authority = crate::execution::pinned_state_authority(state)?;
         let guard = authority.acquire_shared_guard()?;
@@ -563,6 +565,7 @@ pub fn prepare_external_product_consumer(
         project,
         context.fingerprint.clone(),
         context.scopes.clone(),
+        context.execution_origin(state.threads.site_id()),
     )
 }
 
@@ -572,6 +575,7 @@ fn prepare_external_consumer_context(
     project_context: Option<ResolvedProjectContext>,
     principal_fingerprint: String,
     principal_scopes: Vec<String>,
+    origin_site_id: String,
 ) -> anyhow::Result<PreparedExternalProductConsumer> {
     let snapshot = project_context
         .as_ref()
@@ -608,8 +612,11 @@ fn prepare_external_consumer_context(
             None => ryeos_engine::contracts::ProjectContext::None,
         },
         subject_resolution_authority: subject_resolution_authority.clone(),
-        current_site_id: site_id.clone(),
-        origin_site_id: site_id,
+        current_site_id: site_id,
+        // Product composition preserves the authenticated execution origin;
+        // using target-local provenance here would silently change its owner
+        // context. Ordinary binding callers remain local-only at their ingress.
+        origin_site_id,
         execution_hints: Default::default(),
         scheduled_fire: None,
         validate_only: true,

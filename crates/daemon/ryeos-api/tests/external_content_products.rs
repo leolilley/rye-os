@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 const ROOT: &str = "T-00000000-0000-0000-0000-000000000001";
 const TERMINAL: &str = "T-00000000-0000-0000-0000-000000000002";
 const PRODUCT_BYTES: &[u8] = b"exact input";
+const REMOTE_ORIGIN: &str = "site:product-source";
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -42,6 +43,15 @@ struct Fixture {
 }
 
 fn fixture(large_tier: bool, import_ceiling: u64, publish: bool) -> Fixture {
+    fixture_with_remote_owner(large_tier, import_ceiling, publish, false)
+}
+
+fn fixture_with_remote_owner(
+    large_tier: bool,
+    import_ceiling: u64,
+    publish: bool,
+    remote_owner: bool,
+) -> Fixture {
     let (directory, mut state) = test_state::build_test_state();
     let closure = state
         .node_policy
@@ -69,13 +79,21 @@ fn fixture(large_tier: bool, import_ceiling: u64, publish: bool) -> Fixture {
             }),
         ]),
     );
-    let operator = NodeIdentity::load(&state.config.operator_signing_key_path).unwrap();
+    let local_operator = NodeIdentity::load(&state.config.operator_signing_key_path).unwrap();
+    let operator = if remote_owner {
+        NodeIdentity::create(&directory.path().join("source-operator.pem")).unwrap()
+    } else {
+        local_operator.clone()
+    };
+    if remote_owner {
+        assert_ne!(operator.fingerprint(), local_operator.fingerprint());
+    }
     let scopes = vec![
         "ryeos.execute.service.external-content/capture-product".to_owned(),
         "ryeos.execute.service.external-content/import".to_owned(),
         "ryeos.execute.service.external-content/product".to_owned(),
     ];
-    ryeos_app::identity::write_authorized_key_toml(
+    ryeos_app::identity::reconcile_authorized_key_toml_scopes(
         &state.config.authorized_keys_dir,
         operator.fingerprint(),
         &base64::engine::general_purpose::STANDARD.encode(operator.verifying_key().as_bytes()),
@@ -83,16 +101,23 @@ fn fixture(large_tier: bool, import_ceiling: u64, publish: bool) -> Fixture {
         "product test operator",
         state.identity.fingerprint(),
         "2026-09-07T00:00:00Z",
-        state.identity.signing_key(),
+        &state.identity,
         WildcardPolicy::Reject,
+        false,
+        remote_owner.then_some(REMOTE_ORIGIN),
+        false,
     )
     .unwrap();
     let context = HandlerContext::new_with_authority(
         operator.principal_id(),
         scopes,
         true,
-        Some(AuthorizedKeyPrincipalClass::LocalClient),
-        None,
+        Some(if remote_owner {
+            AuthorizedKeyPrincipalClass::RemoteOperator
+        } else {
+            AuthorizedKeyPrincipalClass::LocalClient
+        }),
+        remote_owner.then(|| REMOTE_ORIGIN.to_owned()),
     );
     let authority = state.state_store.pinned_state_authority().unwrap();
     let guard = authority.acquire_exclusive_guard(true).unwrap();
@@ -335,14 +360,22 @@ async fn testimony_is_not_a_new_import_grant_under_stricter_current_policy() {
 }
 
 #[tokio::test]
-async fn product_services_refuse_foreign_or_remote_operator_contexts() {
+async fn product_services_refuse_unadmitted_operator_contexts() {
     let fixture = fixture(false, 4096, true);
     let mut foreign = fixture.context.clone();
     foreign.fingerprint = format!("fp:{}", "f".repeat(64));
     let mut remote = fixture.context.clone();
     remote.authorized_key_class = Some(AuthorizedKeyPrincipalClass::RemoteOperator);
-    remote.authenticated_origin_site_id = Some("site:other".to_owned());
-    for context in [foreign, remote] {
+    remote.authenticated_origin_site_id = None;
+    let mut unverified = fixture.context.clone();
+    unverified.verified = false;
+    let mut remote_node = fixture.context.clone();
+    remote_node.authorized_key_class = Some(AuthorizedKeyPrincipalClass::RemoteNode);
+    remote_node.authenticated_origin_site_id = Some(REMOTE_ORIGIN.to_owned());
+    let mut malformed = remote.clone();
+    malformed.authenticated_origin_site_id = Some(REMOTE_ORIGIN.to_owned());
+    malformed.fingerprint = "fp:not-a-hash".to_owned();
+    for context in [foreign, remote, unverified, remote_node, malformed] {
         assert!(
             external_content_products::get(request(), context.clone(), Arc::clone(&fixture.state))
                 .await
@@ -368,9 +401,10 @@ async fn product_services_refuse_foreign_or_remote_operator_contexts() {
             context.clone(),
             Arc::clone(&fixture.state),
         ).await.unwrap_err();
+        let qualification_error = format!("{qualification:#}");
         assert!(
-            format!("{qualification:#}").contains("operator"),
-            "{qualification:#}"
+            qualification_error.contains("operator") || qualification_error.contains("verified"),
+            "{qualification_error}"
         );
         let composition = external_content_products::compose(
             ryeos_app::operator_external_content::product_composition::ComposeRetainedProductsRequest {
@@ -391,9 +425,10 @@ async fn product_services_refuse_foreign_or_remote_operator_contexts() {
         .unwrap_err();
         // Authorization must fail before attempting to resolve this deliberately
         // nonexistent consumer generation or publishing an import stage.
+        let composition_error = format!("{composition:#}");
         assert!(
-            format!("{composition:#}").contains("operator"),
-            "{composition:#}"
+            composition_error.contains("operator") || composition_error.contains("verified"),
+            "{composition_error}"
         );
         assert!(
             external_content_import::handle(
@@ -409,6 +444,196 @@ async fn product_services_refuse_foreign_or_remote_operator_contexts() {
             .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn admitted_remote_owner_reads_and_stages_own_product_without_ambient_authority() {
+    use ryeos_app::operator_external_content::{
+        BindConsumerKind, BindRequest, FilesystemImportRequest, ImportShape, ImportStorage,
+    };
+    let fixture = fixture_with_remote_owner(false, 4096, true, true);
+    let remote = fixture.context.clone();
+    // This direct-handler fixture starts after authenticated ingress. The
+    // node-signed public grant is real; no target operator key is replaced.
+    let admitted = ryeos_app::operator_authority::retained_admitted_operator_authority(
+        &fixture.state,
+        &remote.fingerprint,
+        REMOTE_ORIGIN,
+    )
+    .unwrap();
+    assert_eq!(
+        admitted.principal_class,
+        AuthorizedKeyPrincipalClass::RemoteOperator
+    );
+    assert!(
+        ryeos_app::operator_authority::retained_admitted_operator_authority(
+            &fixture.state,
+            &remote.fingerprint,
+            "site:wrong-origin"
+        )
+        .is_err()
+    );
+    let observed =
+        external_content_products::get(request(), remote.clone(), Arc::clone(&fixture.state))
+            .await
+            .unwrap();
+    assert_eq!(observed["witness_hash"], fixture.witness_hash);
+    // An existing immutable witness is an exact capture retry, not evidence
+    // that this fixture launched and captured a new producer.
+    let retry =
+        external_content_products::capture(request(), remote.clone(), Arc::clone(&fixture.state))
+            .await
+            .unwrap();
+    assert_eq!(retry["witness_hash"], fixture.witness_hash);
+    let imported = import(&fixture, &fixture.witness_hash, 11).await.unwrap();
+    assert_eq!(imported["manifest_hash"], fixture.evidence.manifest_hash);
+    {
+        let authority = fixture.state.state_store.pinned_state_authority().unwrap();
+        let guard = authority.acquire_shared_guard().unwrap();
+        let stage = authority
+            .require_recovery()
+            .unwrap()
+            .open_durable_cas_upload_admitted(
+                &guard,
+                imported["staging_id"].as_str().unwrap(),
+                remote.fingerprint.strip_prefix("fp:").unwrap(),
+            )
+            .unwrap();
+        stage
+            .ensure_protects_object(&fixture.evidence.manifest_hash)
+            .unwrap();
+        assert!(stage.admitted_target_hash().is_none());
+    }
+    let local = NodeIdentity::load(&fixture.state.config.operator_signing_key_path).unwrap();
+    let foreign = HandlerContext::new_with_authority(
+        local.principal_id(),
+        remote.scopes.clone(),
+        true,
+        Some(AuthorizedKeyPrincipalClass::LocalClient),
+        None,
+    );
+    assert!(external_content_import::handle(
+        ImportRequest::RetainedProduct(RetainedProductImportRequest {
+            witness_hash: fixture.witness_hash.clone(),
+            witness_source: ryeos_state::external_content::products::transfer::ProductWitnessSource::LocalCapture {},
+            maximum_bytes: 11,
+        }), foreign, Arc::clone(&fixture.state)
+    ).await.is_err());
+    let ambient = external_content_import::handle(
+        ImportRequest::Filesystem(FilesystemImportRequest {
+            root: "not-admitted".into(),
+            path: "runtime".into(),
+            shape: ImportShape::Tree,
+            storage: ImportStorage::Content,
+            maximum_bytes: 11,
+            expected_file_sha256: None,
+        }),
+        remote.clone(),
+        Arc::clone(&fixture.state),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{ambient:#}").contains("local_client"));
+    let general_bind = ryeos_app::operator_external_content::bind(
+        Arc::clone(&fixture.state),
+        remote,
+        BindRequest {
+            staging_id: imported["staging_id"].as_str().unwrap().into(),
+            request_digest: imported["request_digest"].as_str().unwrap().into(),
+            manifest_hash: fixture.evidence.manifest_hash.clone(),
+            consumer_ref: "config:test/not-admitted".into(),
+            consumer_kind: BindConsumerKind::InstalledBundle,
+            project_snapshot_hash: None,
+            project_path: None,
+            product_selections: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{general_bind:#}").contains("local_client"));
+}
+
+#[test]
+fn remote_owned_product_binding_requires_unchanged_current_grant() {
+    use ryeos_state::objects::{ExternalContentBinding, ExternalContentConsumerAuthority};
+    let fixture = fixture_with_remote_owner(false, 4096, true, true);
+    let operator =
+        NodeIdentity::load(&fixture._directory.path().join("source-operator.pem")).unwrap();
+    let grant = ryeos_app::identity::load_verified_authorized_key(
+        operator.fingerprint(),
+        &fixture.state.config.authorized_keys_dir,
+        &fixture.state.identity,
+    )
+    .unwrap()
+    .unwrap();
+    let consumer = ExternalContentConsumerAuthority::installed_bundle(
+        "config:test/product-consumer".into(),
+        "a".repeat(64),
+    )
+    .unwrap();
+    let binding = ExternalContentBinding::active(
+        fixture.evidence.manifest_hash.clone(),
+        fixture.evidence.manifest_kind.clone(),
+        consumer.clone(),
+        fixture.state.identity.fingerprint().into(),
+        operator.fingerprint().into(),
+        grant.source_file_hash,
+    )
+    .unwrap();
+    let authority = fixture.state.state_store.pinned_state_authority().unwrap();
+    let guard = authority.acquire_exclusive_guard(true).unwrap();
+    let cas = authority.cas_store().unwrap();
+    let binding_hash = cas.store_object(&binding.to_value().unwrap()).unwrap();
+    let signer = NodeIdentitySigner::from_identity(&fixture.state.identity);
+    fixture
+        .state
+        .state_store
+        .with_state_db(|db| {
+            db.ensure_current_external_content_binding_epoch(&guard)?;
+            db.advance_generic_head_ref(
+                ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE,
+                &binding.binding_subject_id,
+                &binding_hash,
+                None,
+                &signer,
+                &guard,
+            )
+        })
+        .unwrap();
+    drop(guard);
+    let read = || {
+        ryeos_app::operator_external_content::require_active_binding(
+            &fixture.state,
+            &cas,
+            &fixture.evidence.manifest_hash,
+            &consumer,
+        )
+    };
+    read().unwrap();
+    let (grant_path, _, _) = ryeos_app::identity::reconcile_authorized_key_toml_scopes(
+        &fixture.state.config.authorized_keys_dir,
+        operator.fingerprint(),
+        &base64::engine::general_purpose::STANDARD.encode(operator.verifying_key().as_bytes()),
+        &["ryeos.execute.service.external-content/product".into()],
+        "narrowed remote operator",
+        fixture.state.identity.fingerprint(),
+        "2026-09-10T00:00:00Z",
+        &fixture.state.identity,
+        WildcardPolicy::Reject,
+        false,
+        Some(REMOTE_ORIGIN),
+        false,
+    )
+    .unwrap();
+    assert!(
+        read().is_err(),
+        "changed grant cannot authorize its previous binding"
+    );
+    std::fs::remove_file(grant_path).unwrap();
+    assert!(
+        read().is_err(),
+        "revoked grant cannot authorize retained binding bytes"
+    );
 }
 
 #[tokio::test]

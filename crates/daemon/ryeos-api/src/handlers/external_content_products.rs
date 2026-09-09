@@ -39,7 +39,7 @@ pub async fn compose(
     state: Arc<AppState>,
 ) -> Result<Value> {
     req.validate()?;
-    ryeos_app::operator_authority::require_local_configured_operator(&state, &ctx)?;
+    ryeos_app::operator_authority::require_admitted_operator(&state, &ctx)?;
     let preparation_request = req.clone();
     let preparation_state = Arc::clone(&state);
     let preparation_context = ctx.clone();

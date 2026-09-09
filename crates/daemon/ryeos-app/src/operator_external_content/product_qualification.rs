@@ -111,7 +111,7 @@ pub async fn prove(
     context: HandlerContext,
     request: ProductQualificationRequest,
 ) -> anyhow::Result<ProductQualificationEvidence> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     request.validate()?;
     tokio::task::spawn_blocking(move || prove_blocking(state, context, request))
         .await
@@ -126,7 +126,7 @@ pub async fn qualify(
     context: HandlerContext,
     request: ProductQualificationRequest,
 ) -> anyhow::Result<ProductQualificationResponse> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     request.validate()?;
     tokio::task::spawn_blocking(move || qualify_blocking(state, context, request))
         .await
@@ -138,7 +138,7 @@ fn prove_blocking(
     context: HandlerContext,
     request: ProductQualificationRequest,
 ) -> anyhow::Result<ProductQualificationEvidence> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     request.validate()?;
     let authority = state.state_store.pinned_state_authority()?;
     let guard = authority.acquire_shared_guard()?;
@@ -154,7 +154,7 @@ fn qualify_blocking(
     context: HandlerContext,
     request: ProductQualificationRequest,
 ) -> anyhow::Result<ProductQualificationResponse> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     request.validate()?;
     let authority = state.state_store.pinned_state_authority()?;
     let guard = authority.acquire_shared_guard()?;
@@ -658,7 +658,7 @@ fn resolve_current_bundle_verifier_identity_against_admitted(
     admitted_resolution: Option<&ResolutionOutput>,
 ) -> anyhow::Result<CurrentBundleVerifierIdentity> {
     authority.ensure_guard(guard)?;
-    crate::operator_authority::require_local_configured_operator(state, context)?;
+    crate::operator_authority::require_admitted_operator(state, context)?;
     state.engine.with_checked_bundle_generation(|_| {
         resolve_current_bundle_verifier_identity_in_generation(
             state,
@@ -702,7 +702,9 @@ fn resolve_current_bundle_verifier_identity_in_generation(
         project_context: ProjectContext::None,
         subject_resolution_authority: SubjectResolutionAuthority::Projectless,
         current_site_id: state.threads.site_id().to_owned(),
-        origin_site_id: state.threads.site_id().to_owned(),
+        // Configured-operator forwarding is not delegated execution. Retain
+        // the authenticated source site without manufacturing local origin.
+        origin_site_id: context.execution_origin(state.threads.site_id()),
         execution_hints: ExecutionHints::default(),
         scheduled_fire: None,
         // This remains a threadless proof, but plan reconstruction must use

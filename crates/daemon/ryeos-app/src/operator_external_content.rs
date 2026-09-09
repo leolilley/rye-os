@@ -1,9 +1,10 @@
 //! Operator-owned external-content import, binding, and integrity operations.
 //!
 //! The API layer authenticates ordinary signed service execution; this module
-//! additionally requires the configured local operator identity, resolves the
-//! system/state-only import policy, and orchestrates meaning-blind state
-//! primitives. No runtime callback or manifest authority reaches this code.
+//! keeps ambient import and general binding local-operator-only. Exact owned
+//! product operations also admit configured remote operators. Both resolve the
+//! node-owned import policy and reuse the same meaning-blind state primitives;
+//! no product selector grants another owner's bytes or ambient filesystem access.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -739,6 +740,28 @@ async fn bind_prepared_resolution(
     expected_kind: Option<BindConsumerKind>,
 ) -> anyhow::Result<BindResponse> {
     let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    bind_prepared_resolution_authorized(
+        state,
+        operator,
+        resolution,
+        subject,
+        request,
+        expected_kind,
+    )
+    .await
+}
+
+/// Shared binding mechanics after the distinct public-local or exact-product
+/// entrypoint has authenticated its owner. Never infer this authority from a
+/// manifest, staged bytes, or a caller-supplied principal.
+async fn bind_prepared_resolution_authorized(
+    state: Arc<AppState>,
+    operator: String,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    subject: &ryeos_engine::contracts::SubjectResolutionAuthority,
+    request: BindPublicationRequest,
+    expected_kind: Option<BindConsumerKind>,
+) -> anyhow::Result<BindResponse> {
     let consumer_authority =
         crate::external_content_admission::consumer_authority(resolution, subject)?;
     ensure_bind_consumer_kind(expected_kind, &consumer_authority)?;
@@ -782,13 +805,14 @@ pub(super) async fn bind_selected_product_resolution(
     subject: &ryeos_engine::contracts::SubjectResolutionAuthority,
     imported: ImportResponse,
 ) -> anyhow::Result<BindResponse> {
+    let operator = crate::operator_authority::require_admitted_operator(&state, &context)?;
     let request = BindPublicationRequest {
         staging_id: imported.staging_id,
         request_digest: imported.request_digest,
         manifest_hash: imported.manifest_hash,
         consumer_ref: resolution.root.resolved_ref.clone(),
     };
-    bind_prepared_resolution(state, context, resolution, subject, request, None).await
+    bind_prepared_resolution_authorized(state, operator, resolution, subject, request, None).await
 }
 
 /// Bind one component after a managed-activation caller has authenticated the
@@ -1395,16 +1419,14 @@ pub fn require_current_binding_authorizer(
     state: &AppState,
     binding: &ryeos_state::objects::ExternalContentBinding,
 ) -> anyhow::Result<()> {
-    let current_grant = crate::identity::load_verified_authorized_key(
+    // General binding writers remain local-only; exact owned product writers
+    // can retain a configured remote grant. The existing grant digest pins
+    // its class, source origin and scope generation without a second authority.
+    let current_digest = crate::operator_authority::admitted_operator_authority_digest(
+        state,
         &binding.authorized_by,
-        &state.config.authorized_keys_dir,
-        &state.identity,
-    )?
-    .ok_or_else(|| anyhow::anyhow!("external-content binding authorizer was revoked"))?;
-    if current_grant.principal_class != crate::identity::AuthorizedKeyPrincipalClass::LocalClient
-        || current_grant.configured_origin_site_id.is_some()
-        || current_grant.source_file_hash != binding.authorizer_grant_digest
-    {
+    )?;
+    if current_digest != binding.authorizer_grant_digest {
         bail!("external-content binding authorizer grant changed");
     }
     Ok(())

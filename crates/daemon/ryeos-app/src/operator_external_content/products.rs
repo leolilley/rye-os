@@ -2,6 +2,8 @@
 //!
 //! Calls carry coordinates only. The terminal capsule owns recipe identity,
 //! declarations and output selection. Product testimony is not a consumer grant.
+//! Local and configured remote operators may capture only their own admitted
+//! producer results; this never grants ambient import or another owner's bytes.
 
 use super::*;
 use ryeos_state::external_content::products::admission::{
@@ -79,7 +81,7 @@ pub async fn get(
     context: HandlerContext,
     request: ProductRequest,
 ) -> anyhow::Result<ProductResponse> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     let coordinate = request.coordinate(&context.fingerprint)?;
     tokio::task::spawn_blocking(move || {
         let authority = state.state_store.pinned_state_authority()?;
@@ -111,7 +113,7 @@ pub async fn capture(
     context: HandlerContext,
     request: ProductRequest,
 ) -> anyhow::Result<ProductResponse> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     request.coordinate(&context.fingerprint)?;
     tokio::task::spawn_blocking(move || capture_blocking(state, context, request))
         .await
@@ -160,7 +162,7 @@ pub(super) fn capture_batch_blocking(
     requests: Vec<ProductRequest>,
     guard: &ryeos_state::CasMutationGuard,
 ) -> anyhow::Result<Vec<ProductResponse>> {
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     validate_capture_batch_requests(&requests, &context.fingerprint)?;
     let authority = state.state_store.pinned_state_authority()?;
     authority.ensure_guard(guard)?;
@@ -218,7 +220,7 @@ fn capture_guarded(
     source: &mut Option<ProductCaptureSource>,
 ) -> anyhow::Result<ProductResponse> {
     authority.ensure_guard(guard)?;
-    let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    let operator = crate::operator_authority::require_admitted_operator(&state, &context)?;
     let coordinate = request.coordinate(&context.fingerprint)?;
     let coordinate_id = coordinate.coordinate_id()?;
     // Keep lookup before source verification: immutable published decisions

@@ -36,7 +36,9 @@ pub(super) fn import_with_verified<T>(
         ryeos_state::object_closure::ObjectClosureLimits,
     ) -> anyhow::Result<T>,
 ) -> anyhow::Result<(ImportResponse, T)> {
-    let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    // Exact owned product bytes only. Ambient and general retained-result
+    // import retain their separate local-operator entry boundaries.
+    let operator = crate::operator_authority::require_admitted_operator(&state, &context)?;
     validate_request(&request)?;
     let policy = state
         .node_policy

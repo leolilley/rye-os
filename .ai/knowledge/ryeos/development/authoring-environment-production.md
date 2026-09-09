@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-08T16:56:41Z:05e7ea215622cebd3ef6d3323ef9e513ff63951fefc6e2ed8c54cc43f323e328:6k1LQA9Hj+gTOGdjWoxOgNCWRsZf7RvLSl8cCULQJXMH+cGA7Zibv4AdnwVd1+b6jHg1AEu3Vu65pjd47XjvBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T14:21:58Z:5477fce0195ed2fd2164f26d5fb4ede9559a5fa446bbdda71cdc7d58c40e2b70:jRoUBFaKEm8LGdkWp7IjEsE37mfkRylXZrQBjvdalO4D6VJIJuEgusMyiryVibw3pni5HKrm0dm57nKgqLv3Aw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/development
 tags: [development, authoring, external-content, production]
@@ -43,6 +43,26 @@ inventories and regular-file/bounds checks still apply. Newly produced trees
 and receipts instead verify their exact physical permission bits.
 
 ## Flow through existing owners
+
+Production and product selection retain one exact admitted operator throughout.
+That may be the node's configured local operator or a configured remote operator
+authenticated by the source node and an origin-bound target grant. A remote
+producer, its product witnesses, independent qualification and consuming worker
+must have the same owner; target-local products do not become interchangeable
+with another operator's products. No private signing key moves between nodes.
+
+The target's local operator provisions the literal bootstrap input bindings.
+An admitted remote operator can then execute the finite producer operations and
+capture, qualify and compose its own retained products under separately granted
+service scopes. These are operator operations, not additional worker grants.
+Named-root filesystem import, general binding and managed activation remain
+local-operator operations. Current binding authorizer grant digests remain
+revocable; changing a grant invalidates bindings signed against its old digest.
+Establish the complete finite operator grant before production and binding.
+
+The received-witness API remains a separate same-operator transfer contract.
+Do not relabel historical foreign-owner witnesses as fresh local captures or
+assume that source-node trust delegates another operator's products.
 
 1. Acquire and bind exact literal bootstrap inputs through existing content
    owners. Acquisition is separate from offline production; there is no

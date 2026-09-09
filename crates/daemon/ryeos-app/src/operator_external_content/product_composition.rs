@@ -2,6 +2,8 @@
 //!
 //! Signed source supplies the finite relationship. Invocation selectors choose
 //! exact node testimony, never authority, a filesystem path, or an output digest.
+//! Selection preserves the admitted execution owner across local and configured
+//! remote ingress. Node-local precomposition cannot substitute another owner.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -236,7 +238,7 @@ fn select_products_verified(
     ResolvedExternalProductSelections,
     BTreeMap<String, ryeos_state::external_content::products::publication::VerifiedProductWitness>,
 )> {
-    crate::operator_authority::require_local_configured_operator(state, context)?;
+    crate::operator_authority::require_admitted_operator(state, context)?;
     validate_selection_batch(selectors)?;
     let canonical =
         ryeos_engine::canonical_ref::CanonicalRef::parse(&resolution.root.resolved_ref)?;
@@ -819,7 +821,7 @@ pub async fn compose_selected_products(
     prepared: PreparedProductImports,
 ) -> anyhow::Result<ComposeRetainedProductsResponse> {
     request.validate()?;
-    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    crate::operator_authority::require_admitted_operator(&state, &context)?;
     if prepared.request_digest
         != lillux::sha256_hex(lillux::canonical_json(&serde_json::to_value(&request)?)?.as_bytes())
     {

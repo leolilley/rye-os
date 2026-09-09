@@ -9,7 +9,9 @@ pub(super) fn import(
     context: HandlerContext,
     request: RetainedResultImportRequest,
 ) -> anyhow::Result<ImportResponse> {
-    import_inner(state, context, request, None)?.context("retained result selection is absent")
+    let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    import_inner(state, context, request, None, operator)?
+        .context("retained result selection is absent")
 }
 
 /// Same capture/publication owner with an additional admitted product ceiling.
@@ -37,7 +39,10 @@ pub(super) fn import_product(
     {
         bail!("retained product request contradicts its admitted declaration");
     }
-    import_inner(state, context, request, Some(product))
+    // Only the exact product-capture owner enters this lane. Public retained
+    // result import remains local-only; no remote filesystem import is granted.
+    let operator = crate::operator_authority::require_admitted_operator(&state, &context)?;
+    import_inner(state, context, request, Some(product), operator)
 }
 
 fn import_inner(
@@ -45,8 +50,8 @@ fn import_inner(
     context: HandlerContext,
     request: RetainedResultImportRequest,
     product: Option<&ProductDeclaration>,
+    operator: String,
 ) -> anyhow::Result<Option<ImportResponse>> {
-    let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
     validate_relative_path(&request.path)?;
     if !lillux::valid_hash(&request.result_project_snapshot_hash)
         || request
