@@ -1,0 +1,34 @@
+# ryeos:signed:2026-09-09T14:55:38Z:65e53283bc64e15ed921b992c8aa1d6ba4c6e15b22727fa3033bb41152150666:ZNoI773Qq9PSoNN+920ei8QKcSdtnFYObZDxbYrjcJnzKD36daXVSwj4lwHTblfEGfmu0Jc6bpuUCMz4Ky0PAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+{
+  "category": "development/ryeos",
+  "name": "candidate-evaluation",
+  "version": "1.0.0",
+  "schema": "ryeos.development.candidate-evaluation.v1",
+  "limits": {
+    "max_file_bytes": 1048576,
+    "max_total_bytes": 4194304,
+    "max_files": 8
+  },
+  "tasks": {
+    "strict-json-escaped-keys": {
+      "file_assertions": [
+        {
+          "path": "crates/engine/ryeos-isolation-protocol/src/lib.rs",
+          "sha256": "2a6779634c5a13fbf7c4014cd6b1af3fe7ff7eb97c62fe7103d65c35d83a7992"
+        },
+        {
+          "path": "Cargo.toml",
+          "sha256": "8408289d00d9fdf412845b603504bb1355858aad64fb68e18698998b2aa078d6"
+        },
+        {
+          "path": "Cargo.lock",
+          "sha256": "06d28cce0952ef5ba7082b9410e700881b6c1f08832b6a976a92ef52beb9d52c"
+        },
+        {
+          "path": "crates/engine/ryeos-isolation-protocol/Cargo.toml",
+          "sha256": "acb8fd214592ddacb448742e0fa6e81394fac231524494b67f698242318fea06"
+        }
+      ]
+    }
+  }
+}

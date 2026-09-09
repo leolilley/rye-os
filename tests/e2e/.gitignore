@@ -103,6 +103,9 @@ __pycache__/
 !authoring-environment/README.md
 !development-cargo/qualification.json
 !development-cargo/README.md
+!development-cargo/candidate-task.md
+!development-cargo/strict-json-key-amendment.txt
+!development-cargo/test_candidate_evaluation.py
 !repository-validation/test_validation.py
 !repository-validation/README.md
 !repository-validation/qualification.json
