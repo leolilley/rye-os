@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T14:21:58Z:f04bec159daf218a96dce9d9c31ee036cbcef7a94c79d42c1683aaa374b87663:bh//dW8HcEQUuGaH4KK2Zm/Vu508pBOnPVIPve+xnnaI6vAs9D7RzMpk2q3JuOT/1LtQVdlKFtuuThC02kPfAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T14:32:28Z:8294c6b421d652f9bd95bb7f4ab299294c955f38b74c24608c8a01ba9d63fbaf:3aEe7MADOPE0j8JtG77udFm4pnYO75qkgQ9n3tJwmKKbZCPYh4E/WH28comJSAdpfniWIvawM46L6ax5AweUBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/execution
 tags: [execution, products, external-content, authority]
@@ -51,6 +51,13 @@ Received product testimony is a separate same-operator contract. Trusting an
 origin node does not transfer ownership or local qualification. A historical
 witness from another operator must not be relabelled a local capture. Actual
 large-object sidecar transfer remains separate from ordinary CAS-blob receipt.
+
+For installed-bundle consumers, local literal provisioning is independent of
+product selections because the binding names the consumer and publisher.
+A pinned-project consumer containing both literal inputs and product slots on
+that same item instead has a selection-sensitive binding identity. Its selected
+literal provisioning currently requires the same operator as its products;
+cross-owner selected-literal provisioning is not supplied by this contract.
 
 ## Evidence is not task success
 
