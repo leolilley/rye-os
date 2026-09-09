@@ -1,5 +1,28 @@
 # Authoring environment qualification
 
+## Hosted integration checkpoint — 2026-09-09
+
+`hosted-worker-qualification.json` records partial installed two-node evidence,
+not a passing development-loop gate. The disposable target used its dedicated
+unprivileged runit service and configured-operator forwarding from a separate
+source node. The primary node was not initialized, reset or restarted.
+
+Pinned Codex read/edited the eight-file private fixture. Exact turn observation,
+completion-fenced capture, frozen-candidate survival across daemon restart and
+owner discard passed. Child formatting did not execute: after correcting the
+signed shell environment, the nested command sandbox refused the restricted
+broker connection with EPERM. Do not interpret completed turn/candidate facts
+as successful project verification, promote these candidates, or claim Railway
+or full-repository development acceptance.
+
+The remaining connection must be admitted without general network access or
+weakening broker authentication. The current PID-1 peer proof also needs native
+nested-namespace qualification; it must not be replaced by acceptance of PID 0.
+Shell here-document scratch usability remains unresolved. Existing operator-
+driven Cargo and artifact evidence below does not establish these worker gates.
+
+## Production and independent probes
+
 Production is owned by the ordinary Tools and adjacent libraries under
 `.ai/tools/ryeos/development/authoring-environment-production/`; input contracts
 live in `.ai/config/development/ryeos/`. This directory owns independent probes
