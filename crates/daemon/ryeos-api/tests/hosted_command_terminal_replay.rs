@@ -12,6 +12,16 @@ use ryeos_app::state_store::{
 use serde_json::{Value, json};
 
 fn store_structured_session_capsule(state: &ryeos_app::state::AppState) -> (String, String, Value) {
+    store_structured_session_capsule_with_schema(
+        state,
+        json!(ryeos_state::objects::PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION),
+    )
+}
+
+fn store_structured_session_capsule_with_schema(
+    state: &ryeos_app::state::AppState,
+    schema: Value,
+) -> (String, String, Value) {
     use ryeos_state::objects::{
         AdmittedDirectCommandClosure, AdmittedExecutionClosure, AdmittedLaunchArtifactIdentity,
         AdmittedPersistentSessionCapsule, AdmittedStructuredSessionProfile,
@@ -101,7 +111,13 @@ fn store_structured_session_capsule(state: &ryeos_app::state::AppState) -> (Stri
         runtime_ref: "runtime:fixture/session".to_owned(),
         executor_ref: "native:fixture".to_owned(),
     };
-    let value = capsule.to_value().unwrap();
+    let mut value = capsule.to_value().unwrap();
+    value["schema"] = schema;
+    if value["schema"] != json!(PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION) {
+        // Deliberately opaque nested shape: classifying history must not decode
+        // this predecessor as today's launch or protocol authority.
+        value["structured_session_profile"] = json!({"obsolete_shape":true});
+    }
     let hash = lillux::cas::CasStore::new(state.state_store.cas_root().unwrap())
         .store_object(&value)
         .unwrap();
@@ -301,9 +317,23 @@ fn seed_pending_turn_fixture(
     root: &str,
     early_progress: bool,
 ) -> PendingTurnFixture {
+    seed_pending_turn_fixture_with_schema(
+        state,
+        root,
+        early_progress,
+        json!(ryeos_state::objects::PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION),
+    )
+}
+
+fn seed_pending_turn_fixture_with_schema(
+    state: &ryeos_app::state::AppState,
+    root: &str,
+    early_progress: bool,
+    schema: Value,
+) -> PendingTurnFixture {
     let owner = "fp:test-operator";
     let (capsule_hash, protocol_profile_hash, protocol_schema_hashes) =
-        store_structured_session_capsule(state);
+        store_structured_session_capsule_with_schema(state, schema);
     let launch_owner = format!("claim-{root}");
     let launch_claim = state
         .state_store
@@ -559,6 +589,218 @@ fn complete_turn(state: &ryeos_app::state::AppState, root: &str, turn_id: &str) 
         Value::String(ryeos_state::objects::canonical_value_digest(&terminal_batch).unwrap());
     ryeos_app::dedicated_session_service::ingest_observation_batch(state, root, 1, terminal_batch)
         .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_predecessor_command_history_is_preserved_without_replay() {
+    let (_tmp, state) = test_state::build_test_state();
+    let root = "T-terminal-predecessor";
+    let pending = seed_pending_turn_fixture_with_schema(
+        &state,
+        root,
+        false,
+        json!(ryeos_state::objects::PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION - 1),
+    );
+    // Neither a live placement nor an unproved cleanup is historical authority.
+    assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+    state
+        .state_store
+        .settle_worker_process(&pending.worker_instance_id, root, 1, "unproved", "fixture")
+        .unwrap();
+    assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+    state
+        .state_store
+        .settle_worker_process(&pending.worker_instance_id, root, 1, "reaped", "fixture")
+        .unwrap();
+    // Use the normal terminal transition, then restart fencing is deliberately
+    // not sufficient: this still-attached terminal must not take the opaque path.
+    state
+        .state_store
+        .terminalize_dedicated_session(root, &pending.worker_instance_id, 1, "fixture")
+        .unwrap();
+    finalize_fixture_thread(&state, root);
+    assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+
+    // A separate placement exercises the exact installed failure: its prior
+    // worker was fenced and detached before the session/root became terminal.
+    let (_tmp, state) = test_state::build_test_state();
+    let pending = seed_pending_turn_fixture_with_schema(
+        &state,
+        root,
+        false,
+        json!(ryeos_state::objects::PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION - 1),
+    );
+    retire_fixture_session(&state, root, &pending);
+    let session_before =
+        serde_json::to_value(state.state_store.dedicated_session(root).unwrap()).unwrap();
+    let command_before = serde_json::to_value(
+        state
+            .state_store
+            .dedicated_session_command(root, pending.sequence)
+            .unwrap(),
+    )
+    .unwrap();
+    let history_before = serde_json::to_value(
+        state
+            .state_store
+            .get_authoritative_root_thread_snapshot(root)
+            .unwrap(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).unwrap();
+        ryeos_app::dedicated_session_service::reconcile_observation_outboxes(&state).unwrap();
+        assert_eq!(
+            serde_json::to_value(state.state_store.dedicated_session(root).unwrap()).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            serde_json::to_value(
+                state
+                    .state_store
+                    .dedicated_session_command(root, pending.sequence)
+                    .unwrap()
+            )
+            .unwrap(),
+            command_before
+        );
+        assert_eq!(
+            serde_json::to_value(
+                state
+                    .state_store
+                    .get_authoritative_root_thread_snapshot(root)
+                    .unwrap()
+            )
+            .unwrap(),
+            history_before
+        );
+        assert!(
+            ryeos_app::dedicated_session_service::command_observation(
+                &state,
+                root,
+                pending.sequence
+            )
+            .is_err()
+        );
+    }
+    // Model an orphaned unproved boot not present in the detached slot. The
+    // existing indexed cleanup owner, not slot absence, must refuse retention.
+    let projection = rusqlite::Connection::open(&state.config.db_path).unwrap();
+    projection
+        .execute(
+            "UPDATE worker_process SET cleanup_state='unproved' WHERE worker_instance_id=?1",
+            [&pending.worker_instance_id],
+        )
+        .unwrap();
+    assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+    projection
+        .execute(
+            "UPDATE worker_process SET cleanup_state='reaped' WHERE worker_instance_id=?1",
+            [&pending.worker_instance_id],
+        )
+        .unwrap();
+    ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).unwrap();
+
+    // A stale/corrupt session row may not select another old capsule to evade
+    // exact immutable command association checks.
+    let original_capsule = state
+        .state_store
+        .dedicated_session(root)
+        .unwrap()
+        .unwrap()
+        .admitted_capsule_hash;
+    let (other_capsule, _, _) = store_structured_session_capsule_with_schema(
+        &state,
+        json!(ryeos_state::objects::PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION - 2),
+    );
+    projection
+        .execute(
+            "UPDATE dedicated_session SET admitted_capsule_hash=?1 WHERE placement_thread_id=?2",
+            [&other_capsule, root],
+        )
+        .unwrap();
+    assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+    projection
+        .execute(
+            "UPDATE dedicated_session SET admitted_capsule_hash=?1 WHERE placement_thread_id=?2",
+            [&original_capsule, root],
+        )
+        .unwrap();
+    drop(projection);
+
+    // The old row must not stop current unrelated commands from being repaired.
+    let current = seed_pending_turn_fixture(&state, "T-current-alongside-history", false);
+    append_final_turn_batch(
+        &state,
+        "T-current-alongside-history",
+        current.sequence,
+        &current.request_digest,
+        &current.result,
+    );
+    ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).unwrap();
+    assert_eq!(
+        state
+            .state_store
+            .dedicated_session_command("T-current-alongside-history", current.sequence)
+            .unwrap()
+            .unwrap()
+            .state,
+        "completed"
+    );
+}
+
+fn finalize_fixture_thread(state: &ryeos_app::state::AppState, root: &str) {
+    state
+        .state_store
+        .finalize_thread(
+            root,
+            &FinalizeThreadRecord {
+                status: "failed".to_owned(),
+                outcome_code: None,
+                result_json: None,
+                error_json: Some(json!({"fixture":"retired"})),
+                artifacts: vec![],
+                final_cost: None,
+                managed_envelope: None,
+                result_project_snapshot_hash: None,
+                result_workspace_output_capture_hash: None,
+            },
+        )
+        .unwrap();
+}
+
+fn retire_fixture_session(
+    state: &ryeos_app::state::AppState,
+    root: &str,
+    pending: &PendingTurnFixture,
+) {
+    state
+        .state_store
+        .fence_abandoned_worker_process(&pending.worker_instance_id, root, 1, "reaped")
+        .unwrap();
+    state
+        .state_store
+        .terminalize_unattached_dedicated_session(root, "fixture")
+        .unwrap();
+    finalize_fixture_thread(state, root);
+}
+
+#[tokio::test]
+async fn terminal_history_does_not_hide_malformed_or_future_session_capsules() {
+    for schema in [
+        Value::Null,
+        json!(0),
+        json!(-1),
+        json!("10"),
+        json!(1.5),
+        json!(ryeos_state::objects::PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION + 1),
+    ] {
+        let (_tmp, state) = test_state::build_test_state();
+        let root = "T-invalid-terminal-capsule";
+        let pending = seed_pending_turn_fixture_with_schema(&state, root, false, schema);
+        retire_fixture_session(&state, root, &pending);
+        assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+    }
 }
 
 #[tokio::test]

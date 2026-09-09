@@ -2409,6 +2409,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmp-serde",
+ "rusqlite",
  "ryeos-accounting",
  "ryeos-app",
  "ryeos-bundle",

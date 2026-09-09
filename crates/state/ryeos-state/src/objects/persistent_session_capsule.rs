@@ -805,7 +805,13 @@ impl AdmittedPersistentSessionCapsule {
         if kind != PERSISTENT_SESSION_CAPSULE_KIND {
             anyhow::bail!("unexpected persistent-session capsule kind: {kind}");
         }
-        let schema = object.get("schema").and_then(Value::as_u64).unwrap_or(0);
+        let schema = object
+            .get("schema")
+            .and_then(Value::as_u64)
+            .filter(|schema| *schema > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("persistent-session capsule schema must be a positive integer")
+            })?;
         if schema != u64::from(PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION) {
             return Err(super::IncompatibleCurrentObjectSchema::new(
                 "persistent-session capsule",
@@ -1080,6 +1086,24 @@ mod tests {
             idle_timeout_ms: 1,
         };
         assert!(contract.validate().is_err());
+    }
+
+    #[test]
+    fn malformed_capsule_envelope_is_not_predecessor_history() {
+        for value in [
+            serde_json::json!({"kind": PERSISTENT_SESSION_CAPSULE_KIND}),
+            serde_json::json!({"kind": PERSISTENT_SESSION_CAPSULE_KIND, "schema": null}),
+            serde_json::json!({"kind": PERSISTENT_SESSION_CAPSULE_KIND, "schema": 0}),
+            serde_json::json!({"kind": PERSISTENT_SESSION_CAPSULE_KIND, "schema": "10"}),
+            serde_json::json!({"kind": PERSISTENT_SESSION_CAPSULE_KIND, "schema": PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION}),
+        ] {
+            let error = AdmittedPersistentSessionCapsule::from_current_value(&value).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<super::super::IncompatibleCurrentObjectSchema>()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

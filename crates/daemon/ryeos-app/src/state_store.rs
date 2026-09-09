@@ -6280,6 +6280,14 @@ impl StateStore {
         g.runtime_db.live_worker_processes()
     }
 
+    /// Indexed cleanup guard, including orphaned boots no longer in the
+    /// session's attachment slot. Absence of that slot alone proves no cleanup.
+    pub fn placement_has_unsettled_worker(&self, placement_thread_id: &str) -> Result<bool> {
+        self.lock()?
+            .runtime_db
+            .placement_has_unsettled_worker_except(placement_thread_id, None)
+    }
+
     pub fn fence_abandoned_worker_process(
         &self,
         worker_instance_id: &str,

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T20:42:50Z:79436d9cf9722932730061d25d395e93c9f9e4988eebabcb882bddaf362a0883:VMmJ2cge88qDtvYwSt4giNKVK2lwYROiSRA8sQ6cWj17uxumLBcSKb9t3tOQSwpi2GPiAi1n5bjKKROYchvOBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T21:37:23Z:010f6174a44fa9bacd8b76485918676d36bf3a8010fb489dbebe40e838787a95:vAvAhypIAboeS/RxrcXFXGxr2xAdCILUmzqiWJuTQ57XQAQrQ2RqqObwxy6Lame11zxhauSN10570KVwAt4pDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -39,6 +39,16 @@ The current clean-cut execution formats include:
 - the standalone runtime project-authority envelope epoch 5; and
 - the owned runtime SQLite operator schema epoch 33 (encoded in the RyeOS
   `PRAGMA application_id` family).
+
+Hosted command-outbox startup replay preserves an exact predecessor session
+capsule as opaque history only after authoritative terminal-thread testimony,
+a terminal detached session, and the existing placement-worker index prove no
+unsettled boot remains. Classification uses the verified capsule's positive
+integer outer epoch, never a predecessor decoder. It does not repair those
+command rows, assert settlement, or make them replayable. Current malformed,
+missing/invalid epoch and future capsules remain errors, as do active or
+cleanup-unproved placements. No reset or rewrite of retained history is part
+of this terminal-history classification.
 
 The combined workload-invocation and environment-product cut uses launch
 metadata 35 and runtime epoch 33. It preserves invocation ingress provenance

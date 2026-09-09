@@ -59,5 +59,6 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 ryeos-app = { workspace = true, features = ["test-support"] }
 ryeos-engine = { workspace = true, features = ["test-support"] }

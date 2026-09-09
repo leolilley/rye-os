@@ -1828,6 +1828,9 @@ fn retained_contact_budget_refusal(
 pub fn reconcile_command_outboxes(state: &AppState) -> Result<()> {
     for mut record in state.state_store.dedicated_command_outbox_records()? {
         let session = current_session(state, &record.placement_thread_id)?;
+        if terminal_session_retains_predecessor_capsule(state, &session, &record)? {
+            continue;
+        }
         let fenced_uncontacted = json!({
             "error":"worker epoch ended before contact",
             "retryable_uncontacted":true,
@@ -3169,6 +3172,15 @@ fn admitted_structured_protocol(
     state: &AppState,
     capsule_hash: &str,
 ) -> Result<ryeos_state::objects::AdmittedStructuredSessionProfile> {
+    admitted_session_capsule(state, capsule_hash)?
+        .structured_session_profile
+        .ok_or_else(|| anyhow!("structured session capsule has no admitted protocol profile"))
+}
+
+fn admitted_session_capsule(
+    state: &AppState,
+    capsule_hash: &str,
+) -> Result<ryeos_state::objects::AdmittedPersistentSessionCapsule> {
     let authority = state.state_store.pinned_state_authority()?;
     let guard = authority.acquire_shared_guard()?;
     authority.ensure_guard(&guard)?;
@@ -3176,14 +3188,66 @@ fn admitted_structured_protocol(
         .cas_store()?
         .get_object(capsule_hash)?
         .ok_or_else(|| anyhow!("admitted session capsule disappeared"))?;
+    // Check the retained bytes before even classifying an unsupported envelope.
+    // A schema mismatch must not hide CAS corruption.
+    if ryeos_state::objects::canonical_value_digest(&value)? != capsule_hash {
+        bail!("admitted session capsule content hash changed");
+    }
     let capsule =
         ryeos_state::objects::AdmittedPersistentSessionCapsule::from_current_value(&value)?;
     if capsule.content_hash()? != capsule_hash {
         bail!("admitted session capsule content hash changed");
     }
-    capsule
-        .structured_session_profile
-        .ok_or_else(|| anyhow!("structured session capsule has no admitted protocol profile"))
+    Ok(capsule)
+}
+
+/// An already-terminal, detached placement has no command recovery authority.
+/// Retain its predecessor capsule and outbox as opaque history, not a decoded
+/// current protocol, successful settlement, or permission to retry. Live or
+/// still-attached placements must continue through the ordinary cleanup/recovery
+/// fences; a nonappendable handoff alone is not terminal history.
+fn terminal_session_retains_predecessor_capsule(
+    state: &AppState,
+    session: &DedicatedSessionRecord,
+    record: &crate::runtime_db::DedicatedSessionCommandRecord,
+) -> Result<bool> {
+    if session.state != "terminal"
+        || session.worker_instance_id.is_some()
+        || session.worker_boot_epoch.is_some()
+        || state
+            .state_store
+            .placement_has_unsettled_worker(&session.placement_thread_id)?
+        || state
+            .state_store
+            .get_thread_terminal_authority(&session.placement_thread_id)?
+            .is_none()
+    {
+        return Ok(false);
+    }
+    match admitted_session_capsule(state, &session.admitted_capsule_hash) {
+        Ok(_) => Ok(false),
+        Err(error)
+            if error
+                .downcast_ref::<ryeos_state::IncompatibleCurrentObjectSchema>()
+                .is_some_and(ryeos_state::IncompatibleCurrentObjectSchema::is_predecessor) =>
+        {
+            // The projection cannot choose an unrelated old capsule to evade
+            // replay validation. Its immutable command fact must independently
+            // name this exact capsule and canonical invocation. This does not
+            // decode the predecessor protocol or confer settlement authority.
+            if retained_committed_command_fact(state, session, record)?.is_none() {
+                bail!("terminal predecessor command has no immutable capsule association");
+            }
+            tracing::warn!(
+                placement_thread_id = %session.placement_thread_id,
+                admitted_capsule_hash = %session.admitted_capsule_hash,
+                %error,
+                "preserving terminal predecessor session command outbox as opaque history"
+            );
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Select from already-compiled launch authority; this is not another profile
@@ -3677,6 +3741,29 @@ fn committed_command_fact_exists(
     session: &DedicatedSessionRecord,
     record: &crate::runtime_db::DedicatedSessionCommandRecord,
 ) -> Result<bool> {
+    let Some(payload) = retained_committed_command_fact(state, session, record)? else {
+        return Ok(false);
+    };
+    let (protocol_profile_hash, protocol_schema_hashes) =
+        structured_protocol_identity(state, &session.admitted_capsule_hash)?;
+    if payload.get("protocol_profile_hash").and_then(Value::as_str)
+        != Some(protocol_profile_hash.as_str())
+        || payload.get("protocol_schema_hashes")
+            != Some(&serde_json::to_value(protocol_schema_hashes)?)
+    {
+        bail!("authoritative hosted command fact does not retain its exact command contract");
+    }
+    Ok(true)
+}
+
+/// Immutable command/capsule association only. Current replay additionally
+/// validates the frozen protocol in `committed_command_fact_exists`; opaque
+/// historical retention must never be mistaken for that stronger authority.
+fn retained_committed_command_fact(
+    state: &AppState,
+    session: &DedicatedSessionRecord,
+    record: &crate::runtime_db::DedicatedSessionCommandRecord,
+) -> Result<Option<Value>> {
     if !command_fact_exists(
         state,
         session,
@@ -3685,7 +3772,7 @@ fn committed_command_fact_exists(
         &record.request_digest,
         record.worker_boot_epoch,
     )? {
-        return Ok(false);
+        return Ok(None);
     }
     let operation_id = ryeos_state::objects::canonical_value_digest(&json!({
         "schema":"ryeos.hosted_command_fact.v1",
@@ -3711,9 +3798,6 @@ fn committed_command_fact_exists(
         Some(route_id) => payload.get("route_id").and_then(Value::as_str) == Some(route_id),
         None => payload.get("route_id").is_some_and(Value::is_null),
     };
-    let (protocol_profile_hash, protocol_schema_hashes) =
-        structured_protocol_identity(state, &session.admitted_capsule_hash)?;
-    let protocol_schema_hashes = serde_json::to_value(protocol_schema_hashes)?;
     let exact = payload.get("origin").and_then(Value::as_str) == Some("daemon_observed_io")
         && payload.get("worker_boot_epoch").and_then(Value::as_u64)
             == Some(record.worker_boot_epoch)
@@ -3726,14 +3810,11 @@ fn committed_command_fact_exists(
         && payload
             .get("admitted_session_capsule_hash")
             .and_then(Value::as_str)
-            == Some(session.admitted_capsule_hash.as_str())
-        && payload.get("protocol_profile_hash").and_then(Value::as_str)
-            == Some(protocol_profile_hash.as_str())
-        && payload.get("protocol_schema_hashes") == Some(&protocol_schema_hashes);
+            == Some(session.admitted_capsule_hash.as_str());
     if !exact {
         bail!("authoritative hosted command fact does not retain its exact command contract");
     }
-    Ok(true)
+    Ok(Some(payload))
 }
 
 fn append_command_observation_batch(

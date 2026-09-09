@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T10:43:33Z:86e2714ada7b1f294f997d73220b2629890237555501b87bbdda3a5478c68aeb:j1MRSfsltuKzQ6hPTztNv6i6rvJLKMdTdrnV46jqKPw9XNsXcA37hCSINeP7rqnTZuOwtrxxts3UfRGd5WaqDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T21:37:23Z:c7bd0e8e62c2dbc6622ac0efae916b7e9e4e1cde18bf55389eb06cd171a40119:hdNG756xXd2AynNhH5PvHobR3h97zXb5JbiPX/pVWOx8QzHT8wyIJGv1FVcESx5Y085EpfTlGiDRid88ePlvBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
@@ -1025,6 +1025,14 @@ is rebuilt from the admitted base snapshot in CAS; mutable workspace bytes are
 not re-admitted as engine configuration. A crash during transfer is retryable
 because owner replacement and stale process-attachment removal are one
 transaction.
+
+A terminal, detached placement with no unsettled worker boot may retain an
+older session-capsule epoch as opaque history. Command-outbox startup replay
+leaves those old facts and unknown outcomes unchanged rather than interpreting
+them as the current protocol or preventing unrelated current sessions from
+starting. This is not a compatibility decoder: old commands cannot acquire
+current replay, completion-fence or resume authority. Malformed/current or
+future capsules and unresolved active/cleanup authority still fail closed.
 
 If restart occurs after candidate capture, startup first closes any interrupted
 freezing workspace, repairs the missing root-fact-before-projection boundary,
