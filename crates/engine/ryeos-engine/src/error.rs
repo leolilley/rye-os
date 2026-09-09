@@ -331,6 +331,14 @@ pub enum EngineError {
     #[error("execution failed: {reason}")]
     ExecutionFailed { reason: String },
 
+    /// Preserve the release owner's exact cleanup outcome. An error alone
+    /// does not prove that its process scope and wrapper have been reaped.
+    #[error("attachment release failed: {source}")]
+    AttachmentReleaseFailed {
+        #[source]
+        source: lillux::AttachmentReleaseError,
+    },
+
     /// Generic held-process launch failure. Preserve Lillux's exact cleanup
     /// testimony; callers must not manufacture it from diagnostic strings.
     #[error("subprocess launch failed: {reason}")]

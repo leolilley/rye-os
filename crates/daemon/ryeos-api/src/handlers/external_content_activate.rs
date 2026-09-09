@@ -800,6 +800,7 @@ async fn run_attempt(
                     ryeos_app::operator_external_content::BindConsumerKind::InstalledBundle,
                 project_snapshot_hash: None,
                 project_path: None,
+                product_selections: None,
             },
         )
         .await?;

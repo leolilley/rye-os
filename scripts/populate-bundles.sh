@@ -257,6 +257,7 @@ staged_payload_records_for_set() {
     core rye-parser-yaml-header-document ryeos-handler-bins release \
     core rye-parser-regex-kv ryeos-handler-bins release \
     core rye-composer-identity ryeos-handler-bins release \
+    core ryeos-direct-execution-evidence ryeos-handler-bins release \
     core ryeos-core-tools ryeos-core-tools release \
     core ryeos-session-exec ryeos-session-exec static \
     core ryeos-worker-execution-launch-preparer ryeos-structured-session static \
@@ -267,6 +268,8 @@ staged_payload_records_for_set() {
       printf '%s\t%s\t%s\t%s\n' \
         standard ryeos-directive-runtime ryeos-directive-runtime release \
         standard ryeos-directive-launch-preparer ryeos-handler-bins release \
+        standard ryeos-graph-launch-preparer ryeos-handler-bins release \
+        standard ryeos-graph-execution-evidence ryeos-handler-bins release \
         standard ryeos-graph-runtime ryeos-graph-runtime release \
         standard ryeos-knowledge-runtime ryeos-knowledge-runtime release \
         standard rye-composer-extends-chain ryeos-handler-bins release \

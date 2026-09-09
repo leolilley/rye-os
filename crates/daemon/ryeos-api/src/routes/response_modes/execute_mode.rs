@@ -45,6 +45,9 @@ pub struct ExecuteRequest {
     /// Canonical item ref to execute (e.g. "directive:my/agent").
     pub item_ref: String,
     pub ref_bindings: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     /// Project root path for resolution.
     #[serde(default)]
     pub project_path: Option<String>,
@@ -981,6 +984,8 @@ impl CompiledResponseMode for CompiledExecuteMode {
         ) {
             return Ok(dispatch_error_response(error));
         }
+        request.product_selections = ryeos_state::external_content::products::composition::canonicalize_product_selection_inputs(request.product_selections)
+        .map_err(|error| RouteDispatchError::BadRequest(error.to_string()))?;
         let no_project_requested = matches!(
             &request.execution_policy.project,
             ProjectExecutionPolicy::Projectless
@@ -998,6 +1003,12 @@ impl CompiledResponseMode for CompiledExecuteMode {
             .target_site_id
             .as_deref()
             .is_some_and(|target| target != state.threads.site_id());
+        if remote_target_requested && !request.product_selections.is_empty() {
+            return Err(RouteDispatchError::BadRequest(
+                "product selectors are not supported for remote execution in the first composition lane"
+                    .to_string(),
+            ));
+        }
         if request.launch_mode == "accepted" && remote_target_requested {
             return Ok(dispatch_error_response(target_site_unsupported(
                 request.target_site_id.as_deref().unwrap_or_default(),
@@ -1498,6 +1509,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
             let preflight_kind = root_canonical.kind.clone();
             let preflight_parameters = request.parameters.clone();
             let preflight_ref_bindings = request.ref_bindings.clone();
+            let preflight_product_selections = request.product_selections.clone();
             let preflight_usage_subject = usage_subject.clone();
             let preflight_usage_authority = usage_subject_asserted_by.clone();
             let preflight_exec_ctx = ryeos_executor::executor::ExecutionContext {
@@ -1522,6 +1534,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
                     &preflight_kind,
                     &preflight_parameters,
                     &preflight_ref_bindings,
+                    &preflight_product_selections,
                     preflight_usage_subject.as_ref(),
                     preflight_usage_authority.as_deref(),
                     &accepted_project_binding,
@@ -1594,6 +1607,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
                 accepted_preflight.root_dispatch_evidence,
                 &project_ctx.effective_path,
                 request.ref_bindings.clone(),
+                request.product_selections.clone(),
                 lifecycle_authority,
                 Some(principal.handler_context()),
             )
@@ -1849,6 +1863,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
             let preflight_kind = root_canonical.kind.clone();
             let preflight_parameters = request.parameters.clone();
             let preflight_ref_bindings = request.ref_bindings.clone();
+            let preflight_product_selections = request.product_selections.clone();
             let preflight_usage_subject = usage_subject.clone();
             let preflight_usage_authority = usage_subject_asserted_by.clone();
             let preflight_exec_ctx = exec_ctx.clone();
@@ -1860,6 +1875,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
                     &preflight_kind,
                     &preflight_parameters,
                     &preflight_ref_bindings,
+                    &preflight_product_selections,
                     preflight_usage_subject.as_ref(),
                     preflight_usage_authority.as_deref(),
                     &project_binding,
@@ -1917,6 +1933,7 @@ impl CompiledResponseMode for CompiledExecuteMode {
             validate_only: request.validate_only,
             params: request.parameters.clone(),
             ref_bindings: request.ref_bindings.clone(),
+            product_selections: request.product_selections.clone(),
             acting_principal: caller_principal_id.as_str(),
             project_path: &project_ctx.effective_path,
             provenance,
@@ -2602,6 +2619,7 @@ mod tests {
         ExecuteRequest {
             item_ref: "tool:test/thing".into(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             project_path: Some("/tmp/project".into()),
             parameters: serde_json::Value::Null,
             execution_policy: ExecutionPolicy {

@@ -193,6 +193,23 @@ fn translate_launch(request: &AdapterLaunchRequest) -> Result<lillux::LinuxSandb
             Ok::<_, String>(lillux::LinuxSandboxOverlay {
                 template,
                 destination: PathBuf::from(workspace.destination.as_str()),
+                writable_descendant_mounts: workspace
+                    .writable_descendant_mounts
+                    .iter()
+                    .map(|mount| {
+                        let source = authorities.get(&mount.source).ok_or_else(|| {
+                            "workspace descendant authority disappeared".to_string()
+                        })?;
+                        if source.purpose != IsolationAuthorityPurpose::WorkspaceViewDescendant {
+                            return Err("workspace descendant has the wrong authority role".into());
+                        }
+                        Ok(lillux::LinuxSandboxOverlayDescendantMount {
+                            source_fd: source.inherited_fd,
+                            relative_path: PathBuf::from(&mount.relative_path),
+                            destination: PathBuf::from(mount.destination.as_str()),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
             })
         })
         .transpose()?;
@@ -347,36 +364,7 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
     let mutations = observation
         .mutations
         .into_iter()
-        .map(|mutation| {
-            let (kind, normalized_mode, size, content_hash) = match mutation.kind {
-                lillux::LinuxOverlayMutationKind::UpsertRegular {
-                    normalized_mode,
-                    size,
-                    sha256,
-                } => (
-                    WorkspaceMutationKind::UpsertRegular,
-                    Some(normalized_mode),
-                    Some(size),
-                    Some(sha256),
-                ),
-                lillux::LinuxOverlayMutationKind::DeletePath => {
-                    (WorkspaceMutationKind::DeletePath, None, None, None)
-                }
-                lillux::LinuxOverlayMutationKind::EnsureDirectory => {
-                    (WorkspaceMutationKind::EnsureDirectory, None, None, None)
-                }
-                lillux::LinuxOverlayMutationKind::OpaqueDirectory => {
-                    (WorkspaceMutationKind::OpaqueDirectory, None, None, None)
-                }
-            };
-            WorkspaceMutation {
-                path: mutation.path,
-                kind,
-                normalized_mode,
-                size,
-                content_hash,
-            }
-        })
+        .map(workspace_mutation)
         .collect::<Vec<_>>();
     let mut pinned_root_identities = BTreeMap::new();
     pinned_root_identities.insert("project".to_string(), observation.project_identity.clone());
@@ -432,6 +420,54 @@ fn workspace(request_fd: u32) -> Result<AdapterWorkspaceResponse, String> {
         _ => return Err("workspace transfer and created-view ownership disagree".to_string()),
     }
     Ok(response)
+}
+
+fn workspace_mutation(mutation: lillux::LinuxOverlayMutation) -> WorkspaceMutation {
+    let (kind, normalized_mode, size, content_hash, target) = match mutation.kind {
+        lillux::LinuxOverlayMutationKind::UpsertRegular {
+            normalized_mode,
+            size,
+            sha256,
+        } => (
+            WorkspaceMutationKind::UpsertRegular,
+            Some(normalized_mode),
+            Some(size),
+            Some(sha256),
+            None,
+        ),
+        lillux::LinuxOverlayMutationKind::UpsertSymlink { target } => (
+            WorkspaceMutationKind::UpsertSymlink,
+            None,
+            None,
+            None,
+            Some(target),
+        ),
+        lillux::LinuxOverlayMutationKind::DeletePath => {
+            (WorkspaceMutationKind::DeletePath, None, None, None, None)
+        }
+        lillux::LinuxOverlayMutationKind::EnsureDirectory => (
+            WorkspaceMutationKind::EnsureDirectory,
+            None,
+            None,
+            None,
+            None,
+        ),
+        lillux::LinuxOverlayMutationKind::OpaqueDirectory => (
+            WorkspaceMutationKind::OpaqueDirectory,
+            None,
+            None,
+            None,
+            None,
+        ),
+    };
+    WorkspaceMutation {
+        path: mutation.path,
+        kind,
+        normalized_mode,
+        size,
+        content_hash,
+        target,
+    }
 }
 
 fn workspace_view_receipt(
@@ -589,6 +625,72 @@ fn fail(message: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_translation_preserves_each_normalized_mutation() {
+        assert_eq!(
+            lillux::sandbox::MAX_LINUX_OVERLAY_SYMLINK_TARGET_BYTES,
+            ryeos_isolation_protocol::MAX_WORKSPACE_SYMLINK_TARGET_BYTES,
+        );
+        let cases = [
+            (
+                lillux::LinuxOverlayMutationKind::UpsertRegular {
+                    normalized_mode: 0o755,
+                    size: 7,
+                    sha256: "a".repeat(64),
+                },
+                WorkspaceMutationKind::UpsertRegular,
+            ),
+            (
+                lillux::LinuxOverlayMutationKind::UpsertSymlink {
+                    target: "../lib/interpreter".into(),
+                },
+                WorkspaceMutationKind::UpsertSymlink,
+            ),
+            (
+                lillux::LinuxOverlayMutationKind::DeletePath,
+                WorkspaceMutationKind::DeletePath,
+            ),
+            (
+                lillux::LinuxOverlayMutationKind::EnsureDirectory,
+                WorkspaceMutationKind::EnsureDirectory,
+            ),
+            (
+                lillux::LinuxOverlayMutationKind::OpaqueDirectory,
+                WorkspaceMutationKind::OpaqueDirectory,
+            ),
+        ];
+        for (kind, expected) in cases {
+            let mutation = workspace_mutation(lillux::LinuxOverlayMutation {
+                path: "output/member".into(),
+                kind,
+            });
+            assert_eq!(mutation.path, "output/member");
+            assert_eq!(mutation.kind, expected);
+            mutation.validate().unwrap();
+            let wire = serde_json::to_value(&mutation).unwrap();
+            let decoded: WorkspaceMutation = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded, mutation);
+            match expected {
+                WorkspaceMutationKind::UpsertRegular => {
+                    assert_eq!(mutation.normalized_mode, Some(0o755));
+                    assert_eq!(mutation.size, Some(7));
+                    assert_eq!(
+                        mutation.content_hash.as_deref(),
+                        Some("a".repeat(64).as_str())
+                    );
+                    assert!(wire["target"].is_null());
+                }
+                WorkspaceMutationKind::UpsertSymlink => {
+                    assert_eq!(mutation.target.as_deref(), Some("../lib/interpreter"));
+                    assert!(wire["normalized_mode"].is_null());
+                    assert!(wire["size"].is_null());
+                    assert!(wire["content_hash"].is_null());
+                }
+                _ => assert!(wire["target"].is_null()),
+            }
+        }
+    }
 
     #[test]
     fn capability_projection_does_not_claim_aggregate_resources() {

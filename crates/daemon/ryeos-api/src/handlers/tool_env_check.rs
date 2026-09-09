@@ -149,6 +149,11 @@ pub async fn handle(
     )
     .map_err(map_dispatch_error)?;
     let launch_contract_applied = prepared.is_some();
+    // This symbolic diagnostic has no selected execution/workspace owner.
+    // Report the condition without claiming that current placement satisfies it.
+    let project_result_requirement = prepared
+        .as_ref()
+        .map(|prepared| prepared.project_result_requirement);
     if let Some(prepared) = prepared {
         names.extend(
             prepared
@@ -224,6 +229,7 @@ pub async fn handle(
                     verified_code: &isolation_verified_code,
                     verified_command: None,
                     external_read_only_mounts: &[],
+                    writable_runtime_view_mounts: &[],
                     target_channels: &[],
                     item_ref: &isolation_item_ref,
                     thread_id: "tool-env-check",
@@ -245,6 +251,8 @@ pub async fn handle(
         "secrets": secrets,
         "missing": missing,
         "launch_contract_applied": launch_contract_applied,
+        "project_result_requirement": project_result_requirement,
+        "project_result_readiness": if launch_contract_applied { "not_checked" } else { "not_applicable" },
     });
     if let (Some(obj), Some(extra)) = (response.as_object_mut(), import_report.as_object()) {
         for (k, v) in extra {

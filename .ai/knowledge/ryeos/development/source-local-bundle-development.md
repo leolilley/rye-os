@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T03:59:20Z:91ad2db1ca1719e15f20b63b474e7deb9bf9fef1d846e07ceecf8536f07847c9:NSFkuxjnLkkLL1LVPUNT614lG1SitjSLyVzlSRec0n0nsQqj/egSH2nlhTNVmpjN0w+YK06RcU7XjX7D8gwYBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T09:15:12Z:0207ccd03f533d269b565bdff70b14b513db7d9c3ec58ea0b2ed7d2ce82d48ec:7WvNyEJgcuT3iIB6ExcnYEipJQ2n2ckkdi0k+nFyeFChmRWE5Lz7MVcDjiPMs7Kuw+L3Gbm01evJyCm+E0LDAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -252,8 +252,10 @@ and [cargo vendor](https://doc.rust-lang.org/cargo/commands/cargo-vendor.html).
 
 ## Development execution confinement
 
-The project-owned `config:development/ryeos/worker-environment` composes the
-shared authoring environment with the exact restricted-client tree. Its finite
+The project-owned `config:development/ryeos/worker-environment` selects the
+independently qualified authoring product through its signed relationship and
+requests structured-session workload invocation. It does not include a native
+CLI realization or add one to executable search. Its finite
 request contains `format-check`, `format-file`, `platform-inspect` and the
 bounded `cargo-check`, `cargo-build`, `cargo-test` operations. Each
 workspace-access assertion matches the corresponding
@@ -262,10 +264,10 @@ request does not itself grant authority: node policy, initiating principal,
 parent delegation and resolved child contracts still intersect at admission.
 The Codex bundle's general authoring environment remains client-free.
 
-The client digest names the measured local development artifact from revision
-`e0fd43c89`, not a published release. It must be replaced with the exact released
-artifact when release qualification reaches that gate. Source composition
-checks are not evidence of target-local bindings or a successful worker call.
+Native CLI ingress remains a separate explicit environment selection and
+qualification lane under the same restricted invocation authority. Source
+composition checks are not evidence of target-local product selection/binding,
+a successful worker call, or qualification of the combined implementation.
 Cargo dependency production now has an observed manifest. The finite
 `cargo-check`, `cargo-build` and `cargo-test` Tools select that exact vendor
 closure and the admitted platform. Their initial package allowlist is only
@@ -318,7 +320,7 @@ vendor tree with a 640 MiB aggregate blob ceiling; it still fits the existing
 1 GiB response bound. No compiler-specific runtime limit or bypass is added.
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
-clean-cut isolation-adapter v7 protocol. The backend is available signed data,
+clean-cut isolation-adapter v10 protocol. The backend is available signed data,
 not ambient host setup: bundle membership does not activate it and every
 ordinary init profile remains explicitly disabled. The separately selectable
 `development` init profile maps to the existing `full` bundle set and enables
@@ -337,7 +339,7 @@ for the exact supported filesystem and symlink boundaries. Policy or runtime
 history from the prior authority contract requires explicit scoped retirement,
 not a decoder fallback or automatic install-time reset.
 
-The v8 plan carries bounded fixed-parent views, a sorted collection of
+The v10 plan carries bounded fixed-parent views, a sorted collection of
 daemon-created target channels and explicit PID-namespace and proc-filesystem
 choices. The development profile selects fresh PID-local, read-only procfs for
 ordinary compiler/executable self lookup, never the host proc mount. Lillux owns namespace, mount,

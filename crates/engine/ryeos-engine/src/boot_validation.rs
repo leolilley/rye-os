@@ -605,6 +605,17 @@ fn launch_preparer_validation_request(
                 name.clone(),
                 RefBindingDeclWire {
                     required: binding.required,
+                    project_result_requirement: binding.project_result_requirement,
+                    source: match &binding.source {
+                        crate::runtime_registry::RefBindingSource::Caller => {
+                            ryeos_handler_protocol::RefBindingSourceWire::Caller
+                        }
+                        crate::runtime_registry::RefBindingSource::PrimaryField { path } => {
+                            ryeos_handler_protocol::RefBindingSourceWire::PrimaryField {
+                                path: path.clone(),
+                            }
+                        }
+                    },
                     allowed_kinds: binding.allowed_kinds.clone(),
                     allowed_spaces: binding
                         .allowed_spaces
@@ -2004,6 +2015,7 @@ composed_value_contract:
             },
             callback_channel: CallbackChannel::None,
             session: None,
+            execution_evidence: None,
         }
     }
 
@@ -2088,6 +2100,7 @@ composed_value_contract:
             },
             callback_channel: CallbackChannel::None,
             session: None,
+            execution_evidence: None,
         };
 
         let synthetic_ref = CanonicalRef::parse("tool:synthetic/test").unwrap();

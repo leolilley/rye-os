@@ -7623,6 +7623,7 @@ async fn start_candidate_operation(
             provenance: candidate_provenance.clone(),
             parameters: req.parameters.clone(),
             ref_bindings: req.ref_bindings.clone(),
+            product_selections: Vec::new(),
             principal_id: session.owner_principal.clone(),
             principal_scopes: effective_caps.clone(),
             origin_site_id: origin_site_id.clone(),
@@ -7665,6 +7666,7 @@ async fn start_candidate_operation(
         preflight.root_dispatch_evidence,
         &candidate.effective_path,
         req.ref_bindings.clone(),
+        Vec::new(),
         lifecycle_authority,
         Some(handler_context),
     )

@@ -85,11 +85,11 @@ pub use sandbox::{
     LinuxOverlayWorkspaceObservation, LinuxOverlayWorkspaceOperation, LinuxSandboxAggregateLimits,
     LinuxSandboxExit, LinuxSandboxFixedParentView, LinuxSandboxInspection, LinuxSandboxLifecycle,
     LinuxSandboxMount, LinuxSandboxMountAccess, LinuxSandboxNetwork, LinuxSandboxOverlay,
-    LinuxSandboxProcFilesystem, LinuxSandboxProcess, LinuxSandboxRequest,
-    create_linux_overlay_template, exit_with_linux_sandbox_status, inspect_linux_sandbox,
-    launch_linux_sandbox, operate_linux_overlay_workspace, read_sealed_inherited_descriptor,
-    validate_connected_unix_stream_descriptor, validate_current_executable_descriptor,
-    write_inherited_descriptor,
+    LinuxSandboxOverlayDescendantMount, LinuxSandboxProcFilesystem, LinuxSandboxProcess,
+    LinuxSandboxRequest, create_linux_overlay_template, exit_with_linux_sandbox_status,
+    inspect_linux_sandbox, launch_linux_sandbox, operate_linux_overlay_workspace,
+    read_sealed_inherited_descriptor, validate_connected_unix_stream_descriptor,
+    validate_current_executable_descriptor, write_inherited_descriptor,
 };
 
 pub use identity::envelope::{

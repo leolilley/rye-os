@@ -23,9 +23,7 @@ use crate::item_resolution::ResolutionRoots;
 use crate::kind_registry::KindRegistry;
 use crate::parsers::ParserDispatcher;
 use crate::resolution::TrustClass;
-use crate::runtime::{
-    ChainIntermediate, HostEnvBindings, RuntimeHandlerRegistry, compile_with_handlers,
-};
+use crate::runtime::{ChainIntermediate, HostEnvBindings, RuntimeHandlerRegistry};
 use crate::trust::TrustStore;
 
 /// Maximum executor chain depth before we assume a cycle or misconfiguration.
@@ -929,6 +927,59 @@ pub struct BuildPlanInput<'a> {
     fields(canonical_ref = %input.item.resolved.canonical_ref)
 )]
 pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineError> {
+    build_plan_with_execution_root(input, None)
+}
+
+/// Reconstruct a current Bundle program at its already-admitted logical
+/// execution root, without granting that root any source lookup authority.
+/// This does not create a project binding, materialization, or process.
+pub fn build_bundle_plan_with_logical_project_root(
+    input: BuildPlanInput<'_>,
+    logical_project_root: Option<&Path>,
+) -> Result<ExecutionPlan, EngineError> {
+    validate_logical_project_root_input(&input, logical_project_root)?;
+    build_plan_with_execution_root(input, Some(logical_project_root))
+}
+
+fn validate_logical_project_root_input(
+    input: &BuildPlanInput<'_>,
+    logical_project_root: Option<&Path>,
+) -> Result<(), EngineError> {
+    if logical_project_root.is_some_and(|root| {
+        root.as_os_str() != std::ffi::OsStr::new(ryeos_state::objects::ADMITTED_DIRECT_PROJECT_ROOT)
+    }) || input.item.resolved.source_space != crate::contracts::ItemSpace::Bundle
+        || !matches!(
+            input.item.resolved.source_root,
+            crate::contracts::ItemSourceRoot::Bundle { .. }
+        )
+        || input.item.trust_class != ContractTrustClass::Trusted
+        || input.item.resolved.materialized_project_root.is_some()
+        || input.ctx.project_context != crate::contracts::ProjectContext::None
+        || input.ctx.subject_resolution_authority
+            != crate::contracts::SubjectResolutionAuthority::Projectless
+        || input.item.resolved.subject_resolution_authority
+            != crate::contracts::SubjectResolutionAuthority::Projectless
+        || input.project_authority.is_some()
+        || input
+            .roots
+            .ordered
+            .iter()
+            .any(|root| root.space == crate::contracts::ItemSpace::Project)
+        || input.root_source.is_none()
+    {
+        return Err(EngineError::Internal(
+            "logical project-root compilation requires exact captured Bundle source and projectless lookup authority".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_plan_with_execution_root(
+    input: BuildPlanInput<'_>,
+    // Outer None preserves ordinary context-derived behavior; Some(None)
+    // explicitly retains an admitted projectless execution context.
+    logical_project_root: Option<Option<&Path>>,
+) -> Result<ExecutionPlan, EngineError> {
     let BuildPlanInput {
         item,
         root_source,
@@ -1112,14 +1163,15 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
     );
     plan_env.insert("RYEOS_ITEM_KIND".to_owned(), resolved.kind.clone());
     plan_env.insert("RYEOS_ITEM_REF".to_owned(), canonical_ref.clone());
-    let execution_project_root = match &ctx.project_context {
-        crate::contracts::ProjectContext::LocalPath { path } => Some(path),
-        crate::contracts::ProjectContext::None
-        | crate::contracts::ProjectContext::SnapshotHash { .. }
-        | crate::contracts::ProjectContext::ProjectRef { .. } => {
-            resolved.materialized_project_root.as_ref()
-        }
-    };
+    let execution_project_root =
+        logical_project_root.unwrap_or_else(|| match &ctx.project_context {
+            crate::contracts::ProjectContext::LocalPath { path } => Some(path.as_path()),
+            crate::contracts::ProjectContext::None
+            | crate::contracts::ProjectContext::SnapshotHash { .. }
+            | crate::contracts::ProjectContext::ProjectRef { .. } => {
+                resolved.materialized_project_root.as_deref()
+            }
+        });
     if let Some(root) = execution_project_root {
         plan_env.insert(
             "RYEOS_PROJECT_ROOT".to_owned(),
@@ -1189,7 +1241,7 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
     // the complete meaning-blind implementation set those policies may name.
     let registry = RuntimeHandlerRegistry::with_builtins();
     let root_trust_class = widen_root_trust_class(item.trust_class, item.resolved.source_space);
-    let spec = compile_with_handlers(
+    let spec = crate::runtime::compile_with_handlers_and_execution_root(
         &terminal.intermediates,
         &terminal.root_source_path,
         &terminal.chain,
@@ -1207,6 +1259,7 @@ pub fn build_plan(input: BuildPlanInput<'_>) -> Result<ExecutionPlan, EngineErro
         root_trust_class,
         project_authority,
         sealed_content,
+        logical_project_root.unwrap_or(project_root.as_deref()),
     )?;
 
     // Step 5: Build plan node
@@ -2073,6 +2126,68 @@ config:
 
     fn empty_kinds() -> KindRegistry {
         KindRegistry::empty()
+    }
+
+    #[test]
+    fn logical_project_root_input_refuses_source_authority_or_noncanonical_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = write_chain_tool(temp.path(), "fixture", Some("@subprocess"));
+        let mut item =
+            make_verified_item("tool:fixture", "tool", source, Some("@subprocess"), None);
+        item.resolved.source_space = ItemSpace::Bundle;
+        item.resolved.source_root = crate::contracts::ItemSourceRoot::Bundle {
+            name: "fixture".into(),
+        };
+        item.resolved.subject_resolution_authority =
+            crate::contracts::SubjectResolutionAuthority::Projectless;
+        let ctx = test_plan_context(None);
+        let parsers = crate::parsers::test_helpers::dispatcher_with_canonical_bundle_descriptors();
+        let kinds = empty_kinds();
+        let trust = TrustStore::empty();
+        let host_env = HostEnvBindings::default();
+        let params = json!({});
+        let hints = ExecutionHints::default();
+        let check = |item: &VerifiedItem, ctx: &PlanContext, roots: &ResolutionRoots, logical| {
+            validate_logical_project_root_input(
+                &BuildPlanInput {
+                    item,
+                    ctx,
+                    roots,
+                    root_source: Some("captured bytes"),
+                    parameters: &params,
+                    hints: &hints,
+                    kinds: &kinds,
+                    parsers: &parsers,
+                    registry_fingerprint: "fixture",
+                    trust_store: &trust,
+                    node_trust_store: &trust,
+                    host_env: &host_env,
+                    filesystem_authority_ceiling:
+                        crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+                    project_authority: None,
+                    sealed_content: None,
+                },
+                logical,
+            )
+        };
+        let roots = empty_roots();
+        let logical = Path::new(ryeos_state::objects::ADMITTED_DIRECT_PROJECT_ROOT);
+        check(&item, &ctx, &roots, None).unwrap();
+        check(&item, &ctx, &roots, Some(logical)).unwrap();
+        for invalid in ["/tmp/project", "/", "relative", "/__ryeos_project/../other"] {
+            assert!(check(&item, &ctx, &roots, Some(Path::new(invalid))).is_err());
+        }
+        let slash = format!("{}/", logical.display());
+        assert!(check(&item, &ctx, &roots, Some(Path::new(&slash))).is_err());
+        let project_roots = ResolutionRoots::from_flat(Some(temp.path().join(AI_DIR)), vec![]);
+        assert!(check(&item, &ctx, &project_roots, Some(logical)).is_err());
+        let local_ctx = test_plan_context(Some(temp.path().to_path_buf()));
+        assert!(check(&item, &local_ctx, &roots, Some(logical)).is_err());
+        item.resolved.materialized_project_root = Some(temp.path().to_path_buf());
+        assert!(check(&item, &ctx, &roots, Some(logical)).is_err());
+        item.resolved.materialized_project_root = None;
+        item.resolved.source_space = ItemSpace::Project;
+        assert!(check(&item, &ctx, &roots, Some(logical)).is_err());
     }
 
     fn ignored() -> Vec<String> {

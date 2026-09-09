@@ -1,6 +1,7 @@
 //! Exact owner-authorized retained result admission, using ordinary import staging.
 
 use super::*;
+use ryeos_state::external_content::products::{ProductDeclaration, ProductShape, ProductStorage};
 use ryeos_state::external_content::retained_project::RetainedProjectContent;
 
 pub(super) fn import(
@@ -8,6 +9,43 @@ pub(super) fn import(
     context: HandlerContext,
     request: RetainedResultImportRequest,
 ) -> anyhow::Result<ImportResponse> {
+    import_inner(state, context, request, None)?.context("retained result selection is absent")
+}
+
+/// Same capture/publication owner with an additional admitted product ceiling.
+/// The caller must establish the declaration's admitted recipe relationship.
+pub(super) fn import_product(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    request: RetainedResultImportRequest,
+    product: &ProductDeclaration,
+) -> anyhow::Result<Option<ImportResponse>> {
+    product.validate()?;
+    if request.path != product.path
+        || request.shape
+            != match product.shape {
+                ProductShape::File => ImportShape::File,
+                ProductShape::Tree => ImportShape::Tree,
+            }
+        || request.storage
+            != match product.storage {
+                ProductStorage::Content => ImportStorage::Content,
+                ProductStorage::LargeContent => ImportStorage::LargeContent,
+            }
+        || request.maximum_bytes > product.bounds.maximum_total_bytes
+        || request.expected_file_sha256.is_some()
+    {
+        bail!("retained product request contradicts its admitted declaration");
+    }
+    import_inner(state, context, request, Some(product))
+}
+
+fn import_inner(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    request: RetainedResultImportRequest,
+    product: Option<&ProductDeclaration>,
+) -> anyhow::Result<Option<ImportResponse>> {
     let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
     validate_relative_path(&request.path)?;
     if !lillux::valid_hash(&request.result_project_snapshot_hash)
@@ -74,14 +112,23 @@ pub(super) fn import(
         state.ignore_matcher.as_ref(),
         bounds,
     )?;
-    let selected = RetainedProjectContent::select(
-        &snapshot,
-        match request.shape {
-            ImportShape::File => ryeos_state::ExternalContentCaptureKind::File,
-            ImportShape::Tree => ryeos_state::ExternalContentCaptureKind::Tree,
-        },
-        &capture_policy,
-    )?;
+    let selected = if let Some(product) = product {
+        let Some(selected) =
+            product.select_retained(&snapshot, state.ignore_matcher.as_ref(), &bounds)?
+        else {
+            return Ok(None);
+        };
+        selected
+    } else {
+        RetainedProjectContent::select(
+            &snapshot,
+            match request.shape {
+                ImportShape::File => ryeos_state::ExternalContentCaptureKind::File,
+                ImportShape::Tree => ryeos_state::ExternalContentCaptureKind::Tree,
+            },
+            &capture_policy,
+        )?
+    };
     if request
         .expected_file_sha256
         .as_deref()
@@ -89,17 +136,18 @@ pub(super) fn import(
     {
         bail!("retained result file contradicts expected_file_sha256");
     }
-    let digest = lillux::sha256_hex(
-        lillux::canonical_json(&serde_json::json!({
-            "source": "retained_result",
-            "request": request,
-            "admitted_launch_capsule_hash": thread.admitted_launch_capsule_hash,
-            "limits": policy.limits,
-            "capture_floor_rules": ryeos_state::project_sync::durable_content_capture_floor_rules(),
-            "configured_ignore_patterns": state.ignore_matcher.canonical_patterns(),
-        }))?
-        .as_bytes(),
-    );
+    let mut capture_identity = serde_json::json!({
+        "source": "retained_result",
+        "request": request,
+        "admitted_launch_capsule_hash": thread.admitted_launch_capsule_hash,
+        "limits": policy.limits,
+        "capture_floor_rules": ryeos_state::project_sync::durable_content_capture_floor_rules(),
+        "configured_ignore_patterns": state.ignore_matcher.canonical_patterns(),
+    });
+    if let Some(product) = product {
+        capture_identity["product_declaration"] = serde_json::to_value(product)?;
+    }
+    let digest = lillux::sha256_hex(lillux::canonical_json(&capture_identity)?.as_bytes());
     let key = ryeos_state::DurableCasPublicationKey::external_content_import(&digest)?;
     // Existing blobs need no duplicate payload allocation. Keep conservative
     // metadata/inode reserves; only large-store conversion reserves payload.
@@ -169,15 +217,21 @@ pub(super) fn import(
     // Store the complete verified value before acknowledging its durable root.
     // A failed CAS write must not leave a staged reference to an absent object.
     let manifest_hash = cas.store_object(&manifest)?;
+    if product
+        .and_then(|product| product.expected_manifest_hash.as_deref())
+        .is_some_and(|expected| expected != manifest_hash)
+    {
+        bail!("retained product contradicts expected_manifest_hash");
+    }
     stage.protect_cas_closure(&guard, [manifest_hash.as_str()], std::iter::empty())?;
-    Ok(ImportResponse {
+    Ok(Some(ImportResponse {
         staging_id: stage.staging_id().to_owned(),
         request_digest: digest,
         manifest_hash,
         manifest_kind: kind.to_owned(),
         entry_count: selected.entry_count(),
         total_bytes: selected.total_bytes(),
-    })
+    }))
 }
 
 fn authorize_result(
@@ -186,11 +240,29 @@ fn authorize_result(
     request: &RetainedResultImportRequest,
     operator: &str,
 ) -> anyhow::Result<()> {
-    if root.thread_id != request.chain_root_id
-        || root.chain_root_id != request.chain_root_id
+    authorize_terminal_result(
+        root,
+        thread,
+        &request.chain_root_id,
+        &request.thread_id,
+        &request.result_project_snapshot_hash,
+        operator,
+    )
+}
+
+pub(super) fn authorize_terminal_result(
+    root: &ryeos_state::ThreadSnapshot,
+    thread: &ryeos_state::ThreadSnapshot,
+    chain_root_id: &str,
+    thread_id: &str,
+    result_snapshot_hash: &str,
+    operator: &str,
+) -> anyhow::Result<()> {
+    if root.thread_id != chain_root_id
+        || root.chain_root_id != chain_root_id
         || root.requested_by.as_deref() != Some(operator)
-        || thread.chain_root_id != request.chain_root_id
-        || thread.thread_id != request.thread_id
+        || thread.chain_root_id != chain_root_id
+        || thread.thread_id != thread_id
         || thread.requested_by.as_deref() != Some(operator)
     {
         bail!("retained result execution is not owned at the requested coordinate");
@@ -209,8 +281,7 @@ fn authorize_result(
         .project_authority
         .records_terminal_project_generation()
         || thread.admitted_launch_capsule_hash.is_none()
-        || thread.result_project_snapshot_hash.as_deref()
-            != Some(&request.result_project_snapshot_hash)
+        || thread.result_project_snapshot_hash.as_deref() != Some(result_snapshot_hash)
     {
         bail!("execution does not attest the exact retained result snapshot");
     }

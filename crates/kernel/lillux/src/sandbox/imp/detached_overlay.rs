@@ -269,6 +269,7 @@ pub(super) fn probe() -> Result<(), String> {
             mount_overlay(&LinuxSandboxOverlay {
                 template: template.clone(),
                 destination: PathBuf::from("/project"),
+                writable_descendant_mounts: Vec::new(),
             })?;
             require_probe_bytes("/tmp/project/seed", b"lower")?;
             std::fs::write("/tmp/project/seed", b"borrower one")
@@ -292,6 +293,7 @@ pub(super) fn probe() -> Result<(), String> {
             mount_overlay(&LinuxSandboxOverlay {
                 template: template.clone(),
                 destination: PathBuf::from("/project"),
+                writable_descendant_mounts: Vec::new(),
             })?;
             require_probe_bytes("/tmp/project/seed", b"borrower one")?;
             if std::path::Path::new("/tmp/project/private/secret").exists() {
@@ -457,6 +459,17 @@ mod tests {
             descriptors.pop().unwrap().for_child().unwrap(),
         )
         .unwrap();
+        let runtime_view = template
+            .inherited_authority()
+            .open_or_create_private_directory_descendant(std::path::Path::new(
+                ".ai/cache/ryeos-runtime/native-consumer/tmp",
+            ))
+            .unwrap();
+        let runtime_view_mount = LinuxSandboxOverlayDescendantMount {
+            source_fd: runtime_view.inherited_descriptor().unwrap(),
+            relative_path: PathBuf::from(".ai/cache/ryeos-runtime/native-consumer/tmp"),
+            destination: PathBuf::from("/runtime-view"),
+        };
 
         // Both borrowers begin at the original host-side owner, not by
         // joining or nesting below the now-dead creator's user namespace.
@@ -464,7 +477,25 @@ mod tests {
             enter_namespaces(LinuxSandboxNetwork::Isolated)?;
             mount_private_root()?;
             attach_probe_clone(&template)?;
+            let source = reanchor_overlay_descendant_source(
+                &PathBuf::from("/project"),
+                &runtime_view_mount,
+            )?;
+            let mount = LinuxSandboxMount {
+                source_fd: source.inherited_descriptor()?,
+                destination: runtime_view_mount.destination.clone(),
+                access: LinuxSandboxMountAccess::Writable,
+                layer: 10,
+            };
+            create_target(&rooted(&mount.destination)?, DescriptorKind::Directory)?;
+            bind_descriptor_mount(&mount)?;
+            std::fs::write("/tmp/runtime-view/marker", b"exact descendant")
+                .map_err(|error| error.to_string())?;
             assert_bytes("/tmp/project/seed", b"lower")?;
+            assert_bytes(
+                "/tmp/project/.ai/cache/ryeos-runtime/native-consumer/tmp/marker",
+                b"exact descendant",
+            )?;
             std::fs::write("/tmp/project/seed", b"first borrower")
                 .map_err(|error| error.to_string())
         })
@@ -474,6 +505,10 @@ mod tests {
             mount_private_root()?;
             attach_probe_clone(&template)?;
             assert_bytes("/tmp/project/seed", b"first borrower")?;
+            assert_bytes(
+                "/tmp/project/.ai/cache/ryeos-runtime/native-consumer/tmp/marker",
+                b"exact descendant",
+            )?;
             std::fs::write("/tmp/project/seed", b"second borrower")
                 .map_err(|error| error.to_string())
         })
@@ -501,6 +536,7 @@ mod tests {
         mount_overlay(&LinuxSandboxOverlay {
             template: template.clone(),
             destination,
+            writable_descendant_mounts: Vec::new(),
         })
     }
 

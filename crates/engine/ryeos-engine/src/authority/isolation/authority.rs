@@ -259,6 +259,78 @@ pub struct IsolationReadOnlyMountAuthority {
     scope: IsolationReadOnlyMountScope,
 }
 
+/// One daemon-prepared writable directory for a retained session environment
+/// variable.
+///
+/// The descriptor is the complete source authority. Callers supply only the
+/// validated environment name; the namespace destination is derived by the
+/// shared state owner and can never be redirected to an arbitrary path.
+#[derive(Debug, Clone)]
+pub struct IsolationWritableRuntimeViewMountAuthority {
+    environment_name: String,
+    destination: PathBuf,
+    source: lillux::InheritedDescriptorAuthority,
+    workspace_relative_path: Option<String>,
+}
+
+impl IsolationWritableRuntimeViewMountAuthority {
+    /// Construct the ordinary direct writable-mount lane used only by a
+    /// projectless scratch workspace, which has no retained workspace view.
+    pub fn new(
+        environment_name: String,
+        source: lillux::InheritedDescriptorAuthority,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(environment_name, source, None)
+    }
+
+    /// Construct a directory borrowed from one retained workspace view. The
+    /// child descriptor proves the exact directory now; the canonical
+    /// workspace-relative coordinate lets the isolation adapter reopen that
+    /// same descendant beneath its already-mounted workspace authority.
+    pub fn new_workspace_descendant(
+        environment_name: String,
+        workspace_relative_path: String,
+        source: lillux::InheritedDescriptorAuthority,
+    ) -> anyhow::Result<Self> {
+        ryeos_state::objects::validate_canonical_project_relative_path(&workspace_relative_path)
+            .map_err(|error| anyhow::anyhow!("invalid runtime-view workspace path: {error}"))?;
+        Self::new_inner(environment_name, source, Some(workspace_relative_path))
+    }
+
+    fn new_inner(
+        environment_name: String,
+        source: lillux::InheritedDescriptorAuthority,
+        workspace_relative_path: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let destination = ryeos_state::objects::runtime_view_mount_destination(&environment_name)?;
+        source
+            .directory_identity()
+            .map_err(|error| anyhow::anyhow!("runtime-view source is not a directory: {error}"))?;
+        Ok(Self {
+            environment_name,
+            destination,
+            source,
+            workspace_relative_path,
+        })
+    }
+
+    pub fn environment_name(&self) -> &str {
+        &self.environment_name
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    pub(crate) fn source(&self) -> &lillux::InheritedDescriptorAuthority {
+        &self.source
+    }
+
+    pub(crate) fn workspace_relative_path(&self) -> Option<&str> {
+        self.workspace_relative_path.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IsolationReadOnlyMountScope {
     ProjectRealization,
@@ -451,6 +523,9 @@ pub struct IsolationLaunchContext<'a> {
     /// Exact read-only realization mounts admitted for this program. These
     /// are not ambient policy paths and may not be synthesized by runtimes.
     pub external_read_only_mounts: &'a [IsolationReadOnlyMountAuthority],
+    /// Exact daemon-prepared writable runtime-view directories. These are
+    /// descriptor authority, not external content and not node-policy paths.
+    pub writable_runtime_view_mounts: &'a [IsolationWritableRuntimeViewMountAuthority],
     pub target_channels: &'a [IsolationTargetChannelAuthority],
     pub item_ref: &'a str,
     pub thread_id: &'a str,
@@ -459,6 +534,65 @@ pub struct IsolationLaunchContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_runtime_view_derives_a_flat_destination_from_a_directory_descriptor() {
+        let source = tempfile::tempdir().unwrap();
+        let source = lillux::PinnedDirectory::open(source.path())
+            .unwrap()
+            .unwrap();
+        let authority = IsolationWritableRuntimeViewMountAuthority::new(
+            "XDG_CACHE_HOME".to_string(),
+            source.inherited_descriptor_authority().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(authority.environment_name(), "XDG_CACHE_HOME");
+        assert_eq!(authority.workspace_relative_path(), None);
+        assert_eq!(
+            authority.destination(),
+            Path::new(ryeos_state::objects::SESSION_RUNTIME_VIEWS_ROOT).join("XDG_CACHE_HOME")
+        );
+
+        let descendant = IsolationWritableRuntimeViewMountAuthority::new_workspace_descendant(
+            "XDG_CACHE_HOME".to_string(),
+            ".ai/cache/ryeos-runtime/cache".to_string(),
+            source.inherited_descriptor_authority().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            descendant.workspace_relative_path(),
+            Some(".ai/cache/ryeos-runtime/cache")
+        );
+        assert!(
+            IsolationWritableRuntimeViewMountAuthority::new_workspace_descendant(
+                "XDG_CACHE_HOME".to_string(),
+                ".ai/cache/../escape".to_string(),
+                source.inherited_descriptor_authority().unwrap(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid runtime-view workspace path")
+        );
+
+        let invalid = IsolationWritableRuntimeViewMountAuthority::new(
+            "PATH".to_string(),
+            source.inherited_descriptor_authority().unwrap(),
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("protected or invalid name"));
+
+        let file_name = std::ffi::OsStr::new("not-a-directory");
+        std::fs::write(source.path().join(file_name), b"file").unwrap();
+        let file = source
+            .open_inherited_regular(file_name, false)
+            .unwrap()
+            .unwrap();
+        let invalid =
+            IsolationWritableRuntimeViewMountAuthority::new("XDG_CACHE_HOME".to_string(), file)
+                .unwrap_err();
+        assert!(invalid.to_string().contains("not a directory"));
+    }
 
     #[test]
     fn filesystem_ceiling_intersection_cannot_restore_node_mounts() {

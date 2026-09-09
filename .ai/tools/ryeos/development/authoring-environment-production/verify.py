@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T03:45:22Z:757c078269c15594c29ee2fe635ea162d5b2455d5596799c29cb168348420413:w66lJx1o978KJ9L0yEA12wL34M/qb5fMZ4/HMxIXGdZXe3RYhO9QfwnXAZ6mg9pV0FT3+IHSTCWhq6bUsMbTBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:36:31Z:b0530e30a4840f7dbe2bd7123c6f0c9b4dde60d3660f57e6a08328667b0ee23e:Xvr8rgu7bEzwMx2YW0AOTeW99lDRE7fn3nJdL8mfJ+Ef6r7xVD20xdNWs/8DuZEWqwsYelvSwiYrIn4PsM8zCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 # ryeos-tool:
 #   category: ryeos/development/authoring-environment-production
 #   version: "1.0.0"
@@ -13,10 +13,14 @@
 #     properties: {}
 #     additionalProperties: false
 #   config_resolve:
-#     type: single
-#     spec:
-#       path: development/ryeos/authoring-environment-inputs.yaml
-#       mode: first_match
+#     type: multi
+#     specs:
+#       - path: development/ryeos/authoring-environment-inputs.yaml
+#         mode: first_match
+#       - path: development/ryeos/authoring-utility-sources.yaml
+#         mode: first_match
+#       - path: development/ryeos/authoring-build-support.yaml
+#         mode: first_match
 #   external_content:
 #     - id: producer-python
 #       kind: tree
@@ -24,13 +28,10 @@
 #       digest: 800d4969489634cc3bbc5774bd9e99a330cdc23bbc1fd0fd231ec6a88ca9acdf
 #       mount_root: execution_runtime
 #       mount: producer-python
-#     - id: assembly-inputs
-#       kind: tree
-#       mode: pinned
-#       digest: cc090b3d53dd41c0351dcd5ea7a18bfd4e37957ae5738569039b9b88ffd9ff80
-#       metadata_hint: ryeos-authoring-inputs-v1-large-content
-#       mount_root: execution_runtime
-#       mount: authoring-inputs
+#   # assembly-inputs is selected by the enclosing producer Graph and reaches
+#   # this inline Tool through the admitted normalized realization set.
+#   # built-utilities is selected by that same Graph. Its exact product
+#   # manifest, not this source file, supplies the produced command bytes.
 
 from production import run_operation
 

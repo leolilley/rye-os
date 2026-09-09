@@ -19,7 +19,10 @@ pub const PERSISTENT_SESSION_CAPSULE_KIND: &str = "persistent_session_capsule";
 // mount roots in retained realizations. Predecessors are not launch authority.
 // v8 also requires exact evidence-attachment bindings in the retained program.
 // A v7 program omits that identity and cannot be reinterpreted during recovery.
-pub const PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION: u32 = 8;
+// v9 separates exact retained product redemption proof from program identity.
+// v10 requires prepared session-environment delivery. Earlier retained bridges
+// consume an incompatible raw map and cannot be launched with this envelope.
+pub const PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION: u32 = 10;
 pub const MAX_EXECUTABLE_SEARCH_PATH_ENTRIES: usize = 32;
 pub const MAX_SESSION_PROCESS_ENVIRONMENT_ENTRIES: usize = 32;
 pub const MAX_SESSION_PROCESS_ENVIRONMENT_ENCODED_BYTES: usize = 4_096;
@@ -381,6 +384,73 @@ pub enum SessionProcessEnvironmentPathKind {
     Directory,
 }
 
+/// Operational delivery of the retained environment, prepared by the launch
+/// owner. This is not an authored Config value or additional capsule authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedSessionProcessEnvironment {
+    pub bindings: BTreeMap<String, SessionProcessEnvironmentValue>,
+    pub runtime_view_delivery: SessionRuntimeViewDelivery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionRuntimeViewDelivery {
+    DescriptorWorkspace,
+    MountedNamespace {
+        destinations: BTreeMap<String, std::path::PathBuf>,
+    },
+}
+
+pub const SESSION_RUNTIME_VIEWS_ROOT: &str = "/ryeos/runtime-views";
+const MAX_SESSION_ENVIRONMENT_NAME_BYTES: usize = 128;
+// Preserve the authored-map bound while accounting for one derived destination
+// per entry, including both name spellings and fixed JSON envelope overhead.
+pub const MAX_PREPARED_SESSION_PROCESS_ENVIRONMENT_BYTES: usize =
+    MAX_SESSION_PROCESS_ENVIRONMENT_ENCODED_BYTES
+        + MAX_SESSION_PROCESS_ENVIRONMENT_ENTRIES
+            * (2 * MAX_SESSION_ENVIRONMENT_NAME_BYTES + SESSION_RUNTIME_VIEWS_ROOT.len() + 16)
+        + 128;
+
+pub fn runtime_view_mount_destination(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    validate_session_process_environment_name(name)?;
+    Ok(std::path::Path::new(SESSION_RUNTIME_VIEWS_ROOT).join(name))
+}
+
+impl PreparedSessionProcessEnvironment {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_session_process_environment(&self.bindings)?;
+        if let SessionRuntimeViewDelivery::MountedNamespace { destinations } =
+            &self.runtime_view_delivery
+        {
+            let expected = self
+                .bindings
+                .iter()
+                .filter(|(_, value)| {
+                    matches!(
+                        value,
+                        SessionProcessEnvironmentValue::RuntimeViewDirectory { .. }
+                    )
+                })
+                .map(|(name, _)| Ok((name.clone(), runtime_view_mount_destination(name)?)))
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+            if destinations.len() != expected.len()
+                || expected.iter().any(|(name, path)| {
+                    destinations.get(name).map(|value| value.as_os_str()) != Some(path.as_os_str())
+                })
+            {
+                anyhow::bail!(
+                    "prepared runtime-view mounts must exactly cover the retained bindings"
+                );
+            }
+        }
+        if serde_json::to_vec(self)?.len() > MAX_PREPARED_SESSION_PROCESS_ENVIRONMENT_BYTES {
+            anyhow::bail!("prepared session process environment exceeds its encoded byte bound");
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_session_process_environment(
     environment: &BTreeMap<String, SessionProcessEnvironmentValue>,
 ) -> anyhow::Result<()> {
@@ -430,7 +500,7 @@ pub fn validate_session_process_environment(
 pub fn validate_session_process_environment_name(name: &str) -> anyhow::Result<()> {
     let mut bytes = name.bytes();
     if name.is_empty()
-        || name.len() > 128
+        || name.len() > MAX_SESSION_ENVIRONMENT_NAME_BYTES
         || !bytes
             .next()
             .is_some_and(|byte| byte == b'_' || byte.is_ascii_uppercase())
@@ -535,6 +605,11 @@ pub struct AdmittedPersistentSessionCapsule {
     pub kind: String,
     pub exact_program: Value,
     pub exact_program_hash: String,
+    /// Full product authority retained independently of the semantic program.
+    /// Its exact projection must match the program before any reconstruction.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub retained_product_selections:
+        Option<crate::external_content::products::composition::ResolvedExternalProductSelections>,
     pub lifecycle: PersistentSessionLifecycleContract,
     pub wire: PersistentSessionWireContract,
     pub artifact_identity: AdmittedLaunchArtifactIdentity,
@@ -556,7 +631,47 @@ pub struct AdmittedPersistentSessionCapsule {
     pub executor_ref: String,
 }
 
+fn restore_persistent_product_selections(
+    exact_program: &Value,
+    retained: Option<
+        &crate::external_content::products::composition::ResolvedExternalProductSelections,
+    >,
+) -> anyhow::Result<Value> {
+    use crate::external_content::products::composition::EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY;
+    let slot = exact_program
+        .get("resolution_output")
+        .and_then(|v| v.get("composed"))
+        .and_then(|v| v.get("derived"))
+        .and_then(|v| v.get(EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY));
+    let mut restored = exact_program.clone();
+    match (retained, slot) {
+        (None, None) => {}
+        (Some(retained), Some(semantic)) => {
+            if retained.semantic_identity_value()? != *semantic {
+                anyhow::bail!(
+                    "persistent-session retained product proof contradicts its semantic program"
+                );
+            }
+            restored["resolution_output"]["composed"]["derived"]
+                [EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY] = serde_json::to_value(retained)?;
+        }
+        _ => anyhow::bail!(
+            "persistent-session selected program and retained product proof presence differ"
+        ),
+    }
+    Ok(restored)
+}
+
 impl AdmittedPersistentSessionCapsule {
+    /// Recover the full existing program DTO without guessing a source proof.
+    /// Does not call `validate`, so capsule validation can use this same owner.
+    pub fn retained_exact_program(&self) -> anyhow::Result<Value> {
+        restore_persistent_product_selections(
+            &self.exact_program,
+            self.retained_product_selections.as_ref(),
+        )
+    }
+
     pub fn authority(&self) -> PersistentSessionAuthority {
         PersistentSessionAuthority {
             exact_program_hash: self.exact_program_hash.clone(),
@@ -585,6 +700,10 @@ impl AdmittedPersistentSessionCapsule {
         let observed = lillux::sha256_hex(canonical.as_bytes());
         if observed != self.exact_program_hash {
             anyhow::bail!("persistent-session exact program hash mismatch");
+        }
+        let retained = self.retained_exact_program()?;
+        if lillux::canonical_json(&retained)?.len() > MAX_PERSISTENT_SESSION_EXACT_PROGRAM_BYTES {
+            anyhow::bail!("persistent-session retained program exceeds its byte bound");
         }
         self.authority().validate()?;
         super::thread_snapshot::validate_canonical_hash(
@@ -820,6 +939,129 @@ impl AdmittedStructuredSessionProfile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_session_environment_requires_exact_runtime_view_delivery() {
+        use super::*;
+        let bindings = BTreeMap::from([
+            (
+                "CARGO_HOME".to_owned(),
+                SessionProcessEnvironmentValue::RuntimeViewDirectory {
+                    relative_path: "cargo/home".to_owned(),
+                },
+            ),
+            (
+                "CARGO_NET_OFFLINE".to_owned(),
+                SessionProcessEnvironmentValue::Literal {
+                    value: "true".to_owned(),
+                },
+            ),
+        ]);
+        let valid = PreparedSessionProcessEnvironment {
+            bindings: bindings.clone(),
+            runtime_view_delivery: SessionRuntimeViewDelivery::MountedNamespace {
+                destinations: BTreeMap::from([(
+                    "CARGO_HOME".to_owned(),
+                    runtime_view_mount_destination("CARGO_HOME").unwrap(),
+                )]),
+            },
+        };
+        valid.validate().unwrap();
+        let mut descriptor = valid.clone();
+        descriptor.runtime_view_delivery = SessionRuntimeViewDelivery::DescriptorWorkspace;
+        descriptor.validate().unwrap();
+        for destinations in [
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "CARGO_HOME".to_owned(),
+                std::path::PathBuf::from("/tmp/cache"),
+            )]),
+            BTreeMap::from([
+                (
+                    "CARGO_HOME".to_owned(),
+                    runtime_view_mount_destination("CARGO_HOME").unwrap(),
+                ),
+                (
+                    "CARGO_NET_OFFLINE".to_owned(),
+                    runtime_view_mount_destination("CARGO_NET_OFFLINE").unwrap(),
+                ),
+            ]),
+        ] {
+            let mut changed = valid.clone();
+            changed.runtime_view_delivery =
+                SessionRuntimeViewDelivery::MountedNamespace { destinations };
+            assert!(changed.validate().is_err());
+        }
+        assert!(
+            serde_json::from_value::<PreparedSessionProcessEnvironment>(
+                serde_json::to_value(&bindings).unwrap()
+            )
+            .is_err()
+        );
+        for name in ["../CACHE", "CACHE/subdir", "RYEOS_CACHE", "PATH"] {
+            assert!(runtime_view_mount_destination(name).is_err());
+        }
+        for path in [
+            "/ryeos//runtime-views/CARGO_HOME",
+            "/ryeos/runtime-views/./CARGO_HOME",
+        ] {
+            let mut changed = valid.clone();
+            changed.runtime_view_delivery = SessionRuntimeViewDelivery::MountedNamespace {
+                destinations: BTreeMap::from([("CARGO_HOME".to_owned(), path.into())]),
+            };
+            assert!(changed.validate().is_err());
+        }
+        assert!(
+            serde_json::from_value::<BTreeMap<String, SessionProcessEnvironmentValue>>(
+                serde_json::to_value(&valid).unwrap()
+            )
+            .is_err(),
+            "prepared delivery is not authored environment authority"
+        );
+    }
+
+    #[test]
+    fn persistent_product_proof_restoration_requires_exact_semantic_equality() {
+        use crate::external_content::products::composition::*;
+        use crate::external_content::products::transfer::ProductWitnessSource;
+        let evidence = crate::external_content::products::qualification::tests::dynamic_evidence();
+        let selections = evidence.verifier_root_selections.unwrap();
+        let full = serde_json::json!({"resolution_output":{"composed":{"derived":{
+            (EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY): serde_json::to_value(&selections).unwrap()
+        }}}});
+        let semantic = serde_json::json!({"resolution_output": project_resolution_product_selections_for_identity(&full["resolution_output"]).unwrap()});
+        assert_eq!(
+            super::restore_persistent_product_selections(&semantic, Some(&selections)).unwrap(),
+            full
+        );
+        assert!(super::restore_persistent_product_selections(&semantic, None).is_err());
+        assert!(
+            super::restore_persistent_product_selections(&serde_json::json!({}), Some(&selections))
+                .is_err()
+        );
+        let mut changed = selections.clone().into_inner();
+        let first = changed.values_mut().next().unwrap();
+        first.witness_source = ProductWitnessSource::Received {
+            acceptance_hash: "a".repeat(64),
+        };
+        let received = ResolvedExternalProductSelections::new(changed).unwrap();
+        let restored =
+            super::restore_persistent_product_selections(&semantic, Some(&received)).unwrap();
+        assert_ne!(restored, full);
+        assert_eq!(
+            project_resolution_product_selections_for_identity(&restored["resolution_output"])
+                .unwrap(),
+            semantic["resolution_output"]
+        );
+        let mut mismatched = semantic.clone();
+        let id = selections.iter().next().unwrap().0;
+        mismatched["resolution_output"]["composed"]["derived"]
+            [EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY][id]["manifest_hash"] =
+            serde_json::json!("b".repeat(64));
+        assert!(
+            super::restore_persistent_product_selections(&mismatched, Some(&received)).is_err()
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -839,12 +1081,14 @@ mod tests {
 
     #[test]
     fn predecessor_capsule_schema_is_refused_without_translation() {
-        let value = serde_json::json!({
-            "schema": 1,
-            "kind": PERSISTENT_SESSION_CAPSULE_KIND
-        });
-        let error = AdmittedPersistentSessionCapsule::from_current_value(&value).unwrap_err();
-        assert!(error.to_string().contains("schema"), "got: {error:#}");
+        for schema in [1, 9] {
+            let value = serde_json::json!({
+                "schema": schema,
+                "kind": PERSISTENT_SESSION_CAPSULE_KIND
+            });
+            let error = AdmittedPersistentSessionCapsule::from_current_value(&value).unwrap_err();
+            assert!(error.to_string().contains("schema"), "got: {error:#}");
+        }
     }
 
     #[test]

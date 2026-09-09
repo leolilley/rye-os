@@ -305,6 +305,12 @@ pub enum ExecutionProjectAuthority {
         /// Current operational generation materialized for this transition.
         snapshot_hash: String,
         realization: PinnedProjectRealization,
+        /// Exact output partition admitted before this generation's first
+        /// capsule and workspace birth. Required-nullable distinguishes an
+        /// ordinary pinned execution from an output-bearing one without a
+        /// compatibility default.
+        #[serde(deserialize_with = "super::deserialize_required_nullable")]
+        workspace_outputs: Option<super::WorkspaceOutputAuthority>,
         environment: EnvironmentAuthority,
         capability_ceiling: Vec<String>,
         child_policy: ChildProjectAuthorityPolicy,
@@ -392,6 +398,11 @@ impl ExecutionProjectAuthority {
             OperationalProjectAuthorityTransition::SelectPinnedChildGeneration {
                 snapshot_hash,
             } => {
+                if self.workspace_outputs().is_some() {
+                    anyhow::bail!(
+                        "output-bearing project authority requires an explicit paired snapshot/capture transition"
+                    );
+                }
                 let mut selected = self
                     .clone()
                     .with_pinned_snapshot_hash(snapshot_hash.to_string())?;
@@ -419,10 +430,111 @@ impl ExecutionProjectAuthority {
                         "read-only pinned project authority cannot advance a continuation generation"
                     );
                 }
+                if self.workspace_outputs().is_some() {
+                    anyhow::bail!(
+                        "output-bearing project authority requires an explicit paired snapshot/capture transition"
+                    );
+                }
                 self.clone()
                     .with_pinned_snapshot_hash(snapshot_hash.to_string())
             }
         }
+    }
+
+    /// Attach the complete output partition to an initial retained COW
+    /// generation without changing any existing project-authority field.
+    /// Runtime ownership additionally restricts this operation to a fresh
+    /// non-borrowed root provenance.
+    pub fn condition_initial_workspace_outputs(
+        &self,
+        partition: super::WorkspaceOutputPartition,
+    ) -> anyhow::Result<Self> {
+        self.validate()?;
+        partition.validate()?;
+        let mut conditioned = self.clone();
+        let Self::PinnedGeneration {
+            base_snapshot_hash,
+            snapshot_hash,
+            realization:
+                PinnedProjectRealization::Cow {
+                    terminal_publication,
+                },
+            workspace_outputs,
+            ..
+        } = &mut conditioned
+        else {
+            anyhow::bail!("workspace outputs require pinned COW project authority");
+        };
+        if base_snapshot_hash != snapshot_hash {
+            anyhow::bail!("workspace outputs must be conditioned on the initial COW generation");
+        }
+        if matches!(terminal_publication, PinnedTerminalPublication::Discard) {
+            anyhow::bail!("workspace outputs require retained COW result authority");
+        }
+        if workspace_outputs.is_some() {
+            anyhow::bail!("workspace output authority is already conditioned");
+        }
+        *workspace_outputs = Some(super::WorkspaceOutputAuthority::initial(partition)?);
+        conditioned.validate()?;
+        Ok(conditioned)
+    }
+
+    /// Advance an output-bearing COW generation, or select its immutable child
+    /// generation, only when the caller supplies the capture object paired
+    /// with the new snapshot. The lifecycle owner must verify that object's
+    /// source/result/partition contract before invoking this state transition.
+    pub fn transition_operational_generation_with_workspace_capture(
+        &self,
+        transition: OperationalProjectAuthorityTransition<'_>,
+        workspace_output_capture_hash: &str,
+    ) -> anyhow::Result<Self> {
+        self.validate()?;
+        validate_hash(
+            "workspace output capture hash",
+            workspace_output_capture_hash,
+        )?;
+        let (snapshot_hash, selects_child_generation) = match transition {
+            OperationalProjectAuthorityTransition::SealPinnedCowCheckpoint { snapshot_hash } => {
+                (snapshot_hash, false)
+            }
+            OperationalProjectAuthorityTransition::AdvancePinnedCowContinuation {
+                result_snapshot_hash,
+            } => (result_snapshot_hash, false),
+            OperationalProjectAuthorityTransition::SelectPinnedChildGeneration {
+                snapshot_hash,
+            } => (snapshot_hash, true),
+            OperationalProjectAuthorityTransition::InheritContinuation => {
+                anyhow::bail!("workspace output capture pairing requires a generation transition")
+            }
+        };
+        validate_hash("operational project snapshot hash", snapshot_hash)?;
+        let mut transitioned = self.clone();
+        let Self::PinnedGeneration {
+            snapshot_hash: snapshot_slot,
+            realization,
+            workspace_outputs: Some(workspace_outputs),
+            ..
+        } = &mut transitioned
+        else {
+            anyhow::bail!("paired workspace capture requires output-bearing pinned authority");
+        };
+        if !selects_child_generation && !matches!(realization, PinnedProjectRealization::Cow { .. })
+        {
+            anyhow::bail!("paired workspace capture requires pinned COW authority");
+        }
+        *snapshot_slot = snapshot_hash.to_owned();
+        workspace_outputs.capture_hash = Some(workspace_output_capture_hash.to_owned());
+        if selects_child_generation {
+            let Self::PinnedGeneration {
+                base_snapshot_hash, ..
+            } = &mut transitioned
+            else {
+                unreachable!("paired workspace transition already proved pinned authority")
+            };
+            *base_snapshot_hash = snapshot_hash.to_owned();
+        }
+        transitioned.validate()?;
+        Ok(transitioned)
     }
 
     /// Return whether two admitted continuation segments belong to the same
@@ -444,6 +556,7 @@ impl ExecutionProjectAuthority {
                     base_snapshot_hash: left_base,
                     snapshot_hash: _,
                     realization: left_realization @ PinnedProjectRealization::Cow { .. },
+                    workspace_outputs: left_workspace_outputs,
                     environment: left_environment,
                     capability_ceiling: left_capabilities,
                     child_policy: left_child_policy,
@@ -454,6 +567,7 @@ impl ExecutionProjectAuthority {
                     base_snapshot_hash: right_base,
                     snapshot_hash: _,
                     realization: right_realization @ PinnedProjectRealization::Cow { .. },
+                    workspace_outputs: right_workspace_outputs,
                     environment: right_environment,
                     capability_ceiling: right_capabilities,
                     child_policy: right_child_policy,
@@ -462,6 +576,12 @@ impl ExecutionProjectAuthority {
                 && left_display_path == right_display_path
                 && left_base == right_base
                 && left_realization == right_realization
+                && left_workspace_outputs
+                    .as_ref()
+                    .map(|value| &value.partition)
+                    == right_workspace_outputs
+                        .as_ref()
+                        .map(|value| &value.partition)
                 && left_environment == right_environment
                 && left_capabilities == right_capabilities
                 && left_child_policy == right_child_policy),
@@ -587,6 +707,7 @@ impl ExecutionProjectAuthority {
             base_snapshot_hash: snapshot_hash.clone(),
             snapshot_hash,
             realization,
+            workspace_outputs: None,
             environment,
             capability_ceiling,
             child_policy: ChildProjectAuthorityPolicy::Inherit,
@@ -645,6 +766,7 @@ impl ExecutionProjectAuthority {
                 environment,
                 capability_ceiling,
                 realization,
+                workspace_outputs,
                 ..
             } => {
                 validate_trimmed_control_free(
@@ -720,6 +842,16 @@ impl ExecutionProjectAuthority {
                     anyhow::bail!(
                         "read-only pinned authority base must equal its operational generation"
                     );
+                }
+                if let Some(workspace_outputs) = workspace_outputs {
+                    workspace_outputs.validate()?;
+                    if matches!(realization, PinnedProjectRealization::ReadOnly)
+                        && workspace_outputs.capture_hash.is_none()
+                    {
+                        anyhow::bail!(
+                            "read-only workspace output authority requires a paired capture"
+                        );
+                    }
                 }
                 validate_capability_ceiling(capability_ceiling)
             }
@@ -810,6 +942,7 @@ impl ExecutionProjectAuthority {
                 base_snapshot_hash,
                 snapshot_hash,
                 realization,
+                workspace_outputs,
                 environment,
                 capability_ceiling,
                 child_policy,
@@ -820,6 +953,7 @@ impl ExecutionProjectAuthority {
                 "base_snapshot_hash": base_snapshot_hash,
                 "snapshot_hash": snapshot_hash,
                 "realization": realization,
+                "workspace_outputs": workspace_outputs,
                 "environment": environment,
                 "capability_ceiling": capability_ceiling,
                 "child_policy": child_policy,
@@ -832,6 +966,15 @@ impl ExecutionProjectAuthority {
             Self::PinnedGeneration {
                 base_snapshot_hash, ..
             } => Some(base_snapshot_hash),
+            Self::Projectless { .. } | Self::LiveProject { .. } => None,
+        }
+    }
+
+    pub fn workspace_outputs(&self) -> Option<&super::WorkspaceOutputAuthority> {
+        match self {
+            Self::PinnedGeneration {
+                workspace_outputs, ..
+            } => workspace_outputs.as_ref(),
             Self::Projectless { .. } | Self::LiveProject { .. } => None,
         }
     }
@@ -1069,6 +1212,35 @@ fn validate_capability_ceiling(capabilities: &[String]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn output_partition() -> super::super::WorkspaceOutputPartition {
+        let bounds = crate::external_content::products::ProductBounds {
+            maximum_entries: 8,
+            maximum_depth: 4,
+            maximum_file_bytes: 1_024,
+            maximum_total_bytes: 4_096,
+        };
+        let mut partition = super::super::WorkspaceOutputPartition {
+            schema: super::super::WORKSPACE_OUTPUT_PARTITION_SCHEMA.to_owned(),
+            recipe_binding: "product_recipe".to_owned(),
+            recipe_ref: "config:test/products".to_owned(),
+            recipe_raw_content_digest: "1".repeat(64),
+            declarations_hash: "2".repeat(64),
+            project_snapshot_policy_hash: "3".repeat(64),
+            roots: vec![super::super::WorkspaceOutputRoot {
+                name: "runtime".to_owned(),
+                path: "products/runtime".to_owned(),
+                storage: crate::external_content::products::ProductStorage::LargeContent,
+                declared_bounds: bounds.clone(),
+                effective_bounds: bounds,
+            }],
+            products: Vec::new(),
+            partition_identity: String::new(),
+            capture_policy_digest: "4".repeat(64),
+        };
+        partition.partition_identity = partition.derived_partition_identity().unwrap();
+        partition
+    }
+
     fn live_authority(root: &Path, access: LiveProjectAccess) -> ExecutionProjectAuthority {
         ExecutionProjectAuthority::live(
             root.to_path_buf(),
@@ -1092,6 +1264,89 @@ mod tests {
         });
         let error = serde_json::from_value::<LiveAccessAuthority>(missing).unwrap_err();
         assert!(error.to_string().contains("confinement"));
+    }
+
+    #[test]
+    fn pinned_authority_requires_explicit_nullable_workspace_outputs() {
+        let authority = ExecutionProjectAuthority::pinned(
+            "test-project".to_owned(),
+            Some(PathBuf::from("/tmp/test-project")),
+            "a".repeat(64),
+            PinnedProjectRealization::ReadOnly,
+            EnvironmentAuthority::None,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut encoded = serde_json::to_value(authority).unwrap();
+        assert!(encoded["workspace_outputs"].is_null());
+        encoded.as_object_mut().unwrap().remove("workspace_outputs");
+        assert!(serde_json::from_value::<ExecutionProjectAuthority>(encoded).is_err());
+    }
+
+    #[test]
+    fn output_bearing_generation_advances_only_with_a_new_capture() {
+        let base = "a".repeat(64);
+        let authority = ExecutionProjectAuthority::pinned(
+            "test-project".to_owned(),
+            Some(PathBuf::from("/tmp/test-project")),
+            base,
+            PinnedProjectRealization::Cow {
+                terminal_publication: PinnedTerminalPublication::RetainResult,
+            },
+            EnvironmentAuthority::None,
+            Vec::new(),
+        )
+        .unwrap()
+        .condition_initial_workspace_outputs(output_partition())
+        .unwrap();
+        let result = "b".repeat(64);
+        let transition = OperationalProjectAuthorityTransition::AdvancePinnedCowContinuation {
+            result_snapshot_hash: &result,
+        };
+        assert!(
+            authority
+                .transition_operational_generation(transition)
+                .is_err()
+        );
+        let capture = "c".repeat(64);
+        let advanced = authority
+            .transition_operational_generation_with_workspace_capture(transition, &capture)
+            .unwrap();
+        assert_eq!(
+            advanced.operational_snapshot_projection(),
+            Some(result.as_str())
+        );
+        assert_eq!(
+            advanced
+                .workspace_outputs()
+                .and_then(|outputs| outputs.capture_hash.as_deref()),
+            Some(capture.as_str())
+        );
+        assert!(authority.same_continuation_lineage(&advanced).unwrap());
+
+        let selected_hash = "d".repeat(64);
+        let selected_capture = "e".repeat(64);
+        let selected = authority
+            .clone()
+            .for_child()
+            .unwrap()
+            .transition_operational_generation_with_workspace_capture(
+                OperationalProjectAuthorityTransition::SelectPinnedChildGeneration {
+                    snapshot_hash: &selected_hash,
+                },
+                &selected_capture,
+            )
+            .unwrap();
+        assert_eq!(
+            selected.subject_base_snapshot_hash(),
+            Some(selected_hash.as_str())
+        );
+        assert_eq!(
+            selected
+                .workspace_outputs()
+                .and_then(|outputs| outputs.capture_hash.as_deref()),
+            Some(selected_capture.as_str())
+        );
     }
 
     #[test]

@@ -309,6 +309,7 @@ mod integration_tests {
                         kind: kind.into(),
                         item_ref: item_ref.into(),
                         ref_bindings: std::collections::BTreeMap::new(),
+                        product_selections: Vec::new(),
                         launch_mode: "wait".into(),
                         parameters: serde_json::json!({}),
                         project_context: ProjectContext::LocalPath {
@@ -375,6 +376,7 @@ mod integration_tests {
                         kind: kind.into(),
                         item_ref: item_ref.into(),
                         ref_bindings: std::collections::BTreeMap::new(),
+                        product_selections: Vec::new(),
                         launch_mode: "wait".into(),
                         parameters: serde_json::json!({}),
                         project_context: ProjectContext::None,
@@ -753,6 +755,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
 
@@ -808,6 +811,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
         store
@@ -939,6 +943,7 @@ mod integration_tests {
             }],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
 
@@ -1055,6 +1060,7 @@ mod integration_tests {
                     artifacts: vec![],
                     managed_envelope: None,
                     result_project_snapshot_hash: None,
+                    result_workspace_output_capture_hash: None,
                     final_cost: None,
                 },
             )
@@ -1134,6 +1140,7 @@ mod integration_tests {
                     artifacts: vec![],
                     managed_envelope: None,
                     result_project_snapshot_hash: None,
+                    result_workspace_output_capture_hash: None,
                     final_cost: None,
                 },
             )
@@ -1208,6 +1215,7 @@ mod integration_tests {
                     artifacts: vec![],
                     managed_envelope: None,
                     result_project_snapshot_hash: None,
+                    result_workspace_output_capture_hash: None,
                     final_cost: None,
                 },
             )
@@ -1446,6 +1454,7 @@ mod integration_tests {
                     artifacts: vec![],
                     managed_envelope: None,
                     result_project_snapshot_hash: None,
+                    result_workspace_output_capture_hash: None,
                     final_cost: None,
                 },
             )
@@ -1551,6 +1560,7 @@ mod integration_tests {
             kind: "directive".into(),
             item_ref: "directive:test/item".into(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             launch_mode: "wait".into(),
             parameters: serde_json::json!({}),
             project_context: ProjectContext::LocalPath {
@@ -1695,6 +1705,7 @@ mod integration_tests {
             kind: "directive".into(),
             item_ref: "directive:test/item".into(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             launch_mode: "wait".into(),
             parameters: serde_json::json!({}),
             project_context: ProjectContext::LocalPath {
@@ -2122,6 +2133,7 @@ mod integration_tests {
             }],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
 
@@ -2266,6 +2278,7 @@ mod integration_tests {
             }],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: Some(ryeos_engine::contracts::FinalCost {
                 turns: 3,
                 input_tokens: 1500,
@@ -2381,6 +2394,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
         store
@@ -2453,6 +2467,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
 
@@ -2500,6 +2515,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
 
@@ -2552,6 +2568,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
         store
@@ -2567,6 +2584,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
         let err = store
@@ -2602,6 +2620,7 @@ mod integration_tests {
             artifacts: vec![],
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             final_cost: None,
         };
 

@@ -537,6 +537,7 @@ mod tests {
     fn skeleton() -> PreparedManagedLaunchSkeleton {
         PreparedManagedLaunchSkeleton {
             prepared: PreparedRuntimeLaunch {
+                project_result_requirement: ryeos_handler_protocol::ProjectResultRequirement::None,
                 filesystem_authority_ceiling:
                     ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
                 network_authority_ceiling:
@@ -743,6 +744,8 @@ mod tests {
         fill.complete(
             PreparedManagedLaunchSkeleton {
                 prepared: PreparedRuntimeLaunch {
+                    project_result_requirement:
+                        ryeos_handler_protocol::ProjectResultRequirement::None,
                     filesystem_authority_ceiling:
                         ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
                     network_authority_ceiling:
@@ -773,6 +776,8 @@ mod tests {
         old_fill.complete(
             PreparedManagedLaunchSkeleton {
                 prepared: PreparedRuntimeLaunch {
+                    project_result_requirement:
+                        ryeos_handler_protocol::ProjectResultRequirement::None,
                     filesystem_authority_ceiling:
                         ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
                     network_authority_ceiling:
@@ -796,6 +801,8 @@ mod tests {
         new_fill.complete(
             PreparedManagedLaunchSkeleton {
                 prepared: PreparedRuntimeLaunch {
+                    project_result_requirement:
+                        ryeos_handler_protocol::ProjectResultRequirement::None,
                     filesystem_authority_ceiling:
                         ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
                     network_authority_ceiling:
@@ -829,6 +836,7 @@ mod tests {
         );
         let skeleton = PreparedManagedLaunchSkeleton {
             prepared: PreparedRuntimeLaunch {
+                project_result_requirement: ryeos_handler_protocol::ProjectResultRequirement::None,
                 filesystem_authority_ceiling:
                     ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
                 network_authority_ceiling:

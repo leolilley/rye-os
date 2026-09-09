@@ -154,6 +154,18 @@
       "sources": "69bd92999001a562050e40375b9cf7dc86b89e22ae6b27d2cc492be2aad9db53"
     }
   },
+  "current_support_contract": {
+    "purpose": "Exact post-relocation output observed after the RUNPATH-before-PT_INTERP recipe correction; not qualification authority",
+    "source_snapshot": "018d56e7d662ca7b76186e21060723935ba4d80e6dab85065e0490b7dc3fd456",
+    "producer_thread": "T-2b6fb5bb-c1b8-56bc-0794-c57849e9a417",
+    "product_witness_hash": "c7ddc511736addba9fe1e509584fbbd91eb7b61b54e7cc71df9cbb096df63627",
+    "product_manifest_hash": "57c5c8ce6b2dbb1888b500029f15716883576d9c98d778a17824c681924f0062",
+    "input_contract_sha256": "b2b960e695bfa862f1874b1de48c47ab55abbcb69e2e1c634a8d70dd36ff972b",
+    "relocation_recipe_content_digest": "7456daa992ae8a0b98551f2db8d65afbf6799139553df434064db25e1e28e08b",
+    "inventory_sha256": "a74f701cda735f5f959b900ae26af9bc8ceff83ef6c86f971ff092c74ea7e934",
+    "files": 89,
+    "bytes": 21421985
+  },
   "support_with_tee": {
     "assembly": {
       "thread_id": "T-759204ab-1756-c500-0865-a2a5eafb3bac",

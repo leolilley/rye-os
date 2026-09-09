@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
+pub use ryeos_handler_protocol::ProjectResultRequirement;
 use serde::{Deserialize, Serialize};
 
 use crate::canonical_ref::CanonicalRef;
@@ -42,9 +43,9 @@ const MAX_LAUNCH_RUNTIME_DATA_KEYS: usize = 32;
 const MAX_LAUNCH_CONFIG_INPUTS: usize = 16;
 const MAX_LAUNCH_RUNTIME_FACTS: usize = 128;
 const MAX_LAUNCH_EXECUTION_DEPENDENCIES: usize = 8;
-const MAX_LAUNCH_CONTENT_DEPENDENCIES: usize = 8;
-const MAX_LAUNCH_CONTENT_TARGETS: usize = 8;
-const MAX_LAUNCH_EXECUTABLE_SEARCH_ENTRIES: usize = 32;
+pub(crate) const MAX_LAUNCH_CONTENT_DEPENDENCIES: usize = 8;
+pub(crate) const MAX_LAUNCH_CONTENT_TARGETS: usize = 8;
+pub(crate) const MAX_LAUNCH_EXECUTABLE_SEARCH_ENTRIES: usize = 32;
 const MAX_LAUNCH_EVIDENCE_ATTACHMENTS: usize = 64;
 const MAX_LAUNCH_EVIDENCE_ATTACHMENT_BYTES: u64 = ryeos_state::objects::MAX_BUNDLE_EVENT_ATTACHMENTS
     as u64
@@ -101,6 +102,11 @@ pub struct RuntimeYaml {
     /// merges, and clamps values declared by this signed descriptor.
     #[serde(default)]
     pub limits: RuntimeLimitsDecl,
+    /// Optional pure projector for execution-specific result/call evidence.
+    /// Selection is by this runtime's exact signed ref and content digest,
+    /// never by the kind named in `serves`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_evidence: Option<ryeos_handler_protocol::ExecutionEvidenceProjectorDeclWire>,
     #[serde(default)]
     pub description: Option<String>,
     /// Replay-aware resume policy for this runtime. Presence ⇒ this runtime
@@ -288,9 +294,23 @@ pub enum ExternalEffectAuthorityDecl {
 #[serde(deny_unknown_fields)]
 pub struct RefBindingDecl {
     pub required: bool,
+    pub source: RefBindingSource,
+    pub project_result_requirement: ProjectResultRequirement,
     pub allowed_kinds: Vec<String>,
     pub allowed_spaces: Vec<LaunchItemSpace>,
     pub allowed_trust: Vec<TrustClass>,
+}
+
+/// Signed owner of a managed runtime's ref-binding coordinate.
+///
+/// `caller` preserves explicit invocation input. `primary_field` projects one
+/// exact string from the already verified composed primary, avoiding a second
+/// caller-authored copy while leaving resolution and authorization unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RefBindingSource {
+    Caller,
+    PrimaryField { path: Vec<String> },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -728,6 +748,13 @@ pub(crate) fn validate_runtime_yaml(
             reason: format!("expected `kind: runtime`, got `kind: {}`", yaml.kind),
         });
     }
+    if let Some(projector) = &yaml.execution_evidence {
+        crate::execution_evidence::validate_execution_evidence_projector_declaration(projector)
+            .map_err(|reason| EngineError::RuntimeYamlInvalid {
+                path: yaml_path.to_owned(),
+                reason,
+            })?;
+    }
     if yaml.serves.is_empty() {
         return Err(EngineError::RuntimeYamlInvalid {
             path: yaml_path.to_owned(),
@@ -962,6 +989,30 @@ fn validate_launch_contract(yaml_path: &Path, yaml: &RuntimeYaml) -> Result<(), 
     }
     for (name, binding) in &contract.ref_bindings {
         validate_launch_name(yaml_path, "launch_contract.ref_bindings", name)?;
+        if let RefBindingSource::PrimaryField { path } = &binding.source {
+            if path.is_empty() || path.len() > 8 {
+                return runtime_yaml_error(
+                    yaml_path,
+                    format!(
+                        "launch_contract.ref_bindings.{name}.source.path must contain 1 to 8 fields"
+                    ),
+                );
+            }
+            for field in path {
+                if field.is_empty()
+                    || field.len() > 64
+                    || field.trim() != field
+                    || field.chars().any(char::is_control)
+                {
+                    return runtime_yaml_error(
+                        yaml_path,
+                        format!(
+                            "launch_contract.ref_bindings.{name}.source.path contains an invalid field"
+                        ),
+                    );
+                }
+            }
+        }
         validate_non_empty_unique(
             yaml_path,
             &format!("launch_contract.ref_bindings.{name}.allowed_kinds"),
@@ -1481,8 +1532,8 @@ where
     values.iter().any(|value| !seen.insert(value))
 }
 
-fn validate_launch_name(yaml_path: &Path, field: &str, name: &str) -> Result<(), EngineError> {
-    let valid = !name.is_empty()
+pub(crate) fn valid_launch_name(name: &str) -> bool {
+    !name.is_empty()
         && name.len() <= MAX_LAUNCH_NAME_BYTES
         && name
             .bytes()
@@ -1492,8 +1543,11 @@ fn validate_launch_name(yaml_path: &Path, field: &str, name: &str) -> Result<(),
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         && !name.ends_with('_')
-        && !name.contains("__");
-    if !valid {
+        && !name.contains("__")
+}
+
+fn validate_launch_name(yaml_path: &Path, field: &str, name: &str) -> Result<(), EngineError> {
+    if !valid_launch_name(name) {
         return runtime_yaml_error(
             yaml_path,
             format!(
@@ -1623,6 +1677,7 @@ mod tests {
             },
             observability: RuntimeObservabilityDecl::default(),
             limits: RuntimeLimitsDecl::default(),
+            execution_evidence: None,
             description: None,
             native_resume: None,
         }
@@ -1936,6 +1991,8 @@ mod tests {
             "model".to_string(),
             RefBindingDecl {
                 required: true,
+                source: RefBindingSource::Caller,
+                project_result_requirement: ProjectResultRequirement::None,
                 allowed_kinds: vec!["test_kind".to_string()],
                 allowed_spaces: vec![LaunchItemSpace::Node],
                 allowed_trust: vec![TrustClass::TrustedNode],

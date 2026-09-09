@@ -1,9 +1,9 @@
-<!-- ryeos:signed:2026-09-06T22:52:09Z:8e0102e3efd6c2fa4b18f5181a480fab8ada1a1f6a446705f989cc17757b373c:2/tty1jYQ6GsPEdMh5DeYGhoJWUmBDAET4DX2sDnKm6NbgUUduCDO8YIhnNx6iEj3K58B6gfzsoZsym+8M56CQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T01:19:50Z:8a0f0e0384100b5d465756d8fef8bed6424b01c6be61539d6bfe7cde4e7891e3:wtcpzJI60a8YudURQPbuR/aD4mMeL/9AxVcgJXawIqIQXYzp4JmPVAk8b7dLgDAWq6sx63QvDkIsg08uwdfZCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 
 ---
 category: ryeos/core/state
 tags: [architecture, cas, state, truth, projection, sqlite]
-version: "1.3.0"
+version: "1.4.0"
 description: >
   The three-tier truth model — CAS objects, signed refs, and the
   rebuildable SQLite projection. Content-addressed storage as the
@@ -192,13 +192,14 @@ admission; adding, removing or changing source evidence changes the binding
 subject and cannot reuse a prior grant. Content use still requires the exact
 active target-local binding and current authorizer.
 
-The import service has three explicit sources. `source: filesystem` captures a
+The import service has four explicit sources. `source: filesystem` captures a
 canonical member beneath a node-admitted named root. `source: retained_result`
 selects a file or nonempty regular-file subtree from an exact successfully
 completed execution's retained result snapshot. It requires the configured local
 operator to own the exact chain root and thread; a snapshot hash alone grants
 no access. `source: retained_binding` reuses the complete unchanged manifest of
-an exact currently active node-signed binding. All three produce the same
+an exact currently active node-signed binding. `source: retained_product` reuses
+an exact published node-attested product witness. All four produce the same
 staging receipt for separate consumer binding.
 
 Retained-binding admission requires the configured local operator to be that
@@ -230,6 +231,7 @@ The CLI exposes these as:
 ryeos external-content import <named-root> <path> <file|tree> <content|large_content> <maximum-bytes>
 ryeos external-content import-result <chain-root> <thread> <result-snapshot> <path> <file|tree> <content|large_content> <maximum-bytes>
 ryeos external-content import-binding <exact-active-binding-hash> <maximum-bytes>
+ryeos external-content import-product <exact-product-witness-hash> <maximum-bytes>
 ```
 
 Use exact returned execution coordinates, not thread discovery or a mutable
@@ -238,6 +240,90 @@ ordinary content manifest; files above the small-content ceiling use the existin
 verified large-store ingest and chunk commitments. Producer/snapshot provenance
 changes acquisition identity, not the resulting payload manifest. Current node
 capture exclusions and all selected-tier limits still apply.
+
+### Named producer products
+
+A producer Graph can name a signed Config once using `product_recipe`. The
+graph-owned launch preparer validates its bounded `build_products` block and
+retains the Config ref, raw digest, declarations and declaration hash in the
+admitted capsule. Normal ref authorization and trust checks still apply; the
+caller cannot supply different declarations during capture.
+
+The configured local operator can use exact completed execution coordinates:
+
+```text
+ryeos external-content capture-product <chain-root> <terminal-thread> <product-name>
+ryeos external-content product <chain-root> <terminal-thread> <product-name>
+```
+
+Capture requires successful terminal retained-project authority. The declaration
+owns path, shape, storage, bounds and any expected manifest; current node policy
+can narrow them. A missing optional output is distinct from an excluded,
+malformed or over-budget output. Continued and failed threads cannot publish a
+successful product.
+
+The existing Attestation format carries compact node testimony and owns the
+selected manifest closure. A signed exact-coordinate head preserves its one
+immutable answer across retries. Capsule and historical snapshot hashes are
+testimony, not owning edges to all build scratch. Exact lookup and import work
+without re-opening that history; they verify current node/owner and actual bytes.
+Import creates fresh staging, not a consumer grant or qualification claim.
+
+Product declarations choose their source explicitly. `retained_project` selects
+from the regular-file project snapshot. `workspace_output` selects from a named,
+admitted output root. Output roots are disjoint from source capture and mounted
+inputs; products may select nested subtrees within a root. Source snapshot and
+output capture form one retained generation through suspension, continuation,
+freeze and recovery. Missing roots and empty directories remain distinct.
+
+Output capture uses the existing content or large-content manifest, preserving
+contained relative symlinks, empty directories and normalized file modes
+(0644 or 0755). It does not preserve arbitrary permission bits or owner metadata.
+Native capture reads the frozen tree; enforced capture applies the authenticated
+adapter delta to the retained lower manifest. An overlay upper directory is not
+a complete result tree. Both paths apply the admitted bounds and exclusions.
+
+Product heads currently retain their captured closures until an explicit product
+lifecycle is implemented. Ordinary GC or binding release is not product release;
+do not enable unbounded unattended production on this retention contract.
+
+### Qualification and consumption
+
+A product witness proves capture, not suitability for a consumer. A signed
+producer relationship names the consumer declaration and any required independent
+qualification policy. That bundle-owned policy chooses an admitted verifier and
+finite claims. Qualification is published from the verifier's exact successful
+terminal execution over the captured manifest, not producer-supplied assertions.
+Static admission consumes this evidence without running probes.
+
+The current verifier lane requires a pre-authored literal pin for its subject.
+It can qualify reproduction of that expected manifest; qualification of a new
+manifest without re-signing the verifier is not yet supported by this lane.
+
+`external-content qualify-product` publishes that exact qualification;
+`external-content compose-product` creates a fresh consumer-scoped binding for an
+exact project generation. Worker-environment product selections carry only the
+declaration id and witness hashes. Current policy, subject bytes and scope are
+checked before sealing the selected runtime. Reusing bytes does not reuse a
+consumer's binding authority. Existing literal pins and explicit local execution
+remain available; an execution-runtime mount still requires enforced isolation.
+
+### Recorded producer execution
+
+Build reuse is an ordinary wrapper Graph's `effects: recorded` action targeting
+the product producer Graph. The wrapper has no output partition. The producer
+uses its own awaited, retained workspace root; its admitted source, definition,
+parameters and output partition determine the build subject. On a valid hit,
+RyeOS returns the typed accepted-product result without creating a new producer.
+On a miss, only successful terminal capture can publish that result. Failed
+producers and arbitrary stdout cannot create accepted-product authority.
+
+The retained effect answer owns the accepted product witnesses and their payload
+closures, not the producer's unrelated scratch or historical source snapshots.
+Replay checks required product coverage, current trust and policy, and retained
+bytes. Independent qualification is separate from build acceptance. Original
+admission determines the build identity; final placement remains execution
+evidence when the producer continues into a successor.
 
 Project snapshots retain regular files and normalized executable modes, not
 symlinks or empty directories. Retained tree import derives only directories

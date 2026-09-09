@@ -78,7 +78,8 @@ impl AuthorityClient {
                 "source": "executed",
                 "effect_class": "live",
                 "action_digest": "ab".repeat(32),
-                "publication": "not_applicable"
+                "publication": "not_applicable",
+                "result_projection": {"kind": "dispatched_subject"}
             }
         })
     }

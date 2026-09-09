@@ -1,16 +1,16 @@
-<!-- ryeos:signed:2026-09-07T08:23:42Z:76dad9ed60a9d07136d50c3c14073f48e06ac42140c4dd797db0355eb0b6936d:3Y1D5lj1ss8m7VKCq7Gl9WBxjEXrRO+7z4FRj8tn0nckzzZfTZV4XUZonMB30VCpeKXNMfHyjhyIIN7soJjtBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T16:56:41Z:05e7ea215622cebd3ef6d3323ef9e513ff63951fefc6e2ed8c54cc43f323e328:6k1LQA9Hj+gTOGdjWoxOgNCWRsZf7RvLSl8cCULQJXMH+cGA7Zibv4AdnwVd1+b6jHg1AEu3Vu65pjd47XjvBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/development
 tags: [development, authoring, external-content, production]
-version: "1.2.0"
+version: "1.4.0"
 description: Finite production and qualification of the shared command environment.
 ---
 
 # Authoring-environment production
 
 The source-local namespace
-`tools/ryeos/development/authoring-environment-production/` owns three finite,
-ordinary environment Tool operations: `prepare`, `assemble` and `verify`.
+`tools/ryeos/development/authoring-environment-production/` owns finite,
+ordinary environment Tool operations, including `prepare`, `assemble` and `verify`.
 The separate `assemble-build-support` Tool produces compiler helper inputs;
 `build-utilities` compiles the finite utility selection from exact sources using
 those helpers and Stage0. Neither operation publishes the worker environment.
@@ -26,10 +26,13 @@ host path inheritance or a weaker node environment policy.
 
 The selected `config:development/ryeos/authoring-environment-inputs` enumerates
 every input's hash, bytes and mode, selected output members, exact relocation
-targets and upstream provenance. Assembly and verification pin the same locator-free input
-tree and interpreter. Inputs must be imported and bound to each Tool before
-launch; the source-bearing input tree requires explicit large-content authority.
-Execution has no acquisition, network, signing, binding or publication operation.
+targets and upstream provenance. Literal bootstrap inputs remain exact pins.
+Produced inputs are selected by named product witnesses through the signed
+relationship Configs. Graph-owned shared inputs reach their inline leaves
+through ordinary admitted realization inheritance; leaf-owned interpreter and
+source inputs still require their own exact bindings. Large source trees require
+explicit large-content authority. The production Tools perform no acquisition,
+network, signing, binding or publication operation.
 
 Input modes describe portable manifest identity, matching Lillux: an ordinary
 regular file normalizes to `0755` if any executable bit is set, otherwise
@@ -41,75 +44,92 @@ and receipts instead verify their exact physical permission bits.
 
 ## Flow through existing owners
 
-1. Acquire the exact public inputs identified by the signed configuration using
-   existing import/activation owners as applicable. Acquisition is separate
-   from offline production; there is no turn-time package installer. Import
-   and bind the prepared raw tree to `prepare`, then run that Tool in a fresh
-   private retained workspace. It selects into the already-authored inventory,
-   never learns or signs a replacement contract. Retain and import
-   `products/authoring-prepared-inputs/tree`, then bind it to `assemble` and
-   `verify`. A changed input selection requires explicit authoring/signing.
-2. Admit a pinned private producer with retained result authority. Run
-   `graph:ryeos/development/authoring-environment-production`: its two inline
-   actions run `assemble` followed by `verify` in the same private workspace.
-   Their filesystem ceiling is `captured_execution` and network authority is
-   `isolated`.
-3. Retain `products/authoring-environment` through the existing project result
-   snapshot. Do not use shared-exclusive worker-child execution for this
-   artifact-producing root: its output must survive terminal retention.
-4. Import exact output members from that successful retained terminal. State
-   selection applies the existing project floor/exclusions and verifies bytes;
-   it does not reread the mutable producer workspace.
-5. Bind the resulting content receipt to each exact Worker/Config consumer.
-   Whole-source output and input trees use large content; the runtime subtree
-   fits ordinary content. Neither checksum nor local artifact possession is
-   consumer authorization.
-6. Qualify the actual worker/environment pair, durable completion, fenced
-   candidate retention and independent candidate validation.
+1. Acquire and bind exact literal bootstrap inputs through existing content
+   owners. Acquisition is separate from offline production; there is no
+   turn-time package installer or automatically learned replacement pin.
+2. Run the prepared-input and build-support recorded Graph wrappers. Their
+   awaited producers own declared output partitions in private retained CoW
+   workspaces. The daemon accepts named product witnesses from successful exact
+   terminals, not from caller-authored inventory or mutable workspace reads.
+3. Compose the build-support witness into the utilities producer's declared
+   root slot. Run its recorded wrapper with that explicit selection. Compose
+   the resulting utilities and prepared-input witnesses into final assembly.
+4. Run `authoring-environment-production-recorded` with both selections. Its
+   producer runs `assemble` then `verify` in one shared retained workspace and
+   returns named distribution, runtime and shell products. Build scratch is not
+   promoted into a runtime product.
+5. Select the runtime and prepared-input products into the independent Bundle
+   qualification Tool. Qualify using its exact successful root/thread, then
+   compose the resulting witness and qualification into the Worker Config.
+   Artifact possession, producer testimony and checksums are not authorization.
+6. Separately qualify actual Worker command execution, durable completion,
+   fenced candidate retention and independent candidate validation. A product
+   qualification does not qualify a future worker-edited candidate.
 
 ### Run the retained production graph
 
-Push the signed source generation containing the graph and both Tools into the
-selected principal's project HEAD. Bind `producer-python` and `assembly-inputs`
-to each exact Tool consumer **at that same source snapshot** before launch.
+Push the signed source generation containing the Graphs, Configs and Tools into
+the selected principal's project HEAD. Bind literal inputs to their exact
+consumers **at that same source snapshot** before launch.
 Project consumer bindings include the snapshot hash: existing content manifests
 can be reused, but bindings to an older source generation cannot authorize the
 new one. Use `ryeos external-content import-binding <exact-active-binding-hash>
 <maximum-bytes>` for a fresh receipt, then bind that receipt to the new exact
 Tool/snapshot. The source binding must still be active under the local
 operator's current authority; a completed receipt cannot simply be reused for
-another consumer. The graph does not redeclare its children's dependencies.
+another consumer. Product slots instead use `external-content compose-product`
+with an explicit consumer context and complete selection list. A Graph declares
+only inputs it owns; it does not guess or redeclare every child's environment.
 
 From that project, using the selected node's ordinary CLI connection, run:
 
 ```sh
-ryeos execute graph:ryeos/development/authoring-environment-production --current-head --no-operator-vault --async
+ryeos execute graph:ryeos/development/authoring-prepared-inputs-production-recorded --current-head --async --no-stream --input '{}'
 ```
 
-The existing current-HEAD policy gives the graph one retained CoW workspace.
-Both opaque subprocess leaves borrow that workspace and its original pinned
-subject generation; the second sees the first's products without making those
-products a new source-definition or consumer-binding authority. Leaves receive
-no callback bearer, and only the graph root owns terminal snapshot retention.
-The project execution config allows both bounded leaves plus graph overhead.
-Failure stops the graph before later actions; these live production actions are
-not cross-run cached or automatically retried.
+Each recorded wrapper awaits an independent producer root. Within the final
+assembly producer, `assemble` and `verify` borrow that producer's retained CoW
+workspace and original pinned subject generation. The second sees the first's
+products without making them new source-definition or consumer-binding
+authority. Those opaque leaves receive no callback bearer; their producer root
+owns terminal retention. The execution Config allows both bounded leaves plus
+producer and wrapper overhead.
+Failure stops the producer before later actions. Its leaf actions are live;
+the outer ordinary recorded action can reuse the accepted retained products
+without invoking the builder again. Reuse is not independent reproduction.
+Selected-input wrappers take their typed selections from `inputs`, not a
+separate parameter namespace, and forward only the authored root slots.
 
-Keep the default inherited child policy; do not add `--retain-child-results`.
-Use inline actions rather than detached or follow children: the pipeline needs
-one uninterrupted shared-workspace sequence, not separate child-root ownership
-or generation boundaries. Two separate `--current-head`
+For producer-to-Tool actions, keep the default inherited child policy; do not
+add `--retain-child-results`. These leaves use inline actions rather than
+detached or follow children: assembly needs one uninterrupted shared-workspace
+sequence. This does not turn the wrapper-to-producer boundary into an inline
+borrower. Two separate `--current-head`
 Tool invocations also do not compose: retaining a result does not advance HEAD,
 so `verify` would not see `assemble`'s output. No live filesystem copy or project
 apply-snapshot operation is needed.
 
-After canonical graph completion, import from the graph's exact retained
-`result_project_snapshot_hash`, selecting `products/authoring-environment`.
-The graph's returned inventory values are useful reproduction evidence, not
-CAS receipts, consumer bindings or publication permission. Running `verify`
-here qualifies artifact reproduction; it is not independent hosted candidate
-qualification. Admitted graph execution must still be demonstrated on the
-selected node; source contract tests alone do not prove that acceptance.
+After wrapper completion, consume the exact `ryeos.product_build_accepted_result.v1`
+return and select witnesses by product name. Its producer snapshot remains the
+original admitted generation even when a later consumer uses another snapshot.
+Output bytes live in terminal workspace-output captures and named content
+manifests paired with the source-only result snapshot, not inside that source
+snapshot.
+The inner Tool inventories are reproduction evidence, not witness publication
+authority. Admitted execution, independent product qualification, worker
+acceptance and restart recovery remain distinct checks; source tests do not
+establish any of them.
+
+Product selections explicitly name their witness source: `local_capture`, or
+`received` with the exact local acceptance hash. Receipt uses the existing
+configured-remote admission transport; it does not transfer a consumer binding
+or turn an origin qualification into local qualification. A receiving consumer
+must satisfy its own admitted verifier and current policy. Full receipt proof
+is retained for authorization, recovery and storage ownership, but the receipt
+coordinate alone does not change semantic program identity. The immutable
+product witness, selected content, relationship and qualification still do.
+Current receipt transports ordinary CAS blobs; an actual large-object sidecar
+is refused, not treated as transferred merely because its manifest arrived.
 
 `prepare` consumes the pinned raw tree at
 `/ryeos/realizations/authoring-source-inputs` and resolves both the assembly-input
@@ -118,7 +138,7 @@ and `config:development/ryeos/authoring-utility-sources` contracts. Raw layout:
 holds the selected resource package; `upstreams/` holds the named source/notice
 files; `elf/` and the remaining `notices/` hold exact previously selected members.
 Archive members are bounded, regular, exact-name selections; unselected entries
-are not extracted. The operation verifies all 107 final hashes, sizes and physical modes
+are not extracted. The operation verifies the complete selected inventory's hashes, sizes and physical modes
 before advertising completion. It does not execute the acquired binaries,
 contact a container daemon, use host PATH, acquire packages or manufacture pins.
 
@@ -172,6 +192,51 @@ each inline child. No project HEAD or binding was published by the graph.
 Restart and real hosted candidate qualification remain gates. A successful
 production graph is not worker/child acceptance, and its artifact reproduction
 check is not independent qualification of a worker's edited candidate.
+
+## Finite GNU CPython runtime
+
+The adjacent GNU CPython producer consumes exact pinned upstream install and
+metadata archives plus the existing prepared ELF support product. It writes
+directly into its sole declared private-workspace output root,
+`products/gnu-python-distribution`. There is no sibling scratch output or
+second publication transaction: only a successful terminal can yield named
+products, while an unsuccessful terminal may retain its in-partition files for
+diagnosis. The retained product keeps the `python/` member because its admitted
+mount is `/ryeos/realizations/python-gnu` and its relocated runtime root is
+`/ryeos/realizations/python-gnu/python`.
+
+The finite production Config declares every dependency edit. The producer uses
+the admitted `patchelf` to replace the one observed slash-bearing Python edge
+and to add the exact `libgcc_s.so.1` edge required by the inventoried native
+extension contract. It refuses missing, unused, already-present or additional
+edits, proves the exact before/after `DT_NEEDED` difference, and then applies
+the ordinary relocation owner. Recursive resolution stays within `python/lib`,
+with the exact loader, RUNPATH and `NODEFLIB` contract. A provider with a
+`DT_SONAME` must match the requested dependency name. Absence of `DT_SONAME` is
+valid when the exact admitted `python/lib/<DT_NEEDED>` filename resolves the
+edge; the pinned Tcl libraries exercise this ordinary ELF case. Absence is not
+an alias for a present mismatch.
+
+The producer retains a bounded canonical ELF inventory and its digest as
+reproduction evidence. Neither that inventory nor the relocation receipt is
+independent qualification testimony. The Standard Bundle qualifier instead
+runs the exact selected interpreter, rejects ambient loader overrides, reads
+its actual bounded process mappings, and requires the mapped
+`libgcc_s.so.1` and `libpthread.so.0` objects to be the exact product members.
+It opens both each absolute mapped path and its normal dependency name with
+`RTLD_NOLOAD`, requires the handles to identify the same loaded object, and
+uses `dlvsym` to probe the finite required `GCC_*` and `GLIBC_*` symbol
+versions. The built-in zlib claim remains separate and checks the retained
+build topology and observed runtime behavior.
+
+This proves only the stated runtime and startup-provider claims for the exact
+selected product. It does not qualify every native extension, every future
+dependency, universal GNU ABI compatibility, or the provenance of copied
+libraries. Exact image-member identities and retained notices remain
+production inputs; a notice is not represented as corresponding source when
+the matching source archive is absent. A real GNU production completed on
+2026-09-09, independently of qualification publication or downstream
+consumption.
 
 ## Utility-build dependency gate
 

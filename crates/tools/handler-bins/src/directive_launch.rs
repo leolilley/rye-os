@@ -12,8 +12,8 @@ use ryeos_handler_protocol::{
     LaunchConfigContributorWire, LaunchConfigInputDeclWire, LaunchConfigSnapshotWire,
     LaunchDiagnosticScalarWire, LaunchExecutionDependencyRequestWire, LaunchPrepareError,
     LaunchPrepareErrorClass, LaunchPrepareRequest, LaunchPrepareResponse, LaunchPrepareSuccess,
-    LaunchSecretOriginWire, LaunchSecretRequirement, RuntimeFactKindWire, TrustClassWire,
-    ValidateLaunchPreparerConfigRequest, ValidateLaunchPreparerConfigResponse,
+    LaunchSecretOriginWire, LaunchSecretRequirement, RefBindingSourceWire, RuntimeFactKindWire,
+    TrustClassWire, ValidateLaunchPreparerConfigRequest, ValidateLaunchPreparerConfigResponse,
     ValidateLaunchPreparerConfigSuccess,
 };
 
@@ -442,6 +442,12 @@ fn validate_contract(request: &ValidateLaunchPreparerConfigRequest) -> Result<()
         .ok_or_else(|| "ref_bindings.model is required".to_string())?;
     if !model.required {
         return Err("ref_bindings.model must be required".to_string());
+    }
+    if model.source != RefBindingSourceWire::Caller {
+        return Err("ref_bindings.model must be caller-sourced".to_string());
+    }
+    if model.project_result_requirement != ryeos_handler_protocol::ProjectResultRequirement::None {
+        return Err("ref_bindings.model must not require a retained project result".to_string());
     }
     exact_strings("model.allowed_kinds", &model.allowed_kinds, &["directive"])?;
     exact_values(

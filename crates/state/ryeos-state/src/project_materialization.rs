@@ -301,7 +301,16 @@ impl PinnedProjectMaterialization {
         &self,
     ) -> anyhow::Result<lillux::InheritedDescriptorAuthority> {
         self.ensure_path_binding()?;
-        self.root.inherited_descriptor_authority()
+        self.try_clone_root()?.inherited_descriptor_authority()
+    }
+
+    /// Clone the exact retained root descriptor after checking its path
+    /// binding. This proves root identity only, not mutable file contents;
+    /// callers restoring an owned output partition must first establish the
+    /// ordinary full source proof with `ensure_path_binding`.
+    pub fn try_clone_root(&self) -> anyhow::Result<lillux::PinnedDirectory> {
+        self.root.ensure_path_binding()?;
+        self.root.try_clone()
     }
 
     pub fn owns_path(&self, path: &Path) -> anyhow::Result<bool> {
@@ -876,6 +885,19 @@ mod tests {
         let (root, materialization) = fixture();
         std::fs::write(root.join(".ai/tools/shadow.yaml"), b"name: shadow\n").unwrap();
         assert!(materialization.ensure_path_binding().is_err());
+    }
+
+    #[test]
+    fn cloned_root_retains_the_proven_inode_and_refuses_path_replacement() {
+        let (root, materialization) = fixture();
+        materialization.ensure_path_binding().unwrap();
+        let cloned = materialization.try_clone_root().unwrap();
+        assert!(cloned.is_same_directory(&materialization.root).unwrap());
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(materialization.try_clone_root().is_err());
+        assert!(cloned.ensure_path_binding().is_err());
     }
 
     #[test]

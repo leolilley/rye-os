@@ -555,6 +555,7 @@ pub async fn run(
                 .map_err(|error| LaunchAugmentationError::Threads(error.to_string()))?,
             child_thread_kind.to_string(),
             BTreeMap::new(),
+            Vec::new(),
             None,
             None,
         )
@@ -839,6 +840,7 @@ pub async fn run(
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],
+                    writable_runtime_view_mounts: &[],
                     target_channels: &[],
                     item_ref: &runtime_item_ref_string,
                     thread_id: &child_thread_id,
@@ -2378,7 +2380,7 @@ fn extract_rendered_meta(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use std::sync::{Arc, mpsc};
@@ -2386,7 +2388,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[cfg(target_os = "linux")]
-    fn lifecycle_test_state() -> (tempfile::TempDir, ryeos_app::state::AppState) {
+    pub(crate) fn lifecycle_test_state() -> (tempfile::TempDir, ryeos_app::state::AppState) {
         let temp = tempfile::tempdir().expect("test tempdir");
         let runtime_state_dir = temp.path().join(".ai/state");
         let runtime_db_path = temp.path().join("runtime.sqlite3");
@@ -2519,7 +2521,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn augmentation_child_record(thread_id: &str) -> ryeos_app::state_store::NewThreadRecord {
+    pub(crate) fn augmentation_child_record(
+        thread_id: &str,
+    ) -> ryeos_app::state_store::NewThreadRecord {
         ryeos_app::state_store::NewThreadRecord {
             thread_id: thread_id.to_string(),
             chain_root_id: thread_id.to_string(),
@@ -2549,6 +2553,92 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bound_runtime_children_fixture() -> (tempfile::TempDir, ryeos_app::state::AppState)
+    {
+        use ryeos_app::runtime_db::{RuntimeWorkspaceBinding, WorkspaceBinding, WorkspaceState};
+        let (temp, state) = lifecycle_test_state();
+        let store = &state.state_store;
+        let parent = "T-runtime-parent";
+        store
+            .create_thread_for_test(&augmentation_child_record(parent))
+            .unwrap();
+        let owner = store
+            .claim_thread_launch_active(parent, "claim-parent", "daemon:runtime-test")
+            .unwrap()
+            .unwrap();
+        let binding = RuntimeWorkspaceBinding {
+            workspace_id: "workspace-runtime-parent".to_owned(),
+            view_identity: "exact-runtime-parent-view".to_owned(),
+            borrower_launch_owner: owner.owner,
+        };
+        // Inert journal fixture: no mount, OS process, or real workspace is created.
+        store
+            .reserve_execution_workspace(
+                &binding.workspace_id,
+                &"a".repeat(64),
+                "/runtime-test-workspace",
+            )
+            .unwrap();
+        store
+            .transition_execution_workspace(
+                &binding.workspace_id,
+                &[WorkspaceState::Reserved],
+                WorkspaceState::Constructing,
+                None,
+            )
+            .unwrap();
+        store
+            .claim_execution_workspace_construction(
+                &binding.workspace_id,
+                parent,
+                &owner.claimed_by,
+            )
+            .unwrap();
+        store
+            .bind_execution_workspace(WorkspaceBinding {
+                workspace_id: &binding.workspace_id,
+                thread_id: parent,
+                launch_owner: Some(&owner.claimed_by),
+                backend_id: Some("native"),
+                backend_version: Some("fixture"),
+                pinned_root_identities: Some("fixture-roots"),
+                mount_identity: Some(&binding.view_identity),
+                workspace_output_partition_identity: None,
+                base_output_capture_hash: None,
+            })
+            .unwrap();
+        store.bind_thread_workspace(parent, &binding).unwrap();
+        store
+            .transition_execution_workspace(
+                &binding.workspace_id,
+                &[WorkspaceState::Ready],
+                WorkspaceState::Active,
+                None,
+            )
+            .unwrap();
+        for child in ["T-runtime-child", "T-runtime-sibling"] {
+            store
+                .create_thread_for_test(&augmentation_child_record(child))
+                .unwrap();
+            let claim = store
+                .claim_thread_launch_active(child, &format!("claim-{child}"), "daemon:runtime-test")
+                .unwrap()
+                .unwrap();
+            store.record_child_link(parent, child, "dispatch").unwrap();
+            store
+                .bind_thread_workspace(
+                    child,
+                    &RuntimeWorkspaceBinding {
+                        borrower_launch_owner: claim.owner,
+                        ..binding.clone()
+                    },
+                )
+                .unwrap();
+        }
+        (temp, state)
     }
 
     #[test]

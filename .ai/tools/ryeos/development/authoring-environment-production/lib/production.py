@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-07T06:32:12Z:fd2b50a897337a15d6ca4f100ebc7a3fbea8b615b76b4c808473a294f6253f4d:QBTPCk4chyQEgm+mEBEztEkKLa7LTW/VHN52PGOnIW+XMFc7pPgVZVs2lc0izeTBcsLFLVAXq+lDabTZe2uhBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T15:36:50Z:7456daa992ae8a0b98551f2db8d65afbf6799139553df434064db25e1e28e08b:4dwjiqeDN9HO3yKXcOEAC6eVtgE8SStYTpNf/H29mYxKYO8BoLCWr8XhaZOU6g4hN+j65rbsuTZ6mjT9u/SuCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Finite, offline authoring-environment assembly; no acquisition or publication.
 
 RyeOS owns capture, namespaces, result snapshots and import/binding. This code
@@ -20,8 +20,12 @@ import subprocess
 import sys
 
 
-SCHEMA = "ryeos.development.authoring-environment-inputs.v1"
+SCHEMA = "ryeos.development.authoring-environment-inputs.v2"
 INPUT_ROOT = Path("/ryeos/realizations/authoring-inputs")
+BUILT_UTILITIES_ROOT = Path("/ryeos/realizations/authoring-built-utilities")
+INPUT_CONFIG = "development/ryeos/authoring-environment-inputs.yaml"
+SOURCE_CONFIG = "development/ryeos/authoring-utility-sources.yaml"
+SUPPORT_CONFIG = "development/ryeos/authoring-build-support.yaml"
 RUNTIME_ROOT = "/ryeos/realizations/authoring-tools"
 OUTPUT = PurePosixPath("products/authoring-environment")
 MAX_FILE_BYTES = 128 * 1024 * 1024
@@ -33,6 +37,7 @@ awk basename cat chmod cmp cp cut date diff dirname env find git grep head ln ls
 mkdir mktemp mv patch printf pwd readlink realpath rg rm rmdir sed sha256sum sleep
 sort stat tail tee test timeout touch tr uniq wc xargs zsh
 """.split())
+BUILT_UTILITY_COMMANDS = REQUIRED_COMMANDS - {"rg", "zsh"}
 ELF_TOOLS = {"loader": "elf/lib/ld-linux-x86-64.so.2",
              "readelf": "elf/bin/readelf", "patchelf": "elf/bin/patchelf"}
 RUNTIME_LOADER = "environment/lib/ld-linux-x86-64.so.2"
@@ -75,7 +80,7 @@ def ordinary_member(root: Path, member: str, *, directory: bool = False) -> Path
 
 def validate_config(config: dict) -> None:
     keys = {"category", "name", "version", "schema", "source_date_epoch", "inputs",
-            "files", "relocate", "provenance"}
+            "files", "built_utility_files", "relocate", "provenance"}
     if not isinstance(config, dict) or set(config) != keys or config["schema"] != SCHEMA:
         raise ValueError("unsupported or incomplete authoring input contract")
     if (config["category"] != "development/ryeos" or
@@ -84,7 +89,9 @@ def validate_config(config: dict) -> None:
     if type(config["source_date_epoch"]) is not int or not 0 <= config["source_date_epoch"] <= 4_102_444_800:
         raise ValueError("invalid source normalization epoch")
     inputs, files = config["inputs"], config["files"]
-    if not isinstance(inputs, dict) or not isinstance(files, dict) or not 1 <= len(inputs) <= MAX_ENTRIES:
+    built_files = config["built_utility_files"]
+    if (not isinstance(inputs, dict) or not isinstance(files, dict) or
+            not isinstance(built_files, dict) or not 1 <= len(inputs) <= MAX_ENTRIES):
         raise ValueError("invalid finite input inventory")
     total = 0
     for name, identity in inputs.items():
@@ -107,15 +114,23 @@ def validate_config(config: dict) -> None:
                 raise ValueError("output selects an undeclared input")
         else:
             raise ValueError("output is outside the finite artifact layout")
+    if set(files) & set(built_files):
+        raise ValueError("fixed and built utility selections overlap")
+    if (list(built_files) != sorted(built_files) or
+            set(built_files) != {f"environment/bin/{name}" for name in BUILT_UTILITY_COMMANDS} or
+            any(source != "bin/" + target.removeprefix("environment/bin/")
+                for target, source in built_files.items())):
+        raise ValueError("built utility selection is not the exact finite command map")
     if sum(inputs[source]["bytes"] for source in files.values()) > MAX_TOTAL_BYTES:
         raise ValueError("selected outputs exceed the artifact byte bound")
+    selected_files = set(files) | set(built_files)
     commands = {str(PurePosixPath(path).relative_to("environment/bin"))
-                for path in files if path.startswith("environment/bin/")}
+                for path in selected_files if path.startswith("environment/bin/")}
     if commands != REQUIRED_COMMANDS:
         raise ValueError("authoring command inventory is not the supported exact set")
     if RUNTIME_LOADER not in files:
         raise ValueError("the runtime interpreter must be included in the artifact")
-    executable_outputs = {f"environment/bin/{name}" for name in REQUIRED_COMMANDS} | {RUNTIME_LOADER}
+    executable_outputs = {"environment/bin/rg", "environment/bin/zsh", RUNTIME_LOADER}
     if any(inputs[files[path]]["mode"] != 0o755 for path in executable_outputs):
         raise ValueError("commands and runtime interpreter must have executable mode")
     if not any(path.startswith("corresponding-sources/") for path in files):
@@ -124,8 +139,8 @@ def validate_config(config: dict) -> None:
         raise ValueError("selected ELF authoring tools are missing")
     if any(inputs[path]["mode"] != 0o755 for path in ELF_TOOLS.values()):
         raise ValueError("selected ELF authoring tools must have executable mode")
-    for path in files:
-        if any(parent.as_posix() in files for parent in PurePosixPath(path).parents):
+    for path in selected_files:
+        if any(parent.as_posix() in selected_files for parent in PurePosixPath(path).parents):
             raise ValueError("output file/directory collision")
     if (not isinstance(config["relocate"], list) or
             config["relocate"] != sorted(set(config["relocate"])) or
@@ -199,6 +214,58 @@ def checked_inputs(root: Path, config: dict) -> None:
         raise ValueError("admitted source bytes or modes differ from the authored input inventory")
 
 
+def _bounded_json_member(root: Path, member: str) -> dict:
+    path = ordinary_member(root, member)
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("built utility metadata exceeds its bound")
+    with path.open("rb") as source:
+        value = json.load(source)
+    if not isinstance(value, dict):
+        raise ValueError("built utility metadata must be an object")
+    return value
+
+
+def validate_built_utilities(root: Path, config: dict,
+                             source_config: dict, support_config: dict) -> dict:
+    """Validate the selected product's finite semantic surface before copying.
+
+    RyeOS authenticates the complete product manifest and bytes. This owner
+    additionally proves that the only executable members admitted to the final
+    environment are the exact source-built command set and that their retained
+    build contracts agree with the current signed recipe inputs.
+    """
+    validate_config(config)
+    if not isinstance(source_config, dict) or not isinstance(support_config, dict):
+        raise ValueError("missing built utility source or support contract")
+    observed = input_inventory(root)
+    allowed_roots = ("bin/", "licenses/", "corresponding-sources/")
+    if any(name not in {"source-contract.json", "build-evidence.json"}
+           and not name.startswith(allowed_roots) for name in observed):
+        raise ValueError("unexpected built utility product member")
+    bins = {name.removeprefix("bin/") for name in observed
+            if name.startswith("bin/") and len(relative(name).parts) == 2}
+    if bins != BUILT_UTILITY_COMMANDS:
+        raise ValueError("built utility product has an incomplete command inventory")
+    for source in config["built_utility_files"].values():
+        identity = observed.get(source)
+        if identity is None or identity["mode"] != 0o755:
+            raise ValueError("built utility command is absent or not executable")
+    if (not any(name.startswith("licenses/") for name in observed) or
+            not any(name.startswith("corresponding-sources/") for name in observed)):
+        raise ValueError("built utility licenses or corresponding sources are absent")
+    if _bounded_json_member(root, "source-contract.json") != source_config:
+        raise ValueError("built utility source contract differs from current admission")
+    evidence = _bounded_json_member(root, "build-evidence.json")
+    from utilities import build_evidence
+    support = support_config.get("support")
+    if not isinstance(support, dict):
+        raise ValueError("missing exact nested build support contract")
+    expected = build_evidence(source_config, support)
+    if evidence != expected:
+        raise ValueError("built utility evidence differs from current recipe contracts")
+    return observed
+
+
 class ElfTools:
     """The selected upstream programs, invoked through their exact loader."""
 
@@ -239,6 +306,7 @@ class ElfTools:
         return {"dynamic": "Dynamic section" in dynamic,
                 "interpreter": interpreter,
                 "needed": re.findall(r"Shared library: \[([^\]]+)\]", dynamic),
+                "soname": re.findall(r"Library soname: \[([^\]]+)\]", dynamic),
                 "runpath": re.findall(r"Library runpath: \[([^\]]*)\]", dynamic),
                 "rpath": "(RPATH)" in dynamic, "nodeflib": "NODEFLIB" in dynamic}
 
@@ -277,11 +345,15 @@ def relocate_elf(path: Path, tools: ElfTools, runtime_root: str) -> dict:
     facts = tools.facts(path)
     if not facts["dynamic"] or not (facts["interpreter"] or facts["needed"]):
         raise ValueError("only declared dynamic ELF inputs may be relocated")
+    # patchelf 0.19.1 can relocate the dynamic string table while setting a
+    # longer RUNPATH. On the admitted GNU CPython executable, doing that after
+    # --set-interpreter overwrites PT_INTERP. Commit search policy first, then
+    # write the exact interpreter into its final location.
+    tools.run("patchelf", "--no-sort", "--set-rpath", runtime_root + "/lib",
+              "--no-default-lib", str(path))
     if facts["interpreter"]:
         tools.run("patchelf", "--no-sort", "--set-interpreter",
                   runtime_root + "/lib/ld-linux-x86-64.so.2", str(path))
-    tools.run("patchelf", "--no-sort", "--set-rpath", runtime_root + "/lib",
-              "--no-default-lib", str(path))
     if tools.symbols(path) != symbols:
         raise ValueError(f"ELF symbol ownership or function coordinates changed: {path.name}")
     return {"before": before, "after": sha256(path)}
@@ -338,20 +410,27 @@ def check_closure(environment: Path, files: dict, tools: ElfTools, relocated: se
                     raise ValueError("library dependency names non-ELF data")
 
 
-def assemble(inputs: Path, destination: Path, config: dict, *, tools=None) -> dict:
+def assemble(inputs: Path, built_utilities: Path, destination: Path, config: dict,
+             source_config: dict, support_config: dict, *, tools=None) -> dict:
     checked_inputs(inputs, config)
+    built_inventory = validate_built_utilities(
+        built_utilities, config, source_config, support_config)
     if destination.exists() or destination.is_symlink():
         raise ValueError("assembly destination already exists")
     destination.mkdir(mode=0o700)
     tools = tools or ElfTools(inputs)
     transformations = {}
     copy_selected_files(inputs, destination, config["files"], config["inputs"])
+    copy_selected_files(built_utilities, destination, config["built_utility_files"], built_inventory)
     for member in config["relocate"]:
         path = ordinary_member(destination, member)
         transformations[member] = relocate_elf(path, tools, RUNTIME_ROOT)
-    check_closure(destination / "environment", config["files"], tools, set(transformations),
+    selected_files = {**config["files"], **config["built_utility_files"]}
+    check_closure(destination / "environment", selected_files, tools, set(transformations),
                   runtime_root=RUNTIME_ROOT)
     provenance = {"schema": 1, "input_contract_sha256": hashlib.sha256(canonical_json(config)).hexdigest(),
+                  "built_utility_product_sha256": hashlib.sha256(
+                      canonical_json(built_inventory)).hexdigest(),
                   "runtime_mount": RUNTIME_ROOT, "transformations": transformations,
                   "sources": config["provenance"]}
     provenance_path = destination / "provenance.json"
@@ -387,7 +466,12 @@ def run_operation(operation: str) -> None:
     if len(raw) > 262144:
         raise ValueError("production parameters exceed their bound")
     request = json.loads(raw)
-    config = request.get("resolved_config") if isinstance(request, dict) else None
+    resolved = request.get("resolved_config") if isinstance(request, dict) else None
+    if not isinstance(resolved, dict) or set(resolved) != {INPUT_CONFIG, SOURCE_CONFIG, SUPPORT_CONFIG}:
+        raise ValueError("missing exact production Configs")
+    config = resolved[INPUT_CONFIG]
+    source_config = resolved[SOURCE_CONFIG]
+    support_config = resolved[SUPPORT_CONFIG]
     validate_config(config)
     parent = project / "products"
     if not parent.exists():
@@ -397,7 +481,8 @@ def run_operation(operation: str) -> None:
     if operation == "assemble" and (destination.exists() or destination.is_symlink()):
         raise ValueError("authoring output already exists; use a fresh production workspace")
     staging = parent / ("authoring-assembly" if operation == "assemble" else "authoring-verification")
-    result = assemble(INPUT_ROOT, staging, config)
+    result = assemble(INPUT_ROOT, BUILT_UTILITIES_ROOT, staging, config,
+                      source_config, support_config)
     if operation == "assemble":
         # Fail closed on reuse. No existing successful output is overwritten.
         if destination.exists() or destination.is_symlink():

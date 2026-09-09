@@ -189,6 +189,7 @@ fn run_tool_with_hints(
         }],
         isolation_verified_command: None,
         isolation_external_read_only_mounts: Vec::new(),
+        isolation_writable_runtime_view_mounts: Vec::new(),
         isolation_workspace: None,
         subprocess_limits: None,
         inherited_fds: Vec::new(),

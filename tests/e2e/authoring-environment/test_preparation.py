@@ -177,6 +177,29 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual((self.root / "prepared/input-contract.json").read_bytes(),
                          production.canonical_json(self.config))
 
+    def test_same_image_glibc_compatibility_dsos_are_exact_selected_inputs(self):
+        authored_config = authored("authoring-environment-inputs.yaml")
+        expected = {
+            "libdl.so.2": (14408, "295fa521a03cd2faa99974f378c9e23dd622021ec7d32bcad4f8ea61aec8a872"),
+            "libpthread.so.0": (14408, "85e21f7dba0394411d00959176fd18b470e575b0b05f1f4f41e5636802ce0500"),
+            "librt.so.1": (14552, "7b7b84d1aedda0e0b2bdfc68844362782132180b8f02be1300e21e77572e514b"),
+            "libutil.so.1": (14408, "e3981d10efd152a53f083e38f5f9ddde7a049c85d0ab388a5eec91b52fc98a11"),
+        }
+        raw, copies, _, _ = preparation.selection(self.config, self.sources)
+        for name, (size, digest) in expected.items():
+            with self.subTest(name=name):
+                selected = f"elf/lib/{name}"
+                source = f"/usr/lib/x86_64-linux-gnu/{name}"
+                destination = f"environment/lib/{name}"
+                identity = {"bytes": size, "sha256": digest, "mode": 0o644}
+                self.assertEqual(authored_config["inputs"][selected], identity)
+                self.assertEqual(authored_config["provenance"]["runtime_image_members"][source],
+                                 [selected, 0o644])
+                self.assertEqual(raw[selected], self.config["inputs"][selected])
+                self.assertEqual(copies[selected], selected)
+                self.assertEqual(authored_config["files"][destination], selected)
+                self.assertIn(destination, authored_config["relocate"])
+
     def test_corruption_refuses_before_creating_output(self):
         (self.raw / "bootstrap" / self.binary_name).write_bytes(b"corrupt")
         with self.assertRaisesRegex(ValueError, "identity mismatch"):

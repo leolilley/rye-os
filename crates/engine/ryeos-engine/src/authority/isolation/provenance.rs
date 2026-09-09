@@ -1,13 +1,86 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ryeos_isolation_protocol::{
-    InspectedArtifact, IsolationAdapterProtocolVersion, IsolationArtifactRole,
-    IsolationBackendSelection, IsolationCapability, IsolationPlan,
+    ISOLATION_ADAPTER_PROTOCOL, InspectedArtifact, IsolationAdapterProtocolVersion,
+    IsolationArtifactRole, IsolationBackendSelection, IsolationCapability, IsolationPlan,
 };
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use super::{IsolationBackendStatus, IsolationMode};
 use crate::error::EngineError;
+
+const ISOLATION_ADAPTER_PROTOCOL_IDENTITY_PREFIX: &str = "ryeos.isolation-adapter/v";
+
+/// Canonical identity retained in historical launch provenance.
+///
+/// Active adapter declarations and requests continue to use
+/// [`IsolationAdapterProtocolVersion`], which accepts only the current wire.
+/// This type exists solely so an authenticated historical launch can retain
+/// the exact protocol generation that actually produced it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IsolationAdapterProtocolIdentity(String);
+
+impl IsolationAdapterProtocolIdentity {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn parse(value: String) -> Result<Self, String> {
+        let version = value
+            .strip_prefix(ISOLATION_ADAPTER_PROTOCOL_IDENTITY_PREFIX)
+            .ok_or_else(|| {
+                "isolation adapter protocol identity has the wrong family".to_string()
+            })?;
+        if version.is_empty()
+            || !version.bytes().all(|byte| byte.is_ascii_digit())
+            || version.starts_with('0')
+        {
+            return Err(
+                "isolation adapter protocol identity requires a canonical positive u32 version"
+                    .to_string(),
+            );
+        }
+        let parsed = version
+            .parse::<u32>()
+            .map_err(|_| "isolation adapter protocol identity version exceeds u32".to_string())?;
+        if parsed == 0 || parsed.to_string() != version {
+            return Err(
+                "isolation adapter protocol identity requires a canonical positive u32 version"
+                    .to_string(),
+            );
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<IsolationAdapterProtocolVersion> for IsolationAdapterProtocolIdentity {
+    fn from(version: IsolationAdapterProtocolVersion) -> Self {
+        match version {
+            IsolationAdapterProtocolVersion::Current => {
+                Self(ISOLATION_ADAPTER_PROTOCOL.to_string())
+            }
+        }
+    }
+}
+
+impl Serialize for IsolationAdapterProtocolIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for IsolationAdapterProtocolIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
 
 /// Secret-free identity of the exact isolation generation and compiled plan
 /// used for one launch. Managed execution persists this in its launch ledger;
@@ -22,7 +95,7 @@ pub struct IsolationLaunchProvenance {
     pub bundle_manifest_digest: Option<String>,
     pub signer_fingerprint: Option<String>,
     pub adapter_digest: Option<String>,
-    pub adapter_protocol: Option<IsolationAdapterProtocolVersion>,
+    pub adapter_protocol: Option<IsolationAdapterProtocolIdentity>,
     pub payloads: BTreeMap<IsolationArtifactRole, InspectedArtifact>,
     pub effective_capabilities: BTreeSet<IsolationCapability>,
     /// Actually qualified node-generation guarantees, not merely implemented
@@ -136,4 +209,84 @@ pub(super) fn redacted_plan_digest(plan: &IsolationPlan) -> Result<String, Engin
         "sha256:{}",
         lillux::sha256_hex(canonical.as_bytes())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provenance(protocol: &str) -> IsolationLaunchProvenance {
+        IsolationLaunchProvenance {
+            policy_digest: None,
+            mode: IsolationMode::Enforce,
+            backend: None,
+            backend_status: IsolationBackendStatus::Available,
+            bundle_manifest_digest: None,
+            signer_fingerprint: None,
+            adapter_digest: None,
+            adapter_protocol: Some(serde_json::from_value(protocol.into()).unwrap()),
+            payloads: BTreeMap::new(),
+            effective_capabilities: BTreeSet::new(),
+            plan_digest: Some("sha256:attempt".to_string()),
+        }
+    }
+
+    #[test]
+    fn historical_adapter_protocol_identity_round_trips_exactly() {
+        let historical: IsolationAdapterProtocolIdentity =
+            serde_json::from_str(r#""ryeos.isolation-adapter/v8""#).unwrap();
+        assert_eq!(historical.as_str(), "ryeos.isolation-adapter/v8");
+        assert_eq!(
+            serde_json::to_string(&historical).unwrap(),
+            r#""ryeos.isolation-adapter/v8""#
+        );
+
+        let current =
+            IsolationAdapterProtocolIdentity::from(IsolationAdapterProtocolVersion::Current);
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::to_value(IsolationAdapterProtocolVersion::Current).unwrap()
+        );
+    }
+
+    #[test]
+    fn historical_adapter_protocol_identity_requires_canonical_positive_u32() {
+        for refused in [
+            "ryeos.isolation-adapter/v",
+            "ryeos.isolation-adapter/v0",
+            "ryeos.isolation-adapter/v01",
+            "ryeos.isolation-adapter/v+1",
+            "ryeos.isolation-adapter/v-1",
+            "ryeos.isolation-adapter/v 1",
+            "ryeos.isolation-adapter/v4294967296",
+            "ryeos.isolation-adapter/v1/extra",
+            "other.isolation-adapter/v8",
+        ] {
+            assert!(
+                serde_json::from_value::<IsolationAdapterProtocolIdentity>(refused.into()).is_err(),
+                "noncanonical protocol identity unexpectedly admitted: {refused}"
+            );
+        }
+        for admitted in [
+            "ryeos.isolation-adapter/v1",
+            "ryeos.isolation-adapter/v8",
+            "ryeos.isolation-adapter/v9",
+            "ryeos.isolation-adapter/v4294967295",
+        ] {
+            let identity: IsolationAdapterProtocolIdentity =
+                serde_json::from_value(admitted.into()).unwrap();
+            assert_eq!(identity.as_str(), admitted);
+        }
+    }
+
+    #[test]
+    fn admission_class_keeps_exact_historical_protocol_identity() {
+        let historical = provenance("ryeos.isolation-adapter/v8");
+        let mut same_class = historical.clone();
+        same_class.plan_digest = Some("sha256:another-attempt".to_string());
+        assert!(historical.has_same_admission_class(&same_class));
+
+        let current = provenance("ryeos.isolation-adapter/v9");
+        assert!(!historical.has_same_admission_class(&current));
+    }
 }

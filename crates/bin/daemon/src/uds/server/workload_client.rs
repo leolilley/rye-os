@@ -678,6 +678,7 @@ fn dispatch_request(
         // second child operation.
         let operation_id = dispatch.source.runtime_operation_id(grant_digest)?;
         let action = ryeos_runtime::callback::ActionPayload {
+            product_selections: Vec::new(),
             operation_id: Some(operation_id),
             item_id: execute.item_ref,
             ref_bindings: execute.ref_bindings,

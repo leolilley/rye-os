@@ -3232,6 +3232,51 @@ impl Engine {
         })
     }
 
+    /// Compile current captured Bundle source with its retained logical
+    /// execution-root coordinate. Program and executor lookup remains
+    /// projectless; the logical root only supplies process-path templates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_bundle_plan_from_captured_root_with_logical_project_root(
+        &self,
+        ctx: &PlanContext,
+        item: &VerifiedItem,
+        root_source: &str,
+        parameters: &Value,
+        hints: &ExecutionHints,
+        sealed_content: Option<&dyn crate::project_content::SealedDependencyBytes>,
+        filesystem_authority_ceiling: crate::isolation::IsolationFilesystemAuthorityCeiling,
+        logical_project_root: Option<&Path>,
+    ) -> Result<ExecutionPlan, EngineError> {
+        self.checked_bundle_generation(|| {
+            crate::scope::check_execution_scope(&ctx.requested_by)?;
+            let roots = self.resolution_roots(None);
+            let request_snapshot = self.effective_request_snapshot_current(
+                None,
+                &crate::contracts::SubjectResolutionAuthority::Projectless,
+            )?;
+            crate::plan_builder::build_bundle_plan_with_logical_project_root(
+                crate::plan_builder::BuildPlanInput {
+                    item,
+                    root_source: Some(root_source),
+                    parameters,
+                    hints,
+                    ctx,
+                    kinds: &self.kinds,
+                    parsers: &request_snapshot.parser_dispatcher,
+                    roots: &roots,
+                    registry_fingerprint: &request_snapshot.registry_fingerprint,
+                    trust_store: &request_snapshot.trust_store,
+                    node_trust_store: &self.node_trust_store,
+                    host_env: &self.host_env,
+                    filesystem_authority_ceiling,
+                    project_authority: None,
+                    sealed_content,
+                },
+                logical_project_root,
+            )
+        })
+    }
+
     /// Build an execution plan whose root, executor chain, project config, and
     /// precedence probes are all sourced from one admitted project-content
     /// authority. `sealed_content`, when present, overrides that authority for

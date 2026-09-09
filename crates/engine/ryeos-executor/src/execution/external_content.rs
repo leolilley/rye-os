@@ -41,6 +41,17 @@ pub(crate) struct BoundExternalRealizations {
 }
 
 impl BoundExternalRealizations {
+    pub(crate) fn project_mount_targets(
+        &self,
+    ) -> impl Iterator<Item = (&str, ExternalContentKind)> {
+        self.realized
+            .iter()
+            .filter(|entry| {
+                entry.mount_root == ryeos_state::objects::ExternalContentMountRoot::Project
+            })
+            .map(|entry| (entry.mount.as_str(), entry.kind))
+    }
+
     pub(crate) fn mounts(&self) -> &[ryeos_engine::isolation::IsolationReadOnlyMountAuthority] {
         &self.mounts
     }
@@ -1456,6 +1467,7 @@ impl ryeos_engine::project_content::SealedDependencyBytes for SealedRealizationD
 pub(crate) fn sealed_dependency_bytes_for_child_dispatch(
     state: &ryeos_app::state::AppState,
     params: &super::runner::ExecutionParams,
+    child_resolution: &ryeos_engine::resolution::ResolutionOutput,
 ) -> anyhow::Result<Option<SealedRealizationDependencyBytes>> {
     let Some(parent_thread_id) = params.parent_thread_id.as_deref() else {
         return Ok(None);
@@ -1464,19 +1476,12 @@ pub(crate) fn sealed_dependency_bytes_for_child_dispatch(
         return Ok(None);
     };
     let engine = admission.request_engine();
-    let resolution = admission.resolution_output();
-    let contract = engine
-        .kinds
-        // `ResolvedExecutionRequest.kind` is the lifecycle profile
-        // (`tool_run`, etc.), not the item kind that owns this contract.
-        // Keep this aligned with direct effective-program finalization.
-        .get(&params.resolved.resolved_item.kind)
-        .and_then(|schema| schema.external_content_contract());
-    let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
-    if ryeos_engine::external_content::declarations_from_composed(
-        &resolution.composed.composed,
-        contract,
-        declarer,
+    // `ResolvedExecutionRequest.kind` is the lifecycle profile (`tool_run`,
+    // etc.), not the item kind that owns this contract. Use the same
+    // child-declaration authority as direct realization commands.
+    if ryeos_app::thread_lifecycle::effective_child_external_content_declarations(
+        engine,
+        child_resolution,
     )?
     .is_some()
     {
@@ -1597,7 +1602,7 @@ pub(crate) fn sealed_dependency_bytes_for_child_dispatch(
     }))
 }
 
-fn ensure_materialization_parent(
+pub(crate) fn ensure_materialization_parent(
     root: &lillux::PinnedDirectory,
     relative: &str,
 ) -> anyhow::Result<(lillux::PinnedDirectory, OsString)> {
@@ -1610,6 +1615,64 @@ fn ensure_materialization_parent(
         parent = parent.open_or_create_child(OsStr::new(component), 0o755)?;
     }
     anyhow::bail!("external materialization path is empty")
+}
+
+/// Restore one admitted writable output root through the same verified cache
+/// and private-copy owner as ordinary realization materialization. The caller
+/// has already proved the source partition and the output manifest's admitted
+/// policy/bounds. The target must be a newly created, empty output directory.
+pub(crate) fn restore_workspace_output_tree(
+    authority: &ryeos_state::PinnedStateAuthority,
+    guard: &ryeos_state::CasMutationGuard,
+    target: &lillux::PinnedDirectory,
+    manifest_hash: &str,
+    storage: ryeos_state::external_content::products::ProductStorage,
+    budget: &PrivateMaterializationBudget,
+) -> anyhow::Result<()> {
+    authority.ensure_guard(guard)?;
+    if !target.entries_no_follow_bounded(1)?.is_empty() {
+        anyhow::bail!("workspace output restoration requires an empty target");
+    }
+    let cas = authority.cas_store()?;
+    let cache =
+        ExternalMaterializationCache::from_runtime_state_root(authority.runtime_directory().path());
+    match storage {
+        ryeos_state::external_content::products::ProductStorage::Content => {
+            let closure = ryeos_state::VerifiedExternalContentClosure::load(&cas, manifest_hash)?;
+            let generation = cache.materialize(&cas, &closure, ExternalContentKind::Tree)?;
+            copy_materialized_tree(&generation.root, target, closure.manifest(), budget)?;
+            verify_materialized_tree(&cas, target, closure.manifest())?;
+        }
+        ryeos_state::external_content::products::ProductStorage::LargeContent => {
+            let value = ryeos_state::object_closure::load_exact_cas_object_with_cas(
+                &cas,
+                manifest_hash,
+                ryeos_state::objects::MAX_LARGE_CONTENT_MANIFEST_BYTES as u64,
+            )?;
+            let manifest =
+                ryeos_state::objects::ExternalLargeContentManifestObject::from_value(&value)?;
+            let store = authority.large_object_store()?;
+            let generation = cache.materialize_large(
+                &cas,
+                &store,
+                manifest_hash,
+                &manifest,
+                ExternalContentKind::Tree,
+            )?;
+            // Large shared objects must never become writable workspace
+            // hardlinks. The existing private-copy budget owns reflink/copy.
+            copy_large_materialized_tree(&generation.root, target, &manifest, budget)?;
+            verify_large_materialized_tree(
+                &cas,
+                target,
+                &manifest,
+                LargeMaterializationVerification::PrivateDigest,
+            )?;
+        }
+    }
+    target.ensure_path_binding()?;
+    authority.runtime_directory().ensure_path_binding()?;
+    Ok(())
 }
 
 fn symlink_target_bytes(

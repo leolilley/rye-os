@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T08:19:40Z:716444de2384b9bbcbd569105983bc50a4de9e4520a6cebff00365fa1fa0fada:c9x/OrWm7fAHCdATwi2EQaIKKSGhV+VfEkddz53RqByBHF5bznlf5Mjd6v0E1Y4So3NSQ16Nm6qPJbSqtyQWBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T09:15:12Z:3c6d25e9c35342c59f7d9ec0109552f0bfa57ec65d8669ebafc821f2fa72bba4:bvzXxA/leo4yc2pe0bh62bTgXSehbfnFiV9Hn/uEC88I6+5pV+0BOuDo1jcnuT+3Jgn8W/gS/QPvUpLoojDTAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -24,7 +24,7 @@ compilation. Core ships the self-contained `linux-lillux` implementation as
 available signed data. The explicit development profile selects enforced
 execution; the general installation profiles retain their explicit disabled choice.
 
-Durable execution workspaces use the isolation-adapter v8 contract. RyeOS owns
+Durable execution workspaces use the isolation-adapter v10 contract. RyeOS owns
 one canonical private `project/` generation. Disabled/native execution creates
 no other workspace directory and uses Lillux descriptor-relative filesystem
 mechanics directly. Enforced execution additionally grants the selected signed
@@ -725,6 +725,22 @@ close capture without natural pipe EOF. Neither EOF nor a claimed successful
 terminal frame overrides cancellation, overflow, timeout or a failing exit.
 
 ## Launch coverage
+
+Workspace membership is process-lifetime authority, not an inference from a
+thread's terminal status. A failed child may retire its exact membership only
+while its launch claim remains active and its preparation boundary proves no
+process contact, or its held-process owner proves abort and reap. The caller's
+launch owner must match the binding; settlement also refuses live descendants.
+Attached identity and membership settle atomically using the existing reaped
+process owner. Never clear the attachment first and then infer the borrower is
+safe because its PID is absent.
+
+Direct and managed launch paths preserve this distinction through failure.
+Task panic, cancellation, a generic engine error, and unproved abort/release
+cleanup retain quarantine; unconditional resource destruction is not settlement
+evidence. Shutdown retains the coordinator's recovery obligations. These rules
+apply equally to fresh, detached and resumed child execution and do not give a
+child authority to close or publish its parent's workspace.
 
 The immutable runtime covers engine plan subprocesses, managed and streaming
 runtime launches, compose-context children, external parser/composer handlers

@@ -44,7 +44,8 @@ class AuthoringEnvironmentTests(unittest.TestCase):
         self.assertEqual(self.default["worker_ref"], "worker:codex/hosted")
 
     def test_explicit_worker_uses_existing_environment_contract(self):
-        self.assertEqual(self.environment["schema"], "ryeos.worker_environment.v5")
+        self.assertEqual(self.environment["schema"], "ryeos.worker_environment.v6")
+        self.assertEqual(self.environment["external_product_slots"], [])
         self.assertEqual(self.environment["worker_ref"], "worker:codex/hosted-authoring")
         for key in ("credential_requirement", "portable_state_contract", "workload_client"):
             self.assertEqual(self.environment[key], self.default[key])
@@ -158,24 +159,51 @@ class AuthoringEnvironmentTests(unittest.TestCase):
             for name in environment["configuration"]["process_environment"]:
                 self.assertEqual(policy["filters"].get(name), "include", name)
 
-    def test_input_selection_is_the_authored_finite_contract(self):
+    def test_current_production_contract_selects_fresh_utility_products(self):
         production = module("authoring_production", REPOSITORY /
             ".ai/tools/ryeos/development/authoring-environment-production/lib/production.py")
         config = yaml.safe_load((REPOSITORY /
             ".ai/config/development/ryeos/authoring-environment-inputs.yaml").read_text())
         production.validate_config(config)
+        # This is the current producer's source contract, not reproduction of
+        # the separately retained September 6/7 literal-baseline evidence.
         self.assertEqual(hashlib.sha256(production.canonical_json(config)).hexdigest(),
-                         self.selection["input_contract_sha256"])
-        self.assertEqual(len(config["inputs"]), self.selection["input_files"])
+                         "69b09219bc0205e4c221fb9dca9afa2293f4c6b04e276c14c215acbac0720e21")
+        self.assertEqual(config["schema"], "ryeos.development.authoring-environment-inputs.v2")
+        self.assertEqual(len(config["inputs"]), 111)
         self.assertEqual(sum(item["bytes"] for item in config["inputs"].values()),
-                         self.selection["input_bytes"])
+                         139987893)
+        self.assertEqual(len(config["built_utility_files"]), 41)
+        self.assertEqual(config["built_utility_files"]["environment/bin/sed"], "bin/sed")
+        self.assertNotIn("environment/bin/sed", config["files"])
         self.assertEqual(len(production.REQUIRED_COMMANDS), 43)
-        for field in self.selection["expected_manifests"].values():
-            self.assertRegex(field, r"^[0-9a-f]{64}$")
+        graph = yaml.safe_load((REPOSITORY /
+            ".ai/graphs/ryeos/development/authoring-environment-production.yaml").read_text())
+        self.assertEqual({slot["id"] for slot in graph["external_product_slots"]},
+                         {"assembly-inputs", "built-utilities"})
         for operation in ("assemble", "verify"):
             text = (REPOSITORY / ".ai/tools/ryeos/development/authoring-environment-production" /
                     (operation + ".py")).read_text()
-            self.assertIn(self.selection["expected_manifests"]["assembly_inputs"], text)
+            header = text.split("# ryeos-tool:\n", 1)[1].split("\n\n", 1)[0]
+            definition = yaml.safe_load("\n".join(line.removeprefix("# ") for line in header.splitlines()))
+            self.assertEqual([entry["id"] for entry in definition["external_content"]],
+                             ["producer-python"])
+            self.assertIn("development/ryeos/authoring-environment-inputs.yaml",
+                          [spec["path"] for spec in definition["config_resolve"]["specs"]])
+
+    def test_literal_baseline_retains_its_historical_input_selection(self):
+        # Historical receipts cannot be relabelled with the new producer's
+        # input digest or used as evidence that its changed recipe executed.
+        self.assertEqual(self.selection["input_contract_sha256"],
+                         "88e99105df613be12870b3ff6283af77c36d78075d741595a4d028c048a5f946")
+        self.assertEqual(self.selection["input_files"], 107)
+        self.assertEqual(self.selection["input_bytes"], 139930117)
+        self.assertEqual(self.environment["external_content"][0]["digest"],
+                         self.selection["expected_manifests"]["environment"])
+        for name, manifest in self.selection["expected_manifests"].items():
+            self.assertRegex(manifest, r"^[0-9a-f]{64}$")
+            self.assertEqual(manifest, self.selection["admitted_production_evidence"][
+                "observed_imports"][name]["manifest_hash"])
 
     def test_evidence_distinguishes_admitted_production_from_model_qualification(self):
         self.assertTrue(self.selection["qualification"]["independent_reproduction"])

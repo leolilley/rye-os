@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-09",
+  "status": "source_checked_installed_qualification_open",
+  "scope": "hosted_invocation_environment_source_integration",
+  "inputs": {
+    "hosted_checkpoint": "c914c51df2a1fbf3ba119eae8e698dc78f6d8999",
+    "environment_checkpoint": "55e1ffcb0022dbbd88cfe6712b09ee3ecdc66c6b"
+  },
+  "clean_cut": {
+    "worker_environment": 6,
+    "isolation_adapter": 10,
+    "runtime_database": 33,
+    "launch_metadata": 35
+  },
+  "checks_passed": [
+    "combined daemon/executor/structured-session/core-tools/CLI/isolation-adapter all-target cargo check",
+    "157 focused authored Python contract and fixture tests",
+    "native-authoring fixture source checker",
+    "direct and managed precontact settlement production-helper tests",
+    "wrong-owner and uncertain-contact membership retention tests",
+    "18 workspace-binding StateStore/runtime database regressions",
+    "item-spawn typed boundary testimony regression",
+    "persistent-session spawn cleanup testimony regression",
+    "Lillux process-and-scope release cleanup truth-table regression",
+    "cargo fmt --all -- --check",
+    "git diff --check"
+  ],
+  "evidence_limits": [
+    "Settlement fixtures use actual journal and lifecycle owners, but create no native process or mounted workspace.",
+    "The invalid environment error exercises the production settlement helper, not a complete worker launch.",
+    "Release cleanup truth-table coverage does not replace installed native scope qualification.",
+    "Historical authoring artifact hashes and v15/v16 failed-task candidates remain unchanged.",
+    "No combined package installation, node restart, model turn, candidate publication or remote deployment occurred during these checks."
+  ],
+  "remaining_gates": [
+    "matched combined package build and publication",
+    "privileged installation of the selected matched payloads",
+    "installed worker edit and restricted child-operation acceptance through both invocation ingress paths",
+    "exact completion fence and frozen candidate",
+    "independent negative and positive candidate evaluation",
+    "restart/reattachment and source-fenced remote result return",
+    "full RyeOS repository development qualification and real remote deployment"
+  ]
+}

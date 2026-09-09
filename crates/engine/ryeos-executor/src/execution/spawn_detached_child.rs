@@ -87,6 +87,11 @@ pub async fn spawn_detached_child(
         })?;
     let parent_lifecycle_authority = parent_resume.lifecycle_authority;
     let scheduled_fire = parent_resume.scheduled_fire.clone();
+    if !parent_resume.product_selections.is_empty() {
+        anyhow::bail!(
+            "detach: product-selected executions cannot spawn callback children in the first composition lane"
+        );
+    }
     if !parent_lifecycle_authority.permits_durable_handoff() {
         anyhow::bail!("detach: request-scoped execution cannot spawn a durable child");
     }
@@ -284,7 +289,7 @@ pub async fn spawn_detached_child(
     }
     state
         .state_store
-        .bind_detached_action_project_authority(operation_id, &child_project_authority)?;
+        .bind_root_action_project_authority(operation_id, &child_project_authority)?;
     // The intent now roots the exact generation. Drop staging leases before
     // resolving the child so retries consume the bound authority and never
     // capture/freeze a second generation.
@@ -413,6 +418,7 @@ pub async fn spawn_detached_child(
             launch_mode: "detached",
             parameters: child_parameters.clone(),
             ref_bindings: child_ref_bindings.clone(),
+            product_selections: Vec::new(),
             usage_subject: None,
             usage_subject_asserted_by: None,
             creates_chain_root: true,
@@ -453,6 +459,7 @@ pub async fn spawn_detached_child(
             kind: child_thread_profile.clone(),
             item_ref: child_item_ref.to_string(),
             ref_bindings: child_ref_bindings.clone(),
+            product_selections: Vec::new(),
             launch_mode: "detached".to_string(),
             parameters: child_parameters.clone(),
             // Resume identity derives from validated server-side provenance, never
@@ -532,7 +539,7 @@ pub async fn spawn_detached_child(
             });
         }
     }
-    state.state_store.seal_detached_action_intent(
+    state.state_store.seal_root_action_intent(
         operation_id,
         &child_project_authority,
         prepared.launch_metadata(),

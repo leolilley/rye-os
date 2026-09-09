@@ -1,6 +1,13 @@
-# ryeos:signed:2026-09-06T02:30:59Z:8be80a065621b5f1e70991e633f6ac9b08fd17de72d9e498cb3395bbf3a12915:/oD3m7gJfq5XUjqw+uXgKbhz7e31S4SsWs+s+dI7jzInLoEuy6RCUILjpC+I4mOXO25/HNQ/dpoFp8dhhYdyDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T19:05:41Z:07e7dd807586b53dd130043b390f6bb8357e9f33fe073a9af1749e9efc766f7a:1bHZXfiGxupGjVVgOgPJBTmBO8kmWrmxLANolgsM6PKWHV5goIzQY5tbn7MUWbYxC34Pq3+NOYsr05Gkt6X9Dw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 tokens: [external-content, bind]
 description: Bind a staged external-content manifest to one exact consumer authority
+arguments:
+  - name: product_selections
+    kind: json
+    positional: 7
+    required: false
+    arity: optional
+    description: Complete typed product-selection list for the exact consumer
 forms:
   - slots:
       - field: staging_id
@@ -20,7 +27,7 @@ project:
   bind_parameter: project_path
   no_project_flag: true
 help:
-  usage: ryeos external-content bind <staging-id> <request-digest> <manifest-hash> <consumer-ref> <consumer-kind> [project-snapshot-hash] --project <project-root>
+  usage: ryeos external-content bind <staging-id> <request-digest> <manifest-hash> <consumer-ref> <consumer-kind> [project-snapshot-hash] [--product-selections <json>] --project <project-root>
   examples:
     - ryeos --project /absolute/project external-content bind <stage> <request> <manifest> tool:project/build pinned_project <snapshot>
     - ryeos --no-project external-content bind <stage> <request> <manifest> worker:provider/hosted installed_bundle

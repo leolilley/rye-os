@@ -161,6 +161,7 @@ pub enum ExecutionProvenance {
         effective_path: PathBuf,
         workspace_lifeline: Arc<TempDirGuard>,
         input_snapshot_hash: String,
+        input_output_capture_hash: Option<String>,
         input_pinned_materialization: PinnedMaterializationAuthority,
         project_authority: ryeos_state::objects::ExecutionProjectAuthority,
         candidate_evaluation:
@@ -500,6 +501,47 @@ impl ExecutionProvenance {
         .validate_project_authority_binding()
     }
 
+    /// Condition a fresh, non-borrowed pinned root with its exact prepared
+    /// workspace-output partition. This changes no generation,
+    /// materialization, engine, path, or caller authority.
+    pub fn condition_root_workspace_outputs(
+        mut self,
+        partition: ryeos_state::objects::WorkspaceOutputPartition,
+    ) -> anyhow::Result<Self> {
+        let authority = match &self {
+            Self::RootPinnedGeneration {
+                candidate_evaluation: None,
+                project_authority,
+                ..
+            } => project_authority.condition_initial_workspace_outputs(partition)?,
+            Self::RootPinnedGeneration {
+                candidate_evaluation: Some(_),
+                ..
+            } => {
+                anyhow::bail!(
+                    "candidate-evaluation provenance cannot acquire workspace output authority"
+                )
+            }
+            Self::Projectless { .. }
+            | Self::RootLiveProject { .. }
+            | Self::ChildLiveProject { .. }
+            | Self::ChildPinnedGeneration { .. }
+            | Self::ChildImmutableWorkspaceInput { .. } => {
+                anyhow::bail!(
+                    "workspace output authority requires fresh non-borrowed pinned root provenance"
+                )
+            }
+        };
+        let Self::RootPinnedGeneration {
+            project_authority, ..
+        } = &mut self
+        else {
+            unreachable!("workspace output conditioning admitted only pinned root provenance")
+        };
+        *project_authority = authority;
+        self.validate_project_authority_binding()
+    }
+
     #[cfg(test)]
     pub(crate) fn root_pushed_head_for_test(
         effective_path: PathBuf,
@@ -623,6 +665,7 @@ impl ExecutionProvenance {
             effective_path,
             workspace_lifeline,
             input_snapshot_hash,
+            input_output_capture_hash,
             input_pinned_materialization,
             ..
         } = &self
@@ -653,6 +696,11 @@ impl ExecutionProvenance {
                 }
                 materialization.ensure_root_binding()?;
             }
+            ryeos_state::objects::WorkspaceGenerationPair {
+                snapshot_hash: input_snapshot_hash.clone(),
+                output_capture_hash: input_output_capture_hash.clone(),
+            }
+            .validate()?;
         }
         match &mut self {
             Self::Projectless {
@@ -1091,6 +1139,7 @@ impl ExecutionProvenance {
                 effective_path,
                 workspace_lifeline,
                 input_snapshot_hash,
+                input_output_capture_hash,
                 input_pinned_materialization,
                 project_authority,
                 candidate_evaluation,
@@ -1105,6 +1154,7 @@ impl ExecutionProvenance {
                 effective_path: effective_path.clone(),
                 workspace_lifeline: workspace_lifeline.clone(),
                 input_snapshot_hash: input_snapshot_hash.clone(),
+                input_output_capture_hash: input_output_capture_hash.clone(),
                 input_pinned_materialization: input_pinned_materialization.clone(),
                 project_authority: child_authority(project_authority),
                 candidate_evaluation: candidate_evaluation.clone(),
@@ -1122,11 +1172,17 @@ impl ExecutionProvenance {
     /// transient read generation never changes the root workspace lifecycle.
     pub fn with_immutable_workspace_input(
         self,
+        input_generation: ryeos_state::objects::WorkspaceGenerationPair,
         input_materialization: ryeos_state::PinnedProjectMaterialization,
         input_workspace_lifeline: Arc<TempDirGuard>,
     ) -> anyhow::Result<Self> {
+        input_generation.validate()?;
         input_materialization.ensure_root_binding()?;
-        let input_snapshot_hash = input_materialization.snapshot_hash().to_owned();
+        if input_materialization.snapshot_hash() != input_generation.snapshot_hash.as_str() {
+            anyhow::bail!(
+                "immutable workspace-input materialization does not match its captured generation"
+            );
+        }
         let effective_path = input_materialization.path().to_path_buf();
         if !input_workspace_lifeline.owns_effective_path(&effective_path) {
             anyhow::bail!("immutable workspace-input lifeline does not own its materialization");
@@ -1154,7 +1210,8 @@ impl ExecutionProvenance {
             subject_pinned_materialization,
             effective_path,
             workspace_lifeline: input_workspace_lifeline,
-            input_snapshot_hash,
+            input_snapshot_hash: input_generation.snapshot_hash,
+            input_output_capture_hash: input_generation.output_capture_hash,
             input_pinned_materialization: PinnedMaterializationAuthority::Verified(
                 input_materialization,
             ),
@@ -1298,6 +1355,25 @@ impl ExecutionProvenance {
                 input_snapshot_hash,
                 ..
             } => Some(input_snapshot_hash),
+            _ => None,
+        }
+    }
+
+    /// Exact source/output generation presented to an immutable borrowed
+    /// child's process. This is distinct from the unchanged project authority
+    /// used to resolve and admit the child program.
+    pub fn immutable_workspace_input_generation(
+        &self,
+    ) -> Option<ryeos_state::objects::WorkspaceGenerationPair> {
+        match self {
+            Self::ChildImmutableWorkspaceInput {
+                input_snapshot_hash,
+                input_output_capture_hash,
+                ..
+            } => Some(ryeos_state::objects::WorkspaceGenerationPair {
+                snapshot_hash: input_snapshot_hash.clone(),
+                output_capture_hash: input_output_capture_hash.clone(),
+            }),
             _ => None,
         }
     }
@@ -1528,6 +1604,10 @@ impl std::fmt::Debug for ExecutionProvenance {
             .field(
                 "immutable_workspace_input_snapshot_hash",
                 &self.immutable_workspace_input_snapshot_hash(),
+            )
+            .field(
+                "immutable_workspace_input_generation",
+                &self.immutable_workspace_input_generation(),
             )
             .field("state_root", &self.state_root_override())
             .field(
@@ -1847,9 +1927,13 @@ mod tests {
             .with_candidate_evaluation_scope(scope.clone())
             .unwrap();
         let (input, input_lifeline) = materialize("input", &input_hash);
+        let input_generation = ryeos_state::objects::WorkspaceGenerationPair {
+            snapshot_hash: input_hash.clone(),
+            output_capture_hash: Some("f".repeat(64)),
+        };
         let child = candidate
             .clone_for_borrowed_child()
-            .with_immutable_workspace_input(input, input_lifeline)
+            .with_immutable_workspace_input(input_generation.clone(), input, input_lifeline)
             .unwrap();
         for borrowed in [&child, &child.clone_for_borrowed_child()] {
             assert!(Arc::ptr_eq(
@@ -1867,6 +1951,10 @@ mod tests {
             assert_eq!(
                 borrowed.immutable_workspace_input_snapshot_hash(),
                 Some(input_hash.as_str())
+            );
+            assert_eq!(
+                borrowed.immutable_workspace_input_generation(),
+                Some(input_generation.clone())
             );
             assert_eq!(
                 borrowed

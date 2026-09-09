@@ -1,6 +1,6 @@
-# ryeos:signed:2026-09-05T00:45:21Z:ec1dc43e72b5639e1710fb773a9fac84cff2c3692ee4b46f2b29bc31ed453f3f:tXkx9K38Y+mR5MQGdkGxcJbrvW2mQmKfOTst6DqTxp9mo/44U2Syjsu2YZvwcet8TLCi2iQikyDqaRGPP0VqBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T01:19:41Z:319a9245fcc8a44e435090846a6d11cd1861c305270d84509001b561d37fae82:6bXFZDcLnSqWFYVdWAmG9moYLWz9ahOGGgRnM8tzcjzvb5a+eifkuH0l3wakURQg4wOPT2Mw+UnnTtc/mLXQAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "ryeos/core/runtimes/python"
-version: "1.1.0"
+version: "1.1.1"
 executor_id: "@subprocess"
 execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Python script runtime - runs Python scripts that manage their own __main__ entry point"
@@ -32,6 +32,7 @@ config:
   command: "${interpreter}"
   args:
     - "-I"
+    - "-B"
     - "-u"
     - "-c"
     - literal: |

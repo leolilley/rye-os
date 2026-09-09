@@ -3769,6 +3769,7 @@ impl Runner {
                     Ok(Box::new(ryeos_runtime::callback::DispatchActionRequest {
                         thread_id: self.thread_id.clone(),
                         action: ryeos_runtime::callback::ActionPayload {
+                            product_selections: Vec::new(),
                             operation_id: Some(operation_id.to_string()),
                             item_id: dispatch_result.canonical_ref.clone(),
                             ref_bindings: std::collections::BTreeMap::new(),

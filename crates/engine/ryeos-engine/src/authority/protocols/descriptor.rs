@@ -52,6 +52,12 @@ pub struct ProtocolDescriptor {
     /// of stdio. Absence means this is an ordinary one-shot protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<PersistentSessionProtocol>,
+
+    /// Optional pure projector for execution-specific result/call evidence.
+    /// Its owning protocol ref and signed digest are selected from the exact
+    /// direct launch artifact identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_evidence: Option<ryeos_handler_protocol::ExecutionEvidenceProjectorDeclWire>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +292,7 @@ mod tests {
             },
             callback_channel: CallbackChannel::Http,
             session: None,
+            execution_evidence: None,
         }
     }
 

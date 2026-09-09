@@ -133,6 +133,15 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
     // a kind identity): a parent that cannot be checkpoint-resumed could never be
     // woken to consume the child, so it must not be allowed to suspend for follow.
     let parent_launch_metadata = state.state_store.get_launch_metadata(&parent_thread_id)?;
+    if parent_launch_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.resume_context.as_ref())
+        .is_some_and(|resume| !resume.product_selections.is_empty())
+    {
+        bail!(
+            "follow: product-selected executions cannot suspend into a follow continuation in the first composition lane"
+        );
+    }
     let parent_is_native_resume = parent_launch_metadata
         .as_ref()
         .and_then(|metadata| metadata.native_resume.as_ref())
@@ -331,11 +340,17 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
                 base,
                 generation.snapshot_hash(),
             )?;
-            selected = selected.transition_operational_generation(
-                ryeos_state::objects::OperationalProjectAuthorityTransition::SelectPinnedChildGeneration {
-                    snapshot_hash: generation.snapshot_hash(),
-                },
-            )?;
+            let transition = ryeos_state::objects::OperationalProjectAuthorityTransition::SelectPinnedChildGeneration {
+                snapshot_hash: generation.snapshot_hash(),
+            };
+            selected = match generation.generation().output_capture_hash.as_deref() {
+                Some(capture_hash) => selected
+                    .transition_operational_generation_with_workspace_capture(
+                        transition,
+                        capture_hash,
+                    )?,
+                None => selected.transition_operational_generation(transition)?,
+            };
             sealed_cow_generation = Some(generation);
         }
 
@@ -763,26 +778,33 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
                                 &successor_id,
                             ),
                         );
-                    if let Some(frozen) = parent_successor_operational_generation.as_deref() {
+                    if let Some(frozen) = parent_successor_operational_generation.as_ref() {
                         let resume = successor_launch_metadata
                             .resume_context
                             .as_mut()
                             .ok_or_else(|| {
                                 anyhow::anyhow!("follow: successor lost its durable ResumeContext")
                             })?;
-                        resume.original_snapshot_hash = Some(frozen.to_string());
+                        resume.original_snapshot_hash = Some(frozen.snapshot_hash.clone());
                         resume.original_pushed_head_ref = None;
                         if matches!(
                             resume.project_authority,
                             ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration { .. }
                         ) {
-                            resume.project_authority = resume
-                                .project_authority
-                                .transition_operational_generation(
-                                    ryeos_state::objects::OperationalProjectAuthorityTransition::AdvancePinnedCowContinuation {
-                                        result_snapshot_hash: frozen,
-                                    },
-                                )?;
+                            let transition = ryeos_state::objects::OperationalProjectAuthorityTransition::AdvancePinnedCowContinuation {
+                                result_snapshot_hash: &frozen.snapshot_hash,
+                            };
+                            resume.project_authority = match frozen.output_capture_hash.as_deref() {
+                                Some(capture_hash) => resume
+                                    .project_authority
+                                    .transition_operational_generation_with_workspace_capture(
+                                        transition,
+                                        capture_hash,
+                                    )?,
+                                None => resume
+                                    .project_authority
+                                    .transition_operational_generation(transition)?,
+                            };
                         }
                     }
                     let successor_resume = successor_launch_metadata
@@ -849,7 +871,17 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
                         &parent.chain_root_id,
                         &params.completion,
                         &successor_launch_metadata,
-                        child_snapshot_hash.as_deref(),
+                        child_snapshot_hash
+                            .as_ref()
+                            .map(
+                                |snapshot_hash| ryeos_state::objects::WorkspaceGenerationPair {
+                                    snapshot_hash: snapshot_hash.clone(),
+                                    output_capture_hash: child_project_authority
+                                        .workspace_outputs()
+                                        .and_then(|outputs| outputs.capture_hash.clone()),
+                                },
+                            )
+                            .as_ref(),
                     )?;
                     drop(successor_realization.publication);
                     if let Err(error) = state
@@ -1085,6 +1117,7 @@ fn admit_follow_child_requests(
                         launch_mode: "detached",
                         parameters: child.parameters.clone(),
                         ref_bindings: child.ref_bindings.clone(),
+                        product_selections: Vec::new(),
                         usage_subject: None,
                         usage_subject_asserted_by: None,
                         creates_chain_root: true,
@@ -1251,6 +1284,7 @@ async fn prepare_follow_children(
                     kind: child_execution.kind.clone(),
                     item_ref: child.item_ref.clone(),
                     ref_bindings: child.ref_bindings.clone(),
+                    product_selections: Vec::new(),
                     launch_mode: "detached".to_string(),
                     parameters: child.parameters.clone(),
                     project_context: seed_project_context,
@@ -1448,6 +1482,7 @@ fn readmit_fresh_follow_child_for_launch(
             launch_mode: "detached",
             parameters: child.parameters.clone(),
             ref_bindings: child.ref_bindings.clone(),
+            product_selections: Vec::new(),
             usage_subject: None,
             usage_subject_asserted_by: None,
             creates_chain_root: true,
@@ -1787,7 +1822,7 @@ fn enforce_follow_nesting_depth(state: &AppState, chain_root_id: &str) -> Result
 fn parent_successor_operational_generation(
     parent: &ryeos_state::objects::ExecutionProjectAuthority,
     child: &ryeos_state::objects::ExecutionProjectAuthority,
-) -> Option<String> {
+) -> Option<ryeos_state::objects::WorkspaceGenerationPair> {
     matches!(
         parent,
         ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
@@ -1795,7 +1830,18 @@ fn parent_successor_operational_generation(
             ..
         }
     )
-    .then(|| child.operational_snapshot_projection().map(str::to_owned))
+    .then(|| {
+        child
+            .operational_snapshot_projection()
+            .map(
+                |snapshot_hash| ryeos_state::objects::WorkspaceGenerationPair {
+                    snapshot_hash: snapshot_hash.to_owned(),
+                    output_capture_hash: child
+                        .workspace_outputs()
+                        .and_then(|outputs| outputs.capture_hash.clone()),
+                },
+            )
+    })
     .flatten()
 }
 
@@ -1878,7 +1924,10 @@ mod tests {
         let child = pinned('b', PinnedProjectRealization::ReadOnly);
         assert_eq!(
             parent_successor_operational_generation(&parent, &child),
-            Some("b".repeat(64))
+            Some(ryeos_state::objects::WorkspaceGenerationPair {
+                snapshot_hash: "b".repeat(64),
+                output_capture_hash: None,
+            })
         );
     }
 

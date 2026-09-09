@@ -37,11 +37,6 @@ impl RetainedProjectContent {
         shape: ExternalContentCaptureKind,
         policy: &LargeContentCapturePolicy<'_>,
     ) -> anyhow::Result<Self> {
-        for (i, _) in policy.locator_prefix.match_indices('/') {
-            if policy.excludes_complete_path(&policy.locator_prefix[..i]) {
-                bail!("retained result member has an excluded ancestor");
-            }
-        }
         let mut selected = Self {
             files: BTreeMap::new(),
             directories: BTreeSet::new(),

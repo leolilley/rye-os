@@ -2460,6 +2460,7 @@ dependencies = [
  "ryeos-effect-contract",
  "ryeos-engine",
  "ryeos-graph-definition",
+ "ryeos-handler-protocol",
  "ryeos-isolation-protocol",
  "ryeos-provider-contract",
  "ryeos-runtime",
@@ -2782,6 +2783,7 @@ dependencies = [
  "ryeos-runtime",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -2823,6 +2825,8 @@ dependencies = [
  "ryeos-engine",
  "ryeos-graph-definition",
  "ryeos-handler-protocol",
+ "ryeos-runtime",
+ "ryeos-state",
  "serde",
  "serde_json",
  "serde_yaml",

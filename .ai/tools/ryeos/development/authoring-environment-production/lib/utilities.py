@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-07T08:05:59Z:16bc998bec744227321243302fedfaf50de3c8863af1452e8523855deaf152ed:UHRfF9jgnJ14v/gYd6cVEV7ythXhJAs674KPLTjUt89WVfwUinHnX842BAKHzFFep7UplW/cfLx3Sb+6j55zAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T16:57:42Z:281872d7aebc678f39a5f960508067fc1674c57f142e1733c32abd9eca9f8cd8:G9ebcMLYAThEGbrxAHes1Tc56NLNTVYBXGaT7i1S2btaWB+EJmCVpnpzLAy5uH2V4eBsqm38A3iFOC/SDELBBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Finite utility production for an admitted, private RyeOS Tool execution.
 
 This library owns the recipe used by build-utilities and its separate E2E probe.
@@ -35,6 +35,7 @@ MAX_SOURCE_BYTES = 128 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024
 MAX_EXTRACTED_ENTRIES = 100_000
 MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_FAILURE_CONFIG_LOG_BYTES = 64 * 1024
 RECIPE_FILES = ("utilities.py", "utility_production.py", "production.py", "archives.py")
 # This is a minimum, not a claim that upstream's whole subprocess closure has
 # already been qualified. Every additional helper must be in the exact inventory.
@@ -119,8 +120,29 @@ def validate_sources(config: dict) -> dict:
 def checked_support(root: Path, config: dict) -> dict[str, Path]:
     if not isinstance(config, dict) or set(config) != {"inputs", "commands", "notices"}:
         raise ValueError("exact build-support inventory is required")
-    if not config["inputs"] or input_inventory(root) != config["inputs"]:
-        raise ValueError("build-support bytes or modes differ from the exact inventory")
+    expected = config["inputs"]
+    if not isinstance(expected, dict) or not expected:
+        raise ValueError("exact build-support inventory is required")
+    observed = input_inventory(root)
+    missing = sorted(set(expected) - set(observed))
+    if missing:
+        raise ValueError(f"build-support inventory is missing exact member {missing[0]!r}")
+    unexpected = sorted(set(observed) - set(expected))
+    if unexpected:
+        raise ValueError(f"build-support inventory has unexpected member {unexpected[0]!r}")
+    for member in sorted(expected):
+        identity = expected[member]
+        if (not isinstance(identity, dict) or
+                set(identity) != {"bytes", "mode", "sha256"}):
+            raise ValueError(f"build-support expected identity is invalid for member {member!r}")
+        differences = [
+            f"{field} expected {identity[field]!r}, observed {observed[member][field]!r}"
+            for field in ("bytes", "mode", "sha256")
+            if identity[field] != observed[member][field]
+        ]
+        if differences:
+            raise ValueError(
+                f"build-support member {member!r} differs: " + "; ".join(differences))
     if any(member not in config["inputs"] or config["inputs"][member]["mode"] != 0o755
            for member in ELF_TOOLS.values()):
         raise ValueError("build support lacks its exact ELF inspection tools")
@@ -166,6 +188,46 @@ def extract_source(archive: Path, destination: Path, directory: str) -> Path:
     return ordinary_member(destination, directory, directory=True)
 
 
+def _append_failure_config_log(cwd: Path, log: Path, used: int) -> int:
+    """Append bounded config.log head/tail evidence without following a link."""
+    header = b"\n--- config.log bounded evidence ---\n"
+    omitted = b"\n--- config.log omitted middle ---\n"
+    available = MAX_LOG_BYTES - used
+    if available <= len(header):
+        return used
+    descriptor = None
+    try:
+        candidate = ordinary_member(cwd, "config.log")
+        descriptor = os.open(candidate, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        facts = os.fstat(descriptor)
+        if not stat.S_ISREG(facts.st_mode):
+            return used
+        payload_room = min(MAX_FAILURE_CONFIG_LOG_BYTES, available - len(header))
+        if facts.st_size <= payload_room:
+            detail = os.read(descriptor, facts.st_size)
+        elif payload_room > len(omitted):
+            retained_room = payload_room - len(omitted)
+            head_bytes = retained_room // 2
+            tail_bytes = retained_room - head_bytes
+            head = os.read(descriptor, head_bytes)
+            os.lseek(descriptor, facts.st_size - tail_bytes, os.SEEK_SET)
+            tail = os.read(descriptor, tail_bytes)
+            detail = head + omitted + tail
+        else:
+            detail = b""
+        with log.open("ab") as stream:
+            stream.write(header)
+            stream.write(detail)
+        return used + len(header) + len(detail)
+    except (OSError, ValueError):
+        # The upstream failure remains authoritative when no safe diagnostic is
+        # available. Never replace it with a diagnostic-retention error.
+        return used
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def run(argv: list[str], cwd: Path, env: dict[str, str], log: Path) -> None:
     """Bound diagnostics without creating a second process-group/time owner."""
     if not Path(argv[0]).is_absolute():
@@ -186,6 +248,8 @@ def run(argv: list[str], cwd: Path, env: dict[str, str], log: Path) -> None:
                     stream.write(block)
                     used += len(block)
                 if process.wait():
+                    stream.flush()
+                    used = _append_failure_config_log(cwd, log, used)
                     raise ValueError(f"utility build command failed; inspect {log.name}")
             finally:
                 if process.poll() is None:
@@ -247,6 +311,19 @@ def require_static(path: Path, tools: ElfTools) -> None:
     facts = tools.facts(path)
     if facts["interpreter"] or facts["needed"] or facts["runpath"] or facts["rpath"]:
         raise ValueError("utility output requires a loader or library search")
+
+
+def build_evidence(source_config: dict, support_config: dict, *,
+                   platform: Path = PLATFORM, support: Path = SUPPORT) -> dict:
+    """Canonical evidence emitted by the sole utility recipe owner."""
+    return {
+        "source_contract_sha256": hashlib.sha256(canonical_json(source_config)).hexdigest(),
+        "support_contract_sha256": hashlib.sha256(canonical_json(support_config)).hexdigest(),
+        "platform_root": str(platform),
+        "support_root": str(support),
+        "recipe_source_sha256": sha256(Path(__file__)),
+        "effects": "live",
+    }
 
 
 def build_utilities(source_config: dict, support_config: dict, source_archives: Path,
@@ -358,12 +435,8 @@ def build_utilities(source_config: dict, support_config: dict, source_archives: 
         deliver(destination / "corresponding-sources" / "ryeos-production" / name,
                 source=ordinary_member(Path(__file__).parent, name))
     deliver(destination / "source-contract.json", data=canonical_json(source_config))
-    deliver(destination / "build-evidence.json", data=canonical_json({
-        "source_contract_sha256": hashlib.sha256(canonical_json(source_config)).hexdigest(),
-        "support_contract_sha256": hashlib.sha256(canonical_json(support_config)).hexdigest(),
-        "platform_root": str(platform), "support_root": str(support),
-        "recipe_source_sha256": sha256(Path(__file__)), "effects": "live",
-    }))
+    deliver(destination / "build-evidence.json", data=canonical_json(
+        build_evidence(source_config, support_config, platform=platform, support=support)))
     for path in sorted(destination.rglob("*")):
         path.chmod(0o755 if path.is_dir() or path.parent == destination / "bin" else 0o644)
         os.utime(path, (source_config["source_date_epoch"], source_config["source_date_epoch"]))

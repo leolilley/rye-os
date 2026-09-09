@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-09T03:59:20Z:0bcb134bc5784d97226cfb3824aaf87e2042e119541647bd422e673aae7862b5:7QcsTmQlkbu7t9+yC7chSEUeqbZ4P875fhlweoBPxrP5J0CFnjsRTJNM5HmGVpsV3dIgaEp2NTZmFMW5pGd2Bw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-09T09:15:12Z:9f3c2310a686172fe41396d18b63b19a57e1727a06054283f3038bcb399275cd:cOG3BNpgzB1Zb6zw42xjCOZo8V4FG3dlY/Q175N33u8wmgqRRhmnVnLnuOHvKDL2mPF7+oGraWGnfBiXIwtbCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -224,7 +224,7 @@ policies:
         allow:
           - "*"
       limits:
-        open_files: 1024
+        open_files: 4096
         stdout_bytes: 8388608
         stderr_bytes: 8388608
         verified_artifact_file_bytes: 268435456

@@ -238,6 +238,19 @@ impl Walker {
         // action off to a detached child and suspend (handled in commit_step). The
         // result is consumed on resume, so nothing is dispatched or cached here.
         if node.follow && resumed_follow_envelope.is_none() {
+            if rendered_action
+                .get("product_selections")
+                .is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+            {
+                return StepOutcome::DispatchHardError(DispatchHardErrorOutcome {
+                    item_id: Some(dispatched_item_id),
+                    error: "product selection controls are not admitted on follow actions"
+                        .to_owned(),
+                    next_on_error: resolve_next_on_error(node, cfg),
+                    elapsed_ms: elapsed,
+                    cost: None,
+                });
+            }
             let ref_bindings = match rendered_action.get("ref_bindings") {
                 Some(value) => {
                     match serde_json::from_value::<BTreeMap<String, String>>(value.clone()) {
@@ -376,6 +389,8 @@ impl Walker {
                             publication: ryeos_runtime::callback_contract::RuntimeDispatchPublication::NotApplicable,
                             record_hash: None,
                             replayed_from: None,
+                            result_projection:
+                                ryeos_runtime::callback_contract::DispatchResultProjection::DispatchedSubject,
                         },
                     );
                     Ok(dispatch::ActionOutcome::Success(success))
@@ -547,7 +562,7 @@ impl Walker {
                         ),
                     )
                     .with_result(&val)
-                    .with_dispatch_option(dispatch.as_ref())
+                    .with_post_action_dispatch(dispatch.as_ref(), child_thread_id.as_deref())
                     .render_json(assign)
                     {
                         Ok(value) => Some(value),
@@ -581,7 +596,7 @@ impl Walker {
                         ),
                     )
                     .with_result(&val)
-                    .with_dispatch_option(dispatch.as_ref())
+                    .with_post_action_dispatch(dispatch.as_ref(), child_thread_id.as_deref())
                     .render_json(template)
                     {
                         Ok(Value::Array(observations)) => observations,
@@ -632,7 +647,7 @@ impl Walker {
                         effects: ExpressionFailureEffects::action(dispatch_observation),
                     });
                 }
-                let next = match edges::evaluate_next_with_result(
+                let next = match edges::evaluate_next_with_action_result(
                     compiled,
                     &candidate_state,
                     inputs,
@@ -645,6 +660,7 @@ impl Walker {
                         &self.graph.effective_definition_digest,
                     ),
                     dispatch.as_ref(),
+                    child_thread_id.as_deref(),
                 ) {
                     Ok(next) => next,
                     Err(error) => {
@@ -1076,6 +1092,20 @@ impl Walker {
                     item_id: None,
                     error: format!(
                         "follow fanout item {index} has missing or empty rendered item_id"
+                    ),
+                    next_on_error: resolve_next_on_error(node, cfg),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    cost: None,
+                });
+            }
+            if action
+                .get("product_selections")
+                .is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+            {
+                return StepOutcome::DispatchHardError(DispatchHardErrorOutcome {
+                    item_id: Some(item_ref),
+                    error: format!(
+                        "product selection controls are not admitted on follow fanout item {index}"
                     ),
                     next_on_error: resolve_next_on_error(node, cfg),
                     elapsed_ms: start.elapsed().as_millis() as u64,

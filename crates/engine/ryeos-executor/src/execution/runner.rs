@@ -241,6 +241,33 @@ impl ExecutionGuard {
         self.fail_thread_with_error(outcome_code, json!({ "code": outcome_code }))
     }
 
+    /// An explicit preparation error path, never an unconditional Drop hook.
+    /// Call only before scheduling a spawn: once handed to a blocking task,
+    /// cancellation or a generic error cannot prove absence of process contact.
+    fn fail_before_spawn(&mut self, error: anyhow::Error) -> anyhow::Error {
+        let cleanup = match (&self.thread_id, &self.launch_owner) {
+            (Some(thread_id), Some(owner)) => fail_settled_unattached_thread(
+                &self.state,
+                thread_id,
+                "launch_preparation_failed",
+                owner,
+            ),
+            _ => Err(anyhow::anyhow!(
+                "preparation cleanup lacks exact launch ownership"
+            )),
+        };
+        match cleanup {
+            Ok(outcome) => {
+                if outcome.disarms_guard() {
+                    self.mark_finalized();
+                }
+                self.cleanup();
+                error
+            }
+            Err(cleanup) => error.context(format!("precontact settlement failed: {cleanup:#}")),
+        }
+    }
+
     /// Like [`fail_thread`] but with a custom error JSON body.
     fn fail_thread_with_error(
         &mut self,
@@ -914,7 +941,13 @@ pub(crate) fn bind_owned_workspace_after_thread_birth(
     thread_id: &str,
     launch_owner: &str,
 ) -> Result<()> {
-    prepare_owned_workspace_after_thread_birth(state, provenance, thread_id, launch_owner)?;
+    prepare_owned_workspace_after_thread_birth(
+        state,
+        provenance,
+        thread_id,
+        launch_owner,
+        WorkspaceConstructionInput::PristineSource,
+    )?;
     if let Some(lifeline) = provenance.workspace_lifeline()
         && let Some(lifeline) = lifeline.owned_workspace_lifeline()?
         && let Some((workspace_id, view_identity)) = lifeline.workspace_view_identity()?
@@ -932,11 +965,56 @@ pub(crate) fn bind_owned_workspace_after_thread_birth(
     Ok(())
 }
 
+/// A new descriptor/view is not necessarily new backing content. Cold recovery
+/// carries the exact pre-rebind journal, after process settlement and retained
+/// root verification; it must never reapply the initial input generation.
+enum WorkspaceConstructionInput<'a> {
+    PristineSource,
+    RetainedBacking(&'a ryeos_app::runtime_db::WorkspaceRecord),
+}
+
+impl WorkspaceConstructionInput<'_> {
+    fn preserves_retained_contents(
+        &self,
+        current: &ryeos_app::runtime_db::WorkspaceRecord,
+        thread_id: &str,
+    ) -> Result<bool> {
+        let Self::RetainedBacking(previous) = self else {
+            return Ok(false);
+        };
+        if !matches!(
+            previous.state,
+            WorkspaceState::Ready | WorkspaceState::Active | WorkspaceState::Freezing
+        ) || current.state != WorkspaceState::Constructing
+            || previous.thread_id.as_deref() != Some(thread_id)
+            || current.thread_id.as_deref() != Some(thread_id)
+            || previous.workspace_id != current.workspace_id
+            || previous.root_path != current.root_path
+            || previous.base_generation()? != current.base_generation()?
+            || previous.frozen_generation()? != current.frozen_generation()?
+            || previous.workspace_output_partition_identity
+                != current.workspace_output_partition_identity
+            || previous.backend_id.is_none()
+            || previous.backend_id != current.backend_id
+            || previous.backend_version.is_none()
+            || previous.backend_version != current.backend_version
+            || previous.pinned_root_identities.is_none()
+            || previous.pinned_root_identities != current.pinned_root_identities
+        {
+            anyhow::bail!(
+                "retained workspace reconstruction contradicts its exact pre-rebind journal"
+            );
+        }
+        Ok(true)
+    }
+}
+
 fn prepare_owned_workspace_after_thread_birth(
     state: &AppState,
     provenance: &ExecutionProvenance,
     thread_id: &str,
     launch_owner: &str,
+    construction_input: WorkspaceConstructionInput<'_>,
 ) -> Result<()> {
     if provenance.is_borrowed_child() || !provenance.project_authority().requires_project_foldback()
     {
@@ -945,6 +1023,7 @@ fn prepare_owned_workspace_after_thread_birth(
     let Some(lifeline) = provenance.workspace_lifeline() else {
         return Ok(());
     };
+    let workspace_outputs = provenance.project_authority().workspace_outputs();
     let Some(root) = lifeline.path() else {
         anyhow::bail!("execution workspace was released before launch birth");
     };
@@ -955,12 +1034,34 @@ fn prepare_owned_workspace_after_thread_birth(
     let Some(record) = state.state_store.execution_workspace(workspace_id)? else {
         anyhow::bail!("execution workspace journal row is missing: {workspace_id}");
     };
+    validate_retained_workspace_output_coordinates(
+        record.state,
+        record.workspace_output_partition_identity.as_deref(),
+        record.base_output_capture_hash.as_deref(),
+        workspace_outputs.map(|outputs| outputs.partition.partition_identity.as_str()),
+        workspace_outputs.and_then(|outputs| outputs.capture_hash.as_deref()),
+    )?;
     if record.state == WorkspaceState::Constructing
         && (record.thread_id.is_none()
             || (record.thread_id.as_deref() == Some(thread_id)
                 && record.launch_owner.as_deref() == Some(launch_owner)))
     {
         let layout = super::workspace::WorkspaceLayout::from_root(root.clone());
+        let preserve_retained_contents =
+            construction_input.preserves_retained_contents(&record, thread_id)?;
+        if preserve_retained_contents {
+            let retained = provenance.pinned_materialization().ok_or_else(|| {
+                anyhow::anyhow!("retained workspace reconstruction lost its root proof")
+            })?;
+            if retained.snapshot_hash() != record.base_snapshot
+                || !retained.owns_path(&layout.project)?
+            {
+                anyhow::bail!(
+                    "retained workspace reconstruction changed its proven root or source generation"
+                );
+            }
+            retained.ensure_root_binding()?;
+        }
         state.state_store.claim_execution_workspace_construction(
             workspace_id,
             thread_id,
@@ -977,6 +1078,39 @@ fn prepare_owned_workspace_after_thread_birth(
             backend_id,
             backend_version,
         )?;
+        if let Some(outputs) = workspace_outputs {
+            super::workspace_outputs::admission::validate_current_bounds(
+                state,
+                &outputs.partition,
+            )?;
+            if !preserve_retained_contents {
+                let authority = super::pinned_state_authority(state)?;
+                let guard = authority.acquire_shared_guard()?;
+                // The source proof must precede output restoration. Restored
+                // outputs are a separately admitted partition and therefore
+                // intentionally make the resulting project root differ from
+                // the source-only ProjectSnapshot.
+                let source_materialization = ryeos_state::PinnedProjectMaterialization::verify(
+                    &authority,
+                    &guard,
+                    &record.base_snapshot,
+                    &layout.project,
+                )?;
+                if let Some(capture_hash) = outputs.capture_hash.as_deref() {
+                    let budget = super::external_content::private_materialization_budget()?;
+                    restore_process_workspace_output_generation(
+                        state,
+                        &authority,
+                        &guard,
+                        &source_materialization,
+                        &outputs.partition,
+                        capture_hash,
+                        &budget,
+                    )?;
+                    budget.emit_metrics(thread_id)?;
+                }
+            }
+        }
         let created = state
             .isolation
             .create_workspace(
@@ -1045,6 +1179,13 @@ fn prepare_owned_workspace_after_thread_birth(
                 "workspace reconstruction changed its retained backend or pinned backing roots"
             );
         }
+        if provenance
+            .project_authority()
+            .operational_snapshot_projection()
+            != Some(record.base_snapshot.as_str())
+        {
+            anyhow::bail!("workspace source generation contradicts admitted project authority");
+        }
         if state.isolation.is_enforced() {
             state
                 .state_store
@@ -1060,6 +1201,10 @@ fn prepare_owned_workspace_after_thread_birth(
                 backend_version: Some(&evidence.backend_version),
                 pinned_root_identities: Some(&pinned_root_identities),
                 mount_identity: evidence.mount_identity.as_deref(),
+                workspace_output_partition_identity: workspace_outputs
+                    .map(|outputs| outputs.partition.partition_identity.as_str()),
+                base_output_capture_hash: workspace_outputs
+                    .and_then(|outputs| outputs.capture_hash.as_deref()),
             })?;
     } else if record.state != WorkspaceState::Ready
         || record.thread_id.as_deref() != Some(thread_id)
@@ -1069,6 +1214,26 @@ fn prepare_owned_workspace_after_thread_birth(
             "execution workspace {workspace_id} cannot be adopted from state {}",
             record.state
         );
+    }
+    Ok(())
+}
+
+fn validate_retained_workspace_output_coordinates(
+    state: WorkspaceState,
+    retained_partition_identity: Option<&str>,
+    retained_base_capture_hash: Option<&str>,
+    admitted_partition_identity: Option<&str>,
+    admitted_base_capture_hash: Option<&str>,
+) -> Result<()> {
+    let retained_is_unbound =
+        retained_partition_identity.is_none() && retained_base_capture_hash.is_none();
+    if state == WorkspaceState::Constructing && retained_is_unbound {
+        return Ok(());
+    }
+    if retained_partition_identity != admitted_partition_identity
+        || retained_base_capture_hash != admitted_base_capture_hash
+    {
+        anyhow::bail!("retained workspace output generation contradicts admitted provenance");
     }
     Ok(())
 }
@@ -1599,37 +1764,32 @@ fn post_execution_foldback(
         .map_err(|error| anyhow::anyhow!("acquire CAS write permit for fold-back: {error}"))?;
 
     // Fold back changes
-    let operational_shadow_paths =
-        crate::execution::admitted_operational_shadow_paths(state, thread_id)?;
-    let (output_tree_hash, mut publication) =
-        crate::execution::fold_back_outputs(crate::execution::FoldBackOutputsParams {
-            authority: &authority,
-            cas_mutation_guard: &cas_mutation_guard,
-            isolation: &state.isolation,
-            workspace_id,
-            launch_owner,
-            working_dir,
-            pre_tree_hash,
-            policy_hash: pre_policy_hash,
-            base_snapshot_hash,
-            workspace_record: &workspace_record,
-            operational_shadow_paths: &operational_shadow_paths,
-        })
-        .context("freeze, validate, and publish authoritative project delta")?;
+    let (operational_shadow_paths, output_context) =
+        super::admitted_workspace_capture_inputs(state, thread_id, &workspace_record)?;
+    let crate::execution::FoldBackCapture {
+        tree_hash: output_tree_hash,
+        outputs,
+        mut publication,
+    } = crate::execution::fold_back_outputs(crate::execution::FoldBackOutputsParams {
+        authority: &authority,
+        cas_mutation_guard: &cas_mutation_guard,
+        isolation: &state.isolation,
+        workspace_id,
+        launch_owner,
+        working_dir,
+        pre_tree_hash,
+        policy_hash: pre_policy_hash,
+        base_snapshot_hash,
+        workspace_record: &workspace_record,
+        operational_shadow_paths: &operational_shadow_paths,
+        output_partition: output_context.as_ref().map(|context| &context.partition),
+    })
+    .context("freeze, validate, and publish authoritative project delta")?;
 
-    let snapshot_hash = if let Some(ref new_tree_hash) = output_tree_hash {
-        if !matches!(
-            terminal_publication,
-            ryeos_state::objects::PinnedTerminalPublication::AdvanceHead { .. }
-        ) {
-            crate::execution::store_foldback_snapshot(
-                &authority,
-                &cas_mutation_guard,
-                new_tree_hash,
-                base_snapshot_hash,
-                &mut publication,
-            )?
-        } else {
+    let advance_head = if output_tree_hash.is_some() {
+        if let ryeos_state::objects::PinnedTerminalPublication::AdvanceHead { .. } =
+            terminal_publication
+        {
             let ryeos_state::objects::PinnedTerminalPublication::AdvanceHead {
                 head_ref,
                 expected_hash,
@@ -1655,24 +1815,34 @@ fn post_execution_foldback(
                     "sealed terminal publication ref changed before fold-back: expected {expected_head_ref:?}, got {head_ref:?}"
                 );
             }
-            let signer = ryeos_app::state_store::NodeIdentitySigner::from_identity(&state.identity);
-            crate::execution::advance_after_foldback(
-                &authority,
-                &cas_mutation_guard,
-                &state.state_store,
-                thread_id,
-                launch_owner,
-                &signer,
-                principal_key,
-                &project_hash,
-                new_tree_hash,
-                base_snapshot_hash,
-                expected_hash,
-                &mut publication,
-            )?
+            Some((head_ref, expected_hash))
+        } else {
+            None
         }
     } else {
-        base_snapshot_hash.to_string()
+        None
+    };
+    let snapshot_hash = match output_tree_hash {
+        Some(tree_hash) => crate::execution::store_foldback_snapshot(
+            &authority,
+            &cas_mutation_guard,
+            &tree_hash,
+            base_snapshot_hash,
+            &mut publication,
+        )?,
+        None => base_snapshot_hash.to_owned(),
+    };
+    let generation = ryeos_state::objects::WorkspaceGenerationPair {
+        output_capture_hash: super::store_workspace_output_capture(
+            &authority,
+            &cas_mutation_guard,
+            output_context.as_ref(),
+            outputs,
+            base_snapshot_hash,
+            &snapshot_hash,
+            &mut publication,
+        )?,
+        snapshot_hash,
     };
     // The shared CAS guard and staged-root publication retain the completed
     // closure. Release the online mutation permit before StateStore acquires
@@ -1685,10 +1855,20 @@ fn post_execution_foldback(
         workspace_id,
         thread_id,
         launch_owner,
-        &snapshot_hash,
+        &generation,
     )?;
+    if let Some((head_ref, expected_hash)) = advance_head {
+        super::advance_head_to_frozen_runtime_result(
+            state,
+            thread_id,
+            launch_owner,
+            head_ref,
+            expected_hash,
+            &generation.snapshot_hash,
+        )?;
+    }
     Ok(crate::execution::PendingProjectResult {
-        snapshot_hash,
+        generation,
         publication: Some(publication),
         quiesced: None,
     })
@@ -1846,35 +2026,14 @@ fn abort_and_settle_pending_attach_failure(
             Err(error
                 .context("abort and reap attachment-pending process before lifecycle settlement"))
         }
-        Ok(()) => {
+        Ok(()) => (|| {
             if failure.process_attached {
-                match state.state_store.clear_thread_process_if_matches_owned(
-                    thread_id,
-                    &identity,
-                    launch_owner,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return ExecutionCleanupFailure {
-                            operation: failure.operation,
-                            operation_error: failure.error,
-                            cleanup: Err(anyhow::anyhow!(
-                                "attachment changed before dead pending process could be compare-cleared"
-                            )),
-                        };
-                    }
-                    Err(error) => {
-                        return ExecutionCleanupFailure {
-                            operation: failure.operation,
-                            operation_error: failure.error,
-                            cleanup: Err(error
-                                .context("compare-clear dead attachment-pending process identity")),
-                        };
-                    }
-                }
+                // Settle membership and attachment together. Clearing the PID
+                // first would discard the exact reaped-process authority.
+                clear_finished_process(state, thread_id, &identity, launch_owner)?;
             }
-            fail_thread_static_owned(state, thread_id, &failure.outcome_code, launch_owner)
-        }
+            fail_settled_unattached_thread(state, thread_id, &failure.outcome_code, launch_owner)
+        })(),
     };
     ExecutionCleanupFailure {
         operation: failure.operation,
@@ -1883,7 +2042,37 @@ fn abort_and_settle_pending_attach_failure(
     }
 }
 
-fn clear_finished_process(
+/// Only call after bounded preparation failed before process contact, or after
+/// the held process was successfully aborted and reaped. NULL PID, terminal
+/// status, task cancellation and Drop are never substitutes for that proof.
+fn fail_settled_unattached_thread(
+    state: &AppState,
+    thread_id: &str,
+    outcome_code: &str,
+    launch_owner: &str,
+) -> Result<ExecutionCleanupOutcome> {
+    let outcome = fail_thread_static_owned(state, thread_id, outcome_code, launch_owner)?;
+    if matches!(outcome, ExecutionCleanupOutcome::PreservedForShutdown) {
+        return Ok(outcome);
+    }
+    if let Some(binding) = state.state_store.thread_workspace_binding(thread_id)? {
+        let owner: ryeos_app::runtime_db::LaunchOwner = serde_json::from_str(launch_owner)?;
+        if binding.borrower_launch_owner != owner {
+            anyhow::bail!("settled launch cannot retire another workspace borrower's membership");
+        }
+        if !state
+            .state_store
+            .settle_thread_workspace_owned(thread_id, &binding)?
+        {
+            anyhow::bail!(
+                "settled launch retains process contact or unsettled workspace descendants"
+            );
+        }
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn clear_finished_process(
     state: &AppState,
     thread_id: &str,
     process_identity: &ryeos_app::process::ExecutionProcessIdentity,
@@ -1914,19 +2103,27 @@ fn clear_finished_process(
     }
 }
 
+fn release_cleanup_is_settled(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ryeos_engine::error::EngineError>(),
+        Some(ryeos_engine::error::EngineError::AttachmentReleaseFailed { source })
+            if source.cleanup_is_settled()
+    )
+}
+
 /// Finalize a thread from its completion result.
 fn finalize_completion(
     state: &AppState,
     thread_id: &str,
     completion: ExecutionCompletion,
-    result_project_snapshot_hash: Option<&str>,
+    result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
     launch_owner: &str,
 ) -> std::result::Result<ThreadDetail, ExecutionCleanupFailure> {
     let finalized = state.threads.finalize_from_completion_owned(
         thread_id,
         launch_owner,
         &completion,
-        result_project_snapshot_hash,
+        result_generation,
     );
     match finalized {
         Ok(thread) => Ok(thread),
@@ -1986,9 +2183,18 @@ fn runtime_effect_class(
 }
 
 fn verify_dispatch_effect_record(
+    state: &AppState,
     authority: &ryeos_state::PinnedStateAuthority,
     indexed: &ryeos_state::ReplayIndexRecord,
 ) -> ryeos_state::ReplayRecordVerification {
+    let _guard = match authority.acquire_shared_guard() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return ryeos_state::ReplayRecordVerification::Unavailable {
+                reason: format!("dispatch effect CAS authority unavailable: {error:#}"),
+            };
+        }
+    };
     let value = match authority
         .cas_store()
         .and_then(|cas| cas.get_object(&indexed.record_hash))
@@ -2029,6 +2235,50 @@ fn verify_dispatch_effect_record(
                 indexed.record_hash
             ),
         };
+    }
+    if let ryeos_effect_contract::DispatchEffectAnswer::Retained {
+        result,
+        retained_result,
+    } = &record.answer
+    {
+        let verified = (|| -> Result<()> {
+            let limits = state.node_policy.require::<ryeos_app::node_policy::sections::object_closure::NodeObjectClosurePolicy>()?.closure_limits()?;
+            let cas = authority.cas_store()?;
+            let closure = ryeos_state::object_closure::collect_object_closure_with_cas_and_limits(
+                &cas,
+                [indexed.record_hash.clone()],
+                limits,
+            )?;
+            if !closure.is_complete() {
+                anyhow::bail!(
+                    "retained dispatch record has an incomplete or malformed typed closure"
+                );
+            }
+            if !closure.large_object_hashes.is_empty() {
+                let large_store = authority.large_object_store()?;
+                for hash in &closure.large_object_hashes {
+                    let sidecar = large_store
+                        .sidecar(hash)?
+                        .context("retained dispatch record large object has no sidecar")?;
+                    large_store.verify_resident_object(hash, sidecar.size)?;
+                }
+            }
+            // This is typed-closure residency, not a second full product byte
+            // scrub. Current-product admission below owns byte verification.
+            let retained = ryeos_state::object_closure::load_exact_cas_object_with_cas(
+                &cas, retained_result.object_hash(),
+                (ryeos_state::external_content::products::accepted_result::MAX_PRODUCT_BUILD_ACCEPTED_RESULT_BYTES as u64).min(limits.max_object_bytes),
+            )?;
+            if retained != *result {
+                anyhow::bail!("retained dispatch answer contradicts its exact accepted object");
+            }
+            Ok(())
+        })();
+        if let Err(error) = verified {
+            return ryeos_state::ReplayRecordVerification::IntegrityFailure {
+                reason: format!("retained dispatch record closure is invalid: {error:#}"),
+            };
+        }
     }
     let evidence_hash = &record.admission_evidence_hash;
     let evidence = match authority
@@ -2092,11 +2342,136 @@ fn dispatch_subject_components_from_capsule(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("admitted dispatch capsule has no subject ref"))?
         .to_string();
+    // An accepted build consumes the entire exact producer source generation,
+    // not only a dispatched leaf's definition closure. Keep this distinction
+    // in the subject identity; output hashes and attempt IDs remain answers.
+    let launch_authority_digest = if let Some(outputs) =
+        capsule.project_authority.workspace_outputs()
+    {
+        let producer =
+            ryeos_state::external_content::products::admission::admitted_product_producer(capsule)?;
+        ryeos_state::external_content::products::admission::admitted_product_recipe(
+            capsule,
+            &outputs.partition.recipe_binding,
+        )?;
+        product_build_subject_digest(
+            &producer,
+            &outputs.partition.partition_identity,
+            &capsule.launch_authority().product_build_replay_digest()?,
+        )?
+    } else {
+        capsule.launch_authority_digest()?
+    };
     Ok((
         subject_ref,
-        capsule.launch_authority_digest()?,
+        launch_authority_digest,
         capsule.dispatch_effect_caller_authority_digest()?,
     ))
+}
+
+fn product_build_subject_digest(
+    producer: &ryeos_state::external_content::products::ProductProducerAdmission,
+    partition_identity: &str,
+    replay_authority_digest: &str,
+) -> Result<String> {
+    producer.validate()?;
+    ryeos_effect_contract::require_hex64("producer partition identity", partition_identity)?;
+    ryeos_effect_contract::require_hex64("producer replay authority", replay_authority_digest)?;
+    ryeos_state::objects::canonical_value_digest(&json!({
+        "schema": "ryeos.product_build_dispatch_subject.v2",
+        "replay_authority_digest": replay_authority_digest,
+        "producer_project_snapshot_hash": producer.producer_project_snapshot_hash,
+        "producer_effective_definition_digest": producer.effective_definition_digest,
+        "producer_parameters_digest": producer.admitted_parameters_digest,
+        "producer_partition_identity": partition_identity,
+    }))
+}
+
+pub(crate) enum PreparedManagedDispatchEffect {
+    Execute {
+        identity: ryeos_effect_contract::DispatchEffectIdentity,
+    },
+    Replay {
+        result: Value,
+        dispatch: ryeos_runtime::callback_contract::RuntimeDispatchEvidence,
+    },
+}
+
+/// Called only after independent output authority and the exact producer
+/// capsule have been admitted, and before the reserved child is born.
+pub(crate) fn prepare_managed_dispatch_effect(
+    state: &AppState,
+    resolved: &ResolvedExecutionRequest,
+    capsule: &ryeos_state::objects::AdmittedLaunchCapsule,
+    prepared: &ryeos_effect_contract::PreparedEffectDispatchAuthority,
+) -> Result<PreparedManagedDispatchEffect> {
+    prepared.validate()?;
+    capsule
+        .project_authority
+        .workspace_outputs()
+        .context("managed durable action requires admitted retained products")?;
+    let (subject_ref, launch_authority_digest, caller_authority_digest) =
+        dispatch_subject_components_from_capsule(capsule)?;
+    if subject_ref != resolved.item_ref {
+        anyhow::bail!("managed effect subject differs from its admitted producer");
+    }
+    let identity = ryeos_effect_contract::DispatchEffectIdentity {
+        authorization: prepared.authorization.clone(),
+        action_digest: prepared.action_digest.clone(),
+        subject: ryeos_effect_contract::AdmittedDispatchSubject {
+            subject_ref,
+            launch_authority_digest,
+            caller_authority_digest,
+            effect_class_ceiling: prepared.subject_effect_class_ceiling,
+        },
+    };
+    let cache_key = identity.cache_key()?;
+    let authority = super::pinned_state_authority(state)?;
+    let _guard = authority.acquire_shared_guard()?;
+    let namespace =
+        ryeos_state::ReplayIndexNamespace::new(ryeos_effect_contract::EFFECT_REPLAY_NAMESPACE)?;
+    match state
+        .state_store
+        .lookup_replay_record(&namespace, &cache_key, |indexed| {
+            verify_dispatch_effect_record(state, &authority, indexed)
+        })? {
+        ryeos_state::ReplayLookupOutcome::Absent => {
+            Ok(PreparedManagedDispatchEffect::Execute { identity })
+        }
+        ryeos_state::ReplayLookupOutcome::Present(indexed) => {
+            // Current product policy and byte verification happen outside the
+            // state-store mutex while this guard prevents concurrent GC.
+            let record =
+                load_verified_dispatch_effect_record(state, &authority, &indexed, Some(capsule))?;
+            if record.identity != identity {
+                anyhow::bail!("managed build replay contradicts admitted effect identity");
+            }
+            let ryeos_effect_contract::DispatchEffectAnswer::Retained { .. } = &record.answer
+            else {
+                anyhow::bail!("managed build replay has no retained product answer");
+            };
+            Ok(PreparedManagedDispatchEffect::Replay {
+                result: record.answer.replay_leaf_envelope(&indexed.record_hash)?,
+                dispatch: ryeos_runtime::callback_contract::RuntimeDispatchEvidence {
+                    source: ryeos_runtime::callback_contract::RuntimeDispatchSource::EffectRecord,
+                    effect_class: runtime_effect_class(identity.authorization.class),
+                    action_digest: identity.action_digest,
+                    effect_identity: Some(cache_key),
+                    publication:
+                        ryeos_runtime::callback_contract::RuntimeDispatchPublication::NotApplicable,
+                    record_hash: Some(indexed.record_hash.clone()),
+                    replayed_from: Some(indexed.record_hash),
+                    result_projection: record.answer.result_projection(),
+                },
+            })
+        }
+        ryeos_state::ReplayLookupOutcome::Unavailable { reason } => {
+            anyhow::bail!("build replay unavailable: {reason}")
+        }
+        ryeos_state::ReplayLookupOutcome::IntegrityFailure { reason } => {
+            anyhow::bail!("build replay integrity failure: {reason}")
+        }
+    }
 }
 
 fn admitted_subject_from_capsule(
@@ -2104,6 +2479,15 @@ fn admitted_subject_from_capsule(
     capsule: &ryeos_state::objects::AdmittedLaunchCapsule,
     ceiling: ryeos_effect_contract::EffectClass,
 ) -> Result<ryeos_effect_contract::AdmittedDispatchSubject> {
+    // Current effect answers replay values, not workspace mutations. Returning
+    // a recorded builder answer without restoring its outputs would falsely
+    // report work as complete. Immutable selected-product consumers have no
+    // writable output partition and retain ordinary recorded semantics.
+    if capsule.project_authority.workspace_outputs().is_some() {
+        anyhow::bail!(
+            "recorded or sealed execution with workspace outputs requires an admitted replayable output contract; use live producer steps"
+        );
+    }
     let (capsule_subject_ref, launch_authority_digest, caller_authority_digest) =
         dispatch_subject_components_from_capsule(capsule)?;
     if capsule_subject_ref != resolved.item_ref {
@@ -2123,15 +2507,15 @@ fn admitted_subject_from_capsule(
 }
 
 fn load_verified_dispatch_effect_record(
+    state: &AppState,
     authority: &ryeos_state::PinnedStateAuthority,
     indexed: &ryeos_state::ReplayIndexRecord,
+    expected_current_capsule: Option<&ryeos_state::objects::AdmittedLaunchCapsule>,
 ) -> Result<ryeos_effect_contract::DispatchEffectRecord> {
-    if !matches!(
-        verify_dispatch_effect_record(authority, indexed),
-        ryeos_state::ReplayRecordVerification::Verified
-    ) {
-        anyhow::bail!("dispatch-effect record lost verification after indexed lookup");
-    }
+    // Callers have verified the full immutable record outside the index lock.
+    // Hold CAS authority before reloading, and compare the exact index row;
+    // repeating large closure verification here would scrub every hit twice.
+    let guard = authority.acquire_shared_guard()?;
     let value = authority
         .cas_store()?
         .get_object(&indexed.record_hash)?
@@ -2141,7 +2525,49 @@ fn load_verified_dispatch_effect_record(
                 indexed.record_hash
             )
         })?;
-    ryeos_effect_contract::DispatchEffectRecord::from_current_value(&value)
+    let record = ryeos_effect_contract::DispatchEffectRecord::from_current_value(&value)?;
+    if record.cache_key != indexed.cache_key || record.answer_digest != indexed.answer_digest {
+        anyhow::bail!("dispatch-effect record changed after indexed verification");
+    }
+    if let ryeos_effect_contract::DispatchEffectAnswer::Retained {
+        result,
+        retained_result,
+    } = &record.answer
+    {
+        let retained = ryeos_state::object_closure::load_exact_cas_object_with_cas(
+            &authority.cas_store()?,
+            retained_result.object_hash(),
+            ryeos_state::external_content::products::accepted_result::MAX_PRODUCT_BUILD_ACCEPTED_RESULT_BYTES as u64,
+        )?;
+        if retained != *result {
+            anyhow::bail!("retained dispatch answer contradicts its exact result object");
+        }
+        // Product witnesses attest the actual historical producer, including
+        // its exact accounting reservation. Reuse proves current equivalence
+        // separately; it must not rewrite that testimony to this attempt.
+        let historical_capsule = ryeos_state::objects::AdmittedLaunchCapsule::from_current_value(
+            authority
+                .cas_store()?
+                .get_object(&record.admission_evidence_hash)?
+                .context("retained effect admission evidence disappeared")?,
+        )?;
+        if let Some(current) = expected_current_capsule {
+            let current_subject = dispatch_subject_components_from_capsule(current)?;
+            let historical_subject = dispatch_subject_components_from_capsule(&historical_capsule)?;
+            if current_subject != historical_subject {
+                anyhow::bail!(
+                    "retained product effect does not match current admitted reuse authority"
+                );
+            }
+        }
+        ryeos_app::operator_external_content::product_build::verify_current(
+            state,
+            &guard,
+            &retained,
+            &historical_capsule,
+        )?;
+    }
+    Ok(record)
 }
 
 /// Reconstruct a durable callback answer from one already-terminal child.
@@ -2151,6 +2577,42 @@ fn load_verified_dispatch_effect_record(
 /// died after terminal settlement but before effect publication, the signed
 /// terminal response is sufficient to finish that publication; the action is
 /// never executed again.
+fn dispatch_effect_admission_capsule(
+    state: &AppState,
+    terminal_thread_id: &str,
+) -> Result<ryeos_state::objects::AdmittedLaunchCapsule> {
+    let (chain_root_id, _, terminal_capsule) = state
+        .state_store
+        .admitted_launch_capsule_with_coordinates(terminal_thread_id)?
+        .context("durable action terminal has no admitted capsule")?;
+    if terminal_capsule
+        .project_authority
+        .workspace_outputs()
+        .is_none()
+    {
+        return Ok(terminal_capsule);
+    }
+    // A managed build's input is its admitted root. Continuation may advance
+    // source/output generations, but cannot replace that original request
+    // identity. Acceptance separately proves the exact root→terminal lineage.
+    let root_capsule = state
+        .state_store
+        .admitted_launch_capsule(&chain_root_id)?
+        .context("retained build root admission is unavailable")?;
+    let root_outputs = root_capsule
+        .project_authority
+        .workspace_outputs()
+        .context("retained build root has no admitted output partition")?;
+    let terminal_outputs = terminal_capsule
+        .project_authority
+        .workspace_outputs()
+        .context("retained build terminal lost output authority")?;
+    if root_outputs.partition != terminal_outputs.partition {
+        anyhow::bail!("retained build continuation changed its output partition");
+    }
+    Ok(root_capsule)
+}
+
 pub(crate) fn recover_terminal_dispatch_effect(
     state: &AppState,
     child_thread_id: &str,
@@ -2159,14 +2621,9 @@ pub(crate) fn recover_terminal_dispatch_effect(
     terminal_response: &Value,
 ) -> Result<Value> {
     prepared.validate()?;
-    let capsule = state
-        .state_store
-        .admitted_launch_capsule(child_thread_id)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "terminal durable action child {child_thread_id} has no admitted launch capsule"
-            )
-        })?;
+    let authority = super::pinned_state_authority(state)?;
+    let _recovery_guard = authority.acquire_shared_guard()?;
+    let capsule = dispatch_effect_admission_capsule(state, child_thread_id)?;
     let (subject_ref, launch_authority_digest, caller_authority_digest) =
         dispatch_subject_components_from_capsule(&capsule)?;
     if subject_ref != expected_subject_ref {
@@ -2187,16 +2644,16 @@ pub(crate) fn recover_terminal_dispatch_effect(
     };
     identity.validate()?;
     let cache_key = identity.cache_key()?;
-    let authority = super::pinned_state_authority(state)?;
     let namespace =
         ryeos_state::ReplayIndexNamespace::new(ryeos_effect_contract::EFFECT_REPLAY_NAMESPACE)?;
     match state
         .state_store
         .lookup_replay_record(&namespace, &cache_key, |indexed| {
-            verify_dispatch_effect_record(&authority, indexed)
+            verify_dispatch_effect_record(state, &authority, indexed)
         })? {
         ryeos_state::ReplayLookupOutcome::Present(indexed) => {
-            let record = load_verified_dispatch_effect_record(&authority, &indexed)?;
+            let record =
+                load_verified_dispatch_effect_record(state, &authority, &indexed, Some(&capsule))?;
             if record.identity != identity {
                 anyhow::bail!(
                     "verified dispatch-effect record {} contradicts recovered child authority",
@@ -2215,6 +2672,7 @@ pub(crate) fn recover_terminal_dispatch_effect(
                     publication: ryeos_runtime::callback_contract::RuntimeDispatchPublication::NotApplicable,
                     record_hash: Some(indexed.record_hash.clone()),
                     replayed_from: Some(indexed.record_hash),
+                    result_projection: record.answer.result_projection(),
                 },
             }))
         }
@@ -2229,6 +2687,19 @@ pub(crate) fn recover_terminal_dispatch_effect(
             let object = response.as_object_mut().ok_or_else(|| {
                 anyhow::anyhow!("terminal durable action response is not an object")
             })?;
+            if let ryeos_effect_contract::DispatchEffectAnswer::Retained { result, .. } =
+                &publication.answer
+            {
+                object.insert(
+                    "result".to_owned(),
+                    json!({
+                        "outcome_code": null,
+                        "result": result,
+                        "error": null,
+                        "artifacts": [],
+                    }),
+                );
+            }
             object.insert(
                 "dispatch".to_string(),
                 serde_json::to_value(ryeos_runtime::callback_contract::RuntimeDispatchEvidence {
@@ -2239,6 +2710,7 @@ pub(crate) fn recover_terminal_dispatch_effect(
                     publication: publication.publication,
                     record_hash: Some(publication.record_hash),
                     replayed_from: None,
+                    result_projection: publication.answer.result_projection(),
                 })?,
             );
             Ok(response)
@@ -2255,6 +2727,7 @@ pub(crate) fn recover_terminal_dispatch_effect(
 struct DispatchEffectPublication {
     record_hash: String,
     publication: ryeos_runtime::callback_contract::RuntimeDispatchPublication,
+    answer: ryeos_effect_contract::DispatchEffectAnswer,
 }
 
 fn publish_dispatch_effect_record(
@@ -2263,11 +2736,10 @@ fn publish_dispatch_effect_record(
     response: &Value,
     produced_by_thread: &str,
 ) -> Result<DispatchEffectPublication> {
-    let normalized = ryeos_runtime::normalize_dispatch_effect(response)
-        .context("durable dispatch completed without a replay-safe answer")?;
     let cache_key = identity.cache_key()?;
-    let answer_digest = normalized.answer.digest()?;
-    let capsule = state
+    let state_authority = state.state_store.pinned_state_authority()?;
+    let publication_guard = state_authority.acquire_shared_guard()?;
+    let observed_capsule = state
         .state_store
         .admitted_launch_capsule(produced_by_thread)?
         .ok_or_else(|| {
@@ -2275,8 +2747,43 @@ fn publish_dispatch_effect_record(
                 "durable dispatch producer {produced_by_thread} has no admitted launch capsule"
             )
         })?;
-    let state_authority = state.state_store.pinned_state_authority()?;
-    let realization = capsule.verify_retained_execution_realization(
+    let capsule = dispatch_effect_admission_capsule(state, produced_by_thread)?;
+    // Keep the accepted object alive until the existing replay record becomes
+    // its durable owner. Product captures use their ordinary immutable heads;
+    // this operation introduces no additional cache/head or unguarded gap.
+    let (answer, observed_response_digest) =
+        if capsule.project_authority.workspace_outputs().is_some() {
+            let accepted = ryeos_app::operator_external_content::product_build::accept_terminal(
+                state,
+                &capsule,
+                produced_by_thread,
+                &publication_guard,
+            )?;
+            let result = accepted.to_value()?;
+            ryeos_app::operator_external_content::product_build::verify_current(
+                state,
+                &publication_guard,
+                &result,
+                &capsule,
+            )?;
+            let object_hash = state_authority.cas_store()?.store_object(&result)?;
+            (
+                ryeos_effect_contract::DispatchEffectAnswer::Retained {
+                    result,
+                    retained_result:
+                        ryeos_effect_contract::RetainedEffectResult::ProductBuildAcceptedResult {
+                            object_hash,
+                        },
+                },
+                ryeos_state::objects::canonical_value_digest(response)?,
+            )
+        } else {
+            let normalized = ryeos_runtime::normalize_dispatch_effect(response)
+                .context("durable dispatch completed without a replay-safe answer")?;
+            (normalized.answer, normalized.observed_response_digest)
+        };
+    let answer_digest = answer.digest()?;
+    let realization = observed_capsule.verify_retained_execution_realization(
         &state_authority.cas_store()?,
         &state_authority.large_object_store()?,
         state_authority.trust_store(),
@@ -2294,16 +2801,20 @@ fn publish_dispatch_effect_record(
         identity,
         admission_evidence_hash: capsule.content_hash()?,
         answer_digest: answer_digest.clone(),
-        answer: normalized.answer,
+        answer: answer.clone(),
         first_observation: ryeos_effect_contract::EffectFirstObservation {
             produced_by_thread: produced_by_thread.to_string(),
-            response_digest: normalized.observed_response_digest,
+            response_digest: observed_response_digest,
             observed_at: ryeos_effect_contract::canonical_observation_timestamp_now(),
             execution_identity_digest: Some(substrate_identity.identity_digest()?),
             execution_identity_attestation_hash: Some(
                 realization.substrate_attestation_hash.clone(),
             ),
-            admitted_execution_realization_hash: Some(capsule.execution_realization_hash),
+            // The first observation belongs to the final executing placement.
+            // This is still an admitted realization, not an observed-realization
+            // object. The original admission remains owned by the record's
+            // separate admission_evidence_hash above.
+            admitted_execution_realization_hash: Some(observed_capsule.execution_realization_hash),
             observed_execution_realization_hash: None,
         },
     };
@@ -2323,9 +2834,41 @@ fn publish_dispatch_effect_record(
     };
     let replay_namespace =
         ryeos_state::ReplayIndexNamespace::new(ryeos_effect_contract::EFFECT_REPLAY_NAMESPACE)?;
+    // Verify immutable bytes before acquiring the global state mutex. The
+    // publication callback may only recognize these exact previously checked
+    // rows; a concurrently appearing incumbent is unavailable, not trusted.
+    match verify_dispatch_effect_record(state, &authority, &candidate) {
+        ryeos_state::ReplayRecordVerification::Verified => {}
+        ryeos_state::ReplayRecordVerification::Unavailable { reason } => {
+            anyhow::bail!("dispatch-effect candidate verification unavailable: {reason}");
+        }
+        ryeos_state::ReplayRecordVerification::IntegrityFailure { reason } => {
+            anyhow::bail!("dispatch-effect candidate integrity failure: {reason}");
+        }
+    }
+    let incumbent = match state.state_store.lookup_replay_record(
+        &replay_namespace,
+        &candidate.cache_key,
+        |indexed| verify_dispatch_effect_record(state, &authority, indexed),
+    )? {
+        ryeos_state::ReplayLookupOutcome::Absent => None,
+        ryeos_state::ReplayLookupOutcome::Present(indexed) => Some(indexed),
+        ryeos_state::ReplayLookupOutcome::Unavailable { reason } => {
+            anyhow::bail!("dispatch-effect incumbent verification unavailable: {reason}");
+        }
+        ryeos_state::ReplayLookupOutcome::IntegrityFailure { reason } => {
+            anyhow::bail!("dispatch-effect incumbent integrity failure: {reason}");
+        }
+    };
     let outcome = state.state_store.with_state_db(|db| {
         db.publish_replay_record(&replay_namespace, &candidate, |indexed| {
-            verify_dispatch_effect_record(&authority, indexed)
+            if indexed == &candidate || incumbent.as_ref() == Some(indexed) {
+                ryeos_state::ReplayRecordVerification::Verified
+            } else {
+                ryeos_state::ReplayRecordVerification::Unavailable {
+                    reason: "dispatch-effect incumbent changed after immutable verification; retry exact publication".into(),
+                }
+            }
         })
     })?;
     match outcome {
@@ -2333,12 +2876,14 @@ fn publish_dispatch_effect_record(
             Ok(DispatchEffectPublication {
                 record_hash,
                 publication: ryeos_runtime::callback_contract::RuntimeDispatchPublication::Inserted,
+                answer,
             })
         }
         ryeos_state::ReplayPublishOutcome::Folded { record_hash } => {
             Ok(DispatchEffectPublication {
                 record_hash,
                 publication: ryeos_runtime::callback_contract::RuntimeDispatchPublication::Folded,
+                answer,
             })
         }
         ryeos_state::ReplayPublishOutcome::Unavailable { reason } => {
@@ -2376,42 +2921,8 @@ fn resolved_terminator_protocol<'a>(
     resolved: &ResolvedExecutionRequest,
 ) -> Result<&'a ryeos_engine::protocols::VerifiedProtocol> {
     let kind = &resolved.resolved_item.kind;
-    let schema = engine
-        .kinds
-        .get(kind)
-        .ok_or_else(|| anyhow::anyhow!("execution kind schema not registered: {kind}"))?;
-    let terminator = schema
-        .execution()
-        .and_then(|execution| execution.terminator.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("execution kind '{kind}' has no terminator"))?;
-    let protocol_ref = match terminator {
-        ryeos_engine::kind_registry::TerminatorDecl::Subprocess { protocol } => {
-            let effective = engine.effective_item(ryeos_engine::engine::EffectiveItemRequest {
-                item_ref: resolved.resolved_item.canonical_ref.clone(),
-                expected_kind: Some(kind.clone()),
-                project_root: resolved.resolved_item.materialized_project_root.clone(),
-                subject_resolution_authority: resolved
-                    .resolved_item
-                    .subject_resolution_authority
-                    .clone(),
-            })?;
-            if effective.source.content_hash != resolved.resolved_item.content_hash {
-                anyhow::bail!(
-                    "effective subprocess protocol selection changed the verified root bytes"
-                );
-            }
-            protocol
-                .resolve(&effective.composed_value)
-                .map_err(anyhow::Error::msg)?
-        }
-        ryeos_engine::kind_registry::TerminatorDecl::InProcess { .. } => {
-            anyhow::bail!("execution kind '{kind}' has an in-process terminator")
-        }
-    };
-    let protocol = engine
-        .protocols
-        .require(&protocol_ref)
-        .map_err(|error| anyhow::anyhow!("protocol lookup failed for '{protocol_ref}': {error}"))?;
+    let protocol =
+        ryeos_app::thread_lifecycle::resolve_direct_terminator_protocol(engine, resolved)?;
     crate::dispatch::validate_ordinary_protocol_contract(protocol, kind)
         .map_err(|error| anyhow::anyhow!(error))?;
     if protocol.descriptor.stdout.shape
@@ -2726,14 +3237,33 @@ enum ProcessInputRootSelection {
     CandidateIntegrationPrivate,
 }
 
+/// Physical scratch is launch authority, not a logical project context. Keep
+/// projectless plans projectless while handing their already-owned input root
+/// to isolation. Other launches retain their existing project-root routing.
+fn projectless_isolation_workspace(
+    project: ProcessProjectClass,
+    process_path: &Path,
+) -> Option<PathBuf> {
+    match project {
+        ProcessProjectClass::Projectless => Some(process_path.to_path_buf()),
+        ProcessProjectClass::Live
+        | ProcessProjectClass::PinnedReadOnly
+        | ProcessProjectClass::PinnedCow => None,
+    }
+}
+
 fn select_process_input_root(
     project: ProcessProjectClass,
     has_bindings: bool,
     isolation_enforced: bool,
     candidate_integration: bool,
+    restore_outputs: bool,
 ) -> ProcessInputRootSelection {
     if candidate_integration {
         return ProcessInputRootSelection::CandidateIntegrationPrivate;
+    }
+    if restore_outputs {
+        return ProcessInputRootSelection::PinnedReadOnlyPrivate;
     }
     match (project, has_bindings, isolation_enforced) {
         (ProcessProjectClass::Live, true, _) => ProcessInputRootSelection::SparsePrivate,
@@ -2759,39 +3289,214 @@ fn bindings_require_private_copy(
             ))
 }
 
+/// Mount attachment may not create entries beneath a bound source directory.
+/// The executor therefore prepares exact empty targets in its freshly owned
+/// sparse input root, before handing that root to isolation. No admitted bytes
+/// are copied and no live project or materialization cache is modified.
+fn prepare_sparse_input_mount_target(
+    root: &lillux::PinnedDirectory,
+    relative: &str,
+    kind: ryeos_engine::external_content::ExternalContentKind,
+) -> Result<()> {
+    ryeos_state::objects::validate_canonical_project_relative_path(relative)?;
+    let (parent, name) = super::pinned_output_parent(root, relative)?;
+    match kind {
+        ryeos_engine::external_content::ExternalContentKind::Tree => {
+            // The owned root already contains its control-directory skeleton.
+            // Reuse only a real directory; this no-follow primitive still
+            // refuses a regular file or symlink at the exact target.
+            parent.open_or_create_child(&name, 0o700)?;
+        }
+        ryeos_engine::external_content::ExternalContentKind::File => {
+            parent.open_regular_create(&name, true, true, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod process_input_selection_tests {
     use super::*;
 
     #[test]
+    fn sparse_input_targets_are_empty_and_leave_admitted_sources_untouched() {
+        use ryeos_engine::external_content::ExternalContentKind::{File, Tree};
+        let private = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(live.path().join(".ai/tools/test")).unwrap();
+        std::fs::write(live.path().join(".ai/tools/test/main.py"), b"original").unwrap();
+        let root = lillux::PinnedDirectory::open(private.path())
+            .unwrap()
+            .unwrap();
+        for (relative, kind) in [
+            (".ai/tools/test", Tree),
+            ("vendor/simulator", Tree),
+            ("contracts/input.json", File),
+        ] {
+            prepare_sparse_input_mount_target(&root, relative, kind).unwrap();
+        }
+        assert!(private.path().join(".ai/tools/test").is_dir());
+        assert!(private.path().join("vendor/simulator").is_dir());
+        assert_eq!(
+            std::fs::read(private.path().join("contracts/input.json")).unwrap(),
+            b""
+        );
+        assert!(!private.path().join(".ai/tools/test/main.py").exists());
+        assert_eq!(
+            std::fs::read(live.path().join(".ai/tools/test/main.py")).unwrap(),
+            b"original"
+        );
+        assert!(!live.path().join("vendor").exists());
+        assert!(!live.path().join("contracts").exists());
+        assert!(prepare_sparse_input_mount_target(&root, "contracts/input.json", File).is_err());
+    }
+
+    #[test]
+    fn sparse_input_targets_refuse_noncanonical_paths_and_symlink_parents() {
+        use ryeos_engine::external_content::ExternalContentKind::Tree;
+        let private = tempfile::tempdir().unwrap();
+        let root = lillux::PinnedDirectory::open(private.path())
+            .unwrap()
+            .unwrap();
+        for relative in [
+            "",
+            "/escape",
+            "../escape",
+            "one/../escape",
+            "one//two",
+            "one/",
+        ] {
+            assert!(
+                prepare_sparse_input_mount_target(&root, relative, Tree).is_err(),
+                "{relative}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), private.path().join("link")).unwrap();
+            assert!(prepare_sparse_input_mount_target(&root, "link/escape", Tree).is_err());
+            assert!(!outside.path().join("escape").exists());
+        }
+    }
+
+    #[test]
+    fn sparse_input_targets_reuse_owned_directories_but_refuse_other_leaf_types() {
+        use ryeos_engine::external_content::ExternalContentKind::Tree;
+        let private = tempfile::tempdir().unwrap();
+        let root = lillux::PinnedDirectory::open(private.path())
+            .unwrap()
+            .unwrap();
+        let existing = root
+            .create_child(std::ffi::OsStr::new(".ai"), 0o700)
+            .unwrap();
+        let identity = existing.device_inode().unwrap();
+        prepare_sparse_input_mount_target(&root, ".ai", Tree).unwrap();
+        assert_eq!(
+            root.open_child_directory(std::ffi::OsStr::new(".ai"))
+                .unwrap()
+                .unwrap()
+                .device_inode()
+                .unwrap(),
+            identity
+        );
+        std::fs::write(private.path().join("file"), b"unchanged").unwrap();
+        assert!(prepare_sparse_input_mount_target(&root, "file", Tree).is_err());
+        assert_eq!(
+            std::fs::read(private.path().join("file")).unwrap(),
+            b"unchanged"
+        );
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), private.path().join("link")).unwrap();
+            assert!(prepare_sparse_input_mount_target(&root, "link", Tree).is_err());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn sparse_input_targets_follow_owned_descriptor_not_replacement_path() {
+        use ryeos_engine::external_content::ExternalContentKind::Tree;
+        let base = tempfile::tempdir().unwrap();
+        let original = base.path().join("private");
+        let retained = base.path().join("retained");
+        std::fs::create_dir(&original).unwrap();
+        let root = lillux::PinnedDirectory::open(&original).unwrap().unwrap();
+        std::fs::rename(&original, &retained).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        prepare_sparse_input_mount_target(&root, ".ai/tools/test", Tree).unwrap();
+        assert!(retained.join(".ai/tools/test").is_dir());
+        assert!(!original.join(".ai").exists());
+    }
+
+    #[test]
+    fn projectless_spawn_uses_exact_owned_scratch_without_a_logical_project() {
+        let scratch = Path::new("/exact-owned-execution/scratch");
+        assert_eq!(
+            projectless_isolation_workspace(ProcessProjectClass::Projectless, scratch),
+            Some(scratch.to_path_buf())
+        );
+        for project in [
+            ProcessProjectClass::Live,
+            ProcessProjectClass::PinnedReadOnly,
+            ProcessProjectClass::PinnedCow,
+        ] {
+            assert_eq!(projectless_isolation_workspace(project, scratch), None);
+        }
+    }
+
+    #[test]
     fn exact_input_root_selection_matrix_is_closed() {
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::Live, false, false, false),
+            select_process_input_root(ProcessProjectClass::Live, false, false, false, false),
             ProcessInputRootSelection::Existing
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::Live, true, false, false),
+            select_process_input_root(ProcessProjectClass::Live, true, false, false, false),
             ProcessInputRootSelection::SparsePrivate
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::Live, true, true, false),
+            select_process_input_root(ProcessProjectClass::Live, true, true, false, false),
             ProcessInputRootSelection::SparsePrivate
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedReadOnly, false, false, false,),
+            select_process_input_root(
+                ProcessProjectClass::PinnedReadOnly,
+                false,
+                false,
+                false,
+                false,
+            ),
             ProcessInputRootSelection::PinnedReadOnlyPrivate
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedReadOnly, true, true, false),
+            select_process_input_root(
+                ProcessProjectClass::PinnedReadOnly,
+                true,
+                true,
+                false,
+                false,
+            ),
             ProcessInputRootSelection::Existing
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedCow, true, false, false),
+            select_process_input_root(ProcessProjectClass::PinnedCow, true, false, false, false),
             ProcessInputRootSelection::Existing
         );
         assert_eq!(
-            select_process_input_root(ProcessProjectClass::PinnedCow, true, true, true),
+            select_process_input_root(ProcessProjectClass::PinnedCow, true, true, true, false),
             ProcessInputRootSelection::CandidateIntegrationPrivate
+        );
+        assert_eq!(
+            select_process_input_root(
+                ProcessProjectClass::PinnedReadOnly,
+                false,
+                false,
+                false,
+                true,
+            ),
+            ProcessInputRootSelection::PinnedReadOnlyPrivate
         );
     }
 
@@ -2830,6 +3535,70 @@ mod process_input_selection_tests {
     }
 }
 
+fn validate_process_inputs_outside_workspace_outputs(
+    state: &AppState,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    partition: &ryeos_state::objects::WorkspaceOutputPartition,
+) -> Result<()> {
+    partition.validate()?;
+    let mut mounts = super::external_content::admitted_realization_mounts(resolution)?;
+    if let Some(source) = super::source_closure::admitted_source_mount(state, resolution)? {
+        mounts.push(source);
+    }
+    for mount in mounts {
+        let mount = Path::new(&mount);
+        for output in &partition.roots {
+            let output_path = Path::new(&output.path);
+            if mount.starts_with(output_path) || output_path.starts_with(mount) {
+                anyhow::bail!(
+                    "workspace output `{}` overlaps process input mount `{}`",
+                    output.name,
+                    mount.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restore_process_workspace_output_generation(
+    state: &AppState,
+    authority: &ryeos_state::PinnedStateAuthority,
+    guard: &ryeos_state::CasMutationGuard,
+    source: &ryeos_state::PinnedProjectMaterialization,
+    partition: &ryeos_state::objects::WorkspaceOutputPartition,
+    capture_hash: &str,
+    budget: &super::external_content::PrivateMaterializationBudget,
+) -> Result<()> {
+    super::workspace_outputs::admission::validate_current_bounds(state, partition)?;
+    let cas = authority.cas_store()?;
+    let value = ryeos_state::object_closure::load_exact_cas_object_with_cas(
+        &cas,
+        capture_hash,
+        ryeos_state::objects::MAX_WORKSPACE_OUTPUT_CAPTURE_BYTES as u64,
+    )?;
+    let capture = ryeos_state::objects::WorkspaceOutputCapture::from_value(&value)?;
+    if capture.partition != *partition
+        || capture.result_project_snapshot_hash != source.snapshot_hash()
+    {
+        anyhow::bail!("workspace output capture contradicts the selected process generation");
+    }
+    let result = ryeos_state::project_materialization::load_project_snapshot_bounded(
+        &cas,
+        &capture.result_project_snapshot_hash,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("workspace output result snapshot is unavailable"))?;
+    let policy = ryeos_state::project_materialization::load_project_policy_bounded(
+        &cas,
+        &partition.project_snapshot_policy_hash,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("workspace output capture policy is unavailable"))?;
+    partition.validate_result_source_policy(&result, &policy)?;
+    super::workspace_outputs::restore_workspace_outputs_before_view(
+        authority, guard, source, &capture, &policy, budget,
+    )
+}
+
 pub(crate) fn prepare_process_inputs(
     state: &AppState,
     provenance: &ExecutionProvenance,
@@ -2845,6 +3614,46 @@ pub(crate) fn prepare_process_inputs(
     super::source_closure::validate_external_mount_separation(state, retained_resolution)?;
     let has_bindings = retained_resolution_has_filesystem_bindings(retained_resolution)?;
     let project_class = process_project_class(provenance);
+    let workspace_outputs = provenance.project_authority().workspace_outputs();
+    if let Some(outputs) = workspace_outputs {
+        validate_process_inputs_outside_workspace_outputs(
+            state,
+            retained_resolution,
+            &outputs.partition,
+        )?;
+    }
+    let immutable_input_generation = provenance.immutable_workspace_input_generation();
+    if let Some(generation) = &immutable_input_generation {
+        generation.validate()?;
+        if generation.output_capture_hash.is_some() && workspace_outputs.is_none() {
+            anyhow::bail!(
+                "immutable workspace input source/output pair contradicts subject authority"
+            );
+        }
+    }
+    let pinned_read_only_generation = match project_class {
+        ProcessProjectClass::PinnedReadOnly => Some(match immutable_input_generation.clone() {
+            Some(generation) => generation,
+            None => ryeos_state::objects::WorkspaceGenerationPair {
+                snapshot_hash: provenance
+                    .project_authority()
+                    .operational_snapshot_projection()
+                    .ok_or_else(|| anyhow::anyhow!("pinned process lost its source generation"))?
+                    .to_owned(),
+                output_capture_hash: workspace_outputs
+                    .and_then(|outputs| outputs.capture_hash.clone()),
+            },
+        }),
+        ProcessProjectClass::Live
+        | ProcessProjectClass::Projectless
+        | ProcessProjectClass::PinnedCow => None,
+    };
+    if let Some(generation) = &pinned_read_only_generation {
+        generation.validate()?;
+    }
+    let restore_outputs = pinned_read_only_generation
+        .as_ref()
+        .is_some_and(|generation| generation.output_capture_hash.is_some());
     let candidate_integration = provenance
         .candidate_evaluation_scope()
         .is_some_and(|scope| {
@@ -2858,6 +3667,7 @@ pub(crate) fn prepare_process_inputs(
         has_bindings,
         state.isolation.is_enforced(),
         candidate_integration,
+        restore_outputs,
     );
     let live_private_root = root_selection == ProcessInputRootSelection::SparsePrivate;
     let pinned_read_only_private_root =
@@ -2898,28 +3708,31 @@ pub(crate) fn prepare_process_inputs(
             .then(super::external_content::private_materialization_budget)
             .transpose()?;
     if pinned_read_only_private_root || candidate_integration_private_root {
-        let snapshot_hash = match provenance.project_authority() {
-            ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
-                snapshot_hash,
-                ..
-            } => snapshot_hash,
-            _ => unreachable!("pinned read-only selector already proved pinned authority"),
-        };
+        let snapshot_hash = pinned_read_only_generation
+            .as_ref()
+            .map(|generation| generation.snapshot_hash.as_str())
+            .or_else(|| {
+                provenance
+                    .project_authority()
+                    .operational_snapshot_projection()
+            })
+            .ok_or_else(|| anyhow::anyhow!("private pinned root lost its source generation"))?;
         let authority = super::pinned_state_authority(state)?;
         let guard = authority.acquire_shared_guard()?;
         let cache = super::cache::MaterializationCache::new(
             state.config.runtime_root().cache().join("snapshots"),
         );
-        let (materialized_path, generation_lease, _) = super::checkout_project_snapshot(
-            &authority,
-            &guard,
-            snapshot_hash,
-            super::ProjectMaterialization::PrivateWritableWorkspace {
-                target_dir: &path,
-                budget: budget.as_ref(),
-            },
-            &cache,
-        )?;
+        let (materialized_path, generation_lease, source_materialization) =
+            super::checkout_project_snapshot(
+                &authority,
+                &guard,
+                snapshot_hash,
+                super::ProjectMaterialization::PrivateWritableWorkspace {
+                    target_dir: &path,
+                    budget: budget.as_ref(),
+                },
+                &cache,
+            )?;
         if materialized_path != path {
             anyhow::bail!("private pinned project materialization changed its selected root");
         }
@@ -2927,6 +3740,25 @@ pub(crate) fn prepare_process_inputs(
             .as_ref()
             .expect("private pinned project root always has a lifeline")
             .retain_lease(generation_lease);
+        if let Some(capture_hash) = pinned_read_only_generation
+            .as_ref()
+            .and_then(|generation| generation.output_capture_hash.as_deref())
+        {
+            let partition = workspace_outputs
+                .map(|outputs| &outputs.partition)
+                .ok_or_else(|| anyhow::anyhow!("workspace output capture lost its partition"))?;
+            restore_process_workspace_output_generation(
+                state,
+                &authority,
+                &guard,
+                &source_materialization,
+                partition,
+                capture_hash,
+                budget
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("workspace output restore has no budget"))?,
+            )?;
+        }
     }
 
     let (external, source) = if private_copy {
@@ -2956,6 +3788,26 @@ pub(crate) fn prepare_process_inputs(
             super::source_closure::bind_source(state, retained_resolution, &path)?,
         )
     };
+    if live_private_root && !private_copy {
+        let root = lifeline
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sparse input root lost its owner"))?
+            .owned_scratch_root()?;
+        if let Some(external) = external.as_ref() {
+            for (relative, kind) in external.project_mount_targets() {
+                prepare_sparse_input_mount_target(root, relative, kind)?;
+            }
+        }
+        if let Some(relative) =
+            super::source_closure::admitted_source_mount(state, retained_resolution)?
+        {
+            prepare_sparse_input_mount_target(
+                root,
+                &relative,
+                ryeos_engine::external_content::ExternalContentKind::Tree,
+            )?;
+        }
+    }
     if let Some(budget) = budget.as_ref() {
         budget.emit_metrics(thread_id)?;
     }
@@ -3050,6 +3902,7 @@ fn admitted_root_launch_metadata(
         kind: params.resolved.kind.clone(),
         item_ref: params.resolved.item_ref.clone(),
         ref_bindings: params.resolved.ref_bindings.clone(),
+        product_selections: params.resolved.product_selections.clone(),
         launch_mode: params.resolved.launch_mode.clone(),
         parameters: params.parameters.clone(),
         project_context: params.resolved.plan_context.project_context.clone(),
@@ -3159,6 +4012,7 @@ pub(crate) fn finalize_direct_effective_program(
     resolved: &ResolvedExecutionRequest,
     provenance: &ExecutionProvenance,
     parent_thread_id: Option<&str>,
+    handler_context: Option<&ryeos_app::handler_context::HandlerContext>,
 ) -> Result<FinalizedDirectAdmission> {
     let admission = resolved.root_admission.as_ref().ok_or_else(|| {
         anyhow::anyhow!("cannot finalize a direct root execution without root admission")
@@ -3270,6 +4124,22 @@ pub(crate) fn finalize_direct_effective_program(
         &mut publication,
         None,
     )?;
+    ryeos_app::effective_program_preparation::prepare_hookless_preselection_effective_program(
+        engine,
+        item_kind,
+        &mut resolution,
+    )?;
+    ryeos_app::operator_external_content::product_composition::admit_root_product_selections(
+        state,
+        engine,
+        &roots,
+        materialization.subject_authority(),
+        &mut resolution,
+        resolved.requested_by.as_deref(),
+        handler_context,
+        &resolved.product_selections,
+        false,
+    )?;
     let captured_external =
         ryeos_app::external_content_admission::admit_external_realizations_in_publication(
             state,
@@ -3281,13 +4151,22 @@ pub(crate) fn finalize_direct_effective_program(
             inherited_external.as_ref(),
             &mut publication,
         )?;
+    let semantic_projection =
+        ryeos_engine::effective_program::take_recovered_effective_program_derived(&mut resolution);
     let validation = engine
         .effective_validators
         .validate(item_kind, &resolution)?;
-    let candidate =
-        ryeos_engine::effective_program::lock_validated_effective_program(resolution, validation)?;
+    let candidate = ryeos_engine::effective_program::relock_recovered_effective_program(
+        resolution,
+        validation,
+        semantic_projection,
+    )?;
     let proof = ryeos_engine::effective_program::prove_finalization_authority(
         &candidate,
+        engine
+            .kinds
+            .get(item_kind)
+            .and_then(|schema| schema.external_content_contract()),
         &[],
         &roots,
         project,
@@ -3557,8 +4436,12 @@ pub async fn run_and_wait(
     // before this future's next await point.
     let mut prepared_plan = {
         let sealed_dependency_bytes =
-            super::external_content::sealed_dependency_bytes_for_child_dispatch(&state, &params)
-                .context("derive sealed dependency bytes for child dispatch")?;
+            super::external_content::sealed_dependency_bytes_for_child_dispatch(
+                &state,
+                &params,
+                finalized_direct.program.resolution(),
+            )
+            .context("derive sealed dependency bytes for child dispatch")?;
         thread_lifecycle::prepare_item_plan(
             &engine,
             &params.resolved,
@@ -3582,7 +4465,6 @@ pub async fn run_and_wait(
     prepared_plan.bind_realization_command(
         &state,
         &engine,
-        &params.resolved.resolved_item.kind,
         finalized_direct.program.resolution(),
         state.isolation.as_ref(),
     )?;
@@ -3656,12 +4538,17 @@ pub async fn run_and_wait(
             state
                 .state_store
                 .lookup_replay_record(&replay_namespace, &cache_key, |indexed| {
-                    verify_dispatch_effect_record(&authority, indexed)
+                    verify_dispatch_effect_record(&state, &authority, indexed)
                 })?;
         match lookup {
             ryeos_state::ReplayLookupOutcome::Absent => Some(identity),
             ryeos_state::ReplayLookupOutcome::Present(indexed) => {
-                let record = load_verified_dispatch_effect_record(&authority, &indexed)?;
+                let record = load_verified_dispatch_effect_record(
+                    &state,
+                    &authority,
+                    &indexed,
+                    Some(&capsule),
+                )?;
                 if record.identity != identity {
                     anyhow::bail!(
                         "verified dispatch-effect record {} contradicts the current admitted identity",
@@ -3686,6 +4573,7 @@ pub async fn run_and_wait(
                         publication: ryeos_runtime::callback_contract::RuntimeDispatchPublication::NotApplicable,
                         record_hash: Some(indexed.record_hash.clone()),
                         replayed_from: Some(indexed.record_hash),
+                        result_projection: record.answer.result_projection(),
                     },
                 });
             }
@@ -3787,7 +4675,8 @@ pub async fn run_and_wait(
         &created.thread_id,
         &wait_external.retained_resolution,
         &effective_path,
-    )?;
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
     effective_path = process_path;
     if let Some(lifeline) = process_input_lifeline {
         guard.track_process_input_dir(lifeline);
@@ -3805,7 +4694,8 @@ pub async fn run_and_wait(
         let admitted_project_root =
             Path::new(ryeos_app::thread_lifecycle::ADMITTED_DIRECT_PROJECT_ROOT);
         prepared_plan
-            .relocate_project_for_spawn(Some(admitted_project_root), Some(&effective_path))?;
+            .relocate_project_for_spawn(Some(admitted_project_root), Some(&effective_path))
+            .map_err(|error| guard.fail_before_spawn(error.into()))?;
         params.resolved.plan_context.project_context =
             ryeos_engine::contracts::ProjectContext::LocalPath {
                 path: effective_path.clone(),
@@ -3815,7 +4705,8 @@ pub async fn run_and_wait(
         &mut prepared_plan,
         wait_bound_external.as_ref(),
         state.isolation.as_ref(),
-    )?;
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
 
     // Spawn — use the per-request engine (pushed_head overlay or
     // daemon startup engine), NOT state.engine directly.
@@ -3849,9 +4740,9 @@ pub async fn run_and_wait(
         "execution roots resolved"
     );
     if super::process_attachment::finalize_requested_stop_if_present(&state, &tid)? {
-        guard.mark_finalized();
-        guard.cleanup();
-        anyhow::bail!("terminal subprocess {tid} was stopped before credential mint");
+        return Err(guard.fail_before_spawn(anyhow::anyhow!(
+            "terminal subprocess {tid} was stopped before credential mint"
+        )));
     }
     let ProtocolLaunchEnv {
         bindings: protocol_env_bindings,
@@ -3876,10 +4767,7 @@ pub async fn run_and_wait(
         effective_bundle_id_for_request(&params.resolved),
         &wait_launch_owner,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("protocol_contract_failed");
-        guard.cleanup();
-    })?;
+    .map_err(|error| guard.fail_before_spawn(error))?;
     if let Some(token) = callback_token {
         guard.track_callback_token(token);
     }
@@ -3906,13 +4794,14 @@ pub async fn run_and_wait(
     let wait_roots = ryeos_app::env_contract::DaemonRootEnv::from_resolution_roots(
         &engine.resolution_roots(Some(effective_path.clone())),
         &state.config.app_root,
-    )?;
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
     let wait_isolation = state.isolation.clone();
     let wait_isolation_daemon_socket_path = isolation_daemon_socket_path;
     if super::process_attachment::finalize_requested_stop_if_present(&state, &tid)? {
-        guard.mark_finalized();
-        guard.cleanup();
-        anyhow::bail!("terminal subprocess {tid} was stopped before isolation and process spawn");
+        return Err(guard.fail_before_spawn(anyhow::anyhow!(
+            "terminal subprocess {tid} was stopped before isolation and process spawn"
+        )));
     }
     // Mounts travel into the spawn; `wait_external.bound` (the generation
     // leases) stays in this scope, which outlives the in-fn wait.
@@ -3936,11 +4825,14 @@ pub async fn run_and_wait(
     let wait_workspace_view = if wait_isolation_project_authority
         == ryeos_engine::isolation::IsolationProjectAuthority::RuntimeWorkspace
     {
-        borrow_bound_workspace_view(&state, guard.temp_dir.as_ref(), &created.thread_id)?
+        borrow_bound_workspace_view(&state, guard.temp_dir.as_ref(), &created.thread_id)
+            .map_err(|error| guard.fail_before_spawn(error))?
     } else {
         None
     };
     let wait_node_trusted_keys_dir = state.config.runtime_root().trusted_keys_dir();
+    let wait_isolation_workspace =
+        projectless_isolation_workspace(process_project_class(&params.provenance), &effective_path);
     let spawn_handle = task::spawn_blocking(move || {
         let _spawn_workspace_lifeline = spawn_workspace_lifeline;
         thread_lifecycle::spawn_item(thread_lifecycle::SpawnItemParams {
@@ -3959,7 +4851,7 @@ pub async fn run_and_wait(
             isolation_live_access_authority: wait_isolation_live_access_authority,
             isolation_external_read_only_mounts: wait_external_mounts,
             isolation_node_trusted_keys_dir: wait_node_trusted_keys_dir,
-            isolation_workspace: None,
+            isolation_workspace: wait_isolation_workspace,
             inherited_fds: Vec::new(),
             external_realizations_env: wait_external_sealed_env,
             admitted_source_env: wait_source_sealed_env,
@@ -3982,9 +4874,21 @@ pub async fn run_and_wait(
         Ok(Ok(s)) => s,
         Ok(Err(err)) => {
             tracing::error!(error = %err, "engine error while spawning waited execution");
-            guard.fail_thread("engine_error");
+            if err.contact_is_settled() {
+                let outcome = fail_settled_unattached_thread(
+                    &state,
+                    &created.thread_id,
+                    "engine_error",
+                    &wait_launch_owner,
+                )?;
+                if outcome.disarms_guard() {
+                    guard.mark_finalized();
+                }
+            } else {
+                guard.fail_thread("engine_error");
+            }
             guard.cleanup();
-            return Err(err);
+            return Err(err.into_error());
         }
         Err(join_err) => {
             tracing::error!(error = %join_err, "task panic while spawning waited execution");
@@ -3999,15 +4903,23 @@ pub async fn run_and_wait(
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::error!(%error, "spawn attempt contradicted admitted waiting launch metadata");
-            let pending_cleanup = spawned.abort_and_reap();
-            guard.fail_thread("launch_metadata_conflict");
+            let failure = abort_and_settle_pending_attach_failure(
+                &state,
+                &created.thread_id,
+                &wait_launch_owner,
+                spawned,
+                PendingAttachFailure {
+                    operation: "merge admitted launch metadata",
+                    outcome_code: "launch_metadata_conflict".to_string(),
+                    process_attached: false,
+                    error,
+                },
+            );
+            if failure.cleanup_disarms_guard() {
+                guard.mark_finalized();
+            }
             guard.cleanup();
-            return match pending_cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("pending-process reap failed: {cleanup}")))
-                }
-            };
+            return Err(anyhow::Error::new(failure));
         }
     };
 
@@ -4026,26 +4938,23 @@ pub async fn run_and_wait(
             Ok(None) => None,
             Err(err) => {
                 tracing::error!(error = %err, "native-resume project authority validation failed");
-                let pending_cleanup = spawned.abort_and_reap();
-                let failure = ExecutionCleanupFailure {
-                    operation: "validate native-resume project authority",
-                    operation_error: err,
-                    cleanup: fail_thread_static_owned(
-                        &state,
-                        &created.thread_id,
-                        "resume_project_authority_invalid",
-                        &wait_launch_owner,
-                    ),
-                };
+                let failure = abort_and_settle_pending_attach_failure(
+                    &state,
+                    &created.thread_id,
+                    &wait_launch_owner,
+                    spawned,
+                    PendingAttachFailure {
+                        operation: "validate native-resume project authority",
+                        outcome_code: "resume_project_authority_invalid".to_string(),
+                        process_attached: false,
+                        error: err,
+                    },
+                );
                 if failure.cleanup_disarms_guard() {
                     guard.mark_finalized();
                 }
                 guard.cleanup();
-                return match pending_cleanup {
-                    Ok(()) => Err(anyhow::Error::new(failure)),
-                    Err(cleanup) => Err(anyhow::Error::new(failure)
-                        .context(format!("pending-process reap failed: {cleanup}"))),
-                };
+                return Err(anyhow::Error::new(failure));
             }
         }
     } else {
@@ -4081,39 +4990,23 @@ pub async fn run_and_wait(
     let running = match state.threads.mark_running(&created.thread_id) {
         Ok(running) => running,
         Err(error) => {
-            let failed_identity = spawned.process_identity.clone();
-            let pending_cleanup = spawned.abort_and_reap();
-            let _ = clear_finished_process(
+            let failure = abort_and_settle_pending_attach_failure(
                 &state,
                 &created.thread_id,
-                &failed_identity,
                 &wait_launch_owner,
-            ).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
-            let cleanup = fail_thread_static_owned(
-                &state,
-                &created.thread_id,
-                "launch_mark_running_failed",
-                &wait_launch_owner,
+                spawned,
+                PendingAttachFailure {
+                    operation: "mark attached execution running",
+                    outcome_code: "launch_mark_running_failed".to_string(),
+                    process_attached: true,
+                    error,
+                },
             );
-            if let Err(cleanup_error) = cleanup {
-                tracing::error!(
-                    thread_id = %created.thread_id,
-                    error = %cleanup_error,
-                    "waiting execution running-transition failure cleanup did not settle"
-                );
+            if failure.cleanup_disarms_guard() {
+                guard.mark_finalized();
             }
-            guard.mark_finalized();
             guard.cleanup();
-            let error = anyhow::anyhow!(
-                "transition attached waiting execution {} to running: {error}",
-                created.thread_id
-            );
-            return match pending_cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("pending-process reap failed: {cleanup}")))
-                }
-            };
+            return Err(anyhow::Error::new(failure));
         }
     };
     if let Err(error) = state.threads.authorize_process_release_owned(
@@ -4121,44 +5014,36 @@ pub async fn run_and_wait(
         &spawned.process_identity,
         &wait_launch_owner,
     ) {
-        let failed_identity = spawned.process_identity.clone();
-        let pending_cleanup = spawned.abort_and_reap();
-        let _ = clear_finished_process(
+        let failure = abort_and_settle_pending_attach_failure(
             &state,
             &created.thread_id,
-            &failed_identity,
             &wait_launch_owner,
-        )
-        .inspect_err(
-            |error| tracing::error!(%error, "failed launch retains unresolved process authority"),
+            spawned,
+            PendingAttachFailure {
+                operation: "authorize waiting execution release",
+                outcome_code: "launch_release_not_authorized".to_string(),
+                process_attached: true,
+                error,
+            },
         );
-        let lifecycle_cleanup = fail_thread_static_owned(
-            &state,
-            &created.thread_id,
-            "launch_release_not_authorized",
-            &wait_launch_owner,
-        );
-        guard.mark_finalized();
+        if failure.cleanup_disarms_guard() {
+            guard.mark_finalized();
+        }
         guard.cleanup();
-        let mut error = error.context("authorize waiting execution release after attachment");
-        if let Err(cleanup) = pending_cleanup {
-            error = error.context(format!("pending-process reap failed: {cleanup}"));
-        }
-        if let Err(cleanup) = lifecycle_cleanup {
-            error = error.context(format!("lifecycle cleanup failed: {cleanup:#}"));
-        }
-        return Err(error);
+        return Err(anyhow::Error::new(failure));
     }
     let release_identity = spawned.process_identity.clone();
     let spawned = match spawned.release_after_attachment() {
         Ok(running) => running,
         Err(error) => {
-            let _ = clear_finished_process(
+            if release_cleanup_is_settled(&error) {
+                let _ = clear_finished_process(
                 &state,
                 &created.thread_id,
                 &release_identity,
                 &wait_launch_owner,
             ).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
+            }
             let cleanup = fail_thread_static_owned(
                 &state,
                 &created.thread_id,
@@ -4247,7 +5132,7 @@ pub async fn run_and_wait(
 
     let callback_sealed_result = state
         .state_store
-        .authoritative_result_project_snapshot(&running.thread_id)?;
+        .authoritative_result_generation(&running.thread_id)?;
     if candidate_integration_completion.is_some() && callback_sealed_result.is_some() {
         guard.fail_thread("candidate_integration_result_authority_conflict");
         guard.cleanup();
@@ -4256,7 +5141,7 @@ pub async fn run_and_wait(
         );
     }
     let mut pending_project_result = None;
-    let result_project_snapshot_hash = if let Some(snapshot) = callback_sealed_result.as_ref() {
+    let result_generation = if let Some(snapshot) = callback_sealed_result.as_ref() {
         if !wait_requires_foldback {
             guard.fail_thread("readonly_project_result_rejected");
             guard.cleanup();
@@ -4316,9 +5201,9 @@ pub async fn run_and_wait(
                 .inspect_err(|_| {
                     guard.fail_thread("foldback_failed");
                 })?;
-                let snapshot_hash = pending.snapshot_hash().to_string();
+                let generation = pending.generation().clone();
                 pending_project_result = Some(pending);
-                wait_records_terminal_generation.then_some(snapshot_hash)
+                wait_records_terminal_generation.then_some(generation)
             }
             (None, None, None, _) => None,
             _ => {
@@ -4331,6 +5216,9 @@ pub async fn run_and_wait(
             }
         }
     };
+    let result_project_snapshot_hash = result_generation
+        .as_ref()
+        .map(|generation| generation.snapshot_hash.clone());
     if let Some(fact) = candidate_integration_completion.as_ref() {
         let result_snapshot_hash = result_project_snapshot_hash.as_deref().ok_or_else(|| {
             anyhow::anyhow!("successful candidate integration produced no frozen result generation")
@@ -4360,17 +5248,21 @@ pub async fn run_and_wait(
                 .context("close session-bound workspace before candidate disposition")?;
             dedicated_workspace_closed = true;
         }
-        if let Some(pending) = pending_project_result.take() {
-            pending
-                .publish()
-                .context("publish retained candidate recovery root")?;
-        }
         if !state
             .state_store
             .bind_dedicated_session_candidate(&running.thread_id, snapshot_hash)
             .context("bind retained session-bound candidate")?
         {
             anyhow::bail!("session-bound candidate lost its freezing identity/state CAS");
+        }
+        // Closing the view releases the workspace journal's GC root. Keep
+        // the staged source generation owned until its candidate row has
+        // durably taken over; a process crash leaves the stage for the
+        // existing closed-workspace candidate-binding reconciliation.
+        if let Some(pending) = pending_project_result.take() {
+            pending
+                .publish()
+                .context("publish retained candidate recovery root")?;
         }
         loop {
             let session = state
@@ -4430,7 +5322,7 @@ pub async fn run_and_wait(
             &state,
             &running.thread_id,
             completion,
-            result_project_snapshot_hash.as_deref(),
+            result_generation.as_ref(),
             &wait_launch_owner,
         )
     };
@@ -4507,6 +5399,7 @@ pub async fn run_and_wait(
             publication: publication.publication,
             record_hash: Some(publication.record_hash),
             replayed_from: None,
+            result_projection: publication.answer.result_projection(),
         })
     } else {
         None
@@ -4579,8 +5472,12 @@ pub async fn run_detached(
     // before this future's next await point.
     let mut prepared_plan = {
         let sealed_dependency_bytes =
-            super::external_content::sealed_dependency_bytes_for_child_dispatch(&state, &params)
-                .context("derive sealed dependency bytes for child dispatch")?;
+            super::external_content::sealed_dependency_bytes_for_child_dispatch(
+                &state,
+                &params,
+                finalized_direct.program.resolution(),
+            )
+            .context("derive sealed dependency bytes for child dispatch")?;
         thread_lifecycle::prepare_item_plan(
             &engine,
             &params.resolved,
@@ -4604,7 +5501,6 @@ pub async fn run_detached(
     prepared_plan.bind_realization_command(
         &state,
         &engine,
-        &params.resolved.resolved_item.kind,
         finalized_direct.program.resolution(),
         state.isolation.as_ref(),
     )?;
@@ -4715,7 +5611,8 @@ pub async fn run_detached(
         &created.thread_id,
         &bg_fresh_external.retained_resolution,
         &effective_path,
-    )?;
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
     effective_path = process_path;
     if let Some(lifeline) = process_input_lifeline {
         guard.track_process_input_dir(lifeline);
@@ -4731,7 +5628,8 @@ pub async fn run_detached(
         let admitted_project_root =
             Path::new(ryeos_app::thread_lifecycle::ADMITTED_DIRECT_PROJECT_ROOT);
         prepared_plan
-            .relocate_project_for_spawn(Some(admitted_project_root), Some(&effective_path))?;
+            .relocate_project_for_spawn(Some(admitted_project_root), Some(&effective_path))
+            .map_err(|error| guard.fail_before_spawn(error.into()))?;
         params.resolved.plan_context.project_context =
             ryeos_engine::contracts::ProjectContext::LocalPath {
                 path: effective_path.clone(),
@@ -4741,7 +5639,8 @@ pub async fn run_detached(
         &mut prepared_plan,
         bg_bound_external.as_ref(),
         state.isolation.as_ref(),
-    )?;
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
 
     // Capture thread details before moving guard
     let admitted_thread_id = created.thread_id.clone();
@@ -4764,12 +5663,10 @@ pub async fn run_detached(
         "execution roots resolved"
     );
     if super::process_attachment::finalize_requested_stop_if_present(&state, &created.thread_id)? {
-        guard.mark_finalized();
-        guard.cleanup();
-        anyhow::bail!(
+        return Err(guard.fail_before_spawn(anyhow::anyhow!(
             "detached terminal subprocess {} was stopped before credential mint",
             created.thread_id
-        );
+        )));
     }
     let launch_timeout_secs = prepared_plan.timeout_secs;
     let ProtocolLaunchEnv {
@@ -4795,10 +5692,7 @@ pub async fn run_detached(
         effective_bundle_id_for_request(&params.resolved),
         &detached_launch_owner,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("protocol_contract_failed");
-        guard.cleanup();
-    })?;
+    .map_err(|error| guard.fail_before_spawn(error))?;
     if let Some(token) = callback_token {
         guard.track_callback_token(token);
     }
@@ -4840,6 +5734,9 @@ pub async fn run_detached(
         .map(std::path::Path::to_path_buf);
     let bg_runtime_state_dir = state.config.app_root.clone();
 
+    let bg_isolation_workspace =
+        projectless_isolation_workspace(process_project_class(&params.provenance), &effective_path);
+
     tokio::spawn(dispatch_detached_bg_task(
         bg_state,
         bg_thread_id,
@@ -4859,6 +5756,7 @@ pub async fn run_detached(
         bg_project_authority,
         bg_candidate_operation_authority,
         bg_state_root,
+        bg_isolation_workspace,
         bg_isolation_project_authority,
         bg_isolation_immutable_project,
         bg_isolation_live_access_authority,
@@ -4948,7 +5846,7 @@ impl DetachedDispatchKind {
         bg_protocol_env_bindings, bg_acting_principal, bg_pre_tree_hash,
         bg_pre_policy_hash,
         bg_resume_snapshot_hash, bg_tree_publication,
-        bg_project_path, bg_state_root,
+        bg_project_path, bg_state_root, bg_isolation_workspace,
         bg_project_authority,
         bg_candidate_operation_authority,
         bg_isolation_project_authority, bg_isolation_immutable_project, bg_isolation_daemon_socket_path, bg_temp_dir,
@@ -4987,6 +5885,7 @@ async fn dispatch_detached_bg_task(
         ryeos_app::thread_lifecycle::CandidateEvaluationAuthority,
     >,
     bg_state_root: Option<PathBuf>,
+    bg_isolation_workspace: Option<PathBuf>,
     bg_isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
     bg_isolation_immutable_project: Option<ryeos_state::PinnedProjectMaterialization>,
     bg_isolation_live_access_authority: Option<
@@ -5102,6 +6001,14 @@ async fn dispatch_detached_bg_task(
 
     match super::process_attachment::finalize_requested_stop_if_present(&bg_state, &bg_thread_id) {
         Ok(true) => {
+            if let Err(cleanup) = fail_settled_unattached_thread(
+                &bg_state,
+                &bg_thread_id,
+                "stopped_before_spawn",
+                &launch_owner,
+            ) {
+                tracing::error!(thread_id = %bg_thread_id, %cleanup, "settle stopped uncontacted launch");
+            }
             drop(bg_temp_dir.take());
             return;
         }
@@ -5113,7 +6020,7 @@ async fn dispatch_detached_bg_task(
                 %error,
                 "durable stop fence failed before detached isolation and process spawn"
             );
-            if let Err(cleanup_error) = fail_thread_static_owned(
+            if let Err(cleanup_error) = fail_settled_unattached_thread(
                 &bg_state,
                 &bg_thread_id,
                 "stop_fence_failed",
@@ -5139,7 +6046,7 @@ async fn dispatch_detached_bg_task(
             Ok(view) => view,
             Err(error) => {
                 tracing::error!(thread_id = %bg_thread_id, %error, "workspace borrow refused before detached spawn");
-                let _ = fail_thread_static_owned(
+                let _ = fail_settled_unattached_thread(
                     &bg_state,
                     &bg_thread_id,
                     "workspace_borrow_refused",
@@ -5151,16 +6058,32 @@ async fn dispatch_detached_bg_task(
     } else {
         None
     };
+    // Resolve before scheduling: this error is demonstrably before process
+    // contact, unlike an arbitrary error returned by the engine spawn owner.
+    let project_root = match &res_for_spawn.plan_context.project_context {
+        ryeos_engine::contracts::ProjectContext::LocalPath { path } => Some(path.clone()),
+        _ => None,
+    };
+    let roots = match ryeos_app::env_contract::DaemonRootEnv::from_resolution_roots(
+        &eng_for_spawn.resolution_roots(project_root),
+        &bg_runtime_state_dir,
+    ) {
+        Ok(roots) => roots,
+        Err(error) => {
+            tracing::error!(thread_id = %bg_thread_id, %error, "resolve detached launch roots");
+            if let Err(cleanup) = fail_settled_unattached_thread(
+                &bg_state,
+                &bg_thread_id,
+                "launch_roots_invalid",
+                &launch_owner,
+            ) {
+                tracing::error!(thread_id = %bg_thread_id, %cleanup, "settle uncontacted detached launch");
+            }
+            return;
+        }
+    };
     let spawn_result = task::spawn_blocking(move || {
         let _spawn_workspace_lifeline = spawn_workspace_lifeline;
-        let project_root = match &res_for_spawn.plan_context.project_context {
-            ryeos_engine::contracts::ProjectContext::LocalPath { path } => Some(path.clone()),
-            _ => None,
-        };
-        let roots = ryeos_app::env_contract::DaemonRootEnv::from_resolution_roots(
-            &eng_for_spawn.resolution_roots(project_root),
-            &bg_runtime_state_dir,
-        )?;
         thread_lifecycle::spawn_item(thread_lifecycle::SpawnItemParams {
             engine: &eng_for_spawn,
             resolved: &res_for_spawn,
@@ -5177,7 +6100,7 @@ async fn dispatch_detached_bg_task(
             isolation_live_access_authority: bg_isolation_live_access_authority,
             isolation_external_read_only_mounts: bg_external_mounts,
             isolation_node_trusted_keys_dir: bg_node_trusted_keys_dir,
-            isolation_workspace: None,
+            isolation_workspace: bg_isolation_workspace,
             inherited_fds: Vec::new(),
             external_realizations_env: bg_external_sealed_env,
             admitted_source_env: bg_source_sealed_env,
@@ -5198,9 +6121,17 @@ async fn dispatch_detached_bg_task(
                 error = %err,
                 "engine error during spawn"
             );
-            if let Err(cleanup_error) =
+            let cleanup = if err.contact_is_settled() {
+                fail_settled_unattached_thread(
+                    &bg_state,
+                    &bg_thread_id,
+                    "engine_error",
+                    &launch_owner,
+                )
+            } else {
                 fail_thread_static_owned(&bg_state, &bg_thread_id, "engine_error", &launch_owner)
-            {
+            };
+            if let Err(cleanup_error) = cleanup {
                 tracing::error!(
                     phase = log_phase,
                     thread_id = %bg_thread_id,
@@ -5249,27 +6180,19 @@ async fn dispatch_detached_bg_task(
                 %error,
                 "load admitted launch metadata before process attach"
             );
-            if let Err(cleanup) = spawned.abort_and_reap() {
-                tracing::error!(
-                    phase = log_phase,
-                    thread_id = %bg_thread_id,
-                    error = %cleanup,
-                    "failed to reap attachment-pending process after missing launch metadata"
-                );
-            }
-            if let Err(cleanup_error) = fail_thread_static_owned(
+            let failure = abort_and_settle_pending_attach_failure(
                 &bg_state,
                 &bg_thread_id,
-                "launch_metadata_missing",
                 &launch_owner,
-            ) {
-                tracing::error!(
-                    phase = log_phase,
-                    thread_id = %bg_thread_id,
-                    error = %cleanup_error,
-                    "missing launch metadata cleanup did not settle"
-                );
-            }
+                spawned,
+                PendingAttachFailure {
+                    operation: "load admitted launch metadata",
+                    outcome_code: "launch_metadata_missing".to_string(),
+                    process_attached: false,
+                    error,
+                },
+            );
+            tracing::error!(thread_id = %bg_thread_id, %failure, "pending launch refused");
             drop(bg_temp_dir.take());
             return;
         }
@@ -5284,27 +6207,19 @@ async fn dispatch_detached_bg_task(
                     %error,
                     "spawn attempt contradicted admitted launch metadata"
                 );
-                if let Err(cleanup) = spawned.abort_and_reap() {
-                    tracing::error!(
-                        phase = log_phase,
-                        thread_id = %bg_thread_id,
-                        error = %cleanup,
-                        "failed to reap attachment-pending process after launch metadata conflict"
-                    );
-                }
-                if let Err(cleanup_error) = fail_thread_static_owned(
+                let failure = abort_and_settle_pending_attach_failure(
                     &bg_state,
                     &bg_thread_id,
-                    "launch_metadata_conflict",
                     &launch_owner,
-                ) {
-                    tracing::error!(
-                        phase = log_phase,
-                        thread_id = %bg_thread_id,
-                        error = %cleanup_error,
-                        "launch metadata conflict cleanup did not settle"
-                    );
-                }
+                    spawned,
+                    PendingAttachFailure {
+                        operation: "merge admitted launch metadata",
+                        outcome_code: "launch_metadata_conflict".to_string(),
+                        process_attached: false,
+                        error,
+                    },
+                );
+                tracing::error!(thread_id = %bg_thread_id, %failure, "pending launch refused");
                 drop(bg_temp_dir.take());
                 return;
             }
@@ -5328,28 +6243,19 @@ async fn dispatch_detached_bg_task(
                     error = %err,
                     "native-resume project authority validation failed"
                 );
-                if let Err(cleanup) = spawned.abort_and_reap() {
-                    tracing::error!(
-                        phase = log_phase,
-                        thread_id = %bg_thread_id,
-                        error = %cleanup,
-                        "failed to reap attachment-pending process after resume authority refusal"
-                    );
-                }
-                let cleanup = fail_thread_static_owned(
+                let failure = abort_and_settle_pending_attach_failure(
                     &bg_state,
                     &bg_thread_id,
-                    "resume_project_authority_invalid",
                     &launch_owner,
+                    spawned,
+                    PendingAttachFailure {
+                        operation: "validate native-resume project authority",
+                        outcome_code: "resume_project_authority_invalid".to_string(),
+                        process_attached: false,
+                        error: err,
+                    },
                 );
-                if let Err(cleanup_error) = cleanup {
-                    tracing::error!(
-                        phase = log_phase,
-                        thread_id = %bg_thread_id,
-                        error = %cleanup_error,
-                        "resume project authority failure cleanup did not settle"
-                    );
-                }
+                tracing::error!(thread_id = %bg_thread_id, %failure, "pending launch refused");
                 drop(bg_temp_dir.take());
                 return;
             }
@@ -5405,29 +6311,19 @@ async fn dispatch_detached_bg_task(
             error = %err,
             "failed to transition recovered created thread to running; terminating its process"
         );
-        let failed_identity = spawned.process_identity.clone();
-        if let Err(cleanup) = spawned.abort_and_reap() {
-            tracing::error!(
-                phase = log_phase,
-                thread_id = %bg_thread_id,
-                error = %cleanup,
-                "failed to reap attachment-pending process after running-transition refusal"
-            );
-        }
-        let _ = clear_finished_process(&bg_state, &bg_thread_id, &failed_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
-        if let Err(cleanup_error) = fail_thread_static_owned(
+        let failure = abort_and_settle_pending_attach_failure(
             &bg_state,
             &bg_thread_id,
-            "recovery_mark_running_failed",
             &launch_owner,
-        ) {
-            tracing::error!(
-                phase = log_phase,
-                thread_id = %bg_thread_id,
-                error = %cleanup_error,
-                "recovery running-transition failure cleanup did not settle"
-            );
-        }
+            spawned,
+            PendingAttachFailure {
+                operation: "mark recovered execution running",
+                outcome_code: "recovery_mark_running_failed".to_string(),
+                process_attached: true,
+                error: err,
+            },
+        );
+        tracing::error!(thread_id = %bg_thread_id, %failure, "pending launch refused");
         drop(bg_temp_dir.take());
         return;
     }
@@ -5443,29 +6339,19 @@ async fn dispatch_detached_bg_task(
             %error,
             "detached execution release was not authorized after attachment"
         );
-        let failed_identity = spawned.process_identity.clone();
-        if let Err(cleanup) = spawned.abort_and_reap() {
-            tracing::error!(
-                phase = log_phase,
-                thread_id = %bg_thread_id,
-                error = %cleanup,
-                "failed to reap attachment-pending process after release refusal"
-            );
-        }
-        let _ = clear_finished_process(&bg_state, &bg_thread_id, &failed_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
-        if let Err(cleanup_error) = fail_thread_static_owned(
+        let failure = abort_and_settle_pending_attach_failure(
             &bg_state,
             &bg_thread_id,
-            "launch_release_not_authorized",
             &launch_owner,
-        ) {
-            tracing::error!(
-                phase = log_phase,
-                thread_id = %bg_thread_id,
-                error = %cleanup_error,
-                "detached release-refusal cleanup did not settle"
-            );
-        }
+            spawned,
+            PendingAttachFailure {
+                operation: "authorize detached execution release",
+                outcome_code: "launch_release_not_authorized".to_string(),
+                process_attached: true,
+                error,
+            },
+        );
+        tracing::error!(thread_id = %bg_thread_id, %failure, "pending launch refused");
         drop(bg_temp_dir.take());
         return;
     }
@@ -5480,7 +6366,9 @@ async fn dispatch_detached_bg_task(
                 %error,
                 "failed to release detached execution after durable attachment"
             );
-            let _ = clear_finished_process(&bg_state, &bg_thread_id, &release_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
+            if release_cleanup_is_settled(&error) {
+                let _ = clear_finished_process(&bg_state, &bg_thread_id, &release_identity, &launch_owner).inspect_err(|error| tracing::error!(%error, "failed launch retains unresolved process authority"));
+            }
             if let Err(cleanup_error) = fail_thread_static_owned(
                 &bg_state,
                 &bg_thread_id,
@@ -5568,7 +6456,7 @@ async fn dispatch_detached_bg_task(
             }
             let callback_sealed_result = match bg_state
                 .state_store
-                .authoritative_result_project_snapshot(&bg_thread_id)
+                .authoritative_result_generation(&bg_thread_id)
             {
                 Ok(value) => value,
                 Err(error) => {
@@ -5644,9 +6532,7 @@ async fn dispatch_detached_bg_task(
                 return;
             }
             let mut pending_project_result = None;
-            let result_project_snapshot_hash = if let Some(snapshot) =
-                callback_sealed_result.as_ref()
-            {
+            let result_generation = if let Some(snapshot) = callback_sealed_result.as_ref() {
                 if !bg_requires_foldback {
                     tracing::error!(
                         phase = log_phase,
@@ -5712,9 +6598,9 @@ async fn dispatch_detached_bg_task(
                         completion: &completion,
                     }) {
                         Ok(pending) => {
-                            let snapshot_hash = pending.snapshot_hash().to_string();
+                            let generation = pending.generation().clone();
                             pending_project_result = Some(pending);
-                            bg_records_terminal_generation.then_some(snapshot_hash)
+                            bg_records_terminal_generation.then_some(generation)
                         }
                         Err(error) => {
                             tracing::error!(
@@ -5761,6 +6647,9 @@ async fn dispatch_detached_bg_task(
             // disposition has its own operations; do not retain this temporary
             // drain gate through review/publication or reacquire it on failure.
             drop(contact_fence);
+            let result_project_snapshot_hash = result_generation
+                .as_ref()
+                .map(|generation| generation.snapshot_hash.clone());
             if let Some(fact) = candidate_integration_completion.as_ref() {
                 let Some(result_snapshot_hash) = result_project_snapshot_hash.as_deref() else {
                     tracing::error!(
@@ -5808,11 +6697,6 @@ async fn dispatch_detached_bg_task(
                         close_owned_workspace(&bg_state, bg_temp_dir.as_ref(), &bg_thread_id)
                             .context("close detached session-bound workspace")?;
                     }
-                    if let Some(pending) = pending_project_result.take() {
-                        pending
-                            .publish()
-                            .context("publish detached retained-candidate recovery root")?;
-                    }
                     if !bg_state
                         .state_store
                         .bind_dedicated_session_candidate(&bg_thread_id, snapshot_hash)?
@@ -5820,6 +6704,11 @@ async fn dispatch_detached_bg_task(
                         anyhow::bail!(
                             "detached session-bound candidate lost its freezing identity/state CAS"
                         );
+                    }
+                    if let Some(pending) = pending_project_result.take() {
+                        pending
+                            .publish()
+                            .context("publish detached retained-candidate recovery root")?;
                     }
                     loop {
                         let session = bg_state
@@ -5894,7 +6783,7 @@ async fn dispatch_detached_bg_task(
                     &bg_state,
                     &bg_thread_id,
                     completion,
-                    result_project_snapshot_hash.as_deref(),
+                    result_generation.as_ref(),
                     &launch_owner,
                 )
                 .map(|_| ())
@@ -6341,6 +7230,22 @@ pub(crate) fn handoff_live_workspace_for_retry(
     {
         anyhow::bail!("live retry cannot substitute another workspace or view");
     }
+    let admitted_outputs = provenance.project_authority().workspace_outputs();
+    if provenance
+        .project_authority()
+        .operational_snapshot_projection()
+        != Some(workspace.base_snapshot.as_str())
+        || workspace.workspace_output_partition_identity.as_deref()
+            != admitted_outputs.map(|outputs| outputs.partition.partition_identity.as_str())
+        || workspace.base_output_capture_hash.as_deref()
+            != admitted_outputs.and_then(|outputs| outputs.capture_hash.as_deref())
+    {
+        anyhow::bail!("live retry workspace source/output generation changed");
+    }
+    let frozen_generation = workspace.frozen_generation()?;
+    if workspace.state == WorkspaceState::Freezing && frozen_generation.is_none() {
+        anyhow::bail!("live retry frozen workspace has no paired result generation");
+    }
     if let Some(identity) =
         ryeos_app::dedicated_session_service::workspace_worker_capture_identity(state, &workspace)?
     {
@@ -6384,6 +7289,7 @@ pub(crate) fn retained_workspace_provenance_for_native_resume(
     let ryeos_state::objects::ExecutionProjectAuthority::PinnedGeneration {
         snapshot_hash,
         realization: ryeos_state::objects::PinnedProjectRealization::Cow { .. },
+        workspace_outputs,
         ..
     } = &resume.project_authority
     else {
@@ -6415,6 +7321,14 @@ pub(crate) fn retained_workspace_provenance_for_native_resume(
     };
     if workspace.thread_id.as_deref() != Some(thread_id)
         || workspace.base_snapshot != *snapshot_hash
+        || workspace.workspace_output_partition_identity.as_deref()
+            != workspace_outputs
+                .as_ref()
+                .map(|outputs| outputs.partition.partition_identity.as_str())
+        || workspace.base_output_capture_hash.as_deref()
+            != workspace_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.capture_hash.as_deref())
         || !matches!(
             workspace.state,
             WorkspaceState::Ready | WorkspaceState::Active | WorkspaceState::Freezing
@@ -6447,7 +7361,8 @@ pub(crate) fn retained_workspace_provenance_for_native_resume(
     if workspace.state == WorkspaceState::Ready && recorded_process_identity.is_some() {
         anyhow::bail!("ready retained execution workspace still has a process attachment");
     }
-    if workspace.state == WorkspaceState::Freezing && workspace.frozen_snapshot_hash.is_none() {
+    let frozen_generation = workspace.frozen_generation()?;
+    if workspace.state == WorkspaceState::Freezing && frozen_generation.is_none() {
         anyhow::bail!("frozen retained execution workspace has no candidate generation");
     }
     if recorded_process_identity.as_ref().is_some_and(|identity| {
@@ -6524,16 +7439,17 @@ pub(crate) fn retained_workspace_provenance_for_native_resume(
         &provenance,
         thread_id,
         recovery_launch_owner,
+        WorkspaceConstructionInput::RetainedBacking(&workspace),
     )?;
     if workspace.state == WorkspaceState::Freezing {
-        let frozen = workspace.frozen_snapshot_hash.as_deref().ok_or_else(|| {
+        let frozen = frozen_generation.as_ref().ok_or_else(|| {
             anyhow::anyhow!("retained frozen disposition has no committed result generation")
         })?;
         let reconstructed = state
             .state_store
             .execution_workspace(&workspace.workspace_id)?
             .ok_or_else(|| anyhow::anyhow!("reconstructed frozen workspace disappeared"))?;
-        if reconstructed.frozen_snapshot_hash.as_deref() != Some(frozen) {
+        if reconstructed.frozen_generation()?.as_ref() != Some(frozen) {
             anyhow::bail!("workspace reconstruction changed its committed frozen generation");
         }
         // Create/Ready proves the NEW view exists; restoring the exact prior
@@ -7016,6 +7932,11 @@ async fn run_existing_recovered_thread(
     )
     .map_err(ResumeError::CasContext)?;
 
+    // Successful binding above establishes this fresh launch owner's exact
+    // membership. From here until the detached handoff, explicit preparation
+    // errors can settle that membership: no spawn task has been scheduled.
+    // Earlier recovery refusals do not classify old uncertain contact as safe.
+    //
     // Update plan_context to point at the materialized path so the
     // engine resolves item refs from there.
     if matches!(
@@ -7038,33 +7959,45 @@ async fn run_existing_recovered_thread(
     let admitted_capsule = state
         .state_store
         .admitted_launch_capsule(&thread_id)
-        .inspect_err(|_| {
-            guard.fail_thread("admitted_execution_closure_unavailable");
-            guard.cleanup();
+        .map_err(|error| {
+            guard.fail_before_spawn(error.context("admitted_execution_closure_unavailable"))
         })?
         .ok_or_else(|| {
-            guard.fail_thread("admitted_execution_closure_unavailable");
-            guard.cleanup();
-            ResumeError::Other(anyhow::anyhow!(
+            guard.fail_before_spawn(anyhow::anyhow!(
                 "direct recovery has no admitted launch capsule"
             ))
         })?;
     validate_recovered_direct_request_authority(&state, &thread_id, &params, &admitted_capsule)
-        .inspect_err(|_| {
-            guard.fail_thread("admitted_program_authority_invalid");
-            guard.cleanup();
+        .map_err(|error| {
+            guard.fail_before_spawn(error.context("admitted_program_authority_invalid"))
         })?;
-    let retained_resolution = params
-        .resolved
-        .root_admission
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("restored sealed root has no admission"))?
-        .resolution_output();
+    let retained_admission = params.resolved.root_admission.as_ref().ok_or_else(|| {
+        guard.fail_before_spawn(anyhow::anyhow!("restored sealed root has no admission"))
+    })?;
+    let retained_resolution = retained_admission.resolution_output();
+    let mut selection_resolution = retained_resolution.clone();
+    ryeos_app::operator_external_content::product_composition::admit_root_product_selections(
+        &state,
+        &engine,
+        &engine.resolution_roots(
+            retained_admission
+                .resolution_workspace()
+                .map(std::path::Path::to_path_buf),
+        ),
+        retained_admission.resolution_subject_authority(),
+        &mut selection_resolution,
+        params.resolved.requested_by.as_deref(),
+        params.handler_context.as_ref(),
+        &params.resolved.product_selections,
+        true,
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
     ryeos_app::source_closure_admission::recover_source_closure(
         &state,
         &engine,
         retained_resolution,
-    )?;
+    )
+    .map_err(|error| guard.fail_before_spawn(error))?;
     let PreparedProcessInputs {
         path: process_path,
         lifeline: process_input_lifeline,
@@ -7080,9 +8013,8 @@ async fn run_existing_recovered_thread(
         retained_resolution,
         &effective_path,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("recovery_input_materialization_failed");
-        guard.cleanup();
+    .map_err(|error| {
+        guard.fail_before_spawn(error.context("recovery_input_materialization_failed"))
     })?;
     effective_path = process_path;
     if let Some(lifeline) = process_input_lifeline {
@@ -7104,10 +8036,13 @@ async fn run_existing_recovered_thread(
         .state_root_override()
         .unwrap_or(params.provenance.effective_path())
         .to_path_buf();
-    let cas_root = state.state_store.cas_root().map_err(ResumeError::Other)?;
+    let cas_root = state
+        .state_store
+        .cas_root()
+        .map_err(|error| guard.fail_before_spawn(error))?;
     let cas_directory = lillux::PinnedDirectory::open(&cas_root)
-        .map_err(ResumeError::Other)?
-        .ok_or_else(|| ResumeError::Other(anyhow::anyhow!("state CAS root is unavailable")))?;
+        .map_err(|error| guard.fail_before_spawn(error))?
+        .ok_or_else(|| guard.fail_before_spawn(anyhow::anyhow!("state CAS root is unavailable")))?;
     let cas = lillux::CasStore::from_pinned_root(cas_directory);
     let effective_project_root = match &params.resolved.plan_context.project_context {
         ProjectContext::LocalPath { path } => Some(path.as_path()),
@@ -7121,26 +8056,27 @@ async fn run_existing_recovered_thread(
         state.isolation.as_ref(),
         effective_project_root,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("admitted_execution_closure_invalid");
-        guard.cleanup();
+    .map_err(|error| {
+        guard.fail_before_spawn(error.context("admitted_execution_closure_invalid"))
     })?;
     super::external_content::bind_prepared_realization_command(
         &mut prepared_plan,
         bg_external_realizations.as_ref(),
         state.isolation.as_ref(),
     )
-    .inspect_err(|_| {
-        guard.fail_thread("admitted_realization_command_invalid");
-        guard.cleanup();
+    .map_err(|error| {
+        guard.fail_before_spawn(error.context("admitted_realization_command_invalid"))
     })?;
     if params.provenance.project_source()
         == ryeos_app::execution_provenance::ProjectSourceKind::LiveFs
-        && retained_resolution_has_filesystem_bindings(retained_resolution)?
+        && retained_resolution_has_filesystem_bindings(retained_resolution)
+            .map_err(|error| guard.fail_before_spawn(error))?
     {
-        prepared_plan.ensure_no_project_local_interpreter(Path::new(
-            ryeos_app::thread_lifecycle::ADMITTED_DIRECT_PROJECT_ROOT,
-        ))?;
+        prepared_plan
+            .ensure_no_project_local_interpreter(Path::new(
+                ryeos_app::thread_lifecycle::ADMITTED_DIRECT_PROJECT_ROOT,
+            ))
+            .map_err(|error| guard.fail_before_spawn(error))?;
     }
     let launch_timeout_secs = prepared_plan.timeout_secs;
     let protocol = recovered_direct_protocol(
@@ -7148,37 +8084,30 @@ async fn run_existing_recovered_thread(
         &admitted_capsule,
         &params.resolved.resolved_item.kind,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("admitted_protocol_closure_invalid");
-        guard.cleanup();
-    })?;
+    .map_err(|error| guard.fail_before_spawn(error.context("admitted_protocol_closure_invalid")))?;
     crate::dispatch::validate_direct_result_retention(
         &protocol,
         params
             .resolved
             .root_admission
             .as_ref()
-            .context("recovered output lacks retained root admission")?
+            .context("recovered output lacks retained root admission")
+            .map_err(|error| guard.fail_before_spawn(error))?
             .resolved_result_policy()
             .retention,
         &params.resolved.resolved_item.kind,
     )
     .map_err(anyhow::Error::new)
-    .inspect_err(|_| {
-        guard.fail_thread("admitted_output_retention_invalid");
-        guard.cleanup();
-    })?;
+    .map_err(|error| guard.fail_before_spawn(error.context("admitted_output_retention_invalid")))?;
     let root_admission = params.resolved.root_admission.as_ref().ok_or_else(|| {
-        guard.fail_thread("admitted_program_authority_unavailable");
-        guard.cleanup();
-        ResumeError::Other(anyhow::anyhow!(
+        guard.fail_before_spawn(anyhow::anyhow!(
             "direct recovery has no exact admitted root resolution"
         ))
     })?;
     let primary_resolution = root_admission.resolution_output();
     let current_trust_store = root_admission
         .current_policy_trust_store()
-        .map_err(ResumeError::Other)?;
+        .map_err(|error| guard.fail_before_spawn(error))?;
     super::admitted_trust::validate_direct_current_trust(
         &engine,
         &current_trust_store,
@@ -7186,9 +8115,8 @@ async fn run_existing_recovered_thread(
         prepared_plan.execution_plan(),
         &admitted_capsule,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("admitted_program_authority_revoked");
-        guard.cleanup();
+    .map_err(|error| {
+        guard.fail_before_spawn(error.context("admitted_program_authority_revoked"))
     })?;
 
     // Read credentials only after the exact plan, protocol, executor, and
@@ -7224,32 +8152,39 @@ async fn run_existing_recovered_thread(
                 } else {
                     guard.fail_thread("vault_read_failed");
                 }
-                guard.cleanup();
                 ResumeError::VaultRead(
-                    ryeos_app::vault::VaultReadError::MissingSecrets {
-                        principal: params.acting_principal.clone(),
-                        names,
-                    }
-                    .into(),
+                    guard.fail_before_spawn(
+                        ryeos_app::vault::VaultReadError::MissingSecrets {
+                            principal: params.acting_principal.clone(),
+                            names,
+                        }
+                        .into(),
+                    ),
                 )
             }
             error @ ryeos_app::vault::VaultReadError::AuthorityViolation(_) => {
                 guard.fail_thread("vault_read_failed");
-                guard.cleanup();
-                ResumeError::VaultRead(error.into())
+                ResumeError::VaultRead(guard.fail_before_spawn(error.into()))
             }
             ryeos_app::vault::VaultReadError::Internal(e) => {
                 guard.fail_thread("vault_read_failed");
-                guard.cleanup();
-                ResumeError::VaultRead(ryeos_app::vault::VaultReadError::Internal(e).into())
+                ResumeError::VaultRead(
+                    guard.fail_before_spawn(ryeos_app::vault::VaultReadError::Internal(e).into()),
+                )
             }
         })?;
 
         params.vault_bindings = vault_bindings;
     }
     if super::process_attachment::finalize_requested_stop_if_present(&state, &thread_id)
-        .map_err(ResumeError::Other)?
+        .map_err(|error| guard.fail_before_spawn(error))?
     {
+        fail_settled_unattached_thread(
+            &state,
+            &thread_id,
+            "stopped_before_recovery_spawn",
+            &resume_launch_owner,
+        )?;
         guard.mark_finalized();
         guard.cleanup();
         return Ok(RecoveryLaunchOutcome::Skipped("stop_requested"));
@@ -7277,10 +8212,7 @@ async fn run_existing_recovered_thread(
         effective_bundle_id_for_request(&params.resolved),
         &resume_launch_owner,
     )
-    .inspect_err(|_| {
-        guard.fail_thread("protocol_contract_failed");
-        guard.cleanup();
-    })?;
+    .map_err(|error| guard.fail_before_spawn(error.context("protocol_contract_failed")))?;
     if let Some(token) = callback_token {
         guard.track_callback_token(token);
     }
@@ -7328,6 +8260,8 @@ async fn run_existing_recovered_thread(
         .state_root_override()
         .map(std::path::Path::to_path_buf);
     let bg_runtime_state_dir = state.config.app_root.clone();
+    let bg_isolation_workspace =
+        projectless_isolation_workspace(process_project_class(&params.provenance), &effective_path);
     tokio::spawn(dispatch_detached_bg_task(
         bg_state,
         bg_thread_id,
@@ -7347,6 +8281,7 @@ async fn run_existing_recovered_thread(
         bg_project_authority,
         bg_candidate_operation_authority,
         bg_state_root,
+        bg_isolation_workspace,
         bg_isolation_project_authority,
         bg_isolation_immutable_project,
         bg_isolation_live_access_authority,
@@ -7373,6 +8308,296 @@ mod tests {
     use super::*;
     use ryeos_app::launch_metadata::OriginalPushedHeadRef;
     use ryeos_engine::contracts::{EffectivePrincipal, ExecutionHints, Principal};
+
+    #[test]
+    fn release_diagnostics_never_substitute_for_kernel_cleanup_testimony() {
+        assert!(!release_cleanup_is_settled(&anyhow::anyhow!(
+            "cleanup completed synchronously"
+        )));
+        assert!(!release_cleanup_is_settled(&anyhow::Error::new(
+            ryeos_engine::error::EngineError::ExecutionFailed {
+                reason: "no process remains".to_owned(),
+            },
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_precontact_failure_settles_only_current_child_membership() {
+        let (_temp, state) =
+            crate::augmentations::compose_context_positions::tests::bound_runtime_children_fixture(
+            );
+        let store = &state.state_store;
+        let child = "T-runtime-child";
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        let parent = store.thread_workspace_binding("T-runtime-parent").unwrap();
+        let sibling = store.thread_workspace_binding("T-runtime-sibling").unwrap();
+        let mut guard = ExecutionGuard::new(state.clone());
+        guard.track_thread(child);
+        guard.track_launch_owner(claim.claimed_by.clone());
+        let error = guard.fail_before_spawn(anyhow::anyhow!("invalid preparation"));
+        assert!(error.to_string().contains("invalid preparation"));
+        assert!(guard.thread_finalized);
+        assert!(is_terminal_status(
+            &store.get_thread(child).unwrap().unwrap().status
+        ));
+        assert!(store.thread_workspace_binding(child).unwrap().is_none());
+        assert!(store.is_launch_owner_active(&claim.claimed_by));
+        assert_eq!(
+            store.thread_workspace_binding("T-runtime-parent").unwrap(),
+            parent
+        );
+        assert_eq!(
+            store.thread_workspace_binding("T-runtime-sibling").unwrap(),
+            sibling
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_terminal_failure_without_contact_proof_retains_membership() {
+        let (_temp, state) =
+            crate::augmentations::compose_context_positions::tests::bound_runtime_children_fixture(
+            );
+        let store = &state.state_store;
+        let child = "T-runtime-child";
+        let claim = store.get_launch_claim(child).unwrap().unwrap();
+        let binding = store.thread_workspace_binding(child).unwrap();
+        let sibling_owner = store
+            .get_launch_claim("T-runtime-sibling")
+            .unwrap()
+            .unwrap();
+        assert!(
+            fail_settled_unattached_thread(
+                &state,
+                child,
+                "invalid_owner",
+                &sibling_owner.claimed_by
+            )
+            .is_err()
+        );
+        assert_eq!(store.thread_workspace_binding(child).unwrap(), binding);
+        // The ordinary failure path is also used after task panic and unknown
+        // contact. Terminalization alone never retires the borrow.
+        let mut guard = ExecutionGuard::new(state.clone());
+        guard.track_thread(child);
+        guard.track_launch_owner(claim.claimed_by.clone());
+        guard.fail_thread("task_panic");
+        guard.cleanup();
+        assert_eq!(store.thread_workspace_binding(child).unwrap(), binding);
+        store
+            .release_active_thread_launch_claim(child, &claim.claim_id, &claim.claimed_by)
+            .unwrap();
+        assert!(
+            store
+                .settle_thread_workspace_owned(child, binding.as_ref().unwrap())
+                .is_err()
+        );
+        // Quarantine belongs to the workspace owner, not an individual
+        // borrower. Its abandoned view must retain the unresolved child.
+        let parent = store.get_launch_claim("T-runtime-parent").unwrap().unwrap();
+        store
+            .release_active_thread_launch_claim(
+                "T-runtime-parent",
+                &parent.claim_id,
+                &parent.claimed_by,
+            )
+            .unwrap();
+        assert!(
+            store
+                .has_retained_workspace_quarantine("T-runtime-parent")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn product_build_key_commits_original_source_parameters_and_partition() {
+        let producer = ryeos_state::external_content::products::ProductProducerAdmission {
+            canonical_ref: "graph:test/producer".into(),
+            effective_definition_digest: "a".repeat(64),
+            exact_program_hash: "b".repeat(64),
+            producer_project_snapshot_hash: "c".repeat(64),
+            launch_authority_digest: "d".repeat(64),
+            admitted_parameters_digest: "e".repeat(64),
+        };
+        let partition = "f".repeat(64);
+        let replay_authority = "0".repeat(64);
+        let original =
+            product_build_subject_digest(&producer, &partition, &replay_authority).unwrap();
+        assert_eq!(
+            original,
+            product_build_subject_digest(&producer.clone(), &partition, &replay_authority).unwrap()
+        );
+        let mut moved = producer.clone();
+        moved.producer_project_snapshot_hash = "1".repeat(64);
+        assert_ne!(
+            original,
+            product_build_subject_digest(&moved, &partition, &replay_authority).unwrap()
+        );
+        moved = producer.clone();
+        moved.admitted_parameters_digest = "2".repeat(64);
+        assert_ne!(
+            original,
+            product_build_subject_digest(&moved, &partition, &replay_authority).unwrap()
+        );
+        assert_ne!(
+            original,
+            product_build_subject_digest(&producer, &"3".repeat(64), &replay_authority).unwrap()
+        );
+        moved = producer.clone();
+        moved.launch_authority_digest = "4".repeat(64);
+        assert_eq!(
+            original,
+            product_build_subject_digest(&moved, &partition, &replay_authority).unwrap()
+        );
+        assert_ne!(
+            original,
+            product_build_subject_digest(&producer, &partition, &"5".repeat(64)).unwrap()
+        );
+        assert!(product_build_subject_digest(&producer, "pending", &replay_authority).is_err());
+        assert!(product_build_subject_digest(&producer, &partition, "pending").is_err());
+    }
+
+    fn retained_output_workspace(state: WorkspaceState) -> ryeos_app::runtime_db::WorkspaceRecord {
+        ryeos_app::runtime_db::WorkspaceRecord {
+            workspace_id: "workspace-test".into(),
+            thread_id: Some("T-test".into()),
+            launch_owner: Some("previous-owner".into()),
+            backend_id: Some("native".into()),
+            backend_version: Some("1".into()),
+            pinned_root_identities: Some("retained-root-proof".into()),
+            mount_identity: Some("previous-view".into()),
+            base_snapshot: "a".repeat(64),
+            workspace_output_partition_identity: Some("b".repeat(64)),
+            base_output_capture_hash: Some("c".repeat(64)),
+            frozen_snapshot_hash: (state == WorkspaceState::Freezing).then(|| "d".repeat(64)),
+            frozen_output_capture_hash: (state == WorkspaceState::Freezing).then(|| "e".repeat(64)),
+            root_path: "/private/workspace-test".into(),
+            state,
+            process_identity: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn cold_workspace_reconstruction_preserves_ready_active_and_frozen_contents() {
+        for state in [
+            WorkspaceState::Ready,
+            WorkspaceState::Active,
+            WorkspaceState::Freezing,
+        ] {
+            let previous = retained_output_workspace(state);
+            let mut constructing = previous.clone();
+            constructing.state = WorkspaceState::Constructing;
+            constructing.launch_owner = Some("recovery-owner".into());
+            constructing.mount_identity = None;
+            let input = WorkspaceConstructionInput::RetainedBacking(&previous);
+            // The exact recovery branch must skip baseline content verification
+            // and restoration regardless of whether writes are present. It is
+            // selected by the admitted journal, never by disk appearance.
+            assert!(
+                input
+                    .preserves_retained_contents(&constructing, "T-test")
+                    .unwrap()
+            );
+            assert!(
+                !WorkspaceConstructionInput::PristineSource
+                    .preserves_retained_contents(&constructing, "T-test")
+                    .unwrap()
+            );
+            let mut changed = constructing.clone();
+            changed.base_output_capture_hash = Some("f".repeat(64));
+            assert!(
+                input
+                    .preserves_retained_contents(&changed, "T-test")
+                    .is_err()
+            );
+            changed = constructing.clone();
+            changed.pinned_root_identities = Some("different-root".into());
+            assert!(
+                input
+                    .preserves_retained_contents(&changed, "T-test")
+                    .is_err()
+            );
+            assert!(
+                input
+                    .preserves_retained_contents(&constructing, "T-other")
+                    .is_err()
+            );
+            if state == WorkspaceState::Freezing {
+                changed = constructing.clone();
+                changed.frozen_output_capture_hash = Some("f".repeat(64));
+                assert!(
+                    input
+                        .preserves_retained_contents(&changed, "T-test")
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_reconstruction_requires_a_previous_admitted_workspace_view() {
+        let mut previous = retained_output_workspace(WorkspaceState::Constructing);
+        let mut constructing = previous.clone();
+        assert!(
+            WorkspaceConstructionInput::RetainedBacking(&previous)
+                .preserves_retained_contents(&constructing, "T-test")
+                .is_err()
+        );
+        previous.state = WorkspaceState::Active;
+        constructing.state = WorkspaceState::Constructing;
+        previous.backend_id = None;
+        assert!(
+            WorkspaceConstructionInput::RetainedBacking(&previous)
+                .preserves_retained_contents(&constructing, "T-test")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ready_workspace_requires_exact_output_coordinates_in_both_directions() {
+        let partition = "a".repeat(64);
+        let capture = "b".repeat(64);
+
+        validate_retained_workspace_output_coordinates(
+            WorkspaceState::Constructing,
+            None,
+            None,
+            Some(&partition),
+            Some(&capture),
+        )
+        .unwrap();
+        validate_retained_workspace_output_coordinates(
+            WorkspaceState::Ready,
+            Some(&partition),
+            Some(&capture),
+            Some(&partition),
+            Some(&capture),
+        )
+        .unwrap();
+        assert!(
+            validate_retained_workspace_output_coordinates(
+                WorkspaceState::Ready,
+                None,
+                None,
+                Some(&partition),
+                Some(&capture),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_retained_workspace_output_coordinates(
+                WorkspaceState::Ready,
+                Some(&partition),
+                Some(&capture),
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn terminal_workspace_close_requires_terminal_generation_coherence() {
@@ -7534,6 +8759,7 @@ mod tests {
             kind: "graph".into(),
             item_ref: "graph:test/item".into(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             launch_mode: "detached".into(),
             parameters: json!({}),
             project_context,

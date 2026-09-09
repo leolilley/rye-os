@@ -1,14 +1,27 @@
-<!-- ryeos:signed:2026-09-09T04:38:33Z:1746fb0c9bb78da131a1b104274410160c69f848085684163fcf247beb199402:yz5n84ahAnHg8J98xmUFPV815wwcWSySMDZSJlfXS+JMzSw6DwQC0HUo5E1/K0gVw2T6A6MfD2QOf+UrCEoBCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T09:15:12Z:e0ed505a17be2f2ccf3825b56c555685a3ef05df1ace2713f1ff10a3eab04c81:8lAA/VrIocEEtVzxR9HE3VBcojSB/vGbYIMERy4F/RcqXR+Uegm7lJ51GgPQJoQ5cTMBH29Man4NGzIxqrNSCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.8"
+version: "1.8.0"
 ```
 
 # Worker-Hosted Execution
+
+Worker-environment v6 explicitly includes `external_product_slots`, empty for
+literal-only environments. A pending product slot names a signed relationship
+Config and realization shape, not a digest or executable grant. The pure launch
+preparer checks combined literal/slot search and environment references; the
+local operator's product selection must be verified and ordinarily bound before
+the prepared Config dependency can be realized. Dynamic slots are project-only;
+installed bundle environments continue to use literal pins.
+
+The v6 contract combines product slots with explicitly selected CLI and/or
+structured-session invocation bindings. The two earlier v5 branch shapes are
+not accepted as this combined contract. Source integration and separate prior
+acceptance runs do not qualify a newly built combined generation.
 
 Worker-hosted execution runs one long-lived subordinate workload for one
 ordinary RyeOS root execution. It is generic execution substrate, not an
@@ -228,7 +241,7 @@ A project worker execution selects its signed portable environment through the
 runtime-declared `environment` ref binding. The selector is not an ordinary
 parameter and cannot be smuggled through the worker input envelope. The generic
 launch preparer accepts only a trusted bundle/project `config` with the closed
-`ryeos.worker_environment.v5` schema, derives the exact worker dependency from
+`ryeos.worker_environment.v6` schema, derives the exact worker dependency from
 it, and retains the engine-resolved path-free binding record in the outer
 admitted program. The environment may additionally declare locator-free pinned
 external content and an ordered executable-search list over those exact tree
@@ -249,7 +262,7 @@ execution and content dependencies remain projectless: selecting them from a
 project must not give their code a project overlay. Same-site recovery keeps
 the captured realizations rather than re-resolving mutable names.
 
-The v5 configuration may also declare `process_environment`. This is not an
+The v6 configuration may also declare `process_environment`. This is not an
 extension of content authority and is not a project/vault environment overlay.
 The kind-owned preparer emits a generic path-free environment contribution as
 a sibling of execution and content dependencies. Every contribution names its
@@ -264,10 +277,10 @@ non-tree realizations, and paths whose retained manifest type differs from the
 declared file/directory type.
 
 The persistent-session capsule retains only the validated path-free process
-environment, capped at 32 entries and 4096 serialized bytes so the sealed relay
-uses the existing bounded runtime-environment path without a second transport.
-Placement resolves it against that capsule's pinned realization set and the
-node-owned `.ai/cache/ryeos-runtime` view. The session protocol must explicitly
+environment, capped at 32 entries and 4096 serialized bytes. Placement prepares
+a bounded delivery envelope on the existing protected environment channel;
+the envelope is not authored configuration or additional content authority.
+The session protocol must explicitly
 allow the sealed `RYEOS_SESSION_PROCESS_ENVIRONMENT` relay through its existing
 `runtime_env_allowlist`; otherwise admission fails. The receiving bridge clears
 its inherited environment and deliberately installs only these resolved values
@@ -277,7 +290,29 @@ policy remain the final enforcement path. No host environment, absolute
 authored path, credential home, project ignore entry, or kind-specific engine
 branch becomes environment authority.
 
-The required-nullable v5 `workload_client` member is independent of process
+With enforced isolation, execution-runtime paths are usable by ordinary child
+processes without preserving private descriptors. Lillux first proves the
+exact pinned object and read-only namespace ancestors; the initial executable
+still uses its held descriptor. The native backend seals only its synthetic
+root, not separately admitted writable mounts. A readonly leaf below a writable
+ancestor is insufficient and is refused.
+
+For each `runtime_view_directory`, placement prepares the exact directory under
+the borrowed workspace's `.ai/cache/ryeos-runtime` capture floor and mounts it
+at `/ryeos/runtime-views/<ENV_NAME>`. The leaf's contents are writable; its name
+cannot be replaced. The compiler refuses overlaps and the bridge proves that
+the prepared source and target mount are the same directory. Missing or changed
+sources refuse launch instead of triggering bridge-side repair. This supports
+ordinary descendant cache use while keeping caches out of retained candidates.
+Disabled-isolation delivery remains descriptor-bound; it does not claim the
+immutable namespace guarantees of the mounted lane. Delivery mode is explicitly
+prepared, never inferred from whether a mount happens to exist.
+
+Persistent-session capsule v10 fences this prepared delivery contract. Earlier
+retained bridges consume a different environment format and are refused rather
+than translated during recovery.
+
+The required-nullable v6 `workload_client` member is independent of process
 environment and external-content authority. `null` disables it. A non-null
 request selects explicit CLI, structured-session, or both ingress bindings plus
 a finite, sorted set of child item refs, ref-binding values, call forms,

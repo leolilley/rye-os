@@ -387,6 +387,7 @@ async fn execute_prepared_item_ref(
         validate_only: false,
         params: req.params.clone(),
         ref_bindings: req.ref_bindings.clone(),
+        product_selections: Vec::new(),
         acting_principal: prepared.exec_ctx.principal_fingerprint.as_str(),
         project_path: &prepared.project.effective_path,
         provenance,

@@ -58,6 +58,7 @@ pub mod state_manifest;
 pub mod thread_event;
 pub mod thread_snapshot;
 pub mod worker_session_restore;
+pub mod workspace_output_capture;
 
 pub use admitted_launch_capsule::{
     ADMITTED_DIRECT_COMMAND_ROOT, ADMITTED_DIRECT_PROJECT_ROOT,
@@ -138,13 +139,15 @@ pub use persistent_session_capsule::{
     AdmittedPersistentSessionCapsule, AdmittedStructuredSessionProfile,
     CredentialSubjectProjectionContract, ExecutableSearchPathEntry,
     MAX_EXECUTABLE_SEARCH_PATH_ENTRIES, MAX_PERSISTENT_SESSION_EXACT_PROGRAM_BYTES,
-    MAX_SESSION_PROCESS_ENVIRONMENT_ENCODED_BYTES, MAX_SESSION_PROCESS_ENVIRONMENT_ENTRIES,
-    PERSISTENT_SESSION_CAPSULE_KIND, PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION,
-    PersistentSessionAuthority, PersistentSessionLifecycleContract, PersistentSessionWireContract,
-    PortableSessionStateClass, PortableSessionStateContract, PortableSessionStateSelector,
-    SESSION_PROCESS_ENVIRONMENT_ENV, SessionProcessEnvironmentPathKind,
-    SessionProcessEnvironmentValue, validate_session_process_environment,
-    validate_session_process_environment_name, validate_session_process_environment_relative_path,
+    MAX_PREPARED_SESSION_PROCESS_ENVIRONMENT_BYTES, MAX_SESSION_PROCESS_ENVIRONMENT_ENCODED_BYTES,
+    MAX_SESSION_PROCESS_ENVIRONMENT_ENTRIES, PERSISTENT_SESSION_CAPSULE_KIND,
+    PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION, PersistentSessionAuthority,
+    PersistentSessionLifecycleContract, PersistentSessionWireContract, PortableSessionStateClass,
+    PortableSessionStateContract, PortableSessionStateSelector, PreparedSessionProcessEnvironment,
+    SESSION_PROCESS_ENVIRONMENT_ENV, SESSION_RUNTIME_VIEWS_ROOT, SessionProcessEnvironmentPathKind,
+    SessionProcessEnvironmentValue, SessionRuntimeViewDelivery, runtime_view_mount_destination,
+    validate_session_process_environment, validate_session_process_environment_name,
+    validate_session_process_environment_relative_path,
 };
 pub use placement_runtime_seed::{
     MAX_PLACEMENT_RUNTIME_METADATA_BYTES, PLACEMENT_RUNTIME_SEED_KIND,
@@ -199,6 +202,13 @@ pub use worker_session_restore::{
     WORKER_SESSION_RESTORE_CONTRACT, WORKER_SESSION_RESTORE_KIND, WORKER_SESSION_RESTORE_SCHEMA,
     WorkerSessionCheckpointPosition, WorkerSessionDependencyRestore,
     WorkerSessionPortableStateRestore, WorkerSessionRestore,
+};
+pub use workspace_output_capture::{
+    MAX_WORKSPACE_OUTPUT_CAPTURE_BYTES, MAX_WORKSPACE_OUTPUT_PARTITION_BYTES,
+    WORKSPACE_OUTPUT_CAPTURE_KIND, WORKSPACE_OUTPUT_CAPTURE_POLICY_SCHEMA,
+    WORKSPACE_OUTPUT_CAPTURE_SCHEMA, WORKSPACE_OUTPUT_PARTITION_SCHEMA, WorkspaceGenerationPair,
+    WorkspaceOutputAuthority, WorkspaceOutputCapture, WorkspaceOutputCaptureState,
+    WorkspaceOutputPartition, WorkspaceOutputRoot, WorkspaceOutputRootDeclaration,
 };
 
 /// Schema version shared across all CAS object types.

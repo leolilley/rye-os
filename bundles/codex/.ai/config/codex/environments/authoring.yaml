@@ -1,6 +1,7 @@
-# ryeos:signed:2026-09-09T03:59:20Z:e88a060ef674661380366cde83f6a3d8e4c7ebff601b61806c791a2016e84aff:C/vcPtpjGAXRV+wd4YDyknjdteKDQ3lGHPQX+V912YsO1H6xHXSXxCustLhlc76ybWX1E4HlIqk6XZcB7REyAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-09T09:15:12Z:d5f5ddc18d9a37647150cffbad7e9a064b9ef45503705111fa5c1443291f24c9:H1Nxs4+fmdgX+vaR0GlBqOcBHmu1ie502yZT/GpMhtVpdGuw9Eu/R6HjfCwceRtTzvprKC6XvBbFZNgFYFEtCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: codex/environments
-schema: ryeos.worker_environment.v5
+schema: ryeos.worker_environment.v6
+external_product_slots: []
 worker_ref: worker:codex/hosted-authoring
 external_content:
   - id: authoring-tools

@@ -111,6 +111,31 @@ files differ; this is not whole-artifact equality. Historical utility archives a
 worker authoring environment remain separate evidence. This is operator-driven,
 not worker/remote-loop qualification.
 
+## Named-product source composition
+
+The source declarations now express three exact producer relationships without
+changing the live leaf operations: prepared inputs are selected by the retained
+environment Graph, build support is selected by the retained utility Graph, and
+the resulting built utility distribution is selected by the environment Graph.
+Graph-root selection supplies normalized admitted realizations to the inline
+Tools at the existing `execution_runtime` mounts. The literal producer Python,
+Stage0 platform and source-container pins remain fixed bootstrap inputs.
+
+Final assembly uses a closed, disjoint map: `rg`, `zsh`, loader, libraries,
+notices and source delivery come from prepared inputs, while the exact source-built
+command set comes from the selected `authoring-built-utilities` product. The
+product manifest authenticates those command bytes; the recipe additionally
+checks its bounded source/build evidence and rejects undeclared executable
+members. Environment access alone never grants a product or mount.
+
+These edited Configs, Graphs and Tools are intentionally unsigned until the
+operator performs canonical signing and activation. Their relationships require
+no qualification policy because they are intermediate build inputs; this is not
+a claim that the final environment is qualified. Acceptance still requires an
+independent policy/verifier run over the resulting exact witness, including the
+final loader, recursive dynamic-library closure, ABI/symbol requirements, command
+execution and absence of host-library fallback under enforced isolation.
+
 ## Independent artifact probe
 
 ### Pinned App Server registration diagnostic

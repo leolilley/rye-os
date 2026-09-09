@@ -730,6 +730,74 @@ impl InheritedDescriptorAuthority {
         result
     }
 
+    /// Open or create one bounded, canonical directory descendant from this
+    /// exact held root and make the leaf owner-private. No ambient root path
+    /// is reopened. All temporary descriptors stay under the short fork
+    /// lease, and the returned directory is registered before it is released.
+    #[cfg(unix)]
+    pub fn open_or_create_private_directory_descendant(
+        &self,
+        relative: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::path::Component;
+
+        let bytes = relative.as_os_str().as_bytes();
+        if bytes.is_empty()
+            || bytes.len() >= libc::PATH_MAX as usize
+            || bytes.contains(&0)
+            || relative.is_absolute()
+        {
+            anyhow::bail!(
+                "private directory descendant must be bounded canonical relative components"
+            );
+        }
+        let normalized = relative.components().collect::<std::path::PathBuf>();
+        if normalized.as_os_str().as_bytes() != bytes
+            || relative.components().any(|component| {
+                !matches!(component, Component::Normal(name) if name.as_bytes().len() <= 255)
+            })
+        {
+            anyhow::bail!("private directory descendant must be bounded canonical relative components");
+        }
+        let lease = retain_fork_sensitive_descriptors();
+        // A workspace view may be held with O_PATH. Reopen only its exact
+        // inode, not its diagnostic pathname, for mkdirat/fsync traversal.
+        let fd = unsafe {
+            libc::openat(
+                self.file().as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let root = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !crate::secure_fs::same_open_file_identity(self.file(), &root)? {
+            anyhow::bail!("private directory traversal changed its exact held root");
+        }
+        let mut directory =
+            crate::secure_fs::PinnedDirectory::from_open_directory(self.path.clone(), root)?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                unreachable!("relative components validated before mutation");
+            };
+            directory = directory.open_or_create_child(name, 0o700)?;
+        }
+        // Do not use the pathname-binding variant: this directory's
+        // diagnostic path starts at an intentionally opaque descriptor path.
+        directory.set_mode(0o700)?;
+        let result = directory.into_inherited_descriptor_path()?;
+        let metadata = result.file().metadata()?;
+        if !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700 {
+            anyhow::bail!("private directory descendant is not exactly owner-private");
+        }
+        drop(lease);
+        Ok(result)
+    }
+
     #[cfg(unix)]
     pub fn set_regular_file_mode(&self, mode: u32) -> anyhow::Result<()> {
         crate::secure_fs::set_open_regular_file_mode(self.file(), mode)
@@ -791,6 +859,115 @@ impl InheritedDescriptorAuthority {
     }
 }
 
+#[cfg(all(test, unix))]
+mod inherited_directory_traversal_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_descendant_from_path_descriptor_survives_root_rename() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("source");
+        std::fs::create_dir(&original).unwrap();
+        let root = {
+            let lease = retain_fork_sensitive_descriptors();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&original)
+                .unwrap();
+            InheritedDescriptorAuthority::from_owned_file(file, &lease).unwrap()
+        };
+        std::fs::rename(&original, parent.path().join("retained")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let directory = root
+            .open_or_create_private_directory_descendant(Path::new("cache/tool"))
+            .unwrap();
+        assert!(parent.path().join("retained/cache/tool").is_dir());
+        assert!(!original.join("cache").exists());
+        assert_eq!(
+            directory.file().metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(directory.file().as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let repeated = root
+            .open_or_create_private_directory_descendant(Path::new("cache/tool"))
+            .unwrap();
+        assert!(directory.same_file_identity(&repeated).unwrap());
+    }
+
+    #[test]
+    fn private_descendant_refuses_links_and_tightens_only_exact_leaf() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(parent.path().join("existing")).unwrap();
+        std::fs::set_permissions(
+            parent.path().join("existing"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), parent.path().join("link")).unwrap();
+        std::fs::write(parent.path().join("regular"), b"not a directory").unwrap();
+        let root = crate::secure_fs::PinnedDirectory::open(parent.path())
+            .unwrap()
+            .unwrap()
+            .into_inherited_descriptor_path()
+            .unwrap();
+        for path in ["link", "link/escape", "regular", "regular/escape"] {
+            assert!(
+                root.open_or_create_private_directory_descendant(Path::new(path))
+                    .is_err()
+            );
+        }
+        assert!(!outside.path().join("escape").exists());
+        let leaf = root
+            .open_or_create_private_directory_descendant(Path::new("existing"))
+            .unwrap();
+        assert_eq!(
+            leaf.file().metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn private_descendant_validates_entire_relative_path_before_creation() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = crate::secure_fs::PinnedDirectory::open(parent.path())
+            .unwrap()
+            .unwrap()
+            .into_inherited_descriptor_path()
+            .unwrap();
+        for path in [
+            "",
+            ".",
+            "/absolute",
+            "new/../escape",
+            "new/./leaf",
+            "new//leaf",
+            "new/",
+            "new/\0leaf",
+        ] {
+            assert!(
+                root.open_or_create_private_directory_descendant(Path::new(path))
+                    .is_err(),
+                "{path:?}"
+            );
+        }
+        let too_long = format!("new/{}", "x".repeat(libc::PATH_MAX as usize));
+        assert!(
+            root.open_or_create_private_directory_descendant(Path::new(&too_long))
+                .is_err()
+        );
+        assert!(!parent.path().join("new").exists());
+    }
+}
+
 // Keep the opaque inspection interface callable at the existing platform
 // refusal boundary; unsupported hosts never construct synthetic descriptors,
 // metadata, mount identities, or fallback authority.
@@ -829,6 +1006,13 @@ impl InheritedDescriptorAuthority {
         &self,
         _relative: &std::path::Path,
     ) -> anyhow::Result<Option<Self>> {
+        anyhow::bail!("inherited descriptor traversal is unavailable on this platform")
+    }
+
+    pub fn open_or_create_private_directory_descendant(
+        &self,
+        _relative: &std::path::Path,
+    ) -> anyhow::Result<Self> {
         anyhow::bail!("inherited descriptor traversal is unavailable on this platform")
     }
 
@@ -2306,13 +2490,23 @@ pub struct AbortedProcess {
 
 /// Failure while crossing the attachment-to-running lifecycle boundary.
 ///
-/// Before this is returned, the pending process and its process group are
-/// proved quiescent and the exact child is reaped. No live process authority
-/// is hidden inside the error.
+/// Callers may settle durable attachment only when `cleanup_is_settled()`
+/// proves the exact child/wrapper and selected process scope are stopped.
+/// A scoped cleanup failure retains an unresolved recovery obligation; its
+/// diagnostic text and an absent target PID are not cleanup testimony.
 #[derive(Debug)]
 pub struct AttachmentReleaseError {
     pub phase: &'static str,
     pub result: SubprocessResult,
+    cleanup_is_settled: bool,
+}
+
+impl AttachmentReleaseError {
+    /// Exact cleanup testimony issued by this release owner, never inferred
+    /// from the error string or the target's current liveness.
+    pub fn cleanup_is_settled(&self) -> bool {
+        self.cleanup_is_settled
+    }
 }
 
 impl std::fmt::Display for AttachmentReleaseError {
@@ -2323,9 +2517,32 @@ impl std::fmt::Display for AttachmentReleaseError {
 
 impl std::error::Error for AttachmentReleaseError {}
 
-/// Failure of the caller-owned cleanup attempt. This error is returned only
-/// after the attachment boundary has been revoked and exact cleanup has been
-/// proved synchronously.
+#[cfg(target_os = "linux")]
+fn scoped_release_cleanup_outcome(
+    process_cleanup: Result<(), String>,
+    scope_cleanup: Result<(), String>,
+) -> (String, bool) {
+    let errors: Vec<_> = process_cleanup
+        .err()
+        .into_iter()
+        .chain(scope_cleanup.err())
+        .collect();
+    if errors.is_empty() {
+        (String::new(), true)
+    } else {
+        (
+            format!(
+                "; scoped attachment cleanup remains unproved: {}",
+                errors.join("; ")
+            ),
+            false,
+        )
+    }
+}
+
+/// Failure of the caller-owned cleanup attempt. The attachment boundary has
+/// been revoked, but selected scope or wrapper cleanup may remain unproved.
+/// Only a successful abort result authorizes durable attachment settlement.
 #[derive(Debug)]
 pub struct AttachmentAbortError {
     pub pid: u32,
@@ -2382,7 +2599,7 @@ impl ProcessAwaitingAttachment {
                 .abort_and_reap_inner()
                 .map(|_| ())
                 .map_err(|error| error.to_string());
-            let cleanup = self.cleanup_failure_detail(cleanup);
+            let (cleanup, cleanup_is_settled) = self.cleanup_failure_detail(cleanup);
             let result = spawn_failure(
                 Instant::now(),
                 format!(
@@ -2391,6 +2608,7 @@ impl ProcessAwaitingAttachment {
             );
             return Err(AttachmentReleaseError {
                 phase: "release after attachment",
+                cleanup_is_settled,
                 result,
             });
         }
@@ -2399,13 +2617,14 @@ impl ProcessAwaitingAttachment {
                 .abort_and_reap_inner()
                 .map(|_| ())
                 .map_err(|error| error.to_string());
-            let cleanup = self.cleanup_failure_detail(cleanup);
+            let (cleanup, cleanup_is_settled) = self.cleanup_failure_detail(cleanup);
             let result = spawn_failure(
                 Instant::now(),
                 format!("release after attachment refused: {error}{cleanup}"),
             );
             return Err(AttachmentReleaseError {
                 phase: "release after attachment",
+                cleanup_is_settled,
                 result,
             });
         }
@@ -2422,9 +2641,10 @@ impl ProcessAwaitingAttachment {
                         self.pidfd.as_raw_fd(),
                         settle_direct_attachment_worker(self.pid, worker),
                     );
-                    let detail = self.cleanup_failure_detail(settlement);
+                    let (detail, cleanup_is_settled) = self.cleanup_failure_detail(settlement);
                     return Err(AttachmentReleaseError {
                         phase: "release after attachment",
+                        cleanup_is_settled,
                         result: spawn_failure(
                             Instant::now(),
                             format!("release after attachment failed: {error}{detail}"),
@@ -2439,9 +2659,10 @@ impl ProcessAwaitingAttachment {
                             self.pidfd.as_raw_fd(),
                             ATTACHMENT_ABORT_SETTLE_TIMEOUT,
                         );
-                        let detail = self.cleanup_failure_detail(cleanup);
+                        let (detail, cleanup_is_settled) = self.cleanup_failure_detail(cleanup);
                         Err(AttachmentReleaseError {
                             phase: "exec after attachment release",
+                            cleanup_is_settled,
                             result: if detail.is_empty() {
                                 result
                             } else {
@@ -2456,9 +2677,10 @@ impl ProcessAwaitingAttachment {
                             self.pidfd.as_raw_fd(),
                             self.process_scope.as_ref(),
                         );
-                        let detail = self.cleanup_failure_detail(cleanup);
+                        let (detail, cleanup_is_settled) = self.cleanup_failure_detail(cleanup);
                         Err(AttachmentReleaseError {
                             phase: "exec after attachment release",
+                            cleanup_is_settled,
                             result: spawn_failure(
                                 Instant::now(),
                                 format!("attachment spawn worker panicked after release{detail}"),
@@ -2473,9 +2695,10 @@ impl ProcessAwaitingAttachment {
                         self.pidfd.as_raw_fd(),
                         running.abort_and_reap_checked(),
                     );
-                    let detail = self.cleanup_failure_detail(cleanup);
+                    let (detail, cleanup_is_settled) = self.cleanup_failure_detail(cleanup);
                     return Err(AttachmentReleaseError {
                         phase: "release after attachment",
+                        cleanup_is_settled,
                         result: spawn_failure(
                             Instant::now(),
                             format!(
@@ -2491,9 +2714,10 @@ impl ProcessAwaitingAttachment {
                             self.pidfd.as_raw_fd(),
                             running.abort_and_reap_checked(),
                         );
-                        let detail = self.cleanup_failure_detail(cleanup);
+                        let (detail, cleanup_is_settled) = self.cleanup_failure_detail(cleanup);
                         Err(AttachmentReleaseError {
                             phase: "release after attachment",
+                            cleanup_is_settled,
                             result: spawn_failure(
                                 Instant::now(),
                                 format!(
@@ -2533,43 +2757,37 @@ impl ProcessAwaitingAttachment {
     }
 
     #[cfg(target_os = "linux")]
-    fn cleanup_failure_detail(&self, cleanup: Result<(), String>) -> String {
+    fn cleanup_failure_detail(&self, cleanup: Result<(), String>) -> (String, bool) {
         if let Some(scope) = &self.process_scope {
             // A pidfd/group proof never replaces the explicitly selected scope
             // proof, including exec failure and a panicked spawn worker. Keep
             // recovery evidence with the attachment if either duty is unproved.
             let scope_cleanup = scope.terminate_and_wait(ATTACHMENT_ABORT_SETTLE_TIMEOUT);
-            let errors: Vec<_> = cleanup
-                .err()
-                .into_iter()
-                .chain(scope_cleanup.err())
-                .collect();
-            return if errors.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; scoped attachment cleanup remains unproved: {}",
-                    errors.join("; ")
-                )
-            };
+            return scoped_release_cleanup_outcome(cleanup, scope_cleanup);
         }
         match cleanup {
-            Ok(()) => String::new(),
+            Ok(()) => (String::new(), true),
             Err(error) => {
                 // A release error may escape only after exact cleanup proof;
                 // otherwise RyeOS could compare-clear the durable attachment
                 // while this process remained live.
                 complete_attachment_cleanup(self.pidfd.as_raw_fd(), self.pgid);
-                format!("; initial cleanup proof failed: {error}; cleanup completed synchronously")
+                (
+                    format!(
+                        "; initial cleanup proof failed: {error}; cleanup completed synchronously"
+                    ),
+                    true,
+                )
             }
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn cleanup_failure_detail(&self, cleanup: Result<(), String>) -> String {
-        cleanup
-            .err()
-            .map_or_else(String::new, |error| format!("; cleanup failed: {error}"))
+    fn cleanup_failure_detail(&self, cleanup: Result<(), String>) -> (String, bool) {
+        match cleanup {
+            Ok(()) => (String::new(), true),
+            Err(error) => (format!("; cleanup failed: {error}"), false),
+        }
     }
 
     fn abort_and_reap_inner(&mut self) -> Result<AbortedProcess, AttachmentAbortError> {
@@ -5016,6 +5234,27 @@ fn validate_attachment_parent(
 #[cfg(all(test, target_os = "linux"))]
 mod attachment_parent_tests {
     use super::validate_attachment_parent;
+
+    #[test]
+    fn release_cleanup_requires_both_process_and_scope_proof() {
+        for process_settled in [false, true] {
+            for scope_settled in [false, true] {
+                let process = process_settled
+                    .then_some(())
+                    .ok_or_else(|| "wrapper".to_owned());
+                let scope = scope_settled
+                    .then_some(())
+                    .ok_or_else(|| "scope".to_owned());
+                let (detail, settled) = super::scoped_release_cleanup_outcome(process, scope);
+                let error = super::AttachmentReleaseError {
+                    phase: "release after attachment",
+                    result: super::spawn_failure(super::Instant::now(), detail),
+                    cleanup_is_settled: settled,
+                };
+                assert_eq!(error.cleanup_is_settled(), process_settled && scope_settled);
+            }
+        }
+    }
 
     #[test]
     fn pid_one_is_a_valid_exact_attachment_parent() {

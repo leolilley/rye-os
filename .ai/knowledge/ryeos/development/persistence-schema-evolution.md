@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T03:59:20Z:ded08f9893f6c84db735b078f9a9980ffb7c529dba169b30dcea09130da7624d:T12dFMi3Jb8D/43eXJIlcMr98bkPlzgZzf5LGv6gmdJNujHAeoq7RzQ4UROi9XMMt6Z/YEoE6l2kNbyeXNzaCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T09:15:12Z:7ee49eef7d1fc6ac873989634a03d760ac9f12a70e78abe396c1ac7915b67add:BXPRNSc04Ri636DxvRVkRuzIFmZDmTG9c1p3PIV9Hx4rpNRPGqtc9tOjFJ/kE5QZoxsHPjUR4W9mVcSLUYlPAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -29,25 +29,33 @@ occupied. Removing old readers does not make the number reusable.
 
 The current clean-cut execution formats include:
 
-- sealed root execution request schema 18;
-- thread snapshot schema 12;
+- sealed root execution request schema 20;
+- thread snapshot schema 13;
 - project snapshot schema 5;
-- admitted launch capsule schema 25;
-- persistent-session capsule schema 8;
-- runtime launch metadata epoch 33;
-- the standalone runtime project-authority envelope epoch 4; and
-- the owned runtime SQLite operator schema epoch 31 (encoded in the RyeOS
+- admitted launch capsule schema 28;
+- persistent-session capsule schema 10;
+- runtime launch metadata epoch 35;
+- the standalone runtime project-authority envelope epoch 5; and
+- the owned runtime SQLite operator schema epoch 33 (encoded in the RyeOS
   `PRAGMA application_id` family).
 
-Workload invocation uses launch metadata 33 and runtime epoch 31. The existing
+The combined workload-invocation and environment-product cut uses launch
+metadata 35 and runtime epoch 33. It preserves invocation ingress provenance
+and product selection/retention together; neither branch's earlier epoch may be
+reinterpreted as the combined authority. The existing
 runtime-action row now retains trusted ingress provenance; a partial unique
 index fences protocol session/turn/call identity across boot-grant rotation.
 Decoding recomputes the operation coordinate from retained source and grant.
-The request protocol is v2, environment contract v5, and compiled structured
+The request protocol is v2, environment contract v6, and compiled structured
 profile version 3. Structured-session wire version 2 binds command-progress
 acknowledgements to the exact request and digest. The signed protocol and bridge
 select the same version; old peers fail their wire identity check. Predecessor
 authority is not defaulted or reinterpreted.
+
+The combined isolation-adapter wire is v10. It retains both nested-sandbox
+process authority and descriptor-relative runtime-view descendants. Earlier
+v8/v9 launch messages are not the combined contract; historical protocol
+identity remains testimony, not permission to execute an old launch shape.
 
 The isolation policy v4 cut required explicit `network.runtime_files` (including an
 explicit empty list). Launch metadata 31 binds the sealed input digests in the
@@ -85,7 +93,7 @@ ceilings; recovery cannot substitute an ambient kind definition. Launch
 metadata 29 carries both this authority and the proc protocol cut; neither
 standalone v29 shape was installed before the combined generation.
 
-The shared-view workspace cut uses isolation-adapter protocol v7 and launch
+The lossless workspace-mutation cut uses isolation-adapter protocol v8 and launch
 metadata 30, because the nested protocol identity is strict. Runtime epoch 28
 adds exact per-launch workspace/view/launch-owner membership to `thread_runtime`
 and retains creator process identity in the existing construction journal.

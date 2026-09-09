@@ -135,10 +135,11 @@ where
 /// filesystem/network and realization-root execution contract.
 /// v17 seals fixed-parent live confinement and explicit namespace symlink
 /// semantics. Old path-mask claims cannot be decoded as this authority.
-/// v18 requires retained source/runtime and receiving-kind content ceilings in
-/// prepared launches; predecessor preparation cannot authorize this boundary.
-/// v17 is already allocated to the coordinating fixed-parent confinement cut.
-pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 18;
+/// v19 retains the exact invocation product selector map. Predecessor sealed
+/// requests cannot prove whether a selected witness was omitted during
+/// persistence, so they are classified before nested decoding.
+/// v20 requires the exact local-or-received product witness source proof.
+pub(super) const SEALED_ROOT_EXECUTION_REQUEST_SCHEMA_VERSION: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -545,6 +546,8 @@ pub struct SealedRootExecutionRequest {
     usage_subject_asserted_by: Option<String>,
     parameters: Value,
     ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     resolved_ref_bindings: BTreeMap<String, Value>,
     verified_subject: SealedResolvedItem,
     #[serde(deserialize_with = "deserialize_required_nullable")]
@@ -749,6 +752,7 @@ impl SealedRootExecutionRequest {
             usage_subject_asserted_by: request.usage_subject_asserted_by.clone(),
             parameters: request.parameters.clone(),
             ref_bindings: request.ref_bindings.clone(),
+            product_selections: request.product_selections.clone(),
             resolved_ref_bindings,
             verified_subject: SealedResolvedItem::capture(
                 &verified.resolved,
@@ -817,6 +821,11 @@ impl SealedRootExecutionRequest {
         expected_source_site: &str,
         expected_origin_site: &str,
     ) -> Result<&str> {
+        if !self.product_selections.is_empty() {
+            bail!(
+                "cross-site worker handoff cannot carry product selectors in the first composition lane"
+            );
+        }
         let principal = self.planning_principal.restore()?;
         let EffectivePrincipal::Local(principal) = principal else {
             unreachable!("delegated principal restoration is refused")
@@ -833,6 +842,12 @@ impl SealedRootExecutionRequest {
 
     pub fn item_ref(&self) -> &str {
         &self.item_ref
+    }
+
+    pub fn product_selections(
+        &self,
+    ) -> &ryeos_state::external_content::products::composition::ProductSelectionInputs {
+        &self.product_selections
     }
 
     /// Verify and return only the exact admitted root subject. This is safe for
@@ -957,6 +972,8 @@ impl SealedRootExecutionRequest {
             Some("item_ref")
         } else if self.ref_bindings != resume.ref_bindings {
             Some("ref_bindings")
+        } else if self.product_selections != resume.product_selections {
+            Some("product_selections")
         } else if self.launch_mode != resume.launch_mode {
             Some("launch_mode")
         } else if self.parameters != resume.parameters {
@@ -1021,9 +1038,13 @@ impl SealedRootExecutionRequest {
         resume: &crate::launch_metadata::ResumeContext,
         handler_context: Option<crate::handler_context::HandlerContext>,
     ) -> Result<Self> {
+        if !self.product_selections.is_empty() || !resume.product_selections.is_empty() {
+            bail!("continuations cannot carry product selectors in the first composition lane");
+        }
         if self.kind != resume.kind
             || self.item_ref != resume.item_ref
             || self.ref_bindings != resume.ref_bindings
+            || self.product_selections != resume.product_selections
             || self.launch_mode != resume.launch_mode
             || self.current_site_id != resume.current_site_id
             || self.origin_site_id != resume.origin_site_id
@@ -1059,6 +1080,14 @@ impl SealedRootExecutionRequest {
 
     pub fn handler_context(&self) -> Option<&crate::handler_context::HandlerContext> {
         self.handler_context.as_ref()
+    }
+
+    pub fn requested_by(&self) -> Option<&str> {
+        self.requested_by.as_deref()
+    }
+
+    pub fn origin_site_id(&self) -> &str {
+        &self.origin_site_id
     }
 
     pub fn admitted_operator_authority(
@@ -1199,6 +1228,7 @@ impl SealedRootExecutionRequest {
             usage_subject_asserted_by: None,
             parameters: json!({}),
             ref_bindings: BTreeMap::new(),
+            product_selections: Vec::new(),
             resolved_ref_bindings: BTreeMap::new(),
             verified_subject: SealedResolvedItem {
                 canonical_ref: canonical_item_ref.clone(),
@@ -1405,6 +1435,7 @@ impl SealedRootExecutionRequest {
             usage_subject: self.usage_subject.clone(),
             usage_subject_asserted_by: self.usage_subject_asserted_by.clone(),
             ref_bindings: self.ref_bindings.clone(),
+            product_selections: self.product_selections.clone(),
             resolved_history_policy: self.resolved_history_policy.clone(),
             resolved_result_policy: self.resolved_result_policy.clone(),
             captured_history_policy: self.captured_history_policy.clone(),
@@ -1449,6 +1480,7 @@ impl SealedRootExecutionRequest {
             usage_subject_asserted_by: self.usage_subject_asserted_by.clone(),
             parameters: self.parameters.clone(),
             ref_bindings: self.ref_bindings.clone(),
+            product_selections: self.product_selections.clone(),
             root_raw_content_digest: resolved_item.raw_content_digest.clone(),
             resolved_item,
             plan_context,
@@ -1655,6 +1687,7 @@ impl SealedRootExecutionRequest {
             kind: source.kind.clone(),
             item_ref: source.item_ref.clone(),
             ref_bindings: source.ref_bindings.clone(),
+            product_selections: source.product_selections.clone(),
             launch_mode: source.launch_mode.clone(),
             parameters,
             project_context: rebind.target_project_context.clone(),
@@ -2028,6 +2061,7 @@ mod authority_tests {
             kind: "graph_run".to_string(),
             item_ref: "graph:test/storage-fixture".to_string(),
             ref_bindings: BTreeMap::new(),
+            product_selections: Vec::new(),
             launch_mode: "detached".to_string(),
             parameters: json!({"continuation": true}),
             project_context: ProjectContext::LocalPath {
@@ -2554,6 +2588,13 @@ mod authority_tests {
             request.effective_definition_digest()
         );
         assert_eq!(round_trip.admitted_program_value().unwrap(), exact_program);
+
+        let mut predecessor = serde_json::to_value(&request).unwrap();
+        predecessor
+            .as_object_mut()
+            .unwrap()
+            .remove("product_selections");
+        assert!(serde_json::from_value::<SealedRootExecutionRequest>(predecessor).is_err());
     }
 
     #[test]

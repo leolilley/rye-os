@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T06:35:46Z:cafed07f720375cb9deb2a1ff1be28c36d49c2217646c1e073a5ec521a25d535:+8DhnGANV1kfmg5abzDdF661XbZxfDQFSnfg4Nf3lD8BqlPeL/n8Ggb9IyIphDh99IVxFUIZ6VxGBlwJ60bWBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T09:15:12Z:6db58a0759caec6c323a7555be65f991eb421900237297e132d4a130c23deb17:Jp7hoKBOPMeJdRyla6TGOMm7imV1/nqKhbTisLH/YpLJHDZkeTQvFcucpbFx2X8yZRlES4rl3EQzTD31osjqAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [codex, hosted-execution, structured-session, credentials, acceptance]
@@ -17,6 +17,10 @@ paths or instructions. It is workload testimony, not a change to RyeOS grants
 or lifecycle authority. Turn-level model/effort selection can emit this event
 before the start response; it must not be mistaken for an unknown protocol
 message. Other undeclared notifications remain fail-closed.
+
+The worker-environment v6 sources explicitly set `external_product_slots: []`.
+These installed bundle environments retain literal pins; dynamic product slots
+are limited to separately admitted pinned-project environment Configs.
 
 The Codex bundle hosts the pinned Codex App Server using ChatGPT subscription
 authentication managed by Codex. It does not route Codex through RyeOS local
@@ -152,7 +156,7 @@ configured-operator forwarding route to inspect profiles on a remote node.
    cache.
 
    `config:codex/environments/default` uses the closed
-   `ryeos.worker_environment.v5` contract. Its `executable_search` contributes
+   `ryeos.worker_environment.v6` contract. Its `executable_search` contributes
    only the exact activated command-tool tree to `PATH`. Its independent
    `process_environment` map may contribute bounded literals, paths inside an
    explicitly named activated realization, or directories below the

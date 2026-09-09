@@ -397,6 +397,7 @@ fn admit_fresh_launch(
         provenance,
         parameters,
         ref_bindings,
+        &Vec::new(),
         &ctx.fingerprint,
         &ctx.scopes,
         state.threads.site_id(),
@@ -421,6 +422,7 @@ fn admit_fresh_launch(
         preflight.root_dispatch_evidence,
         &project.effective_path,
         ref_bindings.clone(),
+        Vec::new(),
         lifecycle_authority,
         Some(ctx.clone()),
     )
@@ -919,6 +921,7 @@ mod tests {
             kind: "directive_run".to_string(),
             item_ref: "directive:test/identity".to_string(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             launch_mode: "detached".to_string(),
             parameters: json!({}),
             project_context: ryeos_engine::contracts::ProjectContext::SnapshotHash {
@@ -970,6 +973,7 @@ mod tests {
                 .map(|path| path.display().to_string()),
             project_authority: Some(project_authority),
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             lifecycle_authority: Some(
                 ryeos_state::objects::ExecutionLifecycleAuthority::DAEMON_RESTARTABLE,
             ),
