@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T09:15:12Z:0207ccd03f533d269b565bdff70b14b513db7d9c3ec58ea0b2ed7d2ce82d48ec:7WvNyEJgcuT3iIB6ExcnYEipJQ2n2ckkdi0k+nFyeFChmRWE5Lz7MVcDjiPMs7Kuw+L3Gbm01evJyCm+E0LDAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T19:41:44Z:fbb4b118bd5e80b6f163dc2bafd1706df1367b47459428a50a13dad5d357fa89:Hignl1nDDdqUdi51O/emdMGOAhHFVdAIbarDyZvetlgBBeJrEwZrD/i0wLgYnaGGGczu03MzB1C9b41RhmecDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -82,6 +82,15 @@ be pasted into this policy. The focused source-policy test checks every bundle
 in the development profile while retaining source, Tools and the public key
 fixture. Preflight must still inspect the actual manifest for retired/untracked
 directories before a real project is exposed to a worker.
+
+An in-place checkout can contain retired bundle payloads and nested fixture-node
+history that a fresh worktree never had. The project policy also excludes the
+observed retired bundle directories, local smoke items, editor log, and generated
+E2E runs/history. These exclusions preserve the files on disk and retain authored
+fixture directives, Tools, knowledge, and reviewed qualification evidence. They
+are project input selection, not new engine path rules. Check nested paths as
+well as root `.ai/state` when inspecting the actual captured tree; a clean Git
+status alone does not prove a clean project snapshot.
 
 `.dev-keys/PUBLISHER_DEV.pem` is deliberately public, Git-tracked development
 fixture material and remains part of a `full_project` snapshot. Its signature
