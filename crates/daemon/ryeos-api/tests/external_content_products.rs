@@ -636,6 +636,141 @@ fn remote_owned_product_binding_requires_unchanged_current_grant() {
     );
 }
 
+#[test]
+fn selected_launch_is_target_local_without_erasing_remote_operator_origin() {
+    use ryeos_app::operator_external_content::product_composition::admit_root_product_selections;
+    use ryeos_engine::contracts::{ItemSourceRoot, ItemSpace, SubjectResolutionAuthority};
+    use ryeos_engine::resolution::{
+        KindComposedView, ResolutionOutput, ResolutionStepName, ResolvedAncestor, TrustClass,
+    };
+    use ryeos_state::external_content::products::composition::{
+        ProductSelection, ProductSelectionInput, ProductSelectionTarget,
+    };
+
+    let fixture = fixture_with_remote_owner(false, 4096, true, true);
+    let context = ryeos_app::operator_authority::retained_admitted_operator_authority(
+        &fixture.state,
+        &fixture.context.fingerprint,
+        REMOTE_ORIGIN,
+    )
+    .unwrap()
+    .handler_context();
+    assert_ne!(REMOTE_ORIGIN, fixture.state.threads.site_id());
+    // No consumer is mocked as admitted: this deliberately untrusted unresolved
+    // item proves the serving-site fence runs before source/witness admission.
+    // Full selected-program success remains the installed producer qualification.
+    let mut resolution = ResolutionOutput {
+        root: ResolvedAncestor {
+            requested_id: "tool:test/not-admitted".into(),
+            resolved_ref: "tool:test/not-admitted".into(),
+            source_path: "/diagnostic/not-admitted.yaml".into(),
+            source_space: ItemSpace::Project,
+            source_root: ItemSourceRoot::Project,
+            trust_class: TrustClass::UntrustedProject,
+            signer_fingerprint: None,
+            alias_resolution: None,
+            added_by: ResolutionStepName::PipelineInit,
+            raw_content: "fixture".into(),
+            source_content_digest: "a".repeat(64),
+            raw_content_digest: "b".repeat(64),
+        },
+        ancestors: Vec::new(),
+        references_edges: Vec::new(),
+        referenced_items: Vec::new(),
+        step_outputs: Default::default(),
+        effective_trust_class: TrustClass::UntrustedProject,
+        composed: KindComposedView {
+            composed: json!({}),
+            derived: Default::default(),
+            policy_facts: Default::default(),
+        },
+    };
+    let roots = fixture.state.engine.resolution_roots(None);
+    let subject = SubjectResolutionAuthority::PinnedGeneration {
+        snapshot_hash: "d".repeat(64),
+    };
+    let selection = ProductSelection {
+        declaration_id: "runtime".into(),
+        witness_hash: fixture.witness_hash.clone(),
+        witness_source:
+            ryeos_state::external_content::products::transfer::ProductWitnessSource::LocalCapture {},
+        qualification_hash: None,
+    };
+    for target in [
+        ProductSelectionTarget::Root {},
+        ProductSelectionTarget::ContentDependency {
+            binding: "environment".into(),
+        },
+    ] {
+        let inputs = vec![ProductSelectionInput {
+            target: target.clone(),
+            selection: selection.clone(),
+        }];
+        for recovered in [false, true] {
+            let error = admit_root_product_selections(
+                &fixture.state,
+                REMOTE_ORIGIN,
+                &fixture.state.engine,
+                &roots,
+                &subject,
+                &mut resolution,
+                Some(&context.fingerprint),
+                Some(&context),
+                &inputs,
+                recovered,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("current site differs from the serving node"),
+                "{target:?}, recovered={recovered}: {error:#}"
+            );
+            assert!(resolution.composed.derived.is_empty());
+            if matches!(target, ProductSelectionTarget::ContentDependency { .. }) {
+                // At the correct serving site this batch is left for the
+                // separate content-dependency owner, not rejected for origin.
+                admit_root_product_selections(
+                    &fixture.state,
+                    fixture.state.threads.site_id(),
+                    &fixture.state.engine,
+                    &roots,
+                    &subject,
+                    &mut resolution,
+                    Some(&context.fingerprint),
+                    Some(&context),
+                    &inputs,
+                    recovered,
+                )
+                .unwrap();
+                assert!(resolution.composed.derived.is_empty());
+            }
+        }
+    }
+    let different_owner = format!("fp:{}", "f".repeat(64));
+    let error = admit_root_product_selections(
+        &fixture.state,
+        fixture.state.threads.site_id(),
+        &fixture.state.engine,
+        &roots,
+        &subject,
+        &mut resolution,
+        Some(&different_owner),
+        Some(&context),
+        &vec![ProductSelectionInput {
+            target: ProductSelectionTarget::Root {},
+            selection,
+        }],
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ingress differs from its admitted owner")
+    );
+}
+
 #[tokio::test]
 async fn exact_import_refuses_unpublished_wrong_owner_and_wrong_node_witnesses() {
     let fixture = fixture(false, 4096, false);

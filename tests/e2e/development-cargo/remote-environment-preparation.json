@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "date": "2026-09-10",
+  "purpose": "Observed local-remote environment preparation and failed admission; not completed worker development qualification",
+  "driver": "Installed source RyeOS CLI, configured remote operator, independent disposable target on the same machine",
+  "source_site": "site:ae849a0a32ef295ef0420b47acd362ad2998f26c7611bbe6247d2e3da8682ef6",
+  "target_site": "site:0db14ae10fa3e060d175a9ebdd975f4041b0a3a271c99078436a4a4b0e533f60",
+  "owner_principal": "fp:187fab6cdcea75febdf44cda0874fd8da7dd67b70bb8592f90f93506c2393786",
+  "installed_daemon_sha256": "462cbfafb7499a205e04876db3f3a69393c6485c4f51cddcbf8ecbb09ce76dcc",
+  "source_revision": "41929b649",
+  "source_snapshot": "23f3690e3f8f15432ac080826107605d736158b720061643127579d23e3dd13e",
+  "target_snapshot": "82908e91a6a2826b79fbcf1b78722d9f7860cb808cff5e875fce6c9cf2ab2b5b",
+  "tree": "85a738c6a3f4470f7c6a0e51d2b830d6aa5edb564bc75b0578d10527e14e6766",
+  "files": 2638,
+  "prepared_inputs": {
+    "root": "T-f31c935a-4653-4919-f311-da9781f7afac",
+    "status": "completed",
+    "outcome_code": "success",
+    "witness_hash": "44b42f45bd4c93eff4f3b3f355e7451da4b8fdd17b368d52e3a9ead49e741ec0"
+  },
+  "build_support": {
+    "root": "T-30e660c7-a68d-8dba-0738-d0b236fb2e41",
+    "status": "completed",
+    "outcome_code": "success",
+    "witness_hash": "e08646497eb1df539aaff1ece9a04dfbba55c50a1fec789332d2a66b035d48be"
+  },
+  "utility_support_composition": {
+    "service": "svc-1788978140093-413b0961",
+    "binding_hash": "de60ca87313f691ee370317d6a89f52a757976f03fe2b51bb9bdf2afa5d449fb"
+  },
+  "utility_production": {
+    "root": "T-bc903be3-6e9b-b59b-1a2b-63fec91d8ee6",
+    "launch_id": "L-20260910000000000000000000000203",
+    "status": "failed",
+    "producer_executed": false,
+    "error": "node 'produce' failed: dispatch failed: internal: internal: cross-site execution cannot carry product selectors in the first composition lane"
+  },
+  "source_correction": {
+    "description": "Separate authenticated origin from execution placement; validate product selections against serving current site and preserve destination-local selectors through remote/run",
+    "new_authority_model_added": false,
+    "wire_field_added": "remote/run.product_selections",
+    "runtime_schema_changed": false,
+    "installed_execution_after_correction": false,
+    "focused_checks": [
+      "Destination request bounds/canonicality and signed schema: passed",
+      "Both-mode HTTP selector wire test: passed with loopback permission; initial sandbox denied listener",
+      "Remote-origin metadata roundtrip, exact identity and scheduled/malformed selector refusal: passed",
+      "External-content product API fixture: 9/9 passed; first compile exhausted disk, resumed after inactive debug-cache cleanup"
+    ],
+    "review": "Independent ownership and safety reviews found no blocker in the focused correction"
+  },
+  "open_gates": [
+    "Install corrected packaged daemon on disposable source/target nodes",
+    "Complete fresh utility/environment production and independent runtime qualification",
+    "Real repository Codex edit with child format/check/exact one-test evidence",
+    "Restart/reattach and exact completion fence",
+    "Whole candidate diff, independent assertions and source-HEAD-fenced return/integration",
+    "Final merge into next"
+  ],
+  "unchanged": [
+    "Primary node",
+    "Railway",
+    "Existing credential keys",
+    "Worker six-operation grant"
+  ]
+}

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T10:31:21Z:6c5b2736998ad429b76bbf692446b45f3a4b398f894fb9cf99c4b26c98a13339:QHkr/uhull6hY6GuDR+vOyNhNAodh0btbhP0Q+RJR8NXKF0D71JV+DnhUPIpmYhcowXR67je8E+QNBl54CeXAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T18:42:29Z:7c9417adc098971997ee166ae51d030f10617d5f4e485b6966f5584ec3cf0ace:y5odl+aTienJ19No2IEzM2MRQa0Lc8pstOdzhoata2slMr7Lvcm2A8lirkUiU/XgKhrva+7llp+jsEyveLlkCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/remote
 tags: [remote, cli, reference, manpage, capabilities]
@@ -466,6 +466,17 @@ unary service calls. Accepted mode additionally requires a caller-retained
 `launch_id` and is used for durable projectless or project-backed workers.
 Project-backed live/current-HEAD modes still require a configured project
 binding.
+
+Optional `product_selections` use the ordinary typed root/content-dependency
+selection contract, but name witnesses and qualifications on the destination.
+The destination independently admits their exact owner, relationships and
+bindings against the selected pinned generation (or an explicitly projectless
+consumer). This does not make the command's default live project mode eligible
+for products, forward a source-admitted selection, or transfer product bytes.
+Use an explicit destination-local execution policy and configured-operator
+continuity for a retained product workflow. Accepted launch IDs remain
+create-only: query the exact launch after uncertain delivery, rather than
+resubmitting it and expecting a successful response replay.
 
 ## `ryeos remote doctor`
 

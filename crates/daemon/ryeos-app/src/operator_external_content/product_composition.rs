@@ -33,6 +33,7 @@ use crate::state::AppState;
 /// have completed before the ordinary realization owner can admit the launch.
 pub fn admit_root_product_selections(
     state: &AppState,
+    current_site_id: &str,
     engine: &ryeos_engine::engine::Engine,
     roots: &ryeos_engine::item_resolution::ResolutionRoots,
     subject: &SubjectResolutionAuthority,
@@ -43,6 +44,15 @@ pub fn admit_root_product_selections(
     recovered: bool,
 ) -> anyhow::Result<()> {
     use ryeos_state::external_content::products::composition::ProductSelectionTarget;
+    // Run before filtering root slots: a content-dependency-only selection is
+    // also local to this serving node. Origin is not consulted: it identifies
+    // the authenticated caller's provenance, not where these products reside.
+    // Fresh and recovered callers pass the current site from admitted authority.
+    if (!inputs.is_empty() || resolved_external_product_selections(resolution)?.is_some())
+        && current_site_id != state.threads.site_id()
+    {
+        bail!("product-selected execution current site differs from the serving node");
+    }
     let selectors = inputs
         .iter()
         .filter_map(|input| match &input.target {

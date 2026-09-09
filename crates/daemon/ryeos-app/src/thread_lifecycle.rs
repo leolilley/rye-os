@@ -2684,11 +2684,11 @@ impl RootExecutionAdmission {
                     "scheduled execution cannot carry product selectors in the first composition lane"
                 );
             }
-            if self.plan_context.current_site_id != self.plan_context.origin_site_id {
-                bail!(
-                    "cross-site execution cannot carry product selectors in the first composition lane"
-                );
-            }
+            // Origin is authenticated provenance, not placement authority. An
+            // operator on another site may initiate a target-local execution.
+            // Product admission compares current_site_id with the serving
+            // node and verifies that node's exact witness/owner authority;
+            // actual forwarding and handoff reject selectors at their owners.
             if self.candidate_evaluation.is_some() {
                 bail!(
                     "candidate execution cannot carry product selectors in the first composition lane"

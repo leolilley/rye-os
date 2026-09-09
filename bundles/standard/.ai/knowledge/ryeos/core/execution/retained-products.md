@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T14:32:28Z:8294c6b421d652f9bd95bb7f4ab299294c955f38b74c24608c8a01ba9d63fbaf:3aEe7MADOPE0j8JtG77udFm4pnYO75qkgQ9n3tJwmKKbZCPYh4E/WH28comJSAdpfniWIvawM46L6ax5AweUBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T18:38:44Z:54eff35eab5f4a7ce5a36593579481fa3495335644aedfeb1b25582d704d52fe:DNhKLny9hwo+OCqUmAD3UpgS7lYRlQC/KfhSAC/Au9tGMx+oAmGdycjpmu+RiDfTC4tfVveZhWlddG+/84OqAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/execution
 tags: [execution, products, external-content, authority]
@@ -46,6 +46,17 @@ exact owner checks. Active bindings retain the authorizer and exact grant
 digest. Revoking or changing that grant invalidates those bindings, including
 bindings authorized by a remote operator. Recovery uses retained owner/origin
 authority and revalidates the current grant.
+
+Target-local execution may retain a different `origin_site_id`: that records
+the authenticated source, not a request to move an execution. Product admission
+and recovery require the admitted `current_site_id` to match the serving node,
+including selections on content dependencies, and verify exact local witness
+or receiver-acceptance authority. They never rewrite the origin to pass a
+locality check. A configured remote operator can submit selectors explicitly
+for that destination; this does not resolve source-node selectors or transfer
+products implicitly. Generic source-bound forwarding, worker handoff,
+continuations, scheduled execution and candidate evaluation do not acquire
+product-selection support from this destination-local contract.
 
 Received product testimony is a separate same-operator contract. Trusting an
 origin node does not transfer ownership or local qualification. A historical

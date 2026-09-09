@@ -629,11 +629,12 @@ impl ResumeContext {
         ryeos_state::external_content::products::composition::validate_product_selection_inputs(
             &self.product_selections,
         )?;
-        if !self.product_selections.is_empty()
-            && (self.scheduled_fire.is_some() || self.current_site_id != self.origin_site_id)
-        {
+        // Remote-origin provenance survives local recovery. Locality is checked
+        // against the serving node by product admission, never by comparing the
+        // origin with the current placement or rewriting either identity here.
+        if !self.product_selections.is_empty() && self.scheduled_fire.is_some() {
             anyhow::bail!(
-                "product selectors are retained only for unscheduled same-site roots in the first composition lane"
+                "product selectors are retained only for unscheduled roots in the first composition lane"
             );
         }
         if let Some(scheduled_fire) = &self.scheduled_fire {
@@ -1622,6 +1623,109 @@ mod tests {
             executor_ref: Some("native:test".to_string()),
             runtime_ref: None,
         }
+    }
+
+    fn remote_origin_product_resume_context() -> ResumeContext {
+        let mut context = resume_context(ProjectContext::SnapshotHash {
+            hash: "a".repeat(64),
+        });
+        context.current_site_id = "site:target".to_owned();
+        context.origin_site_id = "site:source".to_owned();
+        // EffectivePrincipal::Local represents the admitted configured operator,
+        // not proof that its authenticated origin is this execution site.
+        context.requested_by = EffectivePrincipal::Local(Principal {
+            fingerprint: format!("fp:{}", "b".repeat(64)),
+            scopes: vec!["ryeos.execute.tool.test/run".to_owned()],
+        });
+        context.product_selections = serde_json::from_value(serde_json::json!([{
+            "target": {"kind": "root"},
+            "selection": {
+                "declaration_id": "runtime",
+                "witness_hash": "c".repeat(64),
+                "witness_source": {"kind": "local_capture"},
+                "qualification_hash": null
+            }
+        }]))
+        .unwrap();
+        context
+    }
+
+    #[test]
+    fn target_local_product_resume_preserves_distinct_origin_and_exact_selectors() {
+        // This exercises retained launch-authority validation, not fresh grant
+        // authentication or witness admission. Those remain their own owners.
+        let context = remote_origin_product_resume_context();
+        assert_eq!(
+            context.authoritative_project_identity().unwrap(),
+            (None, Some("a".repeat(64)))
+        );
+        let metadata = RuntimeLaunchMetadata::default().with_resume_context(context.clone());
+        let retained: RuntimeLaunchMetadata =
+            serde_json::from_value(serde_json::to_value(metadata).unwrap()).unwrap();
+        let restored = retained.resume_context.unwrap();
+        assert_eq!(restored, context);
+        assert_eq!(restored.current_site_id, "site:target");
+        assert_eq!(restored.origin_site_id, "site:source");
+        restored.authoritative_project_identity().unwrap();
+        restored
+            .validate_continuation_transition_from(
+                &context,
+                None,
+                ContinuationAuthorityTransitionKind::Inherit,
+            )
+            .unwrap();
+        for field in ["origin", "target", "owner", "witness"] {
+            let mut changed = restored.clone();
+            match field {
+                "origin" => changed.origin_site_id = "site:another-source".to_owned(),
+                "target" => changed.current_site_id = "site:another-target".to_owned(),
+                "owner" => changed.requested_by = local_principal(),
+                "witness" => changed.product_selections[0].selection.witness_hash = "d".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(
+                changed
+                    .validate_continuation_transition_from(
+                        &context,
+                        None,
+                        ContinuationAuthorityTransitionKind::Inherit,
+                    )
+                    .is_err(),
+                "retained product continuation changed {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_origin_does_not_relax_scheduled_product_or_selector_validation() {
+        let context = remote_origin_product_resume_context();
+        let mut scheduled = context.clone();
+        scheduled.scheduled_fire = Some(
+            ryeos_engine::contracts::ScheduledFireContext::new(
+                "nightly.solve".to_owned(),
+                "nightly.solve@1700000000000".to_owned(),
+                1_700_000_000_000,
+                1_700_000_000_100,
+                "normal".to_owned(),
+                "a".repeat(64),
+            )
+            .unwrap(),
+        );
+        assert!(
+            scheduled
+                .authoritative_project_identity()
+                .unwrap_err()
+                .to_string()
+                .contains("scheduled")
+        );
+        let mut malformed = context.clone();
+        malformed.product_selections[0].selection.witness_hash = "not-a-hash".to_owned();
+        assert!(malformed.authoritative_project_identity().is_err());
+        let mut duplicate = context;
+        duplicate
+            .product_selections
+            .push(duplicate.product_selections[0].clone());
+        assert!(duplicate.authoritative_project_identity().is_err());
     }
 
     #[test]

@@ -4709,6 +4709,7 @@ async fn prepare_managed_launch_authority(
 
         ryeos_app::operator_external_content::product_composition::admit_root_product_selections(
             params.state,
+            &params.resolved.current_site_id,
             engine,
             &engine_roots,
             params
@@ -4809,6 +4810,7 @@ async fn prepare_managed_launch_authority(
             .map_err(BuildAndLaunchError::Internal)?;
         super::effective_program_projection::capture_and_finalize_fresh_effective_program(
             params.state,
+            &params.resolved.current_site_id,
             engine,
             &params.resolved.resolved_item.kind,
             resolution,

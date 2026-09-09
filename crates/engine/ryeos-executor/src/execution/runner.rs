@@ -4131,6 +4131,7 @@ pub(crate) fn finalize_direct_effective_program(
     )?;
     ryeos_app::operator_external_content::product_composition::admit_root_product_selections(
         state,
+        &resolved.current_site_id,
         engine,
         &roots,
         materialization.subject_authority(),
@@ -7984,6 +7985,7 @@ async fn run_existing_recovered_thread(
     let mut selection_resolution = retained_resolution.clone();
     ryeos_app::operator_external_content::product_composition::admit_root_product_selections(
         &state,
+        &params.resolved.current_site_id,
         &engine,
         &engine.resolution_roots(
             retained_admission

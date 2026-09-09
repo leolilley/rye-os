@@ -5,6 +5,13 @@ disposable target's exact pinned source generations. Thread/capsule identities
 refer to that node's retained evidence; this file grants no execution, binding,
 credential or publication authority.
 
+`remote-environment-preparation.json` separately records the fresh local-remote
+preparation/support producers, exact product composition and the failed utility
+admission that exposed an origin-versus-placement check. The accompanying
+source correction and focused tests are not installed utility-build or worker
+edit/child/restart/candidate evidence. Historical Cargo qualification above is
+unchanged.
+
 The source-owned Tools are `.ai/tools/ryeos/development/cargo-{check,build,test}.yaml`.
 They use captured files, isolated networking, exact platform/vendor manifests,
 two Cargo jobs and a 300-second operation timeout. The root worker does not

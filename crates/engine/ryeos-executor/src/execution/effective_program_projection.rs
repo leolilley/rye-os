@@ -355,6 +355,7 @@ fn projection_cache_key(
 
 pub(crate) fn capture_and_finalize_fresh_effective_program(
     state: &ryeos_app::state::AppState,
+    current_site_id: &str,
     engine: &ryeos_engine::engine::Engine,
     kind: &str,
     resolution: ResolutionOutput,
@@ -379,6 +380,7 @@ pub(crate) fn capture_and_finalize_fresh_effective_program(
         match capture_and_finalize_fresh_effective_program_once(
             engine,
             state,
+            current_site_id,
             kind,
             resolution.clone(),
             effective_caps,
@@ -412,6 +414,7 @@ pub(crate) fn capture_and_finalize_fresh_effective_program(
 fn capture_and_finalize_fresh_effective_program_once(
     engine: &ryeos_engine::engine::Engine,
     state: &ryeos_app::state::AppState,
+    current_site_id: &str,
     kind: &str,
     resolution: ResolutionOutput,
     effective_caps: &[String],
@@ -459,6 +462,7 @@ fn capture_and_finalize_fresh_effective_program_once(
         .unwrap_or(&projectless_authority);
     ryeos_app::operator_external_content::product_composition::admit_root_product_selections(
         state,
+        current_site_id,
         engine,
         roots,
         subject_resolution_authority,

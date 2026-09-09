@@ -1087,19 +1087,27 @@ impl RemoteClient {
 
     /// POST `/execute` for wait mode or `/execute/launch` for accepted mode
     /// (authenticated).
+    /// Product selections name the destination's retained witnesses, not
+    /// source-bound product resolutions. Only destination admission may resolve
+    /// them against its current owner, project, and qualification authorities.
     pub async fn execute(
         &self,
         item_ref: &str,
         ref_bindings: &BTreeMap<String, String>,
+        product_selections: &[ryeos_state::external_content::products::composition::ProductSelectionInput],
         project_path: Option<&str>,
         parameters: &Value,
         execution_policy: &ryeos_app::execution_policy::ExecutionPolicy,
         launch_id: Option<&str>,
     ) -> Result<Value> {
         let path = remote_execute_path(&execution_policy.response, launch_id)?;
+        ryeos_state::external_content::products::composition::validate_product_selection_inputs(
+            product_selections,
+        )?;
         let mut body = serde_json::json!({
             "item_ref": item_ref,
             "ref_bindings": ref_bindings,
+            "product_selections": product_selections,
             "project_path": project_path,
             "parameters": parameters,
             "execution_policy": execution_policy,
@@ -1138,6 +1146,7 @@ impl RemoteClient {
             .execute(
                 item_ref,
                 ref_bindings,
+                &[],
                 project_path,
                 parameters,
                 execution_policy,
@@ -3366,6 +3375,91 @@ pub struct BlobChunkUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn destination_product_selectors_reach_both_execute_wire_modes() {
+        use ryeos_app::execution_policy::{ExecutionPolicy, ExecutionResponse};
+        use ryeos_state::external_content::products::composition::ProductSelectionInputs;
+
+        async fn echo(axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
+            axum::Json(serde_json::json!({
+                "status": "accepted",
+                "launch_id": body.get("launch_id"),
+                "thread_id": "T-12345678-1234-1234-1234-123456789abc",
+                "request": body,
+            }))
+        }
+        let app = axum::Router::new()
+            .route("/execute", axum::routing::post(echo))
+            .route("/execute/launch", axum::routing::post(echo));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let identity =
+            Arc::new(NodeIdentity::create(&directory.path().join("operator.pem")).unwrap());
+        let forwarding =
+            Arc::new(NodeIdentity::create(&directory.path().join("node.pem")).unwrap());
+        let mut client = RemoteClient::new(&format!("http://{address}"), "fp:peer", identity);
+        client.required_forwarding_origin_site_id = Some("site:source".to_owned());
+        client.forwarding_identity = Some(forwarding);
+        let selectors: ProductSelectionInputs = serde_json::from_value(serde_json::json!([
+            {
+                "target": {"kind": "root"},
+                "selection": {
+                    "declaration_id": "authoring-runtime",
+                    "witness_hash": "ab".repeat(32),
+                    "witness_source": {"kind": "local_capture"},
+                    "qualification_hash": null
+                }
+            },
+            {
+                "target": {"kind": "content_dependency", "binding": "environment"},
+                "selection": {
+                    "declaration_id": "authoring-tools",
+                    "witness_hash": "cd".repeat(32),
+                    "witness_source": {"kind": "local_capture"},
+                    "qualification_hash": "ef".repeat(32)
+                }
+            }
+        ]))
+        .unwrap();
+        for (response, launch_id) in [
+            (ExecutionResponse::Wait, None),
+            (
+                ExecutionResponse::Accepted,
+                Some("L-0123456789abcdef0123456789abcdef"),
+            ),
+        ] {
+            let policy = ExecutionPolicy::projectless(response);
+            let result = client
+                .execute(
+                    "tool:fixture/verify",
+                    &BTreeMap::new(),
+                    &selectors,
+                    None,
+                    &serde_json::json!({}),
+                    &policy,
+                    launch_id,
+                )
+                .await
+                .unwrap();
+            // Decode the real signed request using the destination's existing
+            // contract, not a second test-only selector transport model.
+            let request: crate::routes::response_modes::execute_mode::ExecuteRequest =
+                serde_json::from_value(result["request"].clone()).unwrap();
+            assert_eq!(request.product_selections, selectors);
+            assert_eq!(
+                request.required_origin_site_id.as_deref(),
+                Some("site:source")
+            );
+            assert_eq!(request.launch_id.as_deref(), launch_id);
+            assert_eq!(request.execution_policy, policy);
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn exact_remote_call_timeouts_cancel_a_never_finishing_peer() {
