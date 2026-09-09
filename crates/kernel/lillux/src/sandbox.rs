@@ -1243,8 +1243,8 @@ mod imp {
         .map_err(|error| format!("mount minimal device filesystem: {error}"))?;
         // Linux's synthetic device floor, not a workload package dependency.
         // Nested runtimes reconstruct this surface inside their own namespace.
-        // /dev/tty is only exposed when whole-execution containment permits a
-        // fresh target session; that child must lose its inherited terminal.
+        // /dev/tty is only exposed to nested targets after they lose their
+        // inherited controlling terminal without changing launcher identity.
         for (name, major, minor) in [
             ("null", 1, 3),
             ("zero", 1, 5),
@@ -1319,13 +1319,41 @@ mod imp {
 
     fn detach_nested_target_terminal() -> Result<(), String> {
         // Called in the freshly forked PID-namespace child, never the adapter
-        // or an ordinary process-group-contained target. Scope containment
-        // owns this child's lifetime even after its process-session change.
-        if unsafe { libc::setsid() } < 0 {
+        // or an ordinary process-group-contained target. Do NOT use setsid:
+        // held-launch attachment still proves the inherited launcher PGID,
+        // even when a scope will contain later target session changes.
+        let original_pgid = unsafe { libc::getpgrp() };
+        let original_sid = unsafe { libc::getsid(0) };
+        let fd = unsafe {
+            libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd >= 0 {
+            // A session leader's TIOCNOTTY can affect its entire foreground
+            // group. This fresh child must only detach its own terminal.
+            if original_sid == unsafe { libc::getpid() } {
+                close_fd(fd);
+                return Err(
+                    "nested terminal detachment requires a non-session-leader child".to_owned(),
+                );
+            }
+            let detached = syscall_zero(
+                unsafe { libc::ioctl(fd, libc::TIOCNOTTY) },
+                "detach nested target controlling terminal",
+            );
+            close_fd(fd);
+            detached?;
+        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO) {
             return Err(format!(
-                "detach nested target controlling terminal: {}",
+                "open nested target controlling terminal: {}",
                 std::io::Error::last_os_error()
             ));
+        }
+        if unsafe { libc::getpgrp() } != original_pgid || unsafe { libc::getsid(0) } != original_sid
+        {
+            return Err("nested terminal detachment changed held-launch identity".to_owned());
         }
         let fd = unsafe {
             libc::open(
@@ -3481,6 +3509,12 @@ mod imp {
             );
             if stage == "root" {
                 assert_eq!(unsafe { libc::getpid() }, 1);
+                // The launcher is outside this fresh PID namespace: inherited
+                // group/session leaders therefore appear as zero here. A
+                // setup-time setsid would turn these into 1 and invalidate
+                // the host's exact supervised-attachment identity proof.
+                assert_eq!(unsafe { libc::getpgrp() }, 0);
+                assert_eq!(unsafe { libc::getsid(0) }, 0);
                 use std::io::Read as _;
                 let channel_fd: RawFd = std::env::var("LILLUX_PROBE_CHANNEL_FD")
                     .unwrap()

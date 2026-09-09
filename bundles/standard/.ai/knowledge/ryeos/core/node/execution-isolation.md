@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-09T00:18:13Z:2492c49d1dad12fdc88c32f252d2a0ec616c85d431b26e66b8df58bed6908f54:f9zBrfVoWPlgvRdIzXHXkFz0KyLAsqb5dJTj01NxnSWphN+Od9XQWk/VtjTvqHCiLUvyay5lxGFZSD5Ex3huAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T00:26:31Z:c476af9dda0bbaaa81d9dd0a094c0eb33bbdcc93682c8bbf20815918b404a1b2:kV/5EgWHLWOxXfz9K+cAil3AMJkh3LsMFQgb1geLwQutDvQ/gWtzPfMqqA5YR8V4ixv880rcMX4DGXnm3QU0AQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.21.0"
+version: "1.22.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -513,7 +513,10 @@ The Lillux Linux minimal-device surface pins and verifies the exact kernel
 character devices for null, zero, full, random and urandom; it does not expose
 the host device directory. Nested mode additionally supplies the tty device
 needed by namespace constructors. Before release, its freshly forked target
-starts a new process session and proves it has no controlling terminal.
+detaches its controlling terminal without changing its inherited session or
+process group, then proves the terminal is unavailable. The held-launch
+attachment boundary still verifies the retained launcher's exact process group;
+whole-execution scope ownership is not an exemption from that initial proof.
 Ordinary process-group-contained targets do not receive this tty device or
 change process session. Qualification exercises the device surface after
 private-root exec, including full-device write refusal and nested terminal
