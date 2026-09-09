@@ -2,7 +2,8 @@
 //!
 //! This module never consults live item roots. It verifies the retained
 //! binding and manifest, materializes only their CAS blobs, and binds the
-//! result at the canonical source coordinate proved by the binding.
+//! result at the execution coordinate selected by the consuming launch contract.
+//! Authored source location is identity, not authority to modify the project.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -42,8 +43,45 @@ impl BoundSourceClosure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceMountPlacement {
+    /// Direct source loaders retain their admitted logical project namespace.
+    Project,
+    /// Typed-entry consumers need code, not a shadow in the user's project.
+    ExecutionRuntime,
+}
+
+impl SourceMountPlacement {
+    fn destination(self, workspace: &Path, relative: &str) -> anyhow::Result<PathBuf> {
+        ryeos_state::objects::validate_canonical_project_relative_path(relative)?;
+        Ok(self.mount_root().root(Some(workspace))?.join(relative))
+    }
+
+    fn mount_root(self) -> ryeos_state::objects::ExternalContentMountRoot {
+        match self {
+            Self::Project => ryeos_state::objects::ExternalContentMountRoot::Project,
+            Self::ExecutionRuntime => {
+                ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime
+            }
+        }
+    }
+
+    fn relative_mount(
+        self,
+        binding: &ryeos_state::objects::EffectiveSourceBinding,
+    ) -> anyhow::Result<String> {
+        match self {
+            Self::Project => logical_mount(binding),
+            // This is a namespace partition within the existing execution
+            // runtime, not another content authority or a configurable host
+            // path. The complete binding, not a workload name, owns the leaf.
+            Self::ExecutionRuntime => Ok(format!("source-closures/{}", binding.digest()?)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindingMode {
-    IsolationMount,
+    IsolationMount(SourceMountPlacement),
     PrivateWorkspace,
 }
 
@@ -59,19 +97,34 @@ pub(crate) fn admitted_source_mount(
     Ok(Some(logical_mount(&binding)?))
 }
 
-/// Source is the only admitted layer allowed to shadow the corresponding live
-/// project namespace. It may never shadow, or be shadowed by, an independently
-/// admitted external realization.
+/// Compare destinations within the selected mount root. Runtime source does
+/// not shadow project code, even if their authored relative names coincide.
 pub(crate) fn validate_external_mount_separation(
     state: &ryeos_app::state::AppState,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
+    placement: SourceMountPlacement,
 ) -> anyhow::Result<()> {
-    let Some(source) = admitted_source_mount(state, resolution)? else {
+    let authority = super::pinned_state_authority(state)?;
+    let cas = authority.cas_store()?;
+    let Some((binding, _, _)) = retained_source_records(&cas, resolution)? else {
         return Ok(());
     };
+    let source = placement.relative_mount(&binding)?;
     let source = Path::new(&source);
-    for external in super::external_content::admitted_realization_mounts(resolution)? {
-        let external = Path::new(&external);
+    let Some(value) = resolution
+        .composed
+        .derived
+        .get(ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY)
+    else {
+        return Ok(());
+    };
+    let realized =
+        ryeos_engine::external_realization::RealizedExternalContentSet::from_value(value)?;
+    for entry in realized
+        .iter()
+        .filter(|entry| entry.mount_root == placement.mount_root())
+    {
+        let external = Path::new(&entry.mount);
         if mount_destinations_overlap(source, external) {
             anyhow::bail!("admitted source and external realization destinations overlap");
         }
@@ -87,12 +140,13 @@ pub(crate) fn bind_source(
     state: &ryeos_app::state::AppState,
     resolution: &ryeos_engine::resolution::ResolutionOutput,
     workspace: &Path,
+    placement: SourceMountPlacement,
 ) -> anyhow::Result<Option<BoundSourceClosure>> {
     bind_source_with(
         state,
         resolution,
         workspace,
-        BindingMode::IsolationMount,
+        BindingMode::IsolationMount(placement),
         None,
     )
 }
@@ -126,7 +180,11 @@ fn bind_source_with(
     let Some((binding, manifest, projection)) = retained_source_records(&cas, resolution)? else {
         return Ok(None);
     };
-    let mount = logical_mount(&binding)?;
+    let placement = match mode {
+        BindingMode::IsolationMount(placement) => placement,
+        BindingMode::PrivateWorkspace => SourceMountPlacement::Project,
+    };
+    let mount = placement.relative_mount(&binding)?;
     let entry = logical_entry(&binding)?;
     let identity = serde_json::json!({
         "schema": projection.schema,
@@ -199,15 +257,24 @@ fn bind_source_with(
     let source_path = cache.cache_dir(generation);
     let source = lillux::PinnedDirectory::open(&source_path)?
         .ok_or_else(|| anyhow::anyhow!("admitted source generation disappeared"))?;
-    let destination = workspace.join(&mount);
+    let destination = placement.destination(workspace, &mount)?;
     let mounts = match mode {
-        BindingMode::IsolationMount => vec![
-            ryeos_engine::isolation::IsolationReadOnlyMountAuthority::new(
-                source_path,
-                destination.clone(),
-                source.inherited_descriptor_authority()?,
-            ),
-        ],
+        BindingMode::IsolationMount(placement) => vec![match placement {
+            SourceMountPlacement::Project => {
+                ryeos_engine::isolation::IsolationReadOnlyMountAuthority::new(
+                    source_path,
+                    destination.clone(),
+                    source.inherited_descriptor_authority()?,
+                )
+            }
+            SourceMountPlacement::ExecutionRuntime => {
+                ryeos_engine::isolation::IsolationReadOnlyMountAuthority::new_execution_runtime(
+                    source_path,
+                    destination.clone(),
+                    source.inherited_descriptor_authority()?,
+                )
+            }
+        }],
         BindingMode::PrivateWorkspace => {
             publish_private_source(
                 &source,
@@ -467,6 +534,60 @@ fn open_source_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_source_coordinate_does_not_require_or_modify_project_namespace() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("edited.rs"), b"candidate edits").unwrap();
+        let relative = format!("source-closures/{}", "a".repeat(64));
+        let runtime = SourceMountPlacement::ExecutionRuntime
+            .destination(workspace.path(), &relative)
+            .unwrap();
+        assert_eq!(
+            runtime,
+            Path::new(ryeos_state::objects::EXECUTION_RUNTIME_REALIZATIONS_ROOT).join(&relative)
+        );
+        assert!(!runtime.starts_with(workspace.path()));
+        assert!(!workspace.path().join(".ai").exists());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(workspace.path().join("edited.rs")).unwrap(),
+            b"candidate edits"
+        );
+        assert!(mount_destinations_overlap(
+            &runtime,
+            &runtime.join("nested")
+        ));
+        assert!(mount_destinations_overlap(
+            &runtime,
+            runtime.parent().unwrap()
+        ));
+        assert!(!mount_destinations_overlap(
+            &runtime,
+            &workspace.path().join(&relative)
+        ));
+        assert_eq!(
+            SourceMountPlacement::Project
+                .destination(workspace.path(), ".ai/tools/example")
+                .unwrap(),
+            workspace.path().join(".ai/tools/example")
+        );
+        for placement in [
+            SourceMountPlacement::Project,
+            SourceMountPlacement::ExecutionRuntime,
+        ] {
+            assert!(
+                placement
+                    .destination(workspace.path(), "../escape")
+                    .is_err()
+            );
+            assert!(
+                placement
+                    .destination(workspace.path(), "/absolute")
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn bound_source_keeps_daemon_authority_separate_from_execution_coordinate() {

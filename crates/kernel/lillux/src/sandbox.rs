@@ -666,7 +666,8 @@ mod imp {
                 descriptor_kind(mount.source_fd)?,
                 request.overlay.as_ref().map(|overlay| &overlay.destination),
                 &mounts[..index],
-            )?;
+            )
+            .map_err(|error| format!("prepare mount {}: {error}", mount.destination.display()))?;
             bind_descriptor_mount(mount)
                 .map_err(|error| format!("mount {}: {error}", mount.destination.display()))?;
             if let Some(view) = request

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-08T08:44:49Z:12e932e726bfa880d058fb39bb6b676c5c80e10bc915d676ec7f11494547020b:KOuYzLYep7fE36/YB/2yJJzgstaPLpA+lD5CrI32Wv9CUeHjgPM1vv/+3f8KAIKW3enVOZ2BAEFNsC+feOWVCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T20:42:50Z:cbe2c9c58540bd1241d47b9861f23451d8b24473bc3564b72b268045da7c9bad:JjGPOTHVu3emdSN8kwCYU3CcLB1dVWR6q/1pKa1DGEkrZdg6sIFnbkdB/b0g2P+odf7w/rCeczfzPFX5EohoBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/kinds
 tags: [kind, worker, persistent-session, source]
@@ -31,6 +31,20 @@ retains a separate authority binding. Recovery reopens only retained CAS
 content and rechecks current publisher/kind trust. External runtimes, models,
 datasets, toolchains, and other opaque dependencies remain separate
 `external_content` declarations.
+
+Authored source location is not a required directory in the work project.
+Under enforced isolation, a persistent session receives its retained source at
+`/ryeos/realizations/source-closures/<source-binding-hash>/`; `${source.entry}`
+resolves there. This uses the existing read-only execution-runtime authority,
+with the exact CAS materialization and descriptor lease. It creates no project
+mountpoints or candidate exclusions. Direct Tool source loaders retain their
+existing admitted project-namespace mapping; they are not implicitly relocated.
+Disabled session execution retains its bounded private runtime-view delivery,
+not a host `/ryeos` directory or an isolation fallback.
+
+Persistent-session capsule schema 11 makes this launch-coordinate change an
+explicit clean cut. Predecessor capsules cannot resume under the new placement
+semantics; source-binding identity and schema are unchanged.
 
 Worker content and selected environment content can use either `project` or
 `execution_runtime` mounts. The latter uses the existing fixed

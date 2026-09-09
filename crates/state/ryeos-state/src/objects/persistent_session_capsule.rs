@@ -22,7 +22,10 @@ pub const PERSISTENT_SESSION_CAPSULE_KIND: &str = "persistent_session_capsule";
 // v9 separates exact retained product redemption proof from program identity.
 // v10 requires prepared session-environment delivery. Earlier retained bridges
 // consume an incompatible raw map and cannot be launched with this envelope.
-pub const PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION: u32 = 10;
+// v11 places enforced typed-entry session source in the execution runtime,
+// not the project namespace. Do not recover an older capsule with changed
+// workload-visible source paths and project-shadow semantics.
+pub const PERSISTENT_SESSION_CAPSULE_SCHEMA_VERSION: u32 = 11;
 pub const MAX_EXECUTABLE_SEARCH_PATH_ENTRIES: usize = 32;
 pub const MAX_SESSION_PROCESS_ENVIRONMENT_ENTRIES: usize = 32;
 pub const MAX_SESSION_PROCESS_ENVIRONMENT_ENCODED_BYTES: usize = 4_096;
@@ -1081,7 +1084,7 @@ mod tests {
 
     #[test]
     fn predecessor_capsule_schema_is_refused_without_translation() {
-        for schema in [1, 9] {
+        for schema in [1, 9, 10] {
             let value = serde_json::json!({
                 "schema": schema,
                 "kind": PERSISTENT_SESSION_CAPSULE_KIND

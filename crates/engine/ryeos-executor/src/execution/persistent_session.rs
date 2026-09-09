@@ -2473,7 +2473,20 @@ fn spawn_capsule_process_held(
     process_scope: Option<lillux::ProcessScope>,
 ) -> Result<HeldPersistentSession> {
     let resolution = exact.resolution_output.restore();
-    super::source_closure::validate_external_mount_separation(state, &resolution)?;
+    // A typed source-entry consumer does not require a project-code shadow.
+    // Keep enforced source outside the retained CoW; creating its authored
+    // namespace there would mutate the candidate merely to launch the worker.
+    // Disabled isolation retains its separately budgeted private runtime view.
+    let source_placement = if state.isolation.is_enforced() {
+        super::source_closure::SourceMountPlacement::ExecutionRuntime
+    } else {
+        super::source_closure::SourceMountPlacement::Project
+    };
+    super::source_closure::validate_external_mount_separation(
+        state,
+        &resolution,
+        source_placement,
+    )?;
     let private_budget = (!state.isolation.is_enforced())
         .then(super::external_content::private_materialization_budget)
         .transpose()?;
@@ -2541,7 +2554,7 @@ fn spawn_capsule_process_held(
         leases.extend(evidence_leases);
     }
     let source = if state.isolation.is_enforced() {
-        super::source_closure::bind_source(state, &resolution, &workspace)?
+        super::source_closure::bind_source(state, &resolution, &workspace, source_placement)?
     } else {
         super::source_closure::bind_source_in_private_workspace_with_budget(
             state,

@@ -3611,7 +3611,11 @@ pub(crate) fn prepare_process_inputs(
     // external realizations into the borrowed workspace while preserving the
     // parent's workspace lifeline. Do not route a managed parent's prepared
     // launch dependencies around this path as a second child environment.
-    super::source_closure::validate_external_mount_separation(state, retained_resolution)?;
+    super::source_closure::validate_external_mount_separation(
+        state,
+        retained_resolution,
+        super::source_closure::SourceMountPlacement::Project,
+    )?;
     let has_bindings = retained_resolution_has_filesystem_bindings(retained_resolution)?;
     let project_class = process_project_class(provenance);
     let workspace_outputs = provenance.project_authority().workspace_outputs();
@@ -3785,7 +3789,12 @@ pub(crate) fn prepare_process_inputs(
     } else {
         (
             super::external_content::bind_external_realizations(state, retained_resolution, &path)?,
-            super::source_closure::bind_source(state, retained_resolution, &path)?,
+            super::source_closure::bind_source(
+                state,
+                retained_resolution,
+                &path,
+                super::source_closure::SourceMountPlacement::Project,
+            )?,
         )
     };
     if live_private_root && !private_copy {
@@ -3992,6 +4001,7 @@ fn admitted_root_launch_metadata(
     super::source_closure::validate_external_mount_separation(
         state,
         finalized_program.resolution(),
+        super::source_closure::SourceMountPlacement::Project,
     )?;
     let retained_resolution = finalized_program.resolution().clone();
     Ok((
