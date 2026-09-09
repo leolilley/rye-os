@@ -188,6 +188,7 @@ fn projectless_resume() -> ResumeContext {
         kind: "graph".to_string(),
         item_ref: "graph:test/recovery".to_string(),
         ref_bindings: BTreeMap::new(),
+        product_selections: Vec::new(),
         launch_mode: "detached".to_string(),
         parameters: serde_json::json!({}),
         project_context: ProjectContext::None,
@@ -649,6 +650,7 @@ fn exact_terminal_postcommit_repair_republishes_the_persisted_terminal_event() {
         final_cost: None,
         managed_envelope: None,
         result_project_snapshot_hash: None,
+        result_workspace_output_capture_hash: None,
     };
 
     state
@@ -782,6 +784,7 @@ fn shutdown_authoritative_audit_repairs_and_retires_an_ownerless_terminal() {
                 final_cost: None,
                 managed_envelope: None,
                 result_project_snapshot_hash: None,
+                result_workspace_output_capture_hash: None,
             },
         )
         .unwrap();
@@ -855,6 +858,7 @@ async fn reservation_reconciliation_accepts_a_preconverged_retired_terminal() {
                 final_cost: None,
                 managed_envelope: None,
                 result_project_snapshot_hash: None,
+                result_workspace_output_capture_hash: None,
             },
         )
         .unwrap();
@@ -1278,6 +1282,8 @@ async fn hosted_startup_replays_root_outboxes_before_detaching_the_old_worker_ep
     state
         .state_store
         .bind_execution_workspace(WorkspaceBinding {
+            workspace_output_partition_identity: None,
+            base_output_capture_hash: None,
             workspace_id,
             thread_id: session_id,
             launch_owner: Some(&launch_owner),

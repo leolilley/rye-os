@@ -271,6 +271,7 @@ pub async fn run(cli: Cli, console: &crate::tty::Console) -> Result<(), CliError
     let mut body = serde_json::json!({
         "item_ref": resolved.item_ref,
         "ref_bindings": resolved.ref_bindings,
+        "product_selections": resolved.product_selections,
         "parameters": resolved.parameters,
         "validate_only": resolved.validate_only,
         "execution_policy": execution_policy_value(
@@ -755,6 +756,7 @@ enum StreamTerminalFailure {
 struct CliResolvedExecute {
     item_ref: String,
     ref_bindings: BTreeMap<String, String>,
+    product_selections: Value,
     parameters: Value,
     project_path: Option<PathBuf>,
     async_launch: bool,
@@ -808,6 +810,7 @@ struct ResolvedControlFlags {
     call_args: Option<Value>,
     state_root: Option<String>,
     ref_bindings: BTreeMap<String, String>,
+    product_selections: Option<Value>,
 }
 
 fn resolve_command_for_daemon(
@@ -951,6 +954,9 @@ fn resolve_command_for_daemon_with_commands(
     Ok(CliResolvedExecute {
         item_ref,
         ref_bindings: control.ref_bindings,
+        product_selections: control
+            .product_selections
+            .unwrap_or_else(|| serde_json::json!([])),
         parameters,
         project_path,
         async_launch: control.async_launch,
@@ -1093,6 +1099,30 @@ fn strip_declared_control_flags(
                         })?);
                 }
                 Bind::StateRoot => flags.state_root = Some(value),
+                Bind::ProductSelections => {
+                    if flags.product_selections.is_some() {
+                        return Err(CliError::Local {
+                            detail: format!("duplicate --{name} flag"),
+                        });
+                    }
+                    let maximum_bytes = ryeos_state::external_content::products::composition::MAX_PRODUCT_SELECTION_INPUTS_BYTES;
+                    if value.len() > maximum_bytes {
+                        return Err(CliError::Local {
+                            detail: format!("--{name} JSON exceeds {maximum_bytes} bytes"),
+                        });
+                    }
+                    let parsed: ryeos_state::external_content::products::composition::ProductSelectionInputs =
+                        serde_json::from_str(&value).map_err(|e| CliError::Local {
+                            detail: format!("--{name} must be a typed product-selection list: {e}"),
+                        })?;
+                    let canonical = ryeos_state::external_content::products::composition::canonicalize_product_selection_inputs(parsed)
+                        .map_err(|e| CliError::Local { detail: format!("--{name}: {e}") })?;
+                    flags.product_selections = Some(serde_json::to_value(canonical).map_err(
+                        |e| CliError::Local {
+                            detail: e.to_string(),
+                        },
+                    )?);
+                }
                 Bind::RefBinding => {
                     let (binding_name, item_ref) = match control_flag.ref_binding_name.as_deref() {
                         Some(binding_name) => (binding_name, value.as_str()),
@@ -1297,7 +1327,22 @@ pub(crate) fn apply_project_policy(
     parameters: &mut Value,
     default_project: Option<&Path>,
 ) -> Result<Option<PathBuf>, CliError> {
+    // This global selector is CLI control even when the command is intrinsically
+    // projectless. Never forward it to the command's closed service payload.
+    // Validate before mutation so malformed controls remain a refusal.
+    let no_project = match parameters.get("no_project") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CliError::ProjectResolution(
+                "--no-project must be a boolean".into(),
+            ));
+        }
+    };
     let Some(project) = command.project.as_ref() else {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.remove("no_project");
+        }
         return Ok(None);
     };
 
@@ -1317,15 +1362,6 @@ pub(crate) fn apply_project_policy(
     // Absence permits the descriptor's default; malformed supplied controls
     // must never be erased and reinterpreted as that absence. Validate before
     // canonicalizing/discovering a path, and preserve the input on refusal.
-    let no_project = match obj.get("no_project") {
-        None => false,
-        Some(Value::Bool(value)) => *value,
-        Some(_) => {
-            return Err(CliError::ProjectResolution(
-                "--no-project must be a boolean".into(),
-            ));
-        }
-    };
     if no_project && !project.no_project_flag {
         return Err(CliError::ProjectRequired(format!(
             "command '{}' does not accept --no-project",
@@ -2092,6 +2128,52 @@ mod tests {
         assert_eq!(out.parameters, serde_json::json!({}));
     }
 
+    #[test]
+    fn projectless_form_consumes_global_no_project_before_service_payload() {
+        let mut cmd = command(
+            &["external-content", "capture-product"],
+            vec![vec![("thread_id", CommandArgumentKind::String)]],
+            CommandProjectResolution::None,
+        );
+        cmd.project = None;
+        let rest = rest_with_global_no_project(
+            &s(&["external-content", "capture-product", "T-fixture"]),
+            true,
+        );
+        let out = resolve_command_for_daemon_with_commands(
+            &rest,
+            &[cmd],
+            &ryeos_runtime::CommandRegistrationPolicy::default(),
+            None,
+        )
+        .expect("intrinsically projectless command accepts the global selector");
+        assert_eq!(out.parameters, serde_json::json!({"thread_id":"T-fixture"}));
+    }
+
+    #[test]
+    fn projectless_policy_refuses_malformed_selector_without_mutation() {
+        let mut cmd = command(&["inspect"], vec![], CommandProjectResolution::None);
+        cmd.project = None;
+        for value in [
+            Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!([]),
+        ] {
+            let mut parameters = serde_json::json!({"no_project":value,"subject":"exact"});
+            let original = parameters.clone();
+            assert!(apply_project_policy(&cmd, &mut parameters, None).is_err());
+            assert_eq!(parameters, original);
+        }
+        for value in [false, true] {
+            let mut parameters = serde_json::json!({"no_project":value,"subject":"exact"});
+            assert_eq!(
+                apply_project_policy(&cmd, &mut parameters, None).unwrap(),
+                None
+            );
+            assert_eq!(parameters, serde_json::json!({"subject":"exact"}));
+        }
+    }
+
     /// The execute command's control flags, mirroring
     /// `bundles/core/.ai/node/commands/execute.yaml`. Kept in sync with that
     /// data file; both declare the same flag→binding routing.
@@ -2186,7 +2268,45 @@ mod tests {
                 ref_binding_name: None,
                 aliases: vec![],
             },
+            F {
+                flag: "product-selections".into(),
+                help: "Select admitted product witnesses with a closed typed JSON list".into(),
+                binding: B::ProductSelections,
+                ref_binding_name: None,
+                aliases: vec![],
+            },
         ]
+    }
+
+    #[test]
+    fn product_selections_control_is_one_bounded_typed_json_list() {
+        let controls = execute_control_flags();
+        let selector = serde_json::json!([{
+            "target": {"kind": "content_dependency", "binding": "environment"},
+            "selection": {
+                "declaration_id": "runtime",
+                "witness_hash": "a".repeat(64),
+                "witness_source": {"kind":"local_capture"},
+                "qualification_hash": null,
+            }
+        }]);
+        let encoded = serde_json::to_string(&selector).unwrap();
+        let mut tail = vec!["--product-selections".to_string(), encoded];
+        let flags = strip_declared_control_flags(&mut tail, &controls).unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(flags.product_selections, Some(selector));
+
+        for values in [
+            vec!["--product-selections".to_string(), "{}".to_string()],
+            vec!["--product-selections".to_string(), "not-json".to_string()],
+            vec![
+                "--product-selections={}".to_string(),
+                "--product-selections={}".to_string(),
+            ],
+        ] {
+            let mut values = values;
+            assert!(strip_declared_control_flags(&mut values, &controls).is_err());
+        }
     }
 
     #[test]
@@ -2556,13 +2676,41 @@ mod tests {
                 "installed_bundle",
                 "--no-project",
             ]),
-            &[command],
+            std::slice::from_ref(&command),
             &ryeos_runtime::CommandRegistrationPolicy::default(),
             Some(tmp.path()),
         )
         .unwrap();
         assert!(installed.parameters.get("project_path").is_none());
         assert!(installed.parameters.get("project_snapshot_hash").is_none());
+
+        let selections = serde_json::json!([{
+            "declaration_id":"runtime",
+            "witness_hash":"a".repeat(64),
+            "witness_source":{"kind":"local_capture"},
+            "qualification_hash":null
+        }]);
+        let selections_arg = selections.to_string();
+        let selected = resolve_command_for_daemon_with_commands(
+            &s(&[
+                "external-content",
+                "bind",
+                "stage",
+                "request",
+                "manifest",
+                "worker:fixture/hosted",
+                "installed_bundle",
+                "--product-selections",
+                &selections_arg,
+                "--no-project",
+            ]),
+            std::slice::from_ref(&command),
+            &ryeos_runtime::CommandRegistrationPolicy::default(),
+            Some(tmp.path()),
+        )
+        .unwrap();
+        assert_eq!(selected.parameters["product_selections"], selections);
+        assert!(selected.parameters.get("project_path").is_none());
     }
 
     #[test]

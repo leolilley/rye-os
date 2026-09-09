@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T09:01:08Z:656b801fb4d9723c97c6d264bae3bb9b2367983934b50df0ec54938ad1b5a848:tRJp0DfkFn9/y00ogYFVxnJjODpgmAXfKzeqyDurjBuxQQEgsSTFQf22XPE7nfq1cTheiIF5QZql8j37YkmdBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T10:36:35Z:c0c5f70993e0ccd0969e66a736e83c70b494157dc6bc22ecbed6f9df2b61b039:N7EL4uwlCZ0w5Qa2kNYY8xK/sfY3J5W1rpu2by14OYQriFUKRb08RQ9yI5XfYzZdlYb0xI/iA6RWlM40we7uDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -309,7 +309,7 @@ vendor tree with a 640 MiB aggregate blob ceiling; it still fits the existing
 1 GiB response bound. No compiler-specific runtime limit or bypass is added.
 
 Core carries one self-contained `linux-lillux` isolation adapter under the
-clean-cut isolation-adapter v7 protocol. The backend is available signed data,
+clean-cut isolation-adapter v8 protocol. The backend is available signed data,
 not ambient host setup: bundle membership does not activate it and every
 ordinary init profile remains explicitly disabled. The separately selectable
 `development` init profile maps to the existing `full` bundle set and enables

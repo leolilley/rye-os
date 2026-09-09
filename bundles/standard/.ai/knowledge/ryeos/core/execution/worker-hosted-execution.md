@@ -1,14 +1,22 @@
-<!-- ryeos:signed:2026-09-07T03:16:26Z:7e41e4f6713e54efb139addb60efbd58638ded2b4f811ecdb0279018131dea18:xAsLVMaA4jp/o/XQJjWITPteZOuCxIHDBfftTifjcM0kBWD/XufNwBP1Yrp801JXle9KU79XGNJs/PpTFG8kBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T17:32:20Z:94805598e3852a90b60b1bd5c54613dda0b01fa9dee3b075749d566df40bcb35:/ie2mEgdm8U1CM+YelW9srJzpkQy+Ap/bYW9JOuazzK/btXhj54lHFKaNJ353dlWLEzpiMU/SofLH8biUkvgCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
 title: "Worker-Hosted Execution"
 description: "Implemented authority, protocol, lifecycle, recovery, and publication contracts for session-bound hosted workers"
 entry_type: reference
-version: "1.7.7"
+version: "1.7.9"
 ```
 
 # Worker-Hosted Execution
+
+Worker-environment v5 explicitly includes `external_product_slots`, empty for
+literal-only environments. A pending product slot names a signed relationship
+Config and realization shape, not a digest or executable grant. The pure launch
+preparer checks combined literal/slot search and environment references; the
+local operator's product selection must be verified and ordinarily bound before
+the prepared Config dependency can be realized. Dynamic slots are project-only;
+installed bundle environments continue to use literal pins.
 
 Worker-hosted execution runs one long-lived subordinate workload for one
 ordinary RyeOS root execution. It is generic execution substrate, not an
@@ -220,7 +228,7 @@ A project worker execution selects its signed portable environment through the
 runtime-declared `environment` ref binding. The selector is not an ordinary
 parameter and cannot be smuggled through the worker input envelope. The generic
 launch preparer accepts only a trusted bundle/project `config` with the closed
-`ryeos.worker_environment.v4` schema, derives the exact worker dependency from
+`ryeos.worker_environment.v5` schema, derives the exact worker dependency from
 it, and retains the engine-resolved path-free binding record in the outer
 admitted program. The environment may additionally declare locator-free pinned
 external content and an ordered executable-search list over those exact tree
@@ -241,7 +249,7 @@ execution and content dependencies remain projectless: selecting them from a
 project must not give their code a project overlay. Same-site recovery keeps
 the captured realizations rather than re-resolving mutable names.
 
-The v4 configuration may also declare `process_environment`. This is not an
+The configuration may also declare `process_environment`. This is not an
 extension of content authority and is not a project/vault environment overlay.
 The kind-owned preparer emits a generic path-free environment contribution as
 a sibling of execution and content dependencies. Every contribution names its
@@ -256,10 +264,10 @@ non-tree realizations, and paths whose retained manifest type differs from the
 declared file/directory type.
 
 The persistent-session capsule retains only the validated path-free process
-environment, capped at 32 entries and 4096 serialized bytes so the sealed relay
-uses the existing bounded runtime-environment path without a second transport.
-Placement resolves it against that capsule's pinned realization set and the
-node-owned `.ai/cache/ryeos-runtime` view. The session protocol must explicitly
+environment, capped at 32 entries and 4096 serialized bytes. Placement prepares
+a bounded delivery envelope on the existing protected environment channel;
+the envelope is not authored configuration or additional content authority.
+The session protocol must explicitly
 allow the sealed `RYEOS_SESSION_PROCESS_ENVIRONMENT` relay through its existing
 `runtime_env_allowlist`; otherwise admission fails. The receiving bridge clears
 its inherited environment and deliberately installs only these resolved values
@@ -268,6 +276,28 @@ alongside its fixed minimal environment. Existing
 policy remain the final enforcement path. No host environment, absolute
 authored path, credential home, project ignore entry, or kind-specific engine
 branch becomes environment authority.
+
+With enforced isolation, execution-runtime paths are usable by ordinary child
+processes without preserving private descriptors. Lillux first proves the
+exact pinned object and read-only namespace ancestors; the initial executable
+still uses its held descriptor. The native backend seals only its synthetic
+root, not separately admitted writable mounts. A readonly leaf below a writable
+ancestor is insufficient and is refused.
+
+For each `runtime_view_directory`, placement prepares the exact directory under
+the borrowed workspace's `.ai/cache/ryeos-runtime` capture floor and mounts it
+at `/ryeos/runtime-views/<ENV_NAME>`. The leaf's contents are writable; its name
+cannot be replaced. The compiler refuses overlaps and the bridge proves that
+the prepared source and target mount are the same directory. Missing or changed
+sources refuse launch instead of triggering bridge-side repair. This supports
+ordinary descendant cache use while keeping caches out of retained candidates.
+Disabled-isolation delivery remains descriptor-bound; it does not claim the
+immutable namespace guarantees of the mounted lane. Delivery mode is explicitly
+prepared, never inferred from whether a mount happens to exist.
+
+Persistent-session capsule v10 fences this prepared delivery contract. Earlier
+retained bridges consume a different environment format and are refused rather
+than translated during recovery.
 
 The required-nullable v4 `workload_client` member is independent of process
 environment and external-content authority. `null` disables it. A non-null
@@ -931,6 +961,20 @@ restart or reattach the external worker to already-frozen mutable bytes. The
 controller waits on pushed projection changes, reconstructs the canonical
 generic session result after owner disposition, and commits the terminal root
 event; candidate exposure is permitted only after workspace closure.
+
+Shutdown settles a runtime process identity and its exact workspace membership
+together, after proving group death. Process-only detachment is refused while
+membership remains; unsettled descendants retain the parent's exact identity
+for recovery. A missing identity cannot prove that an earlier borrower never
+contacted the workspace.
+
+An ownerless root with retained borrower membership or an uncommitted freezing
+journal remains workspace-quarantined. Readiness recognizes that existing
+durable authority without resuming the root or releasing its workspace or
+credential fences. This is not successful execution recovery: unrelated node
+work may proceed, but cleanup still requires exact settlement proof. An older
+record that lost that proof is not repaired by interpreting NULL as process
+death, and history is not implicitly reset.
 
 ## Explicit non-claims
 

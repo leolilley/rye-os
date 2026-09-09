@@ -1,6 +1,7 @@
-# ryeos:signed:2026-09-05T00:45:51Z:2e5aa7af1633be69baebec42baa4006742fd0f9b445d2d9f99bfaacd9b1a9b37:5s3uQI0xEDRCvGCMueZ9fQxKmBTi4JhB8GS1QXx5snwkOYrlK3Tcu6KC+r94aAi2gtl+EQbAMqORFiOpYWygDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T01:20:09Z:c52825df7328c29d7469979e46cf36978b3aee885ca1392571c18cde4939ed07:4HAfaLeEiAHLqmOg4DLx0MbYg1aFdIUAySV0t75hc9YLUC02mqNHywSot9tdEuP+Up94SuraLNw9U9u4utzZBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: codex/environments
-schema: ryeos.worker_environment.v4
+schema: ryeos.worker_environment.v5
+external_product_slots: []
 worker_ref: worker:codex/hosted
 external_content:
   - id: command-tools

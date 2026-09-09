@@ -63,7 +63,7 @@ pub fn compile(
         bail!("structured-session configuration authority is not immutable argv");
     }
     validate_identifier(value_string(object, "workload_realization_id")?)?;
-    validate_file_name(value_string(object, "workload_executable")?)?;
+    validate_workload_executable_member(value_string(object, "workload_executable")?)?;
     validate_file_name(value_string(object, "baseline_config")?)?;
     validate_file_name(value_string(object, "baseline_destination")?)?;
     crate::protocol_vocabulary::validate_env_name(value_string(object, "workload_home_env")?)
@@ -895,6 +895,14 @@ fn validate_file_name(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_workload_executable_member(value: &str) -> Result<()> {
+    if value.len() > 4096 {
+        bail!("structured-session workload executable exceeds its path bound");
+    }
+    ryeos_state::objects::validate_canonical_project_relative_path(value)
+        .context("structured-session workload executable is not a canonical relative member")
+}
+
 fn validate_relative_path(value: &str) -> Result<()> {
     let path = Path::new(value);
     if value.len() > 4096
@@ -1010,6 +1018,33 @@ mod tests {
             first.contract.get("schema_version").and_then(Value::as_u64),
             Some(2)
         );
+    }
+
+    #[test]
+    fn workload_executable_accepts_only_canonical_relative_members() {
+        let mut profile: Value =
+            serde_json::from_slice(&fixture_profile("job.status", "job/status")).unwrap();
+        profile["workload_executable"] = json!("bin/fixture-worker");
+        compile(&serde_json::to_vec(&profile).unwrap(), &schemas())
+            .expect("a nested canonical tree member must be admitted");
+
+        for invalid in [
+            "",
+            "/bin/fixture-worker",
+            "../fixture-worker",
+            "bin/../fixture-worker",
+            "bin//fixture-worker",
+            "bin/./fixture-worker",
+            "bin\\fixture-worker",
+            "bin/fixture-worker/",
+            "bin/\u{0}fixture-worker",
+        ] {
+            profile["workload_executable"] = json!(invalid);
+            assert!(
+                compile(&serde_json::to_vec(&profile).unwrap(), &schemas()).is_err(),
+                "non-canonical workload executable was admitted: {invalid:?}"
+            );
+        }
     }
 
     #[test]

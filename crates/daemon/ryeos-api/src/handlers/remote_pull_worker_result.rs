@@ -894,7 +894,9 @@ mod tests {
             "operation_type":OPERATION_TYPE,
             "candidate_result":"not a current result",
         });
-        let error = PullOperation::from_value(operation).unwrap_err().to_string();
+        let error = PullOperation::from_value(operation)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("schema or type is not current"));
         let response = serde_json::json!({
             "schema":"ryeos.remote_hosted_worker_result_pull_result.v1",

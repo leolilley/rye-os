@@ -197,6 +197,9 @@ impl AdmittedWorkloadClientGrant {
     }
 
     pub fn authorize_action(&self, action: &ryeos_runtime::callback::ActionPayload) -> Result<()> {
+        if !action.product_selections.is_empty() {
+            bail!("workload-client grant does not admit product selection controls");
+        }
         if action.thread != "inline" || action.facets.is_some() || action.launch_window.is_some() {
             bail!("workload-client grant admits only unary inline execution");
         }
@@ -1523,6 +1526,7 @@ mod tests {
 
     fn workload_client_action() -> ryeos_runtime::callback::ActionPayload {
         ryeos_runtime::callback::ActionPayload {
+            product_selections: Vec::new(),
             operation_id: Some("5".repeat(64)),
             item_id: "tool:project/check".to_owned(),
             ref_bindings: std::collections::BTreeMap::from([(

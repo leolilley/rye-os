@@ -393,6 +393,7 @@ mod tests {
                 verified_code: &[],
                 verified_command: None,
                 external_read_only_mounts: &[],
+                writable_runtime_view_mounts: &[],
                 target_channels: &[],
                 item_ref: "tool:test",
                 thread_id: "env-probe-test",

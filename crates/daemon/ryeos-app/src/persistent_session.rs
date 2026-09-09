@@ -3431,6 +3431,7 @@ while True:
             isolation_verified_code: Vec::new(),
             isolation_verified_command: None,
             isolation_external_read_only_mounts: Vec::new(),
+            isolation_writable_runtime_view_mounts: Vec::new(),
             isolation_target_channels: vec![target_channel],
             isolation_workspace: None,
             subprocess_limits: None,

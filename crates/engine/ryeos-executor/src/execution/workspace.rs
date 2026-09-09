@@ -47,6 +47,14 @@ pub fn apply_workspace_delta(
                     ryeos_state::project_sync::classify_project_ai_path(relative, Some(&matcher)),
                     ryeos_state::project_sync::ProjectAiPathClass::Deployable(_)
                 ));
+        if mutation.kind == ryeos_isolation_protocol::WorkspaceMutationKind::UpsertSymlink {
+            if included {
+                anyhow::bail!(
+                    "symlink mutation lies outside an admitted output partition: {relative}"
+                );
+            }
+            continue;
+        }
         let expected =
             if mutation.kind == ryeos_isolation_protocol::WorkspaceMutationKind::UpsertRegular {
                 if !included {
@@ -104,6 +112,9 @@ pub fn apply_workspace_delta(
     for (mutation, expected) in selected {
         let relative = mutation.path.as_str();
         match mutation.kind {
+            ryeos_isolation_protocol::WorkspaceMutationKind::UpsertSymlink => {
+                anyhow::bail!("unfiltered source symlink mutation: {relative}");
+            }
             ryeos_isolation_protocol::WorkspaceMutationKind::DeletePath => {
                 remove_path_and_descendants(&mut next, relative);
             }
@@ -172,7 +183,7 @@ pub fn apply_workspace_delta(
     Ok((next != *base_tree).then_some(next))
 }
 
-fn open_mutation_parent(
+pub(super) fn open_mutation_parent(
     root: &lillux::PinnedDirectory,
     relative: &str,
 ) -> Result<(lillux::PinnedDirectory, std::ffi::OsString)> {
@@ -225,6 +236,7 @@ mod tests {
             normalized_mode: Some(ProjectFile::REGULAR_MODE),
             size: Some(bytes.len() as u64),
             content_hash: Some(lillux::cas::sha256_hex(bytes)),
+            target: None,
         }
     }
 
@@ -294,6 +306,46 @@ mod tests {
         let base = ProjectTree {
             files: Default::default(),
         };
+        let link = WorkspaceMutation {
+            path: "products/runtime/link".into(),
+            kind: WorkspaceMutationKind::UpsertSymlink,
+            normalized_mode: None,
+            size: None,
+            content_hash: None,
+            target: Some("member".into()),
+        };
+        let error = apply_workspace_delta(
+            &authority,
+            &guard,
+            &mut roots,
+            &content,
+            &base,
+            &policy,
+            std::slice::from_ref(&link),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside an admitted output partition")
+        );
+        // An admitted output root is excluded before any source-side open.
+        // No target exists in this fixture, proving this is not link following.
+        assert!(
+            apply_workspace_delta(
+                &authority,
+                &guard,
+                &mut roots,
+                &content,
+                &base,
+                &policy,
+                &[link],
+                &["products/runtime".into()]
+            )
+            .unwrap()
+            .is_none()
+        );
         let mutations = [regular_mutation("a", b"one"), regular_mutation("b", b"two")];
         let expected = mutations.iter().map(expected_file).collect::<Vec<_>>();
         let expected_objects = expected
@@ -517,6 +569,7 @@ mod tests {
             normalized_mode: None,
             size: None,
             content_hash: None,
+            target: None,
         };
         let placeholder = |path: &str| WorkspaceMutation {
             normalized_mode: Some(ProjectFile::REGULAR_MODE),

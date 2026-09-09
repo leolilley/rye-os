@@ -1,5 +1,48 @@
-# ryeos:signed:2026-09-06T03:45:22Z:b679195e827dd0422e97e15d1f313a4416bb1496f6e5ab4c7bca21dec9a85057:NyU4wOG03rKBhQC9lfj2fKfYQp0ZKPsKZeLa7+KhzfPUJ/FDX1U7NLCx6Mm8EbjPBfaB8NkymxY5sZfgoP9bDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:36:33Z:3a4bc5951073b05bafa38eb3ba3a88f11987bd12c4c0cffd510cba441e89aa70:SEI0xVzIOwZdi/KxS3MtAybFx1ObpDgoLJTSjjcxb9Wa0z3ierWePEbBpdw4nt25XJ+4JGfnoijOAj0XhpoQDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 {
+  "built_utility_files": {
+    "environment/bin/awk": "bin/awk",
+    "environment/bin/basename": "bin/basename",
+    "environment/bin/cat": "bin/cat",
+    "environment/bin/chmod": "bin/chmod",
+    "environment/bin/cmp": "bin/cmp",
+    "environment/bin/cp": "bin/cp",
+    "environment/bin/cut": "bin/cut",
+    "environment/bin/date": "bin/date",
+    "environment/bin/diff": "bin/diff",
+    "environment/bin/dirname": "bin/dirname",
+    "environment/bin/env": "bin/env",
+    "environment/bin/find": "bin/find",
+    "environment/bin/git": "bin/git",
+    "environment/bin/grep": "bin/grep",
+    "environment/bin/head": "bin/head",
+    "environment/bin/ln": "bin/ln",
+    "environment/bin/ls": "bin/ls",
+    "environment/bin/mkdir": "bin/mkdir",
+    "environment/bin/mktemp": "bin/mktemp",
+    "environment/bin/mv": "bin/mv",
+    "environment/bin/patch": "bin/patch",
+    "environment/bin/printf": "bin/printf",
+    "environment/bin/pwd": "bin/pwd",
+    "environment/bin/readlink": "bin/readlink",
+    "environment/bin/realpath": "bin/realpath",
+    "environment/bin/rm": "bin/rm",
+    "environment/bin/rmdir": "bin/rmdir",
+    "environment/bin/sed": "bin/sed",
+    "environment/bin/sha256sum": "bin/sha256sum",
+    "environment/bin/sleep": "bin/sleep",
+    "environment/bin/sort": "bin/sort",
+    "environment/bin/stat": "bin/stat",
+    "environment/bin/tail": "bin/tail",
+    "environment/bin/tee": "bin/tee",
+    "environment/bin/test": "bin/test",
+    "environment/bin/timeout": "bin/timeout",
+    "environment/bin/touch": "bin/touch",
+    "environment/bin/tr": "bin/tr",
+    "environment/bin/uniq": "bin/uniq",
+    "environment/bin/wc": "bin/wc",
+    "environment/bin/xargs": "bin/xargs"
+  },
   "category": "development/ryeos",
   "files": {
     "corresponding-sources/glibc_2.41-12+deb13u3.debian.tar.xz": "sources/glibc_2.41-12+deb13u3.debian.tar.xz",
@@ -14,53 +57,16 @@
     "corresponding-sources/ryeos-authoring-tools-1.0.0-x86_64-linux-musl-sources.tar.gz": "sources/ryeos-authoring-tools-1.0.0-x86_64-linux-musl-sources.tar.gz",
     "corresponding-sources/zsh-exec-wrapper.patch": "sources/zsh-exec-wrapper.patch",
     "corresponding-sources/zsh-source.tar.gz": "sources/zsh-source.tar.gz",
-    "environment/bin/awk": "utilities/bin/awk",
-    "environment/bin/basename": "utilities/bin/basename",
-    "environment/bin/cat": "utilities/bin/cat",
-    "environment/bin/chmod": "utilities/bin/chmod",
-    "environment/bin/cmp": "utilities/bin/cmp",
-    "environment/bin/cp": "utilities/bin/cp",
-    "environment/bin/cut": "utilities/bin/cut",
-    "environment/bin/date": "utilities/bin/date",
-    "environment/bin/diff": "utilities/bin/diff",
-    "environment/bin/dirname": "utilities/bin/dirname",
-    "environment/bin/env": "utilities/bin/env",
-    "environment/bin/find": "utilities/bin/find",
-    "environment/bin/git": "utilities/bin/git",
-    "environment/bin/grep": "utilities/bin/grep",
-    "environment/bin/head": "utilities/bin/head",
-    "environment/bin/ln": "utilities/bin/ln",
-    "environment/bin/ls": "utilities/bin/ls",
-    "environment/bin/mkdir": "utilities/bin/mkdir",
-    "environment/bin/mktemp": "utilities/bin/mktemp",
-    "environment/bin/mv": "utilities/bin/mv",
-    "environment/bin/patch": "utilities/bin/patch",
-    "environment/bin/printf": "utilities/bin/printf",
-    "environment/bin/pwd": "utilities/bin/pwd",
-    "environment/bin/readlink": "utilities/bin/readlink",
-    "environment/bin/realpath": "utilities/bin/realpath",
     "environment/bin/rg": "utilities/bin/rg",
-    "environment/bin/rm": "utilities/bin/rm",
-    "environment/bin/rmdir": "utilities/bin/rmdir",
-    "environment/bin/sed": "utilities/bin/sed",
-    "environment/bin/sha256sum": "utilities/bin/sha256sum",
-    "environment/bin/sleep": "utilities/bin/sleep",
-    "environment/bin/sort": "utilities/bin/sort",
-    "environment/bin/stat": "utilities/bin/stat",
-    "environment/bin/tail": "utilities/bin/tail",
-    "environment/bin/tee": "utilities/bin/tee",
-    "environment/bin/test": "utilities/bin/test",
-    "environment/bin/timeout": "utilities/bin/timeout",
-    "environment/bin/touch": "utilities/bin/touch",
-    "environment/bin/tr": "utilities/bin/tr",
-    "environment/bin/uniq": "utilities/bin/uniq",
-    "environment/bin/wc": "utilities/bin/wc",
-    "environment/bin/xargs": "utilities/bin/xargs",
     "environment/bin/zsh": "utilities/bin/zsh",
     "environment/lib/ld-linux-x86-64.so.2": "elf/lib/ld-linux-x86-64.so.2",
     "environment/lib/libc.so.6": "elf/lib/libc.so.6",
+    "environment/lib/libdl.so.2": "elf/lib/libdl.so.2",
     "environment/lib/libm.so.6": "elf/lib/libm.so.6",
+    "environment/lib/libpthread.so.0": "elf/lib/libpthread.so.0",
+    "environment/lib/librt.so.1": "elf/lib/librt.so.1",
     "environment/lib/libtinfo.so.6": "elf/lib/libtinfo.so.6",
+    "environment/lib/libutil.so.1": "elf/lib/libutil.so.1",
     "environment/licenses/GPL-2": "notices/GPL-2",
     "environment/licenses/GPL-3": "notices/GPL-3",
     "environment/licenses/LGPL-2.1": "notices/LGPL-2.1",
@@ -123,6 +129,11 @@
       "mode": 420,
       "sha256": "fa430b8f298f817a266046af84a77533185ad6fc4406c7d3787b5a0a0c207826"
     },
+    "elf/lib/libdl.so.2": {
+      "bytes": 14408,
+      "mode": 420,
+      "sha256": "295fa521a03cd2faa99974f378c9e23dd622021ec7d32bcad4f8ea61aec8a872"
+    },
     "elf/lib/libctf-nobfd.so.0": {
       "bytes": 215992,
       "mode": 420,
@@ -138,6 +149,16 @@
       "mode": 420,
       "sha256": "6d567d53e895273ca14a1f9dc164fc6c8d39aed2f60aa46a733c2784228915f3"
     },
+    "elf/lib/libpthread.so.0": {
+      "bytes": 14408,
+      "mode": 420,
+      "sha256": "85e21f7dba0394411d00959176fd18b470e575b0b05f1f4f41e5636802ce0500"
+    },
+    "elf/lib/librt.so.1": {
+      "bytes": 14552,
+      "mode": 420,
+      "sha256": "7b7b84d1aedda0e0b2bdfc68844362782132180b8f02be1300e21e77572e514b"
+    },
     "elf/lib/libsframe.so.1": {
       "bytes": 30976,
       "mode": 420,
@@ -152,6 +173,11 @@
       "bytes": 220464,
       "mode": 420,
       "sha256": "4013e7651ac68f547d8333517def25b2366c97eec7de7f06e105dbf3444ffebf"
+    },
+    "elf/lib/libutil.so.1": {
+      "bytes": 14408,
+      "mode": 420,
+      "sha256": "e3981d10efd152a53f083e38f5f9ddde7a049c85d0ab388a5eec91b52fc98a11"
     },
     "elf/lib/libz.so.1": {
       "bytes": 125376,
@@ -657,6 +683,10 @@
         "elf/lib/libc.so.6",
         420
       ],
+      "/usr/lib/x86_64-linux-gnu/libdl.so.2": [
+        "elf/lib/libdl.so.2",
+        420
+      ],
       "/usr/lib/x86_64-linux-gnu/libctf-nobfd.so.0.0.0": [
         "elf/lib/libctf-nobfd.so.0",
         420
@@ -669,6 +699,14 @@
         "elf/lib/libm.so.6",
         420
       ],
+      "/usr/lib/x86_64-linux-gnu/libpthread.so.0": [
+        "elf/lib/libpthread.so.0",
+        420
+      ],
+      "/usr/lib/x86_64-linux-gnu/librt.so.1": [
+        "elf/lib/librt.so.1",
+        420
+      ],
       "/usr/lib/x86_64-linux-gnu/libsframe.so.1.0.0": [
         "elf/lib/libsframe.so.1",
         420
@@ -679,6 +717,10 @@
       ],
       "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.5": [
         "elf/lib/libtinfo.so.6",
+        420
+      ],
+      "/usr/lib/x86_64-linux-gnu/libutil.so.1": [
+        "elf/lib/libutil.so.1",
         420
       ],
       "/usr/lib/x86_64-linux-gnu/libz.so.1.3.1": [
@@ -880,10 +922,14 @@
   "relocate": [
     "environment/bin/zsh",
     "environment/lib/libc.so.6",
+    "environment/lib/libdl.so.2",
     "environment/lib/libm.so.6",
-    "environment/lib/libtinfo.so.6"
+    "environment/lib/libpthread.so.0",
+    "environment/lib/librt.so.1",
+    "environment/lib/libtinfo.so.6",
+    "environment/lib/libutil.so.1"
   ],
-  "schema": "ryeos.development.authoring-environment-inputs.v1",
+  "schema": "ryeos.development.authoring-environment-inputs.v2",
   "source_date_epoch": 1788566400,
   "version": "1.0.0"
 }

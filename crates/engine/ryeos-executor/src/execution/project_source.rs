@@ -282,7 +282,7 @@ pub fn resolve_project_context(
                     authority: &authority,
                     cas_mutation_guard: &cas_mutation_guard,
                     snapshot_hash: &snap_hash,
-                    original_path,
+                    original_path: Some(original_path),
                     checkout_id,
                     source: ProjectSource::PushedHead,
                     captured_generation: None,
@@ -303,7 +303,7 @@ pub fn resolve_project_context(
                 authority: &authority,
                 cas_mutation_guard: &cas_mutation_guard,
                 snapshot_hash: hash,
-                original_path,
+                original_path: Some(original_path),
                 checkout_id,
                 source: source.clone(),
                 captured_generation: None,
@@ -325,7 +325,7 @@ pub fn resolve_project_context(
                 authority: &authority,
                 cas_mutation_guard: &cas_mutation_guard,
                 snapshot_hash: &snapshot_hash,
-                original_path,
+                original_path: Some(original_path),
                 checkout_id,
                 source: source.clone(),
                 captured_generation: Some(captured),
@@ -369,7 +369,7 @@ pub fn resolve_pinned_snapshot_context(
         authority: &authority,
         cas_mutation_guard: &cas_mutation_guard,
         snapshot_hash,
-        original_path,
+        original_path: Some(original_path),
         checkout_id,
         source: ProjectSource::PushedHead,
         captured_generation: None,
@@ -381,16 +381,105 @@ pub fn resolve_pinned_snapshot_context(
 /// external content to a project consumer. This is the same snapshot overlay,
 /// resolution and source-admission machinery used by execution; the bind path
 /// does not gain a second project loader or trust interpretation.
-pub struct PreparedPinnedProjectExternalConsumer {
+pub struct PreparedExternalProductConsumer {
     resolution: ryeos_engine::resolution::ResolutionOutput,
+    _semantic_config: Option<ryeos_engine::launch_config::LaunchConfigSnapshotSet>,
     _source_closure: Option<ryeos_app::source_closure_admission::AdmittedSourceClosure>,
-    _project_context: ResolvedProjectContext,
+    _project_context: Option<ResolvedProjectContext>,
 }
 
-impl PreparedPinnedProjectExternalConsumer {
+impl PreparedExternalProductConsumer {
     pub fn resolution(&self) -> &ryeos_engine::resolution::ResolutionOutput {
         &self.resolution
     }
+
+    /// Verify and insert one complete product-selection batch without
+    /// importing its manifests. This is used when an independently staged
+    /// literal must bind to the same exact D1 that execution will consume.
+    pub fn select_products_only(
+        &mut self,
+        state: &AppState,
+        context: &ryeos_app::handler_context::HandlerContext,
+        selectors: &[ryeos_state::external_content::products::composition::ProductSelection],
+    ) -> anyhow::Result<()> {
+        let subject = prepared_product_subject(self._project_context.as_ref())?;
+        let engine = self
+            ._project_context
+            .as_ref()
+            .map(|context| &context.request_engine)
+            .unwrap_or(&state.engine);
+        let roots = engine.resolution_roots(
+            self._project_context
+                .as_ref()
+                .map(|context| context.effective_path.clone()),
+        );
+        ryeos_app::operator_external_content::product_composition::select_products(
+            state,
+            context,
+            engine,
+            &roots,
+            &subject,
+            &mut self.resolution,
+            selectors,
+        )?;
+        Ok(())
+    }
+
+    /// Select product testimony using this same checked-out generation and
+    /// request engine. The relationship cannot be resolved against live HEAD
+    /// or the daemon's unrelated startup project.
+    pub fn select_and_import_products(
+        &mut self,
+        state: Arc<AppState>,
+        context: ryeos_app::handler_context::HandlerContext,
+        request: &ryeos_app::operator_external_content::product_composition::ComposeRetainedProductsRequest,
+    ) -> anyhow::Result<
+        ryeos_app::operator_external_content::product_composition::PreparedProductImports,
+    > {
+        if self
+            ._project_context
+            .as_ref()
+            .and_then(|context| context.snapshot_hash.as_deref())
+            != request
+                .project_context
+                .as_ref()
+                .map(|project| project.snapshot_hash.as_str())
+        {
+            anyhow::bail!("product composition request changed its prepared snapshot");
+        }
+        let engine = self
+            ._project_context
+            .as_ref()
+            .map(|context| &context.request_engine)
+            .unwrap_or(&state.engine);
+        let roots = engine.resolution_roots(
+            self._project_context
+                .as_ref()
+                .map(|context| context.effective_path.clone()),
+        );
+        ryeos_app::operator_external_content::product_composition::select_and_import_products(
+            Arc::clone(&state),
+            context,
+            request,
+            engine,
+            &roots,
+            &mut self.resolution,
+        )
+    }
+}
+
+fn prepared_product_subject(
+    project_context: Option<&ResolvedProjectContext>,
+) -> anyhow::Result<ryeos_engine::contracts::SubjectResolutionAuthority> {
+    Ok(match project_context {
+        None => ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+        Some(project) => {
+            let snapshot_hash = project.snapshot_hash.clone().ok_or_else(|| {
+                anyhow::anyhow!("prepared project product consumer lost its exact snapshot")
+            })?;
+            ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration { snapshot_hash }
+        }
+    })
 }
 
 pub fn prepare_pinned_project_external_consumer(
@@ -401,7 +490,7 @@ pub fn prepare_pinned_project_external_consumer(
     principal_fingerprint: String,
     principal_scopes: Vec<String>,
     checkout_id: &str,
-) -> anyhow::Result<PreparedPinnedProjectExternalConsumer> {
+) -> anyhow::Result<PreparedExternalProductConsumer> {
     let project_context = resolve_pinned_snapshot_context(
         state,
         project_snapshot_hash,
@@ -409,10 +498,103 @@ pub fn prepare_pinned_project_external_consumer(
         checkout_id,
         PinnedContextRealization::ReadOnly,
     )?;
-    let subject_resolution_authority =
-        ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
-            snapshot_hash: project_snapshot_hash.to_owned(),
-        };
+    prepare_external_consumer_context(
+        state,
+        consumer_ref,
+        Some(project_context),
+        principal_fingerprint,
+        principal_scopes,
+    )
+}
+
+/// Prepare an installed-bundle consumer through the same verified projectless
+/// resolution owner used by product composition. No mutable project roots are
+/// available to shadow the signed bundle subject.
+pub fn prepare_installed_bundle_external_consumer(
+    state: &AppState,
+    consumer_ref: &str,
+    principal_fingerprint: String,
+    principal_scopes: Vec<String>,
+) -> anyhow::Result<PreparedExternalProductConsumer> {
+    prepare_external_consumer_context(
+        state,
+        consumer_ref,
+        None,
+        principal_fingerprint,
+        principal_scopes,
+    )
+}
+
+/// Explicit composition selects immutable content, never a caller filesystem
+/// coordinate. Reuse the same checked snapshot materializer and source owner as
+/// execution; a null context has no project resolution roots.
+pub fn prepare_external_product_consumer(
+    state: &AppState,
+    request: &ryeos_app::operator_external_content::product_composition::ComposeRetainedProductsRequest,
+    context: &ryeos_app::handler_context::HandlerContext,
+    checkout_id: &str,
+) -> anyhow::Result<PreparedExternalProductConsumer> {
+    request.validate()?;
+    ryeos_app::operator_authority::require_local_configured_operator(state, context)?;
+    let project = if let Some(project) = &request.project_context {
+        let authority = crate::execution::pinned_state_authority(state)?;
+        let guard = authority.acquire_shared_guard()?;
+        Some(resolve_pinned_snapshot_context_admitted(
+            PinnedSnapshotContextParams {
+                state,
+                authority: &authority,
+                cas_mutation_guard: &guard,
+                snapshot_hash: &project.snapshot_hash,
+                original_path: None,
+                checkout_id,
+                source: ProjectSource::Snapshot {
+                    hash: project.snapshot_hash.clone(),
+                },
+                captured_generation: None,
+                realization: PinnedContextRealization::ReadOnly,
+            },
+        )?)
+    } else {
+        None
+    };
+    prepare_external_consumer_context(
+        state,
+        &request.consumer_ref,
+        project,
+        context.fingerprint.clone(),
+        context.scopes.clone(),
+    )
+}
+
+fn prepare_external_consumer_context(
+    state: &AppState,
+    consumer_ref: &str,
+    project_context: Option<ResolvedProjectContext>,
+    principal_fingerprint: String,
+    principal_scopes: Vec<String>,
+) -> anyhow::Result<PreparedExternalProductConsumer> {
+    let snapshot = project_context
+        .as_ref()
+        .map(|context| {
+            context
+                .snapshot_hash
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("prepared product context is not pinned"))
+        })
+        .transpose()?;
+    let subject_resolution_authority = match snapshot {
+        Some(snapshot) => ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+            snapshot_hash: snapshot.to_owned(),
+        },
+        None => ryeos_engine::contracts::SubjectResolutionAuthority::Projectless,
+    };
+    let engine = project_context
+        .as_ref()
+        .map(|context| &context.request_engine)
+        .unwrap_or(&state.engine);
+    let project_root = project_context
+        .as_ref()
+        .map(|context| context.effective_path.clone());
     let site_id = state.threads.site_id().to_owned();
     let plan_context = ryeos_engine::contracts::PlanContext {
         requested_by: ryeos_engine::contracts::EffectivePrincipal::Local(
@@ -421,8 +603,9 @@ pub fn prepare_pinned_project_external_consumer(
                 scopes: principal_scopes,
             },
         ),
-        project_context: ryeos_engine::contracts::ProjectContext::LocalPath {
-            path: project_context.effective_path.clone(),
+        project_context: match &project_root {
+            Some(path) => ryeos_engine::contracts::ProjectContext::LocalPath { path: path.clone() },
+            None => ryeos_engine::contracts::ProjectContext::None,
         },
         subject_resolution_authority: subject_resolution_authority.clone(),
         current_site_id: site_id.clone(),
@@ -432,7 +615,7 @@ pub fn prepare_pinned_project_external_consumer(
         validate_only: true,
     };
     let verified = crate::executor::resolve_and_verify(
-        &project_context.request_engine,
+        engine,
         &plan_context,
         consumer_ref,
         Some("project external-content consumer"),
@@ -441,14 +624,13 @@ pub fn prepare_pinned_project_external_consumer(
     if canonical.to_string() != consumer_ref {
         anyhow::bail!("project external-content consumer ref must be canonical");
     }
-    let mut resolution = project_context.request_engine.effective_resolution_output(
-        ryeos_engine::engine::EffectiveItemRequest {
+    let mut resolution =
+        engine.effective_resolution_output(ryeos_engine::engine::EffectiveItemRequest {
             item_ref: canonical,
             expected_kind: None,
-            project_root: Some(project_context.effective_path.clone()),
+            project_root: project_root.clone(),
             subject_resolution_authority: subject_resolution_authority.clone(),
-        },
-    )?;
+        })?;
     if resolution.root.resolved_ref != verified.resolved.canonical_ref.to_string()
         || resolution.root.source_content_digest != verified.resolved.content_hash
         || resolution.root.raw_content_digest != verified.resolved.raw_content_digest
@@ -456,23 +638,24 @@ pub fn prepare_pinned_project_external_consumer(
         anyhow::bail!("project external-content consumer resolution differs from verified subject");
     }
     let item_kind = verified.resolved.kind.as_str();
-    let source_contract = project_context
-        .request_engine
+    let source_contract = engine
         .kinds
         .get(item_kind)
         .and_then(|schema| schema.execution.as_ref())
         .and_then(|execution| execution.source_closure.as_ref());
-    let roots = project_context
-        .request_engine
-        .resolution_roots(Some(project_context.effective_path.clone()));
-    let materialization = project_context
-        .pinned_materialization
+    let roots = engine.resolution_roots(project_root);
+    let project_authority = project_context
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("pinned project consumer has no materialization proof"))?;
-    let project_authority = Some((
-        project_context.effective_path.as_path(),
-        materialization as &dyn ryeos_engine::project_content::AuthoritativeProjectContent,
-    ));
+        .map(|context| {
+            let materialization = context.pinned_materialization.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("pinned project consumer has no materialization proof")
+            })?;
+            anyhow::Ok((
+                context.effective_path.as_path(),
+                materialization as &dyn ryeos_engine::project_content::AuthoritativeProjectContent,
+            ))
+        })
+        .transpose()?;
     let source_policy = if source_contract.is_some_and(|contract| {
         matches!(
             &contract.location,
@@ -489,11 +672,11 @@ pub fn prepare_pinned_project_external_consumer(
             executor_id,
             &resolution.root.source_path,
             item_kind,
-            &project_context.request_engine.kinds,
-            &project_context.request_engine.parser_dispatcher,
+            &engine.kinds,
+            &engine.parser_dispatcher,
             &roots,
-            &project_context.request_engine.trust_store,
-            &project_context.request_engine.node_trust_store,
+            &engine.trust_store,
+            &engine.node_trust_store,
             project_authority,
         )?
     } else {
@@ -501,15 +684,31 @@ pub fn prepare_pinned_project_external_consumer(
     };
     let source_closure = ryeos_app::source_closure_admission::admit_source_closure(
         state,
-        &project_context.request_engine,
+        engine,
         item_kind,
         &mut resolution,
         &roots,
-        project_authority.map(|(root, content)| (root, content, project_snapshot_hash.to_owned())),
+        project_authority.map(|(root, content)| {
+            (
+                root,
+                content,
+                snapshot.expect("proved pinned project context").to_owned(),
+            )
+        }),
         source_policy.as_ref(),
     )?;
-    Ok(PreparedPinnedProjectExternalConsumer {
+    let semantic_config =
+        ryeos_app::effective_program_preparation::prepare_preselection_effective_program(
+            engine,
+            &verified.resolved,
+            &mut resolution,
+            &roots,
+            &engine.trust_store,
+            project_authority,
+        )?;
+    Ok(PreparedExternalProductConsumer {
         resolution,
+        _semantic_config: semantic_config,
         _source_closure: source_closure,
         _project_context: project_context,
     })
@@ -520,7 +719,7 @@ struct PinnedSnapshotContextParams<'a> {
     authority: &'a ryeos_state::PinnedStateAuthority,
     cas_mutation_guard: &'a ryeos_state::CasMutationGuard,
     snapshot_hash: &'a str,
-    original_path: PathBuf,
+    original_path: Option<PathBuf>,
     checkout_id: &'a str,
     source: ProjectSource,
     captured_generation: Option<super::CapturedProjectGeneration>,
@@ -672,8 +871,8 @@ fn resolve_pinned_snapshot_context_admitted(
     )?;
 
     Ok(ResolvedProjectContext {
+        original_path: original_path.unwrap_or_else(|| effective_path.clone()),
         effective_path,
-        original_path,
         source,
         snapshot_hash: Some(snapshot_hash.to_string()),
         current_head_destination: None,
@@ -873,6 +1072,11 @@ mod canonical_project_ref_tests {
         assert!(matches!(ctx.source, ProjectSource::PushedHead));
         assert!(ctx.snapshot_hash.is_none());
         assert!(ctx.temp_dir.is_none());
+        assert!(prepared_product_subject(Some(&ctx)).is_err());
+        assert!(matches!(
+            prepared_product_subject(None).unwrap(),
+            ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
+        ));
     }
 
     #[test]

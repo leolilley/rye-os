@@ -344,6 +344,7 @@ mod tests {
             },
             callback_channel: CallbackChannel::Http,
             session: None,
+            execution_evidence: None,
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
             },
             callback_channel: CallbackChannel::None,
             session: None,
+            execution_evidence: None,
         }
     }
 

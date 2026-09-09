@@ -716,6 +716,9 @@ stale_bins=(
     ryeos-tui
     ryeos-directive-runtime
     ryeos-directive-launch-preparer
+    ryeos-direct-execution-evidence
+    ryeos-graph-launch-preparer
+    ryeos-graph-execution-evidence
     ryeos-graph-runtime
     ryeos-knowledge-runtime
     rye-parser-yaml-document

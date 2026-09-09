@@ -884,6 +884,116 @@ pub struct PinnedRegularFile {
     file: File,
 }
 
+/// Verify an absolute spelling inside an already-confined mount namespace.
+/// Read-only mounts prevent entry replacement; the caller's confinement must
+/// additionally prevent subsequent mount changes. This does not establish
+/// immutability of bytes through aliases outside that namespace.
+fn verified_read_only_namespace_path(path: &Path, held: &File) -> Result<PathBuf> {
+    verified_namespace_path(path, held, NamespaceLeafAccess::ReadOnly)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NamespaceLeafAccess {
+    ReadOnly,
+    WritableDirectory,
+}
+
+fn verified_namespace_path(
+    path: &Path,
+    held: &File,
+    leaf_access: NamespaceLeafAccess,
+) -> Result<PathBuf> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, held, leaf_access);
+        anyhow::bail!("verified namespace paths are unavailable on this platform");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::Component;
+
+        if !path.is_absolute() || path.as_os_str().as_bytes().len() >= libc::PATH_MAX as usize {
+            anyhow::bail!("namespace path must be bounded, absolute and normalized");
+        }
+        let normalized = path.components().collect::<PathBuf>();
+        if normalized.as_os_str().as_bytes() != path.as_os_str().as_bytes()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            anyhow::bail!("namespace path must be bounded, absolute and normalized");
+        }
+        let held_metadata = held.metadata()?;
+        if leaf_access == NamespaceLeafAccess::WritableDirectory
+            && (!held_metadata.is_dir() || path == Path::new("/"))
+        {
+            anyhow::bail!("writable namespace leaf must be a non-root pinned directory");
+        }
+        let mut directory = PinnedDirectory::open(Path::new("/"))?
+            .ok_or_else(|| anyhow::anyhow!("namespace root disappeared"))?;
+        require_namespace_mount_access(&directory.directory, NamespaceLeafAccess::ReadOnly)?;
+        let mut components = path.components().skip(1).peekable();
+        while let Some(Component::Normal(name)) = components.next() {
+            if components.peek().is_none() && held_metadata.is_file() {
+                let current = directory
+                    .open_pinned_regular(name, false)?
+                    .ok_or_else(|| anyhow::anyhow!("namespace file disappeared"))?;
+                require_namespace_mount_access(&current.file, NamespaceLeafAccess::ReadOnly)?;
+                require_same_namespace_object(held, &current.file)?;
+                return Ok(path.to_path_buf());
+            }
+            directory = directory
+                .open_child_directory(name)?
+                .ok_or_else(|| anyhow::anyhow!("namespace directory disappeared"))?;
+            require_namespace_mount_access(
+                &directory.directory,
+                if components.peek().is_none() {
+                    leaf_access
+                } else {
+                    NamespaceLeafAccess::ReadOnly
+                },
+            )?;
+        }
+        require_same_namespace_object(held, &directory.directory)?;
+        Ok(path.to_path_buf())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_namespace_mount_access(file: &File, access: NamespaceLeafAccess) -> Result<()> {
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect namespace mount flags");
+    }
+    let read_only = unsafe { stats.assume_init() }.f_flag & libc::ST_RDONLY != 0;
+    match access {
+        NamespaceLeafAccess::ReadOnly if !read_only => {
+            anyhow::bail!("namespace path traverses a writable mount");
+        }
+        NamespaceLeafAccess::WritableDirectory if read_only => {
+            anyhow::bail!("namespace directory leaf is not mounted writable");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_same_namespace_object(held: &File, current: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let held = held.metadata()?;
+    let current = current.metadata()?;
+    if held.dev() != current.dev()
+        || held.ino() != current.ino()
+        || held.mode() & libc::S_IFMT != current.mode() & libc::S_IFMT
+        || !(held.is_file() || held.is_dir())
+    {
+        anyhow::bail!("namespace path does not select the exact pinned object");
+    }
+    Ok(())
+}
+
 /// One process-scoped generation in a strict flat regular-file namespace.
 ///
 /// Creation, stale-generation collection, advisory lock ownership, host-clock
@@ -1289,10 +1399,22 @@ impl PinnedRegularFile {
     }
 
     /// Consume this exact file authority into a descriptor-rooted child path.
+    ///
+    /// For ordinary descendant processes in a sealed namespace, see
+    /// [`Self::verified_read_only_namespace_path`].
     pub fn into_inherited_descriptor_path(
         self,
     ) -> Result<crate::exec::InheritedDescriptorAuthority> {
         crate::exec::inherited_descriptor_path(self.file).map_err(anyhow::Error::msg)
+    }
+
+    /// Prove that this absolute, no-follow spelling still selects this exact
+    /// file and traverses only read-only mounts, including every ancestor.
+    /// Unlike descriptor paths it survives ordinary descendants closing FDs.
+    /// The caller must already confine mount changes (as Lillux's native
+    /// sandbox does); this check does not seal mounts or immutable bytes.
+    pub fn verified_read_only_namespace_path(&self) -> Result<PathBuf> {
+        verified_read_only_namespace_path(&self.path, &self.file)
     }
 }
 
@@ -1825,6 +1947,31 @@ impl PinnedDirectory {
             );
         }
         Ok(())
+    }
+
+    /// Prove this absolute, no-follow spelling selects this exact directory
+    /// and traverses only read-only mounts, including every ancestor. The
+    /// caller must already confine subsequent mount changes. Writable views
+    /// intentionally cannot be converted to immutable namespace authority.
+    pub fn verified_read_only_namespace_path(&self) -> Result<PathBuf> {
+        verified_read_only_namespace_path(&self.path, &self.directory)
+    }
+
+    /// Prove a stable writable mountpoint selects this exact pinned directory.
+    /// Every ancestor must be mounted read-only, and the final directory must
+    /// be mounted writable. No component is followed through a symlink.
+    ///
+    /// The source's diagnostic path may differ from `destination`, or have
+    /// been renamed: authority is the exact held directory, not that path.
+    /// Only the leaf directory identity is stable; its contents remain mutable.
+    /// The caller must already confine future mount changes and separately
+    /// admit the destination. This method creates neither mounts nor grants.
+    pub fn verified_writable_mount_namespace_path(&self, destination: &Path) -> Result<PathBuf> {
+        verified_namespace_path(
+            destination,
+            &self.directory,
+            NamespaceLeafAccess::WritableDirectory,
+        )
     }
 
     /// Walk regular files beneath this exact pinned root. Every child is
@@ -6020,6 +6167,86 @@ fn restore_quarantined_regular(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_namespace_path_rejects_noncanonical_spelling_before_mount_checks() {
+        let held = tempfile::tempfile().unwrap();
+        for path in [
+            "relative",
+            "/tmp/../member",
+            "/tmp/./member",
+            "/tmp//member",
+            "/tmp/",
+        ] {
+            let error = verified_read_only_namespace_path(Path::new(path), &held).unwrap_err();
+            assert!(
+                error.to_string().contains("absolute and normalized"),
+                "{path}: {error}"
+            );
+        }
+        let oversized = format!("/{}", "x".repeat(libc::PATH_MAX as usize));
+        assert!(verified_read_only_namespace_path(Path::new(&oversized), &held).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_namespace_object_check_requires_exact_held_inode_and_type() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("member");
+        std::fs::write(&path, b"same bytes").unwrap();
+        let held = File::open(&path).unwrap();
+        require_same_namespace_object(&held, &File::open(&path).unwrap()).unwrap();
+        std::fs::rename(&path, root.path().join("prior")).unwrap();
+        std::fs::write(&path, b"same bytes").unwrap();
+        assert!(require_same_namespace_object(&held, &File::open(&path).unwrap()).is_err());
+        assert!(require_same_namespace_object(&held, &File::open(root.path()).unwrap()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writable_mount_namespace_path_requires_directory_leaf_and_immutable_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectory::open(root.path()).unwrap().unwrap();
+        assert!(
+            pinned
+                .verified_writable_mount_namespace_path(root.path())
+                .is_err()
+        );
+        assert!(
+            pinned
+                .verified_writable_mount_namespace_path(Path::new("relative"))
+                .is_err()
+        );
+        let error = pinned
+            .verified_writable_mount_namespace_path(Path::new("/"))
+            .unwrap_err();
+        assert!(error.to_string().contains("non-root pinned directory"));
+        let file = tempfile::tempfile().unwrap();
+        let error = verified_namespace_path(
+            Path::new("/leaf"),
+            &file,
+            NamespaceLeafAccess::WritableDirectory,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-root pinned directory"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_namespace_path_rejects_writable_mount_and_symlink_rebinding() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("member");
+        std::fs::write(&path, b"exact").unwrap();
+        let held = open_pinned_regular_file_no_follow(&path).unwrap();
+        assert!(held.verified_read_only_namespace_path().is_err());
+        let directory = PinnedDirectory::open(root.path()).unwrap().unwrap();
+        assert!(directory.verified_read_only_namespace_path().is_err());
+        std::fs::rename(&path, root.path().join("prior")).unwrap();
+        std::os::unix::fs::symlink("prior", &path).unwrap();
+        assert!(held.verified_read_only_namespace_path().is_err());
+        assert!(open_pinned_regular_file_no_follow(&path).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

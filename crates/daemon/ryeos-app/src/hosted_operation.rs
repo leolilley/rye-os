@@ -538,9 +538,11 @@ mod tests {
         let root_id = "root-async-drain-fixture";
         let dir = tempfile::tempdir().unwrap();
         let runtime_state_dir = dir.path().join(".ai/state");
-        let identity = crate::identity::NodeIdentity::create(&dir.path().join("node-key.pem"))
-            .unwrap();
-        let signer = Arc::new(crate::state_store::NodeIdentitySigner::from_identity(&identity));
+        let identity =
+            crate::identity::NodeIdentity::create(&dir.path().join("node-key.pem")).unwrap();
+        let signer = Arc::new(crate::state_store::NodeIdentitySigner::from_identity(
+            &identity,
+        ));
         let mut head_trust = ryeos_state::refs::TrustStore::new();
         head_trust.insert(identity.fingerprint().to_owned(), *identity.verifying_key());
         let state_store = Arc::new(

@@ -217,6 +217,11 @@ pub struct EngineContext {
     /// that command by pathname.
     pub isolation_verified_command: Option<crate::isolation::IsolationAdmittedCommand>,
     pub isolation_external_read_only_mounts: Vec<crate::isolation::IsolationReadOnlyMountAuthority>,
+    /// Exact daemon-prepared writable cache/config views for retained session
+    /// environment variables. They are compiled as descriptor-backed mounts,
+    /// never as ambient node-policy writable paths.
+    pub isolation_writable_runtime_view_mounts:
+        Vec<crate::isolation::IsolationWritableRuntimeViewMountAuthority>,
     /// Daemon-created connected duplex channels with exact target-descriptor
     /// and environment bindings. These are deliberately distinct from generic
     /// inherited descriptors and cannot be supplied as raw file descriptors.

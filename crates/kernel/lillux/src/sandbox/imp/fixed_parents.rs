@@ -108,6 +108,12 @@ pub(super) fn validate(request: &LinuxSandboxRequest) -> Result<(), String> {
                     .inherited_authority()
                     .inherited_descriptor()?,
             );
+            other_sources.extend(
+                overlay
+                    .writable_descendant_mounts
+                    .iter()
+                    .map(|mount| mount.source_fd),
+            );
         }
         for fd in other_sources {
             let stat = mount_source_stat(raw_fd(fd)?)?;
@@ -137,6 +143,22 @@ pub(super) fn validate(request: &LinuxSandboxRequest) -> Result<(), String> {
                         && mount.destination.starts_with(&view.destination))
                 {
                     return Err("positive mount conflicts with a fixed-parent restriction".into());
+                }
+            }
+        }
+        if let Some(overlay) = &request.overlay {
+            for mount in &overlay.writable_descendant_mounts {
+                for denied in &view.denied_paths {
+                    let denied = view.destination.join(denied);
+                    if mount.destination.starts_with(&denied)
+                        || (denied.starts_with(&mount.destination)
+                            && mount.destination.starts_with(&view.destination))
+                    {
+                        return Err(
+                            "overlay-descendant mount conflicts with a fixed-parent restriction"
+                                .into(),
+                        );
+                    }
                 }
             }
         }

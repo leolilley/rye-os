@@ -1,6 +1,6 @@
-# ryeos:signed:2026-09-05T00:45:21Z:81c6b774627ad50a0078dc2a1f0f2e14e6d4d4513802439948d27f6797084a45:0Xh2vyqiRBLi4hbBYwM0bgz8D+MWzPBFAtCr6vIa3LTGLr2IPDbQQGF3kAxCCHf6a4UuJzFk62TyLCVT0WIAAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T01:19:41Z:81ab59838fff4b7dee914f8d055f5484c585ea5858fc0232f75cb31da9baac36:6KTlf8/xtOc+OKt4WTaURYyAo03xvOO4txfK+1VjgjJYF+lCoTKZTWTrUA3X9pdsalrVnlrSj2BesKTdY/9BDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "ryeos/core/runtimes/python"
-version: "1.1.0"
+version: "1.1.1"
 executor_id: "@subprocess"
 execution_protocol: "protocol:ryeos/core/tool_callback"
 description: "Python function runtime - calls execute(params, project_path) and serializes result to stdout"
@@ -32,6 +32,7 @@ config:
   command: "${interpreter}"
   args:
     - "-I"
+    - "-B"
     - "-u"
     - "-c"
     - literal: |

@@ -727,6 +727,74 @@ impl InheritedDescriptorAuthority {
         result
     }
 
+    /// Open or create one bounded, canonical directory descendant from this
+    /// exact held root and make the leaf owner-private. No ambient root path
+    /// is reopened. All temporary descriptors stay under the short fork
+    /// lease, and the returned directory is registered before it is released.
+    #[cfg(unix)]
+    pub fn open_or_create_private_directory_descendant(
+        &self,
+        relative: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::path::Component;
+
+        let bytes = relative.as_os_str().as_bytes();
+        if bytes.is_empty()
+            || bytes.len() >= libc::PATH_MAX as usize
+            || bytes.contains(&0)
+            || relative.is_absolute()
+        {
+            anyhow::bail!(
+                "private directory descendant must be bounded canonical relative components"
+            );
+        }
+        let normalized = relative.components().collect::<std::path::PathBuf>();
+        if normalized.as_os_str().as_bytes() != bytes
+            || relative.components().any(|component| {
+                !matches!(component, Component::Normal(name) if name.as_bytes().len() <= 255)
+            })
+        {
+            anyhow::bail!("private directory descendant must be bounded canonical relative components");
+        }
+        let lease = retain_fork_sensitive_descriptors();
+        // A workspace view may be held with O_PATH. Reopen only its exact
+        // inode, not its diagnostic pathname, for mkdirat/fsync traversal.
+        let fd = unsafe {
+            libc::openat(
+                self.file().as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let root = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !crate::secure_fs::same_open_file_identity(self.file(), &root)? {
+            anyhow::bail!("private directory traversal changed its exact held root");
+        }
+        let mut directory =
+            crate::secure_fs::PinnedDirectory::from_open_directory(self.path.clone(), root)?;
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                unreachable!("relative components validated before mutation");
+            };
+            directory = directory.open_or_create_child(name, 0o700)?;
+        }
+        // Do not use the pathname-binding variant: this directory's
+        // diagnostic path starts at an intentionally opaque descriptor path.
+        directory.set_mode(0o700)?;
+        let result = directory.into_inherited_descriptor_path()?;
+        let metadata = result.file().metadata()?;
+        if !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700 {
+            anyhow::bail!("private directory descendant is not exactly owner-private");
+        }
+        drop(lease);
+        Ok(result)
+    }
+
     #[cfg(unix)]
     pub fn set_regular_file_mode(&self, mode: u32) -> anyhow::Result<()> {
         crate::secure_fs::set_open_regular_file_mode(self.file(), mode)
@@ -788,6 +856,115 @@ impl InheritedDescriptorAuthority {
     }
 }
 
+#[cfg(all(test, unix))]
+mod inherited_directory_traversal_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_descendant_from_path_descriptor_survives_root_rename() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("source");
+        std::fs::create_dir(&original).unwrap();
+        let root = {
+            let lease = retain_fork_sensitive_descriptors();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&original)
+                .unwrap();
+            InheritedDescriptorAuthority::from_owned_file(file, &lease).unwrap()
+        };
+        std::fs::rename(&original, parent.path().join("retained")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let directory = root
+            .open_or_create_private_directory_descendant(Path::new("cache/tool"))
+            .unwrap();
+        assert!(parent.path().join("retained/cache/tool").is_dir());
+        assert!(!original.join("cache").exists());
+        assert_eq!(
+            directory.file().metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(directory.file().as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let repeated = root
+            .open_or_create_private_directory_descendant(Path::new("cache/tool"))
+            .unwrap();
+        assert!(directory.same_file_identity(&repeated).unwrap());
+    }
+
+    #[test]
+    fn private_descendant_refuses_links_and_tightens_only_exact_leaf() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(parent.path().join("existing")).unwrap();
+        std::fs::set_permissions(
+            parent.path().join("existing"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), parent.path().join("link")).unwrap();
+        std::fs::write(parent.path().join("regular"), b"not a directory").unwrap();
+        let root = crate::secure_fs::PinnedDirectory::open(parent.path())
+            .unwrap()
+            .unwrap()
+            .into_inherited_descriptor_path()
+            .unwrap();
+        for path in ["link", "link/escape", "regular", "regular/escape"] {
+            assert!(
+                root.open_or_create_private_directory_descendant(Path::new(path))
+                    .is_err()
+            );
+        }
+        assert!(!outside.path().join("escape").exists());
+        let leaf = root
+            .open_or_create_private_directory_descendant(Path::new("existing"))
+            .unwrap();
+        assert_eq!(
+            leaf.file().metadata().unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn private_descendant_validates_entire_relative_path_before_creation() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = crate::secure_fs::PinnedDirectory::open(parent.path())
+            .unwrap()
+            .unwrap()
+            .into_inherited_descriptor_path()
+            .unwrap();
+        for path in [
+            "",
+            ".",
+            "/absolute",
+            "new/../escape",
+            "new/./leaf",
+            "new//leaf",
+            "new/",
+            "new/\0leaf",
+        ] {
+            assert!(
+                root.open_or_create_private_directory_descendant(Path::new(path))
+                    .is_err(),
+                "{path:?}"
+            );
+        }
+        let too_long = format!("new/{}", "x".repeat(libc::PATH_MAX as usize));
+        assert!(
+            root.open_or_create_private_directory_descendant(Path::new(&too_long))
+                .is_err()
+        );
+        assert!(!parent.path().join("new").exists());
+    }
+}
+
 // Keep the opaque inspection interface callable at the existing platform
 // refusal boundary; unsupported hosts never construct synthetic descriptors,
 // metadata, mount identities, or fallback authority.
@@ -826,6 +1003,13 @@ impl InheritedDescriptorAuthority {
         &self,
         _relative: &std::path::Path,
     ) -> anyhow::Result<Option<Self>> {
+        anyhow::bail!("inherited descriptor traversal is unavailable on this platform")
+    }
+
+    pub fn open_or_create_private_directory_descendant(
+        &self,
+        _relative: &std::path::Path,
+    ) -> anyhow::Result<Self> {
         anyhow::bail!("inherited descriptor traversal is unavailable on this platform")
     }
 
@@ -942,6 +1126,32 @@ fn preserve_configured_stdio_across_exec() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Configure three fresh pipes for a directly driven child command.
+///
+/// Use this for full-duplex callers that own `ChildStdin`/`ChildStdout` rather
+/// than Lillux's buffered subprocess runner. Consuming an inherited channel
+/// can leave fd 0 closed: Rust may then allocate its CLOEXEC stdin pipe at fd
+/// 0 and skip dup2 in the fork/pre-exec path. Reuse the runner's exact child
+/// stdio preservation, not ambient `/dev/null` reopening or parent flag edits.
+/// Callers must not replace these streams with inherited stdio afterwards.
+pub fn configure_command_piped_stdio(command: &mut process::Command) {
+    command
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // SAFETY: Command installs our three fresh streams before this hook;
+        // the shared helper uses only allocation-free descriptor syscalls.
+        unsafe {
+            command.pre_exec(preserve_configured_stdio_across_exec);
+        }
+    }
 }
 
 fn bind_inherited_channel_to_subprocess_request(

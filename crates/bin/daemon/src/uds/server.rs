@@ -1100,16 +1100,30 @@ async fn handle_finalize(
             capability,
             &completion.status,
         )
-        .await?;
-    let result_project_snapshot_hash = pending_project_result
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                thread_id = %params.thread_id,
+                launch_owner,
+                item_ref = capability.item_ref.as_deref().unwrap_or(""),
+                effective_definition_digest = capability
+                    .effective_definition_digest
+                    .as_deref()
+                    .unwrap_or(""),
+                error = %format!("{error:#}"),
+                "failed to prepare managed runtime terminal project result"
+            );
+            error.context("prepare managed runtime terminal project result")
+        })?;
+    let result_generation = pending_project_result
         .as_ref()
-        .map(|pending| pending.snapshot_hash().to_string());
+        .map(|pending| pending.generation());
     let finalized = state.threads.finalize_from_runtime_completion_owned(
         &params.thread_id,
         launch_owner,
         &completion,
         Some(managed_envelope),
-        result_project_snapshot_hash.as_deref(),
+        result_generation,
     )?;
     if let Some(pending) = pending_project_result {
         pending
@@ -3059,6 +3073,7 @@ mod tests {
                 kind: "graph_run".into(),
                 item_ref: sealed.item_ref().to_string(),
                 ref_bindings: std::collections::BTreeMap::new(),
+                product_selections: Vec::new(),
                 launch_mode: "detached".into(),
                 parameters: json!({}),
                 project_context,
@@ -3196,6 +3211,7 @@ mod tests {
                 kind: "graph_run".to_string(),
                 item_ref: sealed.item_ref().to_string(),
                 ref_bindings: std::collections::BTreeMap::new(),
+                product_selections: Vec::new(),
                 launch_mode: "detached".to_string(),
                 parameters: json!({}),
                 project_context: ProjectContext::None,
@@ -3589,6 +3605,7 @@ mod tests {
                     final_cost: None,
                     managed_envelope: None,
                     result_project_snapshot_hash: None,
+                    result_workspace_output_capture_hash: None,
                 },
             )
             .unwrap();

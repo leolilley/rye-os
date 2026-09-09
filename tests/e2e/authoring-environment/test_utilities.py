@@ -29,8 +29,8 @@ class UtilityTests(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
 
-    def support(self):
-        root = self.root / "support"
+    def support(self, name="support"):
+        root = self.root / name
         root.mkdir()
         commands = {name: f"bin/{name}" for name in utilities.REQUIRED_SUPPORT_COMMANDS}
         for member in set(commands.values()) | set(utilities.ELF_TOOLS.values()):
@@ -82,14 +82,42 @@ class UtilityTests(unittest.TestCase):
             utilities.validate_sources(config)
 
     def test_shell_support_requires_exact_bytes_modes_and_complete_inventory(self):
-        root, config = self.support()
+        root, config = self.support("changed-bytes")
         utilities.checked_support(root, config)
         del config["commands"]["make"]
         with self.assertRaisesRegex(ValueError, "incomplete"):
             utilities.checked_support(root, config)
         config["commands"]["make"] = "bin/make"
         (root / "bin/sh").write_bytes(b"changed")
-        with self.assertRaisesRegex(ValueError, "bytes or modes"):
+        with self.assertRaisesRegex(ValueError, "member 'bin/sh' differs: bytes expected"):
+            utilities.checked_support(root, config)
+
+    def test_shell_support_inventory_refusal_identifies_first_exact_difference(self):
+        root, config = self.support("inventory-changed-bytes")
+        expected = config["inputs"]["bin/sh"]
+        (root / "bin/sh").write_bytes(b"\x7fELFchanged")
+        with self.assertRaisesRegex(
+                ValueError,
+                rf"member 'bin/sh' differs: bytes expected {expected['bytes']!r}, observed 11; "
+                rf"sha256 expected '{expected['sha256']}', observed '[0-9a-f]{{64}}'"):
+            utilities.checked_support(root, config)
+
+        root, config = self.support("inventory-changed-mode")
+        (root / "bin/sh").chmod(0o644)
+        with self.assertRaisesRegex(
+                ValueError, "member 'bin/sh' differs: mode expected 493, observed 420"):
+            utilities.checked_support(root, config)
+
+        root, config = self.support("inventory-missing-member")
+        (root / "bin/sh").unlink()
+        with self.assertRaisesRegex(ValueError, "missing exact member 'bin/sh'"):
+            utilities.checked_support(root, config)
+
+        root, config = self.support("inventory-unexpected-member")
+        extra = root / "unexpected"
+        extra.write_bytes(b"not admitted")
+        extra.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "has unexpected member 'unexpected'"):
             utilities.checked_support(root, config)
 
     def test_shell_support_refuses_scripts_even_when_inventory_matches(self):
@@ -138,7 +166,7 @@ class UtilityTests(unittest.TestCase):
         utilities.checked_support(root, config)
         self.assertEqual(before, {member: (root / member).lstat().st_mode for member in config["inputs"]})
         (root / "bin/sh").chmod(0o444)
-        with self.assertRaisesRegex(ValueError, "bytes or modes"):
+        with self.assertRaisesRegex(ValueError, "member 'bin/sh' differs: mode"):
             utilities.checked_support(root, config)
 
     def test_special_support_entry_refuses_before_reading_or_executing_it(self):
@@ -262,6 +290,56 @@ class UtilityTests(unittest.TestCase):
             self.assertNotIn("start_new_session", spawn.call_args.kwargs)
             self.assertNotIn("process_group", spawn.call_args.kwargs)
         self.assertLessEqual((self.root / "bounded.log").stat().st_size, 64)
+
+    def test_failed_configure_retains_bounded_regular_config_log_head_and_tail(self):
+        class FailedProcess:
+            def __init__(self):
+                self.stdout = io.BytesIO(b"compiler failed\n")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def poll(self):
+                return 1
+
+            def wait(self):
+                return 1
+
+        config_log = self.root / "config.log"
+        config_log.write_bytes(b"exact-compiler-head" + b"x" * 256 + b"exact-linker-tail")
+        retained = self.root / "retained.log"
+        with patch.object(utilities.subprocess, "Popen", return_value=FailedProcess()), \
+                patch.object(utilities, "MAX_LOG_BYTES", 256), \
+                patch.object(utilities, "MAX_FAILURE_CONFIG_LOG_BYTES", 160):
+            with self.assertRaisesRegex(ValueError, "utility build command failed"):
+                utilities.run(["/selected/bin/configure"], self.root, {}, retained)
+        evidence = retained.read_bytes()
+        self.assertLessEqual(len(evidence), 256)
+        self.assertIn(b"--- config.log bounded evidence ---", evidence)
+        self.assertIn(b"exact-compiler-head", evidence)
+        self.assertIn(b"--- config.log omitted middle ---", evidence)
+        self.assertTrue(evidence.endswith(b"exact-linker-tail"))
+
+        config_log.write_bytes(b"short complete diagnostic")
+        retained = self.root / "short.log"
+        with patch.object(utilities.subprocess, "Popen", return_value=FailedProcess()):
+            with self.assertRaisesRegex(ValueError, "utility build command failed"):
+                utilities.run(["/selected/bin/configure"], self.root, {}, retained)
+        self.assertIn(b"short complete diagnostic", retained.read_bytes())
+
+        config_log.unlink()
+        secret = self.root / "outside"
+        secret.write_bytes(b"must-not-be-retained")
+        config_log.symlink_to(secret)
+        retained = self.root / "symlink-refused.log"
+        with patch.object(utilities.subprocess, "Popen", return_value=FailedProcess()):
+            with self.assertRaisesRegex(ValueError, "utility build command failed"):
+                utilities.run(["/selected/bin/configure"], self.root, {}, retained)
+        self.assertNotIn(b"must-not-be-retained", retained.read_bytes())
+        self.assertNotIn(b"config.log bounded evidence", retained.read_bytes())
 
     def test_compiler_or_support_mount_cannot_be_replaced_by_caller(self):
         with patch.object(utilities.subprocess, "Popen") as spawn:

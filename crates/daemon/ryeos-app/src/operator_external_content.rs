@@ -9,13 +9,20 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
+use ryeos_state::external_content::products::transfer::ProductWitnessSource;
 use serde::{Deserialize, Serialize};
 
 use crate::handler_context::HandlerContext;
 use crate::node_policy::sections::object_closure::NodeObjectClosurePolicy;
 use crate::state::AppState;
 
+pub mod product_build;
+pub mod product_composition;
+pub mod product_qualification;
+pub mod product_receipt;
+pub mod products;
 mod retained_binding;
+mod retained_product;
 mod retained_result;
 
 const BINDING_HEAD_NAMESPACE: &str = ryeos_state::objects::EXTERNAL_CONTENT_BINDING_HEAD_NAMESPACE;
@@ -84,6 +91,17 @@ pub enum ImportRequest {
     Filesystem(FilesystemImportRequest),
     RetainedResult(RetainedResultImportRequest),
     RetainedBinding(RetainedBindingImportRequest),
+    RetainedProduct(RetainedProductImportRequest),
+}
+
+/// Fresh import capability for bytes retained by one exact published product
+/// witness. Publication grants no consumer access; ordinary bind still decides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedProductImportRequest {
+    pub witness_hash: String,
+    pub witness_source: ProductWitnessSource,
+    pub maximum_bytes: u64,
 }
 
 /// Reuse the complete exact manifest of a currently active local binding.
@@ -136,6 +154,12 @@ pub struct BindRequest {
     /// opened nor committed to binding identity.
     #[serde(default)]
     pub project_path: Option<std::path::PathBuf>,
+    /// Complete root product-selection batch used to reconstruct an exact D1
+    /// consumer before binding this independently staged literal manifest.
+    /// Absence retains the ordinary unselected literal-binding path.
+    #[serde(default)]
+    pub product_selections:
+        Option<Vec<ryeos_state::external_content::products::composition::ProductSelection>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -147,6 +171,9 @@ pub enum BindConsumerKind {
 
 impl BindRequest {
     pub fn validate_consumer_request(&self) -> anyhow::Result<()> {
+        if let Some(selections) = &self.product_selections {
+            product_composition::validate_selection_batch(selections)?;
+        }
         match self.consumer_kind {
             BindConsumerKind::InstalledBundle
                 if self.project_snapshot_hash.is_none() && self.project_path.is_none() =>
@@ -240,6 +267,11 @@ pub async fn import(
             tokio::task::spawn_blocking(move || retained_binding::import(state, context, request))
                 .await
                 .context("retained binding import worker stopped")?
+        }
+        ImportRequest::RetainedProduct(request) => {
+            tokio::task::spawn_blocking(move || retained_product::import(state, context, request))
+                .await
+                .context("retained product import worker stopped")?
         }
     }
 }
@@ -587,16 +619,13 @@ pub async fn bind(
 ) -> anyhow::Result<BindResponse> {
     let operator_fingerprint =
         crate::operator_authority::require_local_configured_operator(&state, &context)?;
-    request.validate_consumer_request()?;
-    if request.consumer_kind != BindConsumerKind::InstalledBundle {
-        bail!("pinned-project binding requires exact snapshot preparation");
-    }
+    ensure_unselected_bind_request(&request, BindConsumerKind::InstalledBundle)?;
     let consumer = resolve_installed_external_content_consumer(
         &state,
         &request.consumer_ref,
         &request.manifest_hash,
     )?;
-    bind_authorized(state, operator_fingerprint, request, consumer).await
+    bind_authorized(state, operator_fingerprint, request.into(), consumer).await
 }
 
 /// Complete a project binding after the API layer has materialized the exact
@@ -611,10 +640,7 @@ pub async fn bind_pinned_project(
 ) -> anyhow::Result<BindResponse> {
     let operator_fingerprint =
         crate::operator_authority::require_local_configured_operator(&state, &context)?;
-    request.validate_consumer_request()?;
-    if request.consumer_kind != BindConsumerKind::PinnedProject {
-        bail!("installed-bundle binding does not accept project preparation");
-    }
+    ensure_unselected_bind_request(&request, BindConsumerKind::PinnedProject)?;
     let project_snapshot_hash = request
         .project_snapshot_hash
         .as_deref()
@@ -626,7 +652,143 @@ pub async fn bind_pinned_project(
         project_snapshot_hash,
         &request.manifest_hash,
     )?;
-    bind_authorized(state, operator_fingerprint, request, consumer).await
+    bind_authorized(state, operator_fingerprint, request.into(), consumer).await
+}
+
+fn ensure_unselected_bind_request(
+    request: &BindRequest,
+    expected_kind: BindConsumerKind,
+) -> anyhow::Result<()> {
+    request.validate_consumer_request()?;
+    if request.consumer_kind != expected_kind {
+        bail!("external-content binding used the wrong consumer preparation owner");
+    }
+    if request.product_selections.is_some() {
+        bail!("selected external-content binding requires exact D1 preparation");
+    }
+    Ok(())
+}
+
+/// Bind an independently staged literal manifest against an exact selected
+/// consumer. The selections are authenticated again against the prepared D1;
+/// an absent, partial, or different batch is never interpreted as D0 authority.
+pub async fn bind_selected_literal_resolution(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    request: BindRequest,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+) -> anyhow::Result<BindResponse> {
+    crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    let subject = selected_bind_subject(&request)?;
+    let selections = request
+        .product_selections
+        .as_deref()
+        .expect("selected binding subject requires selections");
+    product_composition::verify_recovered_selections(
+        &state,
+        resolution,
+        &subject,
+        &context.fingerprint,
+        selections,
+    )?;
+    let publication = BindPublicationRequest {
+        staging_id: request.staging_id,
+        request_digest: request.request_digest,
+        manifest_hash: request.manifest_hash,
+        consumer_ref: request.consumer_ref,
+    };
+    bind_prepared_resolution(
+        state,
+        context,
+        resolution,
+        &subject,
+        publication,
+        Some(request.consumer_kind),
+    )
+    .await
+}
+
+fn selected_bind_subject(
+    request: &BindRequest,
+) -> anyhow::Result<ryeos_engine::contracts::SubjectResolutionAuthority> {
+    request.validate_consumer_request()?;
+    if request.product_selections.is_none() {
+        bail!("selected literal binding has no product selections");
+    }
+    Ok(match request.consumer_kind {
+        BindConsumerKind::InstalledBundle => {
+            ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
+        }
+        BindConsumerKind::PinnedProject => {
+            ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+                snapshot_hash: request
+                    .project_snapshot_hash
+                    .clone()
+                    .expect("validated pinned-project request"),
+            }
+        }
+    })
+}
+
+async fn bind_prepared_resolution(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    subject: &ryeos_engine::contracts::SubjectResolutionAuthority,
+    request: BindPublicationRequest,
+    expected_kind: Option<BindConsumerKind>,
+) -> anyhow::Result<BindResponse> {
+    let operator = crate::operator_authority::require_local_configured_operator(&state, &context)?;
+    let consumer_authority =
+        crate::external_content_admission::consumer_authority(resolution, subject)?;
+    ensure_bind_consumer_kind(expected_kind, &consumer_authority)?;
+    let consumer = resolve_external_content_consumer_from_resolution(
+        &state,
+        resolution,
+        consumer_authority,
+        &request.manifest_hash,
+    )?;
+    bind_authorized(state, operator, request, consumer).await
+}
+
+fn ensure_bind_consumer_kind(
+    expected_kind: Option<BindConsumerKind>,
+    consumer_authority: &ryeos_state::objects::ExternalContentConsumerAuthority,
+) -> anyhow::Result<()> {
+    match (expected_kind, consumer_authority) {
+        (None, _)
+        | (
+            Some(BindConsumerKind::InstalledBundle),
+            ryeos_state::objects::ExternalContentConsumerAuthority::InstalledBundle { .. },
+        )
+        | (
+            Some(BindConsumerKind::PinnedProject),
+            ryeos_state::objects::ExternalContentConsumerAuthority::PinnedProject { .. },
+        ) => {}
+        _ => {
+            bail!("selected external-content consumer source differs from the bind request")
+        }
+    }
+    Ok(())
+}
+
+/// Bind an explicitly composed manifest using the same source-inclusive selected
+/// resolution which will be checked by execution. Bundle consumers must not be
+/// re-resolved here: that would discard their admitted product selections.
+pub(super) async fn bind_selected_product_resolution(
+    state: Arc<AppState>,
+    context: HandlerContext,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+    subject: &ryeos_engine::contracts::SubjectResolutionAuthority,
+    imported: ImportResponse,
+) -> anyhow::Result<BindResponse> {
+    let request = BindPublicationRequest {
+        staging_id: imported.staging_id,
+        request_digest: imported.request_digest,
+        manifest_hash: imported.manifest_hash,
+        consumer_ref: resolution.root.resolved_ref.clone(),
+    };
+    bind_prepared_resolution(state, context, resolution, subject, request, None).await
 }
 
 /// Bind one component after a managed-activation caller has authenticated the
@@ -645,19 +807,39 @@ pub async fn bind_managed_activation_component(
     {
         bail!("managed external-content binding authority is inconsistent");
     }
-    request.validate_consumer_request()?;
+    ensure_unselected_bind_request(&request, BindConsumerKind::InstalledBundle)?;
     let consumer = resolve_installed_external_content_consumer(
         &state,
         &request.consumer_ref,
         &request.manifest_hash,
     )?;
-    bind_authorized(state, operator_fingerprint, request, consumer).await
+    bind_authorized(state, operator_fingerprint, request.into(), consumer).await
+}
+
+/// Publication consumes an already checked consumer, not public source-location
+/// controls. Keep those controls out of the shared mutation owner.
+struct BindPublicationRequest {
+    staging_id: String,
+    request_digest: String,
+    manifest_hash: String,
+    consumer_ref: String,
+}
+
+impl From<BindRequest> for BindPublicationRequest {
+    fn from(request: BindRequest) -> Self {
+        Self {
+            staging_id: request.staging_id,
+            request_digest: request.request_digest,
+            manifest_hash: request.manifest_hash,
+            consumer_ref: request.consumer_ref,
+        }
+    }
 }
 
 async fn bind_authorized(
     state: Arc<AppState>,
     operator_fingerprint: String,
-    request: BindRequest,
+    request: BindPublicationRequest,
     consumer: ResolvedConsumer,
 ) -> anyhow::Result<BindResponse> {
     if !lillux::valid_hash(&request.request_digest) || !lillux::valid_hash(&request.manifest_hash) {
@@ -1659,14 +1841,12 @@ fn resolve_external_content_consumer_from_resolution(
             .max_total_bytes
             .unwrap_or(ryeos_state::objects::MAX_LARGE_CONTENT_TOTAL_BYTES)
     });
-    let declarations = resolution
-        .composed
-        .composed
-        .get("external_content")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("consumer does not declare external content"))?;
-    let declarations: Vec<ryeos_engine::external_content::ExternalContentDeclaration> =
-        serde_json::from_value(declarations)?;
+    let declarations = ryeos_engine::external_content::external_content_declarations_for_binding(
+        resolution,
+        Some(external_contract),
+        ryeos_engine::external_content::declaring_authority(resolution)?,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("consumer does not declare external content"))?;
     let declaration = declarations.iter().find(|declaration| {
         declaration.mode == ryeos_engine::external_content::ExternalContentMode::Pinned
             && declaration.digest.as_deref() == Some(manifest_hash)
@@ -1938,8 +2118,37 @@ mod tests {
             consumer_kind: BindConsumerKind::InstalledBundle,
             project_snapshot_hash: None,
             project_path: None,
+            product_selections: None,
         };
         assert!(bundle.validate_consumer_request().is_ok());
+        let selection =
+            ryeos_state::external_content::products::composition::ProductSelection {
+                declaration_id: "runtime".to_owned(),
+                witness_hash: "f".repeat(64),
+                witness_source: ryeos_state::external_content::products::transfer::ProductWitnessSource::LocalCapture {},
+                qualification_hash: None,
+            };
+        let selected_bundle = BindRequest {
+            product_selections: Some(vec![selection.clone()]),
+            ..bundle.clone()
+        };
+        assert!(selected_bundle.validate_consumer_request().is_ok());
+        assert!(matches!(
+            selected_bind_subject(&selected_bundle).unwrap(),
+            ryeos_engine::contracts::SubjectResolutionAuthority::Projectless
+        ));
+        assert!(
+            ensure_unselected_bind_request(&selected_bundle, BindConsumerKind::InstalledBundle)
+                .is_err()
+        );
+        assert!(
+            BindRequest {
+                product_selections: Some(Vec::new()),
+                ..bundle.clone()
+            }
+            .validate_consumer_request()
+            .is_err()
+        );
         let project = BindRequest {
             consumer_kind: BindConsumerKind::PinnedProject,
             project_snapshot_hash: Some("c".repeat(64)),
@@ -1947,13 +2156,54 @@ mod tests {
             ..bundle.clone()
         };
         assert!(project.validate_consumer_request().is_ok());
+        let selected_project = BindRequest {
+            product_selections: Some(vec![selection]),
+            ..project.clone()
+        };
+        assert!(matches!(
+            selected_bind_subject(&selected_project).unwrap(),
+            ryeos_engine::contracts::SubjectResolutionAuthority::PinnedGeneration {
+                snapshot_hash
+            } if snapshot_hash == "c".repeat(64)
+        ));
+        assert!(
+            ensure_unselected_bind_request(&selected_project, BindConsumerKind::PinnedProject)
+                .is_err()
+        );
         assert!(
             BindRequest {
                 project_path: None,
-                ..project
+                ..project.clone()
             }
             .validate_consumer_request()
             .is_err()
+        );
+        assert!(selected_bind_subject(&bundle).is_err());
+    }
+
+    #[test]
+    fn selected_binding_consumer_kind_must_match_exact_resolution_source() {
+        let installed = ryeos_state::objects::ExternalContentConsumerAuthority::installed_bundle(
+            "tool:fixture/verify".to_owned(),
+            "a".repeat(64),
+        )
+        .unwrap();
+        let project = ryeos_state::objects::ExternalContentConsumerAuthority::pinned_project(
+            "config:fixture/worker".to_owned(),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            None,
+        )
+        .unwrap();
+        ensure_bind_consumer_kind(Some(BindConsumerKind::InstalledBundle), &installed).unwrap();
+        ensure_bind_consumer_kind(Some(BindConsumerKind::PinnedProject), &project).unwrap();
+        ensure_bind_consumer_kind(None, &installed).unwrap();
+        assert!(
+            ensure_bind_consumer_kind(Some(BindConsumerKind::InstalledBundle), &project).is_err()
+        );
+        assert!(
+            ensure_bind_consumer_kind(Some(BindConsumerKind::PinnedProject), &installed).is_err()
         );
     }
 

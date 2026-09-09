@@ -625,6 +625,7 @@ fn isolation_plan_request(
                     })
                 }),
             external_read_only_mounts: &ctx.isolation_external_read_only_mounts,
+            writable_runtime_view_mounts: &ctx.isolation_writable_runtime_view_mounts,
             target_channels: &ctx.isolation_target_channels,
             item_ref,
             thread_id: &ctx.thread_id,
@@ -682,6 +683,7 @@ fn isolation_plan_request_awaiting_attachment(
                     })
                 }),
             external_read_only_mounts: &ctx.isolation_external_read_only_mounts,
+            writable_runtime_view_mounts: &ctx.isolation_writable_runtime_view_mounts,
             target_channels: &ctx.isolation_target_channels,
             item_ref,
             thread_id: &ctx.thread_id,
@@ -839,6 +841,7 @@ mod tests {
             isolation_verified_code: Vec::new(),
             isolation_verified_command: None,
             isolation_external_read_only_mounts: Vec::new(),
+            isolation_writable_runtime_view_mounts: Vec::new(),
             isolation_target_channels: Vec::new(),
             isolation_workspace: None,
             subprocess_limits: None,

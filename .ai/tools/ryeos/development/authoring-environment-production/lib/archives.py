@@ -1,9 +1,10 @@
-# ryeos:signed:2026-09-06T04:58:49Z:2b2f29c40c62110bc1519d0b48d8a5b1c04baf894558904ebbd17c3e10213273:dcvlnD8Rl8I8WDz1lYxKIkLU9i8EpOAZhcvR30Ya6B7rwIM6JIC7SgVyM7zPsvlEtB2RqgMNBZ4KyA7Gg+0wBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:38:22Z:6414b540a5c2bbe4075356fe425841a3fc96642051af2b5dc19bbd8c46e3cde3:XCBxJJ10sAql6I21jzVHNeXVH36R2zTj9rSKDqBkFwlh9ktR/7DnAa+2Tu2bZylrd9VY3aXk4caZICWERzpWCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 """Bounded selection from admitted source archives; no filesystem extraction."""
 
 from __future__ import annotations
 
 import bz2
+from collections import deque
 from contextlib import ExitStack, contextmanager
 import gzip
 import lzma
@@ -16,6 +17,68 @@ MAX_ARCHIVE_ENTRIES = 100_000
 MAX_EXPANDED_BYTES = 3 * 1024 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024
 MAX_TOTAL_METADATA_BYTES = 8 * 1024 * 1024
+
+
+def resolve_contained_member(nodes, name: str, *, selected_root: str = "",
+                             max_hops: int = 128) -> tuple[str, str]:
+    """Resolve a bounded, complete member graph without touching a filesystem.
+
+    nodes maps canonical member names to (file/directory/symlink/hardlink,
+    raw target or None). Symlinks start at their parent; archive hardlinks
+    start at archive root. Crucially a/../b follows a before interpreting '..'.
+    The selected root is an exact member prefix, never a host pathname.
+    """
+    if not isinstance(nodes, dict) or len(nodes) > MAX_ARCHIVE_ENTRIES:
+        raise ValueError("member graph exceeds its entry bound")
+    if type(max_hops) is not int or not 0 < max_hops <= 128:
+        raise ValueError("invalid member link-hop bound")
+    relative(name)
+    boundary = relative(selected_root).parts if selected_root else ()
+    if boundary and tuple(name.split("/")[:len(boundary)]) != boundary:
+        raise ValueError("member is outside the selected root")
+    pending, components, hops = deque(name.split("/")), [], 0
+    while pending:
+        component = pending.popleft()
+        if component == ".":
+            continue
+        if component == "..":
+            if len(components) <= len(boundary):
+                raise ValueError("member link escapes selected root through another link")
+            components.pop()
+            continue
+        components.append(component)
+        prefix = "/".join(components)
+        node = nodes.get(prefix)
+        if not isinstance(node, tuple) or len(node) != 2:
+            raise ValueError("member link target is missing or malformed")
+        kind, raw_target = node
+        if kind in ("symlink", "hardlink"):
+            hops += 1
+            if hops > max_hops:
+                raise ValueError("cyclic or excessively deep member link")
+            if (not isinstance(raw_target, str) or not raw_target
+                    or len(raw_target) > 1024 or raw_target.startswith("/")
+                    or "\\" in raw_target or "\0" in raw_target):
+                raise ValueError("unsafe member link target")
+            target_parts = raw_target.split("/")
+            for part in target_parts:
+                if part not in (".", ".."):
+                    relative(part)
+            components = [] if kind == "hardlink" else components[:-1]
+            pending.extendleft(reversed(target_parts))
+        elif kind not in ("file", "directory") or raw_target is not None:
+            raise ValueError("invalid member graph entry")
+        elif pending and kind != "directory":
+            raise ValueError("member link traverses a non-directory")
+    target = "/".join(components)
+    if boundary and tuple(components[:len(boundary)]) != boundary:
+        raise ValueError("resolved member leaves selected root")
+    if not target and not boundary:
+        return "", "directory"
+    node = nodes.get(target)
+    if node is None or node[0] not in ("file", "directory"):
+        raise ValueError("member link does not resolve to retained content")
+    return target, node[0]
 
 
 @contextmanager
@@ -38,6 +101,11 @@ def open_archive(path_or_fileobj, *, maximum_expanded_bytes: int = MAX_EXPANDED_
             decoded = stack.enter_context(lzma.LZMAFile(raw))
         elif magic.startswith(b"BZh"):
             decoded = stack.enter_context(bz2.BZ2File(raw))
+        elif magic.startswith(b"\x28\xb5\x2f\xfd"):
+            # The admitted CPython runtime owns this decoder just as it owns
+            # gzip/xz/bzip2; no executable discovery or alternate decoder lane.
+            from compression.zstd import ZstdFile
+            decoded = stack.enter_context(ZstdFile(raw))
         else:
             decoded = raw
 

@@ -147,6 +147,7 @@ mod tests {
             base_snapshot_hash: "a".repeat(64),
             snapshot_hash: "b".repeat(64),
             realization: PinnedProjectRealization::ReadOnly,
+            workspace_outputs: None,
             environment: EnvironmentAuthority::None,
             capability_ceiling: Vec::new(),
             child_policy: ChildProjectAuthorityPolicy::Inherit,

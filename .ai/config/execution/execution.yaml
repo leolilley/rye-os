@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-07T08:05:59Z:73d6f885d65e0e1bd672f4ecff990297c87c21ff248336b3192ba72e2580b556:nwGgNa7oej0XBaUcLfDlzAjQcxfSohRKZUD+Le1msbi42JVbqKbZasC4bccBIwkEvCIxJxKvk9zWNqRX2kGHDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:36:34Z:d56417fe4e049e376a12e32fb77c41d1aae08a75ba72aca506b0dc1a29f932a7:8bX51wzeFpjoIUh0dmEuKO7Cq2+Tgl+VM7p8ciWOL3j1iCaU8Wlp8yKPuzmssIHowxfoY9joM1T0eh71TBV1Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: execution
 version: "1.0.0"
 schema_version: "2.1.0"
@@ -10,6 +10,21 @@ items:
     ryeos/development/authoring-environment-production:
       # Both 300-second leaves plus bounded graph/lifecycle overhead.
       timeout: 660
+    ryeos/development/authoring-environment-production-recorded:
+      # The wrapper waits for the same exact producer root and its publication.
+      timeout: 720
+    ryeos/development/authoring-prepared-inputs-production:
+      timeout: 360
+    ryeos/development/authoring-prepared-inputs-production-recorded:
+      timeout: 420
+    ryeos/development/authoring-build-support-production:
+      timeout: 360
+    ryeos/development/authoring-build-support-production-recorded:
+      timeout: 420
+    ryeos/development/authoring-built-utilities-production:
+      timeout: 1860
+    ryeos/development/authoring-built-utilities-production-recorded:
+      timeout: 1920
   tool:
     ryeos/development/authoring-environment-production/build-utilities:
       timeout: 1800

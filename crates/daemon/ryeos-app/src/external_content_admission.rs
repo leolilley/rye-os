@@ -160,11 +160,10 @@ pub fn preview_external_content_pins(
         .get(kind)
         .and_then(|schema| schema.external_content_contract());
     let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
-    let Some(declarations) = ryeos_engine::external_content::declarations_from_composed(
-        &resolution.composed.composed,
-        contract,
-        declarer,
-    )?
+    let Some(declarations) =
+        ryeos_engine::external_content::effective_external_content_declarations(
+            resolution, contract, declarer,
+        )?
     else {
         return Ok(None);
     };
@@ -260,8 +259,8 @@ pub fn preview_portable_content_dependency_with_realizations(
 ) -> anyhow::Result<PortableContentDependencyPreview> {
     let contract = policy.declaration_contract();
     let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
-    let declarations = ryeos_engine::external_content::declarations_from_composed(
-        &resolution.composed.composed,
+    let declarations = ryeos_engine::external_content::effective_external_content_declarations(
+        resolution,
         Some(&contract),
         declarer,
     )?
@@ -617,11 +616,10 @@ pub fn admit_external_realizations_in_publication(
         .get(kind)
         .and_then(|schema| schema.external_content_contract());
     let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
-    let Some(declarations) = ryeos_engine::external_content::declarations_from_composed(
-        &resolution.composed.composed,
-        contract,
-        declarer,
-    )?
+    let Some(declarations) =
+        ryeos_engine::external_content::effective_external_content_declarations(
+            resolution, contract, declarer,
+        )?
     else {
         return inherit_external_realizations(state, resolution, inherited);
     };
@@ -659,8 +657,8 @@ pub fn admit_portable_content_dependency_in_publication(
 ) -> anyhow::Result<AdmittedExternalRealizations> {
     let contract = policy.declaration_contract();
     let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
-    let declarations = ryeos_engine::external_content::declarations_from_composed(
-        &resolution.composed.composed,
+    let declarations = ryeos_engine::external_content::effective_external_content_declarations(
+        resolution,
         Some(&contract),
         declarer,
     )?

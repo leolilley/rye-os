@@ -15,7 +15,8 @@ use ryeos_engine::item_resolution::ResolutionRoots;
 use ryeos_engine::parsers::ParserDispatcher;
 use ryeos_engine::resolution::{ResolutionOutput, TrustClass};
 use ryeos_engine::runtime_registry::{
-    LaunchItemSpace, LaunchPreparationDecl, RuntimeFactKind, VerifiedRuntime,
+    LaunchItemSpace, LaunchPreparationDecl, ProjectResultRequirement, RuntimeFactKind,
+    VerifiedRuntime,
 };
 use ryeos_handler_protocol::{
     ItemSpaceWire, LaunchComposedViewWire, LaunchConfigContributorWire, LaunchConfigSnapshotWire,
@@ -44,6 +45,7 @@ const MAX_REF_BINDING_NAME_BYTES: usize = 64;
 const MAX_REF_BINDING_VALUE_BYTES: usize = 2_048;
 const MAX_EXECUTION_DEPENDENCY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_DEPENDENCY_BYTES: usize = 4 * 1024 * 1024;
+
 const MAX_ENVIRONMENT_CONTRIBUTION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,9 @@ pub struct PreparedSecret {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedRuntimeLaunch {
+    /// Restriction derived only from present, resolved signed ref bindings.
+    /// It is not a claim that the invocation owns a suitable workspace.
+    pub project_result_requirement: ProjectResultRequirement,
     /// Effective launch restrictions, sealed with this managed program.
     /// Fresh admission intersects signed subject projections with the parent;
     /// restart and cross-site rebinding preserve these exact values.
@@ -114,6 +119,93 @@ pub struct PreparedRuntimeLaunch {
     /// Its family is opaque to generic launch code, which validates, seals,
     /// and transports the mechanical contract without interpreting it.
     pub external_effect_authority: Option<ryeos_effect_contract::AdmittedExternalEffectAuthority>,
+}
+
+fn project_result_requirement_for_bindings<'a>(
+    declarations: &BTreeMap<String, ryeos_engine::runtime_registry::RefBindingDecl>,
+    present: impl IntoIterator<Item = &'a String>,
+) -> Result<ProjectResultRequirement, DispatchError> {
+    let mut requirement = ProjectResultRequirement::None;
+    let present: BTreeSet<_> = present.into_iter().collect();
+    for name in &present {
+        let declaration = declarations.get(*name).ok_or_else(|| {
+            preparation_error(
+                "undeclared_prepared_ref_binding",
+                "prepared launch contains an undeclared ref binding",
+                LaunchPrepareErrorClass::Internal,
+            )
+        })?;
+        if declaration.project_result_requirement == ProjectResultRequirement::RetainedGeneration {
+            requirement = ProjectResultRequirement::RetainedGeneration;
+        }
+    }
+    if declarations
+        .iter()
+        .any(|(name, decl)| decl.required && !present.contains(name))
+    {
+        return Err(preparation_error(
+            "missing_prepared_ref_binding",
+            "prepared launch omitted a required ref binding",
+            LaunchPrepareErrorClass::Internal,
+        ));
+    }
+    Ok(requirement)
+}
+
+pub(crate) fn validate_prepared_project_result_requirement(
+    runtime: &VerifiedRuntime,
+    prepared: &PreparedRuntimeLaunch,
+) -> Result<(), DispatchError> {
+    let expected = project_result_requirement_for_bindings(
+        &runtime.yaml.launch_contract.ref_bindings,
+        prepared.binding_records.keys(),
+    )?;
+    if prepared.project_result_requirement != expected {
+        return Err(preparation_error(
+            "prepared_project_result_requirement_mismatch",
+            "prepared project-result requirement contradicts its signed binding contract",
+            LaunchPrepareErrorClass::Internal,
+        ));
+    }
+    Ok(())
+}
+
+fn project_result_requirement_satisfied_by_authority(
+    requirement: ProjectResultRequirement,
+    authority: &ryeos_state::objects::ExecutionProjectAuthority,
+    borrowed: bool,
+) -> bool {
+    match requirement {
+        ProjectResultRequirement::None => true,
+        ProjectResultRequirement::RetainedGeneration => {
+            !borrowed && authority.records_terminal_project_generation()
+        }
+    }
+}
+
+pub(crate) fn project_result_requirement_satisfied(
+    prepared: &PreparedRuntimeLaunch,
+    provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
+) -> bool {
+    project_result_requirement_satisfied_by_authority(
+        prepared.project_result_requirement,
+        provenance.project_authority(),
+        provenance.is_borrowed_child(),
+    )
+}
+
+pub(crate) fn require_prepared_project_result(
+    prepared: &PreparedRuntimeLaunch,
+    provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
+) -> Result<(), DispatchError> {
+    if !project_result_requirement_satisfied(prepared, provenance) {
+        return Err(preparation_error(
+            "launch_project_result_required",
+            "a resolved binding requires an owned CoW execution retaining its terminal project generation; live, read-only, discard, and borrowed workspaces do not satisfy this requirement",
+            LaunchPrepareErrorClass::Caller,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +298,12 @@ pub struct PreparedContentDependency {
     pub binding: String,
     pub canonical_ref: String,
     pub resolution: ryeos_engine::resolution::RetainedResolutionOutput,
+    /// Canonical complete invocation-selected product set for this dependency.
+    /// An empty set preserves the literal-only path. The application resolves
+    /// and verifies every witness atomically against one dependency D0 before
+    /// portable content admission consumes the dependency.
+    pub product_selections:
+        Vec<ryeos_state::external_content::products::composition::ProductSelection>,
     pub targets: Vec<String>,
     pub executable_search: Vec<ryeos_handler_protocol::ExecutableSearchPathEntryWire>,
     pub external_content_policy: ryeos_engine::runtime_registry::LaunchContentExternalPolicy,
@@ -242,6 +340,9 @@ impl PreparedContentDependency {
         if self.target_content_contracts.keys().ne(self.targets.iter()) {
             anyhow::bail!("prepared content dependency target contracts disagree with its targets");
         }
+        ryeos_state::external_content::products::composition::validate_product_selections(
+            &self.product_selections,
+        )?;
         let mut searches = BTreeSet::new();
         for entry in &self.executable_search {
             if entry.realization_id.is_empty()
@@ -440,6 +541,11 @@ pub struct PrepareRuntimeLaunchRequest<'a> {
     pub runtime: &'a VerifiedRuntime,
     pub primary: &'a ResolutionOutput,
     pub ref_bindings: &'a BTreeMap<String, String>,
+    /// Bounded invocation control keyed by the exact content-dependency
+    /// binding. This is deliberately absent from `LaunchPrepareRequest`, whose
+    /// handler remains a pure projection of signed item/config inputs.
+    pub product_selections:
+        &'a ryeos_state::external_content::products::composition::ProductSelectionInputs,
     pub roots: &'a ResolutionRoots,
     pub parsers: &'a ParserDispatcher,
     /// Exact trust half of the same effective request snapshot as `parsers`.
@@ -510,6 +616,9 @@ impl OwnedPreparedLaunchSkeletonAuthority {
 #[derive(Clone)]
 struct PreparedRuntimeLaunchInputs {
     primary: LaunchPreparedItemWire,
+    effective_ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     binding_wires: BTreeMap<String, LaunchPreparedItemWire>,
     binding_records: BTreeMap<String, RefBindingLaunchRecord>,
     binding_resolutions: BTreeMap<String, ryeos_engine::resolution::ResolutionOutput>,
@@ -530,6 +639,8 @@ struct OwnedPrepareRuntimeLaunchRequest {
     runtime: VerifiedRuntime,
     primary: ResolutionOutput,
     ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     roots: ResolutionRoots,
     parsers: ParserDispatcher,
     trust_store: ryeos_engine::trust::TrustStore,
@@ -546,6 +657,7 @@ impl OwnedPrepareRuntimeLaunchRequest {
             runtime: request.runtime.clone(),
             primary: request.primary.clone(),
             ref_bindings: request.ref_bindings.clone(),
+            product_selections: request.product_selections.clone(),
             roots: request.roots.clone(),
             parsers: request.parsers.clone(),
             trust_store: request.trust_store.clone(),
@@ -578,6 +690,7 @@ impl OwnedPrepareRuntimeLaunchRequest {
             runtime: &self.runtime,
             primary: &self.primary,
             ref_bindings: &self.ref_bindings,
+            product_selections: &self.product_selections,
             roots: &self.roots,
             parsers: &self.parsers,
             trust_store: &self.trust_store,
@@ -593,7 +706,9 @@ pub fn prepare_runtime_launch(
     request: PrepareRuntimeLaunchRequest<'_>,
 ) -> Result<PreparedRuntimeLaunch, DispatchError> {
     let inputs = prepare_runtime_launch_inputs(&request, None)?;
-    finish_runtime_launch_preparation(&request, &inputs)
+    let prepared = finish_runtime_launch_preparation(&request, &inputs)?;
+    validate_prepared_project_result_requirement(request.runtime, &prepared)?;
+    Ok(prepared)
 }
 
 /// Prepare one managed launch through the bounded secret-free skeleton cache.
@@ -680,6 +795,10 @@ pub async fn prepare_runtime_launch_cached(
                     entry_bytes,
                     0,
                 );
+                validate_prepared_project_result_requirement(
+                    &owned_request.runtime,
+                    &skeleton.prepared,
+                )?;
                 return Ok(skeleton.prepared.clone());
             }
             super::prepared_launch_cache::Lookup::Wait { pending } => {
@@ -709,18 +828,21 @@ pub async fn prepare_runtime_launch_cached(
                     0,
                     wait_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 );
+                validate_prepared_project_result_requirement(
+                    &owned_request.runtime,
+                    &skeleton.prepared,
+                )?;
                 return Ok(skeleton.prepared.clone());
             }
             super::prepared_launch_cache::Lookup::Build(fill) => {
                 let finish_engine = owned_request.engine.clone();
                 let finish_runtime = owned_request.runtime.clone();
-                let finish_ref_bindings = owned_request.ref_bindings.clone();
                 let finish_inputs = inputs.clone();
                 let loaded = tokio::task::spawn_blocking(move || {
                     let prepared = finish_runtime_launch_preparation_parts(
                         &finish_engine,
                         &finish_runtime,
-                        &finish_ref_bindings,
+                        &finish_inputs.effective_ref_bindings,
                         &finish_inputs,
                     )?;
                     let serialized_bytes = serde_json::to_vec(&prepared)
@@ -772,6 +894,10 @@ pub async fn prepare_runtime_launch_cached(
                     0,
                     0,
                 );
+                validate_prepared_project_result_requirement(
+                    &owned_request.runtime,
+                    &skeleton.prepared,
+                )?;
                 return Ok(skeleton.prepared.clone());
             }
             super::prepared_launch_cache::Lookup::Bypass => {
@@ -783,13 +909,12 @@ pub async fn prepare_runtime_launch_cached(
                 );
                 let finish_engine = owned_request.engine.clone();
                 let finish_runtime = owned_request.runtime.clone();
-                let finish_ref_bindings = owned_request.ref_bindings.clone();
                 let finish_inputs = inputs.clone();
                 let prepared = tokio::task::spawn_blocking(move || {
                     finish_runtime_launch_preparation_parts(
                         &finish_engine,
                         &finish_runtime,
-                        &finish_ref_bindings,
+                        &finish_inputs.effective_ref_bindings,
                         &finish_inputs,
                     )
                 })
@@ -809,6 +934,7 @@ pub async fn prepare_runtime_launch_cached(
                     consume_prepared_proof_status(proof_status, &mut authority_retries)?;
                     continue 'authority;
                 }
+                validate_prepared_project_result_requirement(&owned_request.runtime, &prepared)?;
                 return Ok(prepared);
             }
         }
@@ -1263,11 +1389,123 @@ async fn launch_config_hit_status(
     })
 }
 
+/// Resolve the effective ref-binding coordinates under the runtime's signed
+/// source declaration. This performs no item resolution and grants no
+/// authority: the existing binding loop below still parses, authorizes,
+/// resolves, and trust-checks every resulting coordinate.
+pub(crate) fn project_effective_ref_bindings(
+    declarations: &BTreeMap<String, ryeos_engine::runtime_registry::RefBindingDecl>,
+    primary: &Value,
+    caller: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, DispatchError> {
+    for name in caller.keys() {
+        if !declarations.contains_key(name) {
+            return Err(preparation_error_with_binding(
+                "invalid_ref_binding",
+                format!("ref binding `{name}` is not declared by the selected runtime"),
+                LaunchPrepareErrorClass::Caller,
+                Some(name.clone()),
+            ));
+        }
+    }
+    let mut effective = BTreeMap::new();
+    for (name, declaration) in declarations {
+        use ryeos_engine::runtime_registry::RefBindingSource;
+        let projected = match &declaration.source {
+            RefBindingSource::Caller => caller.get(name).cloned(),
+            RefBindingSource::PrimaryField { path } => {
+                let mut value = Some(primary);
+                for field in path {
+                    let Some(current) = value else {
+                        break;
+                    };
+                    let object = current.as_object().ok_or_else(|| {
+                        preparation_error_with_binding(
+                            "ref_binding_primary_field_invalid",
+                            format!(
+                                "signed primary path for ref binding `{name}` crosses a non-object value"
+                            ),
+                            LaunchPrepareErrorClass::Configuration,
+                            Some(name.clone()),
+                        )
+                    })?;
+                    value = object.get(field);
+                }
+                match value {
+                    None => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    Some(_) => {
+                        return Err(preparation_error_with_binding(
+                            "ref_binding_primary_field_invalid",
+                            format!(
+                                "signed primary field for ref binding `{name}` must be a string"
+                            ),
+                            LaunchPrepareErrorClass::Configuration,
+                            Some(name.clone()),
+                        ));
+                    }
+                }
+            }
+        };
+        match (&declaration.source, projected, caller.get(name)) {
+            (RefBindingSource::Caller, Some(value), _) => {
+                effective.insert(name.clone(), value);
+            }
+            (RefBindingSource::Caller, None, _) => {}
+            (RefBindingSource::PrimaryField { .. }, Some(projected), Some(supplied))
+                if supplied != &projected =>
+            {
+                return Err(preparation_error_with_binding(
+                    "ref_binding_source_contradiction",
+                    format!("caller ref binding `{name}` contradicts the signed primary selection"),
+                    LaunchPrepareErrorClass::Caller,
+                    Some(name.clone()),
+                ));
+            }
+            (RefBindingSource::PrimaryField { .. }, Some(projected), _) => {
+                effective.insert(name.clone(), projected);
+            }
+            (RefBindingSource::PrimaryField { .. }, None, Some(_)) => {
+                return Err(preparation_error_with_binding(
+                    "ref_binding_source_undeclared",
+                    format!(
+                        "caller supplied ref binding `{name}` but the signed primary field is absent"
+                    ),
+                    LaunchPrepareErrorClass::Caller,
+                    Some(name.clone()),
+                ));
+            }
+            (RefBindingSource::PrimaryField { .. }, None, None) => {}
+        }
+    }
+    for (name, declaration) in declarations {
+        if declaration.required && !effective.contains_key(name) {
+            return Err(preparation_error_with_binding(
+                "ref_binding_required",
+                format!("required ref binding `{name}` is missing"),
+                LaunchPrepareErrorClass::Caller,
+                Some(name.clone()),
+            ));
+        }
+    }
+    Ok(effective)
+}
+
 fn prepare_runtime_launch_inputs(
     request: &PrepareRuntimeLaunchRequest<'_>,
     cached_config_set: Option<&ryeos_engine::launch_config::LaunchConfigSnapshotSet>,
 ) -> Result<PreparedRuntimeLaunchInputs, DispatchError> {
     validate_ref_bindings(request.ref_bindings)?;
+    ryeos_state::external_content::products::composition::validate_product_selection_inputs(
+        request.product_selections,
+    )
+    .map_err(|error| {
+        preparation_error(
+            "product_selection_input_invalid",
+            error.to_string(),
+            LaunchPrepareErrorClass::Caller,
+        )
+    })?;
     let contract = &request.runtime.yaml.launch_contract;
     validate_prepared_item(
         PreparedItemRole::Primary,
@@ -1278,27 +1516,12 @@ fn prepare_runtime_launch_inputs(
         &contract.primary_allowed_spaces,
         &contract.primary_allowed_trust,
     )?;
-
-    for (name, declaration) in &contract.ref_bindings {
-        if declaration.required && !request.ref_bindings.contains_key(name) {
-            return Err(preparation_error_with_binding(
-                "ref_binding_required",
-                format!("required ref binding `{name}` is missing"),
-                LaunchPrepareErrorClass::Caller,
-                Some(name.clone()),
-            ));
-        }
-    }
-    for name in request.ref_bindings.keys() {
-        if !contract.ref_bindings.contains_key(name) {
-            return Err(preparation_error_with_binding(
-                "invalid_ref_binding",
-                format!("ref binding `{name}` is not declared by the selected runtime"),
-                LaunchPrepareErrorClass::Caller,
-                Some(name.clone()),
-            ));
-        }
-    }
+    let effective_ref_bindings = project_effective_ref_bindings(
+        &contract.ref_bindings,
+        &request.primary.composed.composed,
+        request.ref_bindings,
+    )?;
+    validate_ref_bindings(&effective_ref_bindings)?;
 
     let scopes = principal_scopes(request.principal);
     let mut binding_wires = BTreeMap::new();
@@ -1307,7 +1530,7 @@ fn prepare_runtime_launch_inputs(
     let ref_binding_resolution_timer = request
         .ref_binding_resolution_timings
         .map(|timings| timings.nested("background_dispatch", "ref_binding_resolution"));
-    for (name, raw_ref) in request.ref_bindings {
+    for (name, raw_ref) in &effective_ref_bindings {
         let declaration = &contract.ref_bindings[name];
         let canonical =
             ryeos_engine::canonical_ref::CanonicalRef::parse(raw_ref).map_err(|_| {
@@ -1379,6 +1602,8 @@ fn prepare_runtime_launch_inputs(
     };
     Ok(PreparedRuntimeLaunchInputs {
         primary: prepared_item_wire(request.primary)?,
+        effective_ref_bindings,
+        product_selections: request.product_selections.clone(),
         binding_wires,
         binding_records,
         binding_resolutions,
@@ -1698,7 +1923,7 @@ fn finish_runtime_launch_preparation(
     finish_runtime_launch_preparation_parts(
         request.engine,
         request.runtime,
-        request.ref_bindings,
+        &inputs.effective_ref_bindings,
         inputs,
     )
 }
@@ -1776,6 +2001,10 @@ fn finish_runtime_launch_preparation_parts(
             )
         })?;
     Ok(PreparedRuntimeLaunch {
+        project_result_requirement: project_result_requirement_for_bindings(
+            &contract.ref_bindings,
+            inputs.binding_records.keys(),
+        )?,
         filesystem_authority_ceiling: execution
             .project_filesystem_authority_ceiling(&inputs.primary.composed.composed)
             .map_err(|error| DispatchError::Internal(error.into()))?,
@@ -2198,6 +2427,8 @@ fn resolve_content_dependencies(
     }
     let external_policy = policy.external_content.as_ref();
     let mut prepared = BTreeMap::new();
+    let mut unused_product_selections =
+        content_dependency_product_selections(&inputs.product_selections);
     let mut aggregate_bytes = 0usize;
     for (name, request) in requests {
         if !valid_ref_binding_name(&name)
@@ -2288,7 +2519,7 @@ fn resolve_content_dependencies(
                     LaunchPrepareErrorClass::Configuration,
                 )
             })?;
-        let declarations = ryeos_engine::external_content::declarations_from_composed(
+        let authored_shape = ryeos_engine::external_content::authored_external_content_shape(
             &resolution.composed.composed,
             Some(&synthetic_contract),
             declarer,
@@ -2296,24 +2527,45 @@ fn resolve_content_dependencies(
         .map_err(|error| {
             preparation_error(
                 "content_dependency_declaration_invalid",
-                format!("content dependency `{name}` declaration is invalid: {error}"),
+                format!("content dependency `{name}` authored shape is invalid: {error}"),
                 LaunchPrepareErrorClass::Configuration,
             )
         })?
         .ok_or_else(|| {
             preparation_error(
                 "content_dependency_declaration_missing",
-                format!("content dependency `{name}` has no external_content declaration"),
+                format!(
+                    "content dependency `{name}` has no external_content declaration or product slot"
+                ),
                 LaunchPrepareErrorClass::Configuration,
             )
         })?;
-        if declarations.is_empty()
-            || declarations.iter().any(|declaration| {
+        let product_selections = unused_product_selections
+            .remove(&request.binding)
+            .unwrap_or_default();
+        match_product_selections_to_authored_slots(
+            &request.binding,
+            &authored_shape.product_slots,
+            &product_selections,
+        )?;
+        if authored_shape
+            .literal_declarations
+            .iter()
+            .any(|declaration| {
                 declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned
                     || declaration.locator.is_some()
                     || declaration.digest.is_none()
             })
         {
+            return Err(preparation_error(
+                "content_dependency_declaration_nonportable",
+                format!(
+                    "content dependency `{name}` literal content must be locator-free and pinned"
+                ),
+                LaunchPrepareErrorClass::Configuration,
+            ));
+        }
+        if authored_shape.literal_declarations.is_empty() && product_selections.is_empty() {
             return Err(preparation_error(
                 "content_dependency_declaration_nonportable",
                 format!(
@@ -2350,6 +2602,7 @@ fn resolve_content_dependencies(
             binding: request.binding,
             canonical_ref: resolution.root.resolved_ref.clone(),
             resolution: ryeos_engine::resolution::RetainedResolutionOutput::capture(resolution),
+            product_selections,
             targets: request.targets,
             executable_search: request.executable_search,
             external_content_policy: external_policy,
@@ -2392,7 +2645,201 @@ fn resolve_content_dependencies(
         }
         prepared.insert(name, dependency);
     }
+    if let Some((binding, _)) = unused_product_selections.into_iter().next() {
+        return Err(preparation_error_with_binding(
+            "product_selection_unused",
+            format!(
+                "product selector for binding `{binding}` was not requested by the launch preparer"
+            ),
+            LaunchPrepareErrorClass::Caller,
+            Some(binding),
+        ));
+    }
     Ok(prepared)
+}
+
+fn content_dependency_product_selections(
+    inputs: &ryeos_state::external_content::products::composition::ProductSelectionInputs,
+) -> BTreeMap<String, Vec<ryeos_state::external_content::products::composition::ProductSelection>> {
+    use ryeos_state::external_content::products::composition::ProductSelectionTarget;
+
+    let mut grouped = BTreeMap::<String, Vec<_>>::new();
+    for input in inputs {
+        if let ProductSelectionTarget::ContentDependency { binding } = &input.target {
+            grouped
+                .entry(binding.clone())
+                .or_default()
+                .push(input.selection.clone());
+        }
+    }
+    grouped
+}
+
+fn match_product_selections_to_authored_slots(
+    binding: &str,
+    slots: &[ryeos_state::external_content::products::composition::ExternalProductSlotDeclaration],
+    selections: &[ryeos_state::external_content::products::composition::ProductSelection],
+) -> Result<(), DispatchError> {
+    if slots.is_empty() && selections.is_empty() {
+        return Ok(());
+    }
+    if slots.is_empty() {
+        return Err(preparation_error_with_binding(
+            "product_selection_literal_dependency",
+            format!("product selector for binding `{binding}` targets a literal-only dependency"),
+            LaunchPrepareErrorClass::Caller,
+            Some(binding.to_owned()),
+        ));
+    }
+    if selections.is_empty() {
+        return Err(preparation_error_with_binding(
+            "product_selection_required",
+            format!(
+                "content dependency binding `{binding}` has signed product slots but no invocation selectors"
+            ),
+            LaunchPrepareErrorClass::Caller,
+            Some(binding.to_owned()),
+        ));
+    }
+    let slot_ids = slots
+        .iter()
+        .map(|slot| slot.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let selection_ids = selections
+        .iter()
+        .map(|selection| selection.declaration_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if slot_ids != selection_ids || slots.len() != selections.len() {
+        return Err(preparation_error_with_binding(
+            "product_selection_slot_mismatch",
+            format!(
+                "product selectors do not exactly cover signed product slots for binding `{binding}`"
+            ),
+            LaunchPrepareErrorClass::Caller,
+            Some(binding.to_owned()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod product_selection_preparation_tests {
+    use super::*;
+    use ryeos_state::external_content::products::composition::{
+        ExternalProductSlotDeclaration, ProductSelection, ProductSelectionInput,
+        ProductSelectionTarget,
+    };
+
+    fn slot(id: &str) -> ExternalProductSlotDeclaration {
+        ExternalProductSlotDeclaration {
+            id: id.to_owned(),
+            relationship_ref: "config:test/relationship".to_owned(),
+            relationship: "allowed".to_owned(),
+            kind: ryeos_state::objects::ExternalContentKind::Tree,
+            mount_root: ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime,
+            mount: "runtime".to_owned(),
+        }
+    }
+
+    fn selection(id: &str) -> ProductSelection {
+        ProductSelection {
+            declaration_id: id.to_owned(),
+            witness_hash: "a".repeat(64),
+            witness_source: ryeos_state::external_content::products::transfer::ProductWitnessSource::LocalCapture {},
+            qualification_hash: None,
+        }
+    }
+
+    fn failure_code(result: Result<(), DispatchError>) -> String {
+        let Err(DispatchError::LaunchPreparationFailed { code, .. }) = result else {
+            panic!("selection mismatch must be a typed launch-preparation failure");
+        };
+        code
+    }
+
+    #[test]
+    fn literal_and_slot_selection_contract_is_closed() {
+        assert!(match_product_selections_to_authored_slots("environment", &[], &[]).is_ok());
+        assert_eq!(
+            failure_code(match_product_selections_to_authored_slots(
+                "environment",
+                &[],
+                &[selection("runtime")],
+            )),
+            "product_selection_literal_dependency"
+        );
+        assert_eq!(
+            failure_code(match_product_selections_to_authored_slots(
+                "environment",
+                &[slot("runtime")],
+                &[],
+            )),
+            "product_selection_required"
+        );
+        assert_eq!(
+            failure_code(match_product_selections_to_authored_slots(
+                "environment",
+                &[slot("runtime")],
+                &[selection("other")],
+            )),
+            "product_selection_slot_mismatch"
+        );
+        assert!(
+            match_product_selections_to_authored_slots(
+                "environment",
+                &[slot("runtime")],
+                &[selection("runtime")],
+            )
+            .is_ok()
+        );
+        assert!(
+            match_product_selections_to_authored_slots(
+                "environment",
+                &[slot("one"), slot("two")],
+                &[selection("one"), selection("two")],
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            failure_code(match_product_selections_to_authored_slots(
+                "environment",
+                &[slot("one"), slot("two")],
+                &[selection("one")],
+            )),
+            "product_selection_slot_mismatch"
+        );
+    }
+
+    #[test]
+    fn selectors_are_grouped_by_typed_dependency_without_consuming_root() {
+        let inputs = vec![
+            ProductSelectionInput {
+                target: ProductSelectionTarget::Root {},
+                selection: selection("subject"),
+            },
+            ProductSelectionInput {
+                target: ProductSelectionTarget::ContentDependency {
+                    binding: "environment".to_owned(),
+                },
+                selection: selection("runtime"),
+            },
+            ProductSelectionInput {
+                target: ProductSelectionTarget::ContentDependency {
+                    binding: "environment".to_owned(),
+                },
+                selection: selection("support"),
+            },
+        ];
+        let grouped = content_dependency_product_selections(&inputs);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(
+            grouped["environment"]
+                .iter()
+                .map(|selection| selection.declaration_id.as_str())
+                .collect::<Vec<_>>(),
+            ["runtime", "support"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2447,6 +2894,346 @@ mod content_contract_tests {
         );
         source.allowed_mount_roots.clear();
         assert!(intersect_content_policy(&outer, &source).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ref_binding_projection_tests {
+    use super::*;
+    use ryeos_engine::resolution::TrustClass;
+    use ryeos_engine::runtime_registry::{LaunchItemSpace, RefBindingDecl, RefBindingSource};
+    use serde_json::json;
+
+    fn declaration(required: bool, source: RefBindingSource) -> RefBindingDecl {
+        RefBindingDecl {
+            required,
+            source,
+            project_result_requirement: ProjectResultRequirement::None,
+            allowed_kinds: vec!["config".to_owned()],
+            allowed_spaces: vec![LaunchItemSpace::Bundle, LaunchItemSpace::Project],
+            allowed_trust: vec![TrustClass::TrustedBundle, TrustClass::TrustedProject],
+        }
+    }
+
+    fn code(result: Result<BTreeMap<String, String>, DispatchError>) -> String {
+        let Err(DispatchError::LaunchPreparationFailed { code, .. }) = result else {
+            panic!("projection must fail with a launch-preparation diagnostic");
+        };
+        code
+    }
+
+    #[test]
+    fn project_result_requirement_activates_only_for_present_resolved_bindings() {
+        let mut needs_result = declaration(false, RefBindingSource::Caller);
+        needs_result.project_result_requirement = ProjectResultRequirement::RetainedGeneration;
+        let declarations = BTreeMap::from([
+            ("optional".to_owned(), needs_result),
+            (
+                "ordinary".to_owned(),
+                declaration(false, RefBindingSource::Caller),
+            ),
+        ]);
+        for (names, expected) in [
+            (vec![], ProjectResultRequirement::None),
+            (vec!["ordinary"], ProjectResultRequirement::None),
+            (
+                vec!["optional"],
+                ProjectResultRequirement::RetainedGeneration,
+            ),
+            (
+                vec!["ordinary", "optional"],
+                ProjectResultRequirement::RetainedGeneration,
+            ),
+        ] {
+            let names: Vec<_> = names.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                project_result_requirement_for_bindings(&declarations, &names).unwrap(),
+                expected
+            );
+        }
+        assert!(
+            project_result_requirement_for_bindings(&declarations, &["unknown".to_owned()])
+                .is_err()
+        );
+        let mut required = declarations;
+        required.get_mut("optional").unwrap().required = true;
+        assert!(project_result_requirement_for_bindings(&required, std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn project_result_requirement_revalidation_rejects_cached_or_retained_contradictions() {
+        // Shape-only unit fixture for the shared requirement check, not proof
+        // of real launch admission, descriptor trust or retained realization.
+        let runtime = VerifiedRuntime {
+            canonical_ref: CanonicalRef::parse("runtime:test/graph").unwrap(),
+            raw_content_digest: "a".repeat(64),
+            signer_fingerprint: "b".repeat(64),
+            yaml: serde_yaml::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../bundles/standard/.ai/runtimes/graph-runtime.yaml",
+            )))
+            .unwrap(),
+            trust_class: TrustClass::TrustedBundle,
+            bundle_root: Default::default(),
+            descriptor_path: Default::default(),
+        };
+        let mut prepared = PreparedRuntimeLaunch {
+            project_result_requirement: ProjectResultRequirement::RetainedGeneration,
+            filesystem_authority_ceiling:
+                ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+            network_authority_ceiling:
+                ryeos_engine::isolation::IsolationNetworkAuthorityCeiling::NodePolicy,
+            runtime_data: BTreeMap::new(),
+            required_secrets: Vec::new(),
+            runtime_facts: BTreeMap::new(),
+            binding_records: BTreeMap::from([(
+                "product_recipe".to_owned(),
+                RefBindingLaunchRecord {
+                    canonical_ref: "config:test/recipe".to_owned(),
+                    source_space: ItemSpace::Project,
+                    effective_trust_class: TrustClass::TrustedProject,
+                    resolution: ryeos_engine::resolution::AsLaunchedResolutionDigest {
+                        root: ryeos_engine::resolution::ResolutionDigestNode {
+                            requested_id: "config:test/recipe".to_owned(),
+                            resolved_ref: "config:test/recipe".to_owned(),
+                            source_space: ItemSpace::Project,
+                            source_root: ryeos_engine::contracts::ItemSourceRoot::Search {
+                                label: "fixture".to_owned(),
+                            },
+                            trust_class: TrustClass::TrustedProject,
+                            signer_fingerprint: Some("b".repeat(64)),
+                            raw_content_digest: "c".repeat(64),
+                        },
+                        ancestors: Vec::new(),
+                        referenced_items: Vec::new(),
+                        effective_trust_class: TrustClass::TrustedProject,
+                        policy_facts: Default::default(),
+                    },
+                },
+            )]),
+            execution_dependencies: BTreeMap::new(),
+            content_dependencies: BTreeMap::new(),
+            evidence_attachments: Vec::new(),
+            environment_contributions: BTreeMap::new(),
+            admitted_sessions: BTreeMap::new(),
+            config_contributors: Vec::new(),
+            financial_authority: None,
+            external_effect_authority: None,
+        };
+        validate_prepared_project_result_requirement(&runtime, &prepared).unwrap();
+        prepared.project_result_requirement = ProjectResultRequirement::None;
+        assert!(validate_prepared_project_result_requirement(&runtime, &prepared).is_err());
+        prepared.project_result_requirement = ProjectResultRequirement::RetainedGeneration;
+        prepared.binding_records.clear();
+        assert!(validate_prepared_project_result_requirement(&runtime, &prepared).is_err());
+        prepared.project_result_requirement = ProjectResultRequirement::None;
+        validate_prepared_project_result_requirement(&runtime, &prepared).unwrap();
+        let mut wire = serde_json::to_value(&prepared).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .remove("project_result_requirement");
+        assert!(serde_json::from_value::<PreparedRuntimeLaunch>(wire).is_err());
+    }
+
+    #[test]
+    fn project_result_requirement_uses_existing_retention_and_workspace_ownership() {
+        use ryeos_state::objects::{
+            EnvironmentAuthority, ExecutionProjectAuthority, PinnedProjectRealization,
+            PinnedTerminalPublication,
+        };
+        let hash = "a".repeat(64);
+        for publication in [
+            PinnedTerminalPublication::RetainResult,
+            PinnedTerminalPublication::RetainCurrentHead {
+                principal_key: "b".repeat(64),
+                project_hash: "c".repeat(64),
+                expected_hash: hash.clone(),
+            },
+            PinnedTerminalPublication::AdvanceHead {
+                head_ref: format!("projects/{}/{}/head", "b".repeat(64), "c".repeat(64)),
+                expected_hash: hash.clone(),
+            },
+            PinnedTerminalPublication::Discard,
+        ] {
+            let retained = publication != PinnedTerminalPublication::Discard;
+            let authority = ExecutionProjectAuthority::pinned(
+                "local:/project".to_owned(),
+                None,
+                hash.clone(),
+                PinnedProjectRealization::Cow {
+                    terminal_publication: publication,
+                },
+                EnvironmentAuthority::None,
+                Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                project_result_requirement_satisfied_by_authority(
+                    ProjectResultRequirement::RetainedGeneration,
+                    &authority,
+                    false,
+                ),
+                retained
+            );
+            assert!(!project_result_requirement_satisfied_by_authority(
+                ProjectResultRequirement::RetainedGeneration,
+                &authority,
+                true,
+            ));
+            assert!(project_result_requirement_satisfied_by_authority(
+                ProjectResultRequirement::None,
+                &authority,
+                true,
+            ));
+        }
+        let read_only = ExecutionProjectAuthority::pinned(
+            "local:/project".to_owned(),
+            None,
+            hash,
+            PinnedProjectRealization::ReadOnly,
+            EnvironmentAuthority::None,
+            Vec::new(),
+        )
+        .unwrap();
+        for authority in [read_only, ExecutionProjectAuthority::PROJECTLESS] {
+            assert!(!project_result_requirement_satisfied_by_authority(
+                ProjectResultRequirement::RetainedGeneration,
+                &authority,
+                false,
+            ));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let live = ExecutionProjectAuthority::live(
+            directory.path().to_path_buf(),
+            "local:fixture".to_owned(),
+            ryeos_state::objects::LiveProjectAccess::ReadWrite,
+            ryeos_state::objects::LiveFilesystemConfinement::UnconfinedHost,
+            EnvironmentAuthority::None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!project_result_requirement_satisfied_by_authority(
+            ProjectResultRequirement::RetainedGeneration,
+            &live,
+            false,
+        ));
+        assert!(project_result_requirement_satisfied_by_authority(
+            ProjectResultRequirement::None,
+            &live,
+            false,
+        ));
+    }
+
+    #[test]
+    fn primary_projection_handles_optional_missing_and_required_missing() {
+        let optional = BTreeMap::from([(
+            "recipe".to_owned(),
+            declaration(
+                false,
+                RefBindingSource::PrimaryField {
+                    path: vec!["product_recipe".to_owned()],
+                },
+            ),
+        )]);
+        assert!(
+            project_effective_ref_bindings(&optional, &json!({}), &BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        let mut required = optional;
+        required.get_mut("recipe").unwrap().required = true;
+        assert_eq!(
+            code(project_effective_ref_bindings(
+                &required,
+                &json!({}),
+                &BTreeMap::new()
+            )),
+            "ref_binding_required"
+        );
+    }
+
+    #[test]
+    fn primary_projection_rejects_wrong_type_and_caller_contradiction() {
+        let declarations = BTreeMap::from([(
+            "recipe".to_owned(),
+            declaration(
+                false,
+                RefBindingSource::PrimaryField {
+                    path: vec!["selection".to_owned(), "recipe".to_owned()],
+                },
+            ),
+        )]);
+        assert_eq!(
+            code(project_effective_ref_bindings(
+                &declarations,
+                &json!({"selection":{"recipe":42}}),
+                &BTreeMap::new()
+            )),
+            "ref_binding_primary_field_invalid"
+        );
+        for primary in [
+            json!({"selection":{"recipe":null}}),
+            json!({"selection":42}),
+        ] {
+            assert_eq!(
+                code(project_effective_ref_bindings(
+                    &declarations,
+                    &primary,
+                    &BTreeMap::new()
+                )),
+                "ref_binding_primary_field_invalid"
+            );
+        }
+        assert_eq!(
+            code(project_effective_ref_bindings(
+                &declarations,
+                &json!({"selection":{"recipe":"config:test/one"}}),
+                &BTreeMap::from([("recipe".to_owned(), "config:test/two".to_owned())])
+            )),
+            "ref_binding_source_contradiction"
+        );
+    }
+
+    #[test]
+    fn primary_projection_accepts_same_value_and_rejects_unknown_caller_binding() {
+        let declarations = BTreeMap::from([(
+            "recipe".to_owned(),
+            declaration(
+                false,
+                RefBindingSource::PrimaryField {
+                    path: vec!["product_recipe".to_owned()],
+                },
+            ),
+        )]);
+        let expected = "config:test/one".to_owned();
+        let effective = project_effective_ref_bindings(
+            &declarations,
+            &json!({"product_recipe":expected}),
+            &BTreeMap::from([("recipe".to_owned(), expected.clone())]),
+        )
+        .unwrap();
+        assert_eq!(effective["recipe"], expected);
+        assert_eq!(
+            code(project_effective_ref_bindings(
+                &declarations,
+                &json!({}),
+                &BTreeMap::from([("other".to_owned(), "config:test/one".to_owned())])
+            )),
+            "invalid_ref_binding"
+        );
+    }
+
+    #[test]
+    fn caller_projection_preserves_existing_binding_semantics() {
+        let declarations = BTreeMap::from([(
+            "model".to_owned(),
+            declaration(true, RefBindingSource::Caller),
+        )]);
+        let expected = BTreeMap::from([("model".to_owned(), "config:test/model".to_owned())]);
+        assert_eq!(
+            project_effective_ref_bindings(&declarations, &json!({}), &expected).unwrap(),
+            expected
+        );
     }
 }
 
@@ -2519,7 +3306,7 @@ fn prepared_launch_skeleton_key(
             )
         })?;
     let value = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "request_engine_generation_identity": authority.request_engine_generation_identity,
         "effective_trust_identity": authority.effective_trust_identity,
         "subject_resolution_authority": authority.subject_resolution_authority,
@@ -2538,7 +3325,8 @@ fn prepared_launch_skeleton_key(
         },
         "executor_chain_identity": authority.executor_chain_identity,
         "primary_post_augmentation": &inputs.primary,
-        "ref_bindings": request.ref_bindings,
+        "ref_bindings": &inputs.effective_ref_bindings,
+        "product_selections": &inputs.product_selections,
         "resolved_binding_records": &inputs.binding_records,
         "config_inputs": &inputs.config_inputs,
         "config_dependency_digest": config_dependency_digest,

@@ -1,16 +1,21 @@
 """Focused source-level checks; these do not claim namespace/worker acceptance."""
 
 import copy
+import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[3]
 OWNER = ROOT / ".ai/tools/ryeos/development/authoring-environment-production"
+sys.path.insert(0, str(OWNER / "lib"))
+import utilities
 SPEC = importlib.util.spec_from_file_location("authoring_production", OWNER / "lib/production.py")
 production = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(production)
@@ -52,14 +57,31 @@ class ProductionTests(unittest.TestCase):
         self.root = Path(self.scratch.name)
         self.inputs = self.root / "inputs"
         self.inputs.mkdir()
+        self.built_utilities = self.root / "built-utilities"
+        self.built_utilities.mkdir()
+        self.source_config = {"fixture": "exact utility source contract"}
+        self.support_config = {"support": {"fixture": "exact build support contract"}}
         self.config = {
             "category": "development/ryeos", "name": "authoring-environment-inputs",
             "version": "1.0.0", "schema": production.SCHEMA, "source_date_epoch": 123,
-            "inputs": {}, "files": {}, "relocate": ["environment/bin/zsh"],
+            "inputs": {}, "files": {}, "built_utility_files": {},
+            "relocate": ["environment/bin/zsh"],
             "provenance": {"test": "synthetic bytes; not an executable artifact"},
         }
-        for command in production.REQUIRED_COMMANDS:
-            self.add_file(f"utilities/{command}", f"environment/bin/{command}", mode=0o755)
+        for command in sorted(production.REQUIRED_COMMANDS):
+            target = f"environment/bin/{command}"
+            self.add_file(f"utilities/{command}",
+                          target if command not in production.BUILT_UTILITY_COMMANDS else None,
+                          mode=0o755)
+            if command in production.BUILT_UTILITY_COMMANDS:
+                member = f"bin/{command}"
+                self.add_built_file(member, mode=0o755)
+                self.config["built_utility_files"][target] = member
+        self.add_built_file("licenses/NOTICE")
+        self.add_built_file("corresponding-sources/upstream.tar")
+        self.add_built_file("source-contract.json", production.canonical_json(self.source_config))
+        self.add_built_file("build-evidence.json", production.canonical_json(
+            utilities.build_evidence(self.source_config, self.support_config["support"])))
         self.add_file("licenses/NOTICE", "environment/licenses/NOTICE")
         self.add_file("sources/upstream.tar", "corresponding-sources/upstream.tar")
         for name in production.ELF_TOOLS.values():
@@ -75,15 +97,27 @@ class ProductionTests(unittest.TestCase):
         if target:
             self.config["files"][target] = source
 
+    def add_built_file(self, member, data=b"synthetic built utility", *, mode=0o644):
+        path = self.built_utilities / member
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+
     def assemble(self, name="output", **kwargs):
-        return production.assemble(self.inputs, self.root / name, self.config,
-                                   tools=FakeElfTools(**kwargs))
+        return production.assemble(
+            self.inputs, self.built_utilities, self.root / name, self.config,
+            self.source_config, self.support_config, tools=FakeElfTools(**kwargs))
+
+    def assemble_with_tools(self, name, tools):
+        return production.assemble(
+            self.inputs, self.built_utilities, self.root / name, self.config,
+            self.source_config, self.support_config, tools=tools)
 
     def test_inventory_requires_the_exact_supported_commands(self):
         production.checked_inputs(self.inputs, self.config)
         self.assertEqual(len(production.REQUIRED_COMMANDS), 43)
-        del self.config["files"]["environment/bin/sed"]
-        with self.assertRaisesRegex(ValueError, "command inventory"):
+        del self.config["built_utility_files"]["environment/bin/sed"]
+        with self.assertRaisesRegex(ValueError, "exact finite command map"):
             production.validate_config(self.config)
 
     def test_repeat_production_has_equal_inventory_and_preserves_inputs(self):
@@ -99,7 +133,7 @@ class ProductionTests(unittest.TestCase):
         (self.inputs / "utilities/sed").write_bytes(b"drift")
         tools = FakeElfTools()
         with self.assertRaisesRegex(ValueError, "source bytes or modes"):
-            production.assemble(self.inputs, self.root / "out", self.config, tools=tools)
+            self.assemble_with_tools("out", tools)
         self.assertFalse((self.root / "out").exists())
         self.assertEqual(tools.calls, [])
 
@@ -162,6 +196,19 @@ class ProductionTests(unittest.TestCase):
             self.assemble(corrupt_symbols=True)
         self.assertFalse((self.root / "output/inventory.json").exists())
 
+    def test_relocation_sets_search_policy_before_the_final_interpreter(self):
+        executable = self.inputs / "utilities/zsh"
+        tools = FakeElfTools()
+        production.relocate_elf(executable, tools, production.RUNTIME_ROOT)
+        patchelf_options = [
+            "--set-rpath" if "--set-rpath" in arguments else "--set-interpreter"
+            for name, arguments in tools.calls if name == "patchelf"
+        ]
+        self.assertEqual(patchelf_options, ["--set-rpath", "--set-interpreter"])
+        self.assertEqual(tools.facts(executable)["interpreter"], [
+            production.RUNTIME_ROOT + "/lib/ld-linux-x86-64.so.2",
+        ])
+
     def test_unclosed_interpreter_or_dependency_refuses(self):
         self.assemble()
         class BadTools(FakeElfTools):
@@ -171,7 +218,8 @@ class ProductionTests(unittest.TestCase):
                     result["interpreter"] = ["/usr/lib/host-loader"]
                 return result
         with self.assertRaisesRegex(ValueError, "unclosed interpreter"):
-            production.check_closure(self.root / "output/environment", self.config["files"],
+            production.check_closure(self.root / "output/environment",
+                                     {**self.config["files"], **self.config["built_utility_files"]},
                                      BadTools(), set(), runtime_root=production.RUNTIME_ROOT)
 
     def test_selected_file_links_and_ancestor_links_are_refused(self):
@@ -201,6 +249,52 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             production.validate_config(self.config)
 
+    def test_built_product_metadata_and_selected_bytes_are_required(self):
+        (self.built_utilities / "bin/sed").write_bytes(b"different selected bytes")
+        receipt = self.assemble()
+        self.assertEqual(
+            production.sha256(self.built_utilities / "bin/sed"),
+            production.sha256(self.root / "output/environment/bin/sed"))
+        self.assertIn("built_utility_product_sha256",
+                      json.loads((self.root / "output/provenance.json").read_text()))
+        self.assertGreater(receipt["bytes"], 0)
+        evidence = self.built_utilities / "build-evidence.json"
+        changed = json.loads(evidence.read_text())
+        changed["effects"] = "unverified"
+        evidence.write_bytes(production.canonical_json(changed))
+        with self.assertRaisesRegex(ValueError, "evidence differs"):
+            self.assemble("bad-evidence")
+
+    def test_built_evidence_is_derived_by_the_actual_producer_owner(self):
+        observed = json.loads((self.built_utilities / "build-evidence.json").read_text())
+        expected = utilities.build_evidence(
+            self.source_config, self.support_config["support"])
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            observed["recipe_source_sha256"],
+            production.sha256(OWNER / "lib/utilities.py"))
+        self.assertEqual(
+            observed["support_contract_sha256"],
+            hashlib.sha256(
+                production.canonical_json(self.support_config["support"])).hexdigest())
+        self.assertNotEqual(
+            observed["support_contract_sha256"],
+            hashlib.sha256(production.canonical_json(self.support_config)).hexdigest())
+        self.assertEqual(
+            production.validate_built_utilities(
+                self.built_utilities, self.config,
+                self.source_config, self.support_config),
+            production.input_inventory(self.built_utilities))
+
+    def test_built_product_missing_command_or_extra_top_level_member_refuses(self):
+        (self.built_utilities / "bin/sed").unlink()
+        with self.assertRaisesRegex(ValueError, "incomplete command inventory"):
+            self.assemble("missing-command")
+        self.add_built_file("bin/sed", mode=0o755)
+        self.add_built_file("ambient-helper")
+        with self.assertRaisesRegex(ValueError, "unexpected built utility product member"):
+            self.assemble("extra-member")
+
     def test_missing_sources_or_transformer_is_not_qualified(self):
         changed = copy.deepcopy(self.config)
         del changed["files"]["corresponding-sources/upstream.tar"]
@@ -217,12 +311,15 @@ class ProductionTests(unittest.TestCase):
         self.assertFalse((self.root / "output").exists())
 
     def test_nonexecutable_commands_and_loaders_refuse_before_assembly(self):
-        for source in ("utilities/sed", "lib/ld-linux-x86-64.so.2", production.ELF_TOOLS["loader"]):
+        for source in ("lib/ld-linux-x86-64.so.2", production.ELF_TOOLS["loader"]):
             with self.subTest(source=source):
                 config = copy.deepcopy(self.config)
                 config["inputs"][source]["mode"] = 0o644
                 with self.assertRaisesRegex(ValueError, "executable mode"):
                     production.validate_config(config)
+        (self.built_utilities / "bin/sed").chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            self.assemble("nonexecutable-built")
         self.assertFalse((self.root / "output").exists())
 
     def test_loader_is_required_independently_of_needed_libraries(self):
@@ -233,7 +330,8 @@ class ProductionTests(unittest.TestCase):
         self.assemble()
         (self.root / "output/environment/lib/ld-linux-x86-64.so.2").unlink()
         with self.assertRaises(FileNotFoundError):
-            production.check_closure(self.root / "output/environment", self.config["files"],
+            production.check_closure(self.root / "output/environment",
+                                     {**self.config["files"], **self.config["built_utility_files"]},
                                      FakeElfTools(), set(), runtime_root=production.RUNTIME_ROOT)
 
     def test_loader_cannot_itself_depend_on_another_loader(self):
@@ -244,8 +342,7 @@ class ProductionTests(unittest.TestCase):
                     result["needed"] = ["libc.so.6"]
                 return result
         with self.assertRaisesRegex(ValueError, "independently loadable"):
-            production.assemble(self.inputs, self.root / "output", self.config,
-                                tools=DependentLoader())
+            self.assemble_with_tools("output", DependentLoader())
 
     def test_static_pie_is_not_confused_with_external_runtime_dependencies(self):
         class StaticPieTools(FakeElfTools):
@@ -255,11 +352,11 @@ class ProductionTests(unittest.TestCase):
                     result["dynamic"] = True
                 return result
         before = production.sha256(self.inputs / "utilities/rg")
-        production.assemble(self.inputs, self.root / "output", self.config, tools=StaticPieTools())
+        self.assemble_with_tools("output", StaticPieTools())
         self.assertEqual(before, production.sha256(self.root / "output/environment/bin/rg"))
         self.config["relocate"] = ["environment/bin/rg", "environment/bin/zsh"]
         with self.assertRaisesRegex(ValueError, "only declared dynamic ELF"):
-            production.assemble(self.inputs, self.root / "bad", self.config, tools=StaticPieTools())
+            self.assemble_with_tools("bad", StaticPieTools())
 
     def test_changed_output_cannot_pass_independent_comparison(self):
         first = self.assemble()
@@ -276,7 +373,11 @@ class ProductionTests(unittest.TestCase):
             self.assertIn("network_authority: isolated", source)
             self.assertIn("protocol:ryeos/core/opaque", source)
             self.assertIn("800d4969489634cc", source)
-            self.assertIn("cc090b3d53dd41c0", source)
+            self.assertNotIn("cc090b3d53dd41c0", source)
+            self.assertIn("type: multi", source)
+            self.assertIn("authoring-utility-sources.yaml", source)
+            self.assertIn("authoring-build-support.yaml", source)
+            self.assertIn("built-utilities is selected by that same Graph", source)
             self.assertNotIn("mode: captured", source)
             self.assertNotIn("locator:", source)
             self.assertNotIn("shared_exclusive", source)

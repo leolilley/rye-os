@@ -876,6 +876,7 @@ pub async fn execute_service_verified(
                     state.node_history_policy()?,
                     thread_profile,
                     std::collections::BTreeMap::new(),
+                    Vec::new(),
                     recording.usage_subject.cloned(),
                     recording.usage_subject_asserted_by.map(str::to_owned),
                 )?)

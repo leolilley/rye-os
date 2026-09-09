@@ -8,6 +8,7 @@ pub mod effective_validators;
 pub mod engine;
 pub mod error;
 pub mod execution_contract;
+pub mod execution_evidence;
 pub mod execution_workspace;
 pub mod handlers;
 pub mod history_policy;
@@ -36,7 +37,8 @@ pub mod structured_session_profile;
 // observes the move.
 pub use authority::{capability_cover, isolation, protocols, trust};
 pub use identity::{
-    canonical_ref, effective_program, external_content, external_realization, resolution,
+    canonical_ref, content_dependencies, effective_program, external_content, external_realization,
+    resolution,
 };
 pub use launch::{
     execution_policy, launch_config, launch_envelope_types, launch_preparers, plan_builder,

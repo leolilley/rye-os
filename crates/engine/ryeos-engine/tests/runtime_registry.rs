@@ -117,6 +117,9 @@ launch_contract:
   ref_bindings:
     context:
       required: false
+      project_result_requirement: none
+      source:
+        kind: caller
       allowed_kinds: [directive]
       allowed_spaces: [bundle, project]
       allowed_trust: [trusted_bundle, trusted_project]
@@ -249,6 +252,50 @@ fn parse_runtime_yaml_success() {
     assert_eq!(
         yaml.description.as_deref(),
         Some("Default directive runtime")
+    );
+}
+
+#[test]
+fn ref_binding_source_is_explicit_and_closed() {
+    let missing = FULL_RUNTIME_YAML.replace("      source:\n        kind: caller\n", "");
+    assert!(parse_via_registry(&missing).is_err());
+
+    let unknown = FULL_RUNTIME_YAML.replace(
+        "      source:\n        kind: caller\n",
+        "      source:\n        kind: inferred\n",
+    );
+    assert!(parse_via_registry(&unknown).is_err());
+
+    let projected = FULL_RUNTIME_YAML.replace(
+        "      source:\n        kind: caller\n",
+        "      source:\n        kind: primary_field\n        path: [product_recipe]\n",
+    );
+    let yaml = parse_via_registry(&projected).expect("primary field source parses");
+    assert!(matches!(
+        yaml.launch_contract.ref_bindings["context"].source,
+        ryeos_engine::runtime_registry::RefBindingSource::PrimaryField { ref path }
+            if path == &["product_recipe".to_owned()]
+    ));
+}
+
+#[test]
+fn ref_binding_project_result_requirement_is_explicit_and_closed() {
+    let field = "      project_result_requirement: none\n";
+    assert!(parse_via_registry(&FULL_RUNTIME_YAML.replace(field, "")).is_err());
+    assert!(
+        parse_via_registry(
+            &FULL_RUNTIME_YAML.replace(field, "      project_result_requirement: auto\n")
+        )
+        .is_err()
+    );
+    let yaml = parse_via_registry(&FULL_RUNTIME_YAML.replace(
+        field,
+        "      project_result_requirement: retained_generation\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        yaml.launch_contract.ref_bindings["context"].project_result_requirement,
+        ryeos_engine::runtime_registry::ProjectResultRequirement::RetainedGeneration,
     );
 }
 

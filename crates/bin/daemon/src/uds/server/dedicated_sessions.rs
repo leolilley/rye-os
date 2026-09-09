@@ -554,6 +554,8 @@ fn create_dedicated_runtime_workspace(
         .bind_execution_workspace(WorkspaceBinding {
             workspace_id,
             thread_id,
+            workspace_output_partition_identity: None,
+            base_output_capture_hash: None,
             launch_owner: Some(launch_owner),
             backend_id: Some(&evidence.backend_id),
             backend_version: Some(&evidence.backend_version),
@@ -732,6 +734,14 @@ pub(super) async fn start(
     cap: &CallbackCapability,
 ) -> Result<Value> {
     require_start_authority(state, cap)?;
+    if cap
+        .provenance
+        .project_authority()
+        .workspace_outputs()
+        .is_some()
+    {
+        bail!("session-bound candidate disposition does not admit workspace output partitions");
+    }
     let request: DedicatedSessionStartRequest = serde_json::from_value(params.clone())?;
     if request.thread_id != cap.thread_id {
         bail!("dedicated-session start is restricted to the callback root");

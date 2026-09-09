@@ -136,21 +136,31 @@ class BuildSupportTests(unittest.TestCase):
         self.assertIn('work = Path("/tmp/build-support-probe")', fixture)
         self.assertNotIn('work = products /', fixture)
 
-    def test_support_selection_matches_observed_assembly_not_full_build_claim(self):
+    def test_support_selection_matches_current_observed_producer_contract(self):
         import hashlib
         import yaml
         config = yaml.safe_load((ROOT / ".ai/config/development/ryeos/"
                                  "authoring-build-support.yaml").read_text())
+        inputs = yaml.safe_load((ROOT / ".ai/config/development/ryeos/"
+                                 "authoring-build-support-inputs.yaml").read_text())
         evidence = json.loads((ROOT / "tests/e2e/authoring-environment/"
                                "build-support-qualification.json").read_text())
         support = config["support"]
-        assembly = evidence["support_with_tee"]["assembly"]
+        assembly = evidence["current_support_contract"]
         self.assertEqual(hashlib.sha256(production.canonical_json(support["inputs"])).hexdigest(),
                          assembly["inventory_sha256"])
+        self.assertEqual(hashlib.sha256(production.canonical_json(inputs)).hexdigest(),
+                         assembly["input_contract_sha256"])
         self.assertEqual(len(support["inputs"]), assembly["files"])
         self.assertEqual(sum(v["bytes"] for v in support["inputs"].values()),
                          assembly["bytes"])
+        self.assertRegex(assembly["product_witness_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(assembly["product_manifest_hash"], r"^[0-9a-f]{64}$")
         self.assertIn("tee", support["commands"])
+        # Preserve the earlier full build proof as historical evidence. The
+        # current record refreshes only the exact support output contract.
+        self.assertEqual(evidence["support_with_tee"]["assembly"]["inventory_sha256"],
+                         "e160361010e018c512ae7559e937c5bc3ea7594e92b5ae2beae84ff9556b4ec6")
         self.assertTrue(evidence["gates"]["fresh_utility_build"])
         self.assertTrue(evidence["support_with_tee"]["fresh_utility_build_pass"]["git_runtime_shell_verified"])
         self.assertFalse(evidence["gates"]["worker_driven_development"])
@@ -172,7 +182,9 @@ class BuildSupportTests(unittest.TestCase):
                       "filesystem_authority", "workspace_access", "config_schema", "config_resolve"):
             self.assertEqual(tool_header[field], contract[field])
         self.assertEqual(tool_header["external_content"],
-                         [entry for entry in contract["external_content"] if entry["id"] != "authoring-tools"])
+                         [entry for entry in contract["external_content"]
+                          if entry["id"] not in {"authoring-tools", "authoring-build-support"}])
+        self.assertIn("authoring-build-support is selected by the enclosing producer Graph", tool)
         self.assertIn("from utility_production import main", tool)
         self.assertNotIn("build_utilities(", tool)
         execution = yaml.safe_load((ROOT / ".ai/config/execution/execution.yaml").read_text())

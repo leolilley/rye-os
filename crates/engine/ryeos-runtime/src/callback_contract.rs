@@ -22,6 +22,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use ryeos_effect_contract::{DispatchResultProjection, RetainedEffectResult};
+
 /// Runtime-neutral provenance for one callback-dispatched action.
 ///
 /// The daemon owns this statement. Kind runtimes may project it into their
@@ -40,6 +42,9 @@ pub struct RuntimeDispatchEvidence {
     pub record_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_from: Option<String>,
+    /// Selects the owner of the callback-visible result contract. This is
+    /// daemon evidence, never inferred from the returned JSON or item kind.
+    pub result_projection: DispatchResultProjection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +73,7 @@ pub enum RuntimeDispatchPublication {
 
 impl RuntimeDispatchEvidence {
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.result_projection.validate()?;
         for (field, value) in [
             ("dispatch action digest", Some(self.action_digest.as_str())),
             ("dispatch effect identity", self.effect_identity.as_deref()),
@@ -111,7 +117,92 @@ impl RuntimeDispatchEvidence {
                 && self.replayed_from.is_none() => {}
             _ => anyhow::bail!("dispatch evidence fields are mutually inconsistent"),
         }
+        if matches!(
+            &self.result_projection,
+            DispatchResultProjection::RetainedEffect { .. }
+        ) && !matches!(
+            (self.source, self.effect_class),
+            (
+                RuntimeDispatchSource::Executed | RuntimeDispatchSource::EffectRecord,
+                RuntimeDispatchEffectClass::Recorded | RuntimeDispatchEffectClass::Sealed,
+            )
+        ) {
+            anyhow::bail!(
+                "a retained-effect result projection requires durable executed or replay evidence"
+            );
+        }
         Ok(())
+    }
+
+    /// Validate and project the daemon-owned retained answer, when selected.
+    ///
+    /// The envelope remains the existing bounded subprocess-shaped leaf wire;
+    /// this authority changes who owns its result, not its transport. The
+    /// accepted value must hash to the retained CAS object before a runtime can
+    /// expose it to authored control flow.
+    pub fn retained_effect_result(
+        &self,
+        value: &Value,
+    ) -> anyhow::Result<Option<ValidatedRetainedEffectResult>> {
+        self.validate()?;
+        let DispatchResultProjection::RetainedEffect { retained_result } = &self.result_projection
+        else {
+            return Ok(None);
+        };
+        let envelope: RetainedEffectEnvelope = serde_json::from_value(value.clone())
+            .map_err(|error| anyhow::anyhow!("invalid retained-effect result envelope: {error}"))?;
+        if envelope.outcome_code.0.is_some() {
+            anyhow::bail!("retained-effect result envelope must carry null outcome_code");
+        }
+        if !envelope.error.is_null() {
+            anyhow::bail!("retained-effect result envelope must carry null error");
+        }
+        if !envelope.artifacts.is_empty() {
+            anyhow::bail!("retained-effect result envelope must not carry artifacts");
+        }
+        if envelope.replayed_from != self.replayed_from {
+            anyhow::bail!("retained-effect result replay provenance contradicts dispatch evidence");
+        }
+        let result_digest = ryeos_effect_contract::canonical_value_digest(&envelope.result)?;
+        if result_digest != retained_result.object_hash() {
+            anyhow::bail!("retained-effect result does not match its admitted object hash");
+        }
+        Ok(Some(ValidatedRetainedEffectResult {
+            result: envelope.result,
+            replayed_from: envelope.replayed_from,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedRetainedEffectResult {
+    pub result: Value,
+    pub replayed_from: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedEffectEnvelope {
+    outcome_code: RequiredNullableString,
+    result: Value,
+    error: Value,
+    artifacts: Vec<Value>,
+    #[serde(default)]
+    replayed_from: Option<String>,
+}
+
+#[derive(Debug)]
+struct RequiredNullableString(Option<String>);
+
+impl<'de> Deserialize<'de> for RequiredNullableString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        serde_json::from_value(value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -174,6 +265,7 @@ mod tests {
             publication: RuntimeDispatchPublication::NotApplicable,
             record_hash: None,
             replayed_from: None,
+            result_projection: DispatchResultProjection::DispatchedSubject,
         }
     }
 
@@ -241,6 +333,81 @@ mod tests {
         assert!(
             msg.contains("data") || msg.contains("status") || msg.contains("unknown field"),
             "expected deny_unknown_fields error mentioning the old field, got: {msg}"
+        );
+    }
+
+    fn retained_dispatch(replayed: bool, object_hash: String) -> RuntimeDispatchEvidence {
+        let record_hash = "cd".repeat(32);
+        RuntimeDispatchEvidence {
+            source: if replayed {
+                RuntimeDispatchSource::EffectRecord
+            } else {
+                RuntimeDispatchSource::Executed
+            },
+            effect_class: RuntimeDispatchEffectClass::Recorded,
+            action_digest: "ab".repeat(32),
+            effect_identity: Some("bc".repeat(32)),
+            publication: if replayed {
+                RuntimeDispatchPublication::NotApplicable
+            } else {
+                RuntimeDispatchPublication::Inserted
+            },
+            record_hash: Some(record_hash.clone()),
+            replayed_from: replayed.then_some(record_hash),
+            result_projection: DispatchResultProjection::RetainedEffect {
+                retained_result: RetainedEffectResult::ProductBuildAcceptedResult { object_hash },
+            },
+        }
+    }
+
+    #[test]
+    fn retained_effect_projection_requires_exact_value_and_replay_evidence() {
+        let result = json!({"products": [{"name": "runtime"}]});
+        let object_hash = ryeos_effect_contract::canonical_value_digest(&result).unwrap();
+        for replayed in [false, true] {
+            let evidence = retained_dispatch(replayed, object_hash.clone());
+            let envelope = json!({
+                "outcome_code": null,
+                "result": result,
+                "error": null,
+                "artifacts": [],
+                "replayed_from": replayed.then(|| "cd".repeat(32)),
+            });
+            let projected = evidence
+                .retained_effect_result(&envelope)
+                .unwrap()
+                .expect("retained projection");
+            assert_eq!(projected.result, result);
+            assert_eq!(projected.replayed_from, evidence.replayed_from);
+
+            let mut changed = envelope.clone();
+            changed["result"]["products"][0]["name"] = json!("other");
+            assert!(evidence.retained_effect_result(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn retained_effect_projection_refuses_live_or_unbound_transport() {
+        let result = json!({"products": []});
+        let object_hash = ryeos_effect_contract::canonical_value_digest(&result).unwrap();
+        let mut evidence = retained_dispatch(false, object_hash);
+        evidence.effect_class = RuntimeDispatchEffectClass::Live;
+        evidence.effect_identity = None;
+        evidence.record_hash = None;
+        evidence.publication = RuntimeDispatchPublication::NotApplicable;
+        assert!(evidence.validate().is_err());
+
+        let evidence = retained_dispatch(false, "ab".repeat(32));
+        assert!(
+            evidence
+                .retained_effect_result(&json!({
+                    "outcome_code": null,
+                    "result": {"products": []},
+                    "error": null,
+                    "artifacts": [],
+                    "unexpected": true,
+                }))
+                .is_err()
         );
     }
 }

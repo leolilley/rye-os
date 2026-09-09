@@ -1,18 +1,19 @@
-# ryeos:signed:2026-09-07T04:44:03Z:5200cbd2aa599c680101cc470fab11dff0926041bbb097bab71f8ef682d9d006:wW6+mQg57AHV8wQYw1N4jRlV33NWw0KmkC0yHJXdH7lRYD5GHsT67HC6NSyN9eCogj3Hb0RAg9Q74xU/F5DHCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:36:34Z:a3c6a3b378642d56f782ed0595f0889b2ea74a89917b0b2f7de48c6567197971:FZYTWmoWxbj/7RrTnlZdFc0tGb5JAxroETNBbVIR7X7css/oyHXvneuBFFoLl/rJMHqWu3dDP5nem7wqbzZMDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 # Root authoring and child operations are separate admitted programs. This
 # environment requests only the finite project operations below. Their ordinary
 # installed execution has been qualified; worker-to-child acceptance is a
 # separate gate. Compiler/dependency trees remain child-owned external content.
 category: development/ryeos
-schema: ryeos.worker_environment.v4
-worker_ref: worker:codex/hosted-authoring
-external_content:
+schema: ryeos.worker_environment.v5
+external_product_slots:
   - id: authoring-tools
+    relationship_ref: config:development/ryeos/authoring-environment-products
+    relationship: runtime_to_authoring_worker
     kind: tree
-    mode: pinned
-    digest: 1ca7a7fe9ecc1d19c38c986ba9df435ff7bbe6d4ba020f2643564b8bba0c84e6
     mount_root: execution_runtime
     mount: authoring-tools
+worker_ref: worker:codex/hosted-authoring
+external_content:
   - id: workload-client
     kind: tree
     mode: pinned

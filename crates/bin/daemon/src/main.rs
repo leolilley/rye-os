@@ -1840,6 +1840,19 @@ fn ensure_recovery_targets_classified(state: &AppState, targets: &BTreeSet<Strin
         {
             continue;
         }
+        // A retained workspace journal is a durable quarantine owner, not
+        // permission to resume or clean up. Recheck its exact retained state;
+        // neither an in-memory blocked set nor a NULL PID grants this status.
+        if state
+            .state_store
+            .has_retained_workspace_quarantine(thread_id)?
+        {
+            tracing::warn!(
+                thread_id,
+                "recovery target remains workspace-quarantined; execution and cleanup stay fenced"
+            );
+            continue;
+        }
         anyhow::bail!(
             "recovery target {thread_id} reached readiness without terminal state, a verified live process, an active daemon handler, or durable claim/wait/follow/handoff/window ownership"
         );
@@ -2304,6 +2317,33 @@ async fn supervise_background_tasks(
     }
 }
 
+/// Called only after the shutdown process owner proves exact group death.
+/// The waiting task may have relinquished its launch owner during shutdown;
+/// both existing settlement paths compare the same attachment and binding.
+/// If descendants or another owner still retain contact, preserve the identity
+/// for cold recovery instead of detaching it independently of membership.
+fn settle_shutdown_process(
+    state: &AppState,
+    thread_id: &str,
+    identity: &process::ExecutionProcessIdentity,
+) -> Result<bool> {
+    if let Some(binding) = state.state_store.thread_workspace_binding(thread_id)? {
+        if state
+            .state_store
+            .settle_reaped_thread_workspace_owned(thread_id, &binding, identity)?
+        {
+            return Ok(true);
+        }
+        state
+            .state_store
+            .settle_dead_thread_workspace_if_matches(thread_id, &binding, identity)
+    } else {
+        state
+            .state_store
+            .clear_thread_process_if_matches(thread_id, identity)
+    }
+}
+
 async fn drain_running_threads(state: &AppState) -> bool {
     // Serialize shutdown against every future UDS/internal attachment. An
     // attach that committed first appears below; one that arrives later is
@@ -2429,15 +2469,22 @@ async fn drain_running_threads(state: &AppState) -> bool {
             );
             continue;
         }
-        let detached = match state
-            .state_store
-            .clear_thread_process_if_matches(&thread_id, &identity)
-        {
+        let detached = match settle_shutdown_process(state, &thread_id, &identity) {
             Ok(true) => true,
             Ok(false) => match state.state_store.get_thread(&thread_id) {
-                Ok(Some(current)) if current.runtime.process_identity.is_none() => true,
+                Ok(Some(current)) if current.runtime.process_identity.is_none() => {
+                    // A concurrent clear is settlement only when it also
+                    // released membership. Old NULL-PID borrowers stay fenced.
+                    matches!(
+                        state.state_store.thread_workspace_binding(&thread_id),
+                        Ok(None)
+                    )
+                }
                 Ok(Some(_)) => {
-                    tracing::warn!(thread_id, "shutdown identity changed before clear");
+                    tracing::warn!(
+                        thread_id,
+                        "shutdown retains exact process authority for unsettled workspace recovery or a changed attachment"
+                    );
                     false
                 }
                 Ok(None) => true,

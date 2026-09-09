@@ -37,6 +37,8 @@ pub mod events_replay;
 pub mod external_content_activate;
 pub mod external_content_bind;
 pub mod external_content_import;
+pub mod external_content_product_receive;
+pub mod external_content_products;
 pub mod external_content_release;
 pub mod external_content_scrub;
 pub mod federated_follow;
@@ -57,8 +59,8 @@ pub mod objects_get;
 pub mod objects_has;
 pub mod objects_put;
 pub mod project_apply_snapshot;
-pub mod project_status;
 pub mod project_snapshot_status;
+pub mod project_status;
 pub mod push_head;
 pub mod rebuild;
 pub mod remote_admit;
@@ -169,6 +171,11 @@ pub const ALL: &[ServiceDescriptor] = &[
     events_replay::DESCRIPTOR,
     events_chain_replay::DESCRIPTOR,
     external_content_import::DESCRIPTOR,
+    external_content_product_receive::DESCRIPTOR,
+    external_content_products::CAPTURE_DESCRIPTOR,
+    external_content_products::GET_DESCRIPTOR,
+    external_content_products::COMPOSE_DESCRIPTOR,
+    external_content_products::QUALIFY_DESCRIPTOR,
     external_content_activate::DESCRIPTOR,
     external_content_bind::DESCRIPTOR,
     external_content_release::DESCRIPTOR,

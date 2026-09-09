@@ -31,7 +31,9 @@ use super::{
 // v25 retains independently enforced receiving-kind content contracts in the
 // prepared launch, alongside the intersected source/runtime content policy.
 // v24 is already allocated to the coordinating fixed-parent confinement cut.
-pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 25;
+// v27 admits the complete typed root/dependency product-selection list.
+// v28 retains exact product receipt proofs separately from semantic program identity.
+pub const ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION: u32 = 28;
 pub const ADMITTED_DIRECT_COMMAND_ROOT: &str = "/ryeos/admitted-direct-command";
 pub const ADMITTED_DIRECT_PROJECT_ROOT: &str = "/ryeos/admitted-project";
 
@@ -55,6 +57,7 @@ const SEALED_ROOT_INVOCATION_FIELDS: &[&str] = &[
     "project_authority",
     "project_binding_subject_authority",
     "project_context",
+    "product_selections",
     "ref_bindings",
     "resolved_ref_bindings",
     "requested_by",
@@ -206,7 +209,7 @@ fn retained_resolution_projection(value: &serde_json::Value) -> anyhow::Result<s
         edge.remove("to_source_path")
             .ok_or_else(|| anyhow::anyhow!("sealed resolution edge has no to_source_path"))?;
     }
-    Ok(retained)
+    crate::external_content::products::composition::project_resolution_product_selections_for_identity(&retained)
 }
 
 fn admitted_subject_projection(value: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -331,6 +334,19 @@ pub fn project_sealed_root_exact_program(
             .ok_or_else(|| anyhow::anyhow!("sealed invocation has no resolution_output"))?,
     )?;
     object.insert("resolution_output".to_string(), resolution);
+    let selectors: crate::external_content::products::composition::ProductSelectionInputs =
+        serde_json::from_value(
+            object
+                .get("product_selections")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("sealed invocation has no product selections"))?,
+        )?;
+    object.insert(
+        "product_selections".to_owned(),
+        crate::external_content::products::composition::product_selection_inputs_semantic_identity(
+            &selectors,
+        )?,
+    );
     Ok(program)
 }
 
@@ -1012,6 +1028,80 @@ impl AdmittedLaunchAuthority {
         Ok(lillux::sha256_hex(
             lillux::canonical_json(&serde_json::to_value(&self.artifact_identity)?)?.as_bytes(),
         ))
+    }
+
+    /// Reusable product-build authority, distinct from exact recovery authority.
+    /// Budget identifiers name this attempt's reservation owners; they do not
+    /// change an already successful build's answer. Keep the financial site,
+    /// ledger generation and presence of a narrower directive scope, together
+    /// with every program, material, project and permission field. Limits stay
+    /// sealed in the execution closure. This never authorizes a reservation or
+    /// substitutes for `digest()` during recovery or payment settlement.
+    pub fn product_build_replay_digest(&self) -> anyhow::Result<String> {
+        self.validate()?;
+        #[derive(Serialize)]
+        struct AccountingAuthority<'a> {
+            budget_authority_site_id: &'a str,
+            ledger_epoch: u64,
+            directive_budget_scope_present: bool,
+        }
+        #[derive(Serialize)]
+        struct ReplayAuthority<'a> {
+            schema: &'static str,
+            exact_program_hash: &'a str,
+            project_authority: &'a ExecutionProjectAuthority,
+            lifecycle_authority: &'a ExecutionLifecycleAuthority,
+            launch_driver: &'a ExecutionLaunchDriver,
+            artifact_identity: &'a AdmittedLaunchArtifactIdentity,
+            execution_closure: &'a AdmittedExecutionClosure,
+            accounting_authority: Option<AccountingAuthority<'a>>,
+            effective_caps: &'a [String],
+            parent_delegation_caps: &'a Option<Vec<String>>,
+            runtime_ref: &'a str,
+            executor_ref: &'a str,
+        }
+        // Exhaustive destructuring makes new authority fields a compile-time
+        // review requirement rather than silently omitting them from reuse.
+        let Self {
+            exact_program_hash,
+            project_authority,
+            lifecycle_authority,
+            launch_driver,
+            artifact_identity,
+            execution_closure,
+            accounting_scope,
+            effective_caps,
+            parent_delegation_caps,
+            runtime_ref,
+            executor_ref,
+        } = self;
+        let accounting_authority = accounting_scope.as_ref().map(|scope| {
+            let AdmittedAccountingScope {
+                budget_authority_site_id,
+                ledger_epoch,
+                execution_budget_id: _,
+                directive_budget_id,
+            } = scope;
+            AccountingAuthority {
+                budget_authority_site_id,
+                ledger_epoch: *ledger_epoch,
+                directive_budget_scope_present: directive_budget_id.is_some(),
+            }
+        });
+        super::canonical_value_digest(&serde_json::to_value(ReplayAuthority {
+            schema: "ryeos.product_build_replay_authority.v1",
+            exact_program_hash,
+            project_authority,
+            lifecycle_authority,
+            launch_driver,
+            artifact_identity,
+            execution_closure,
+            accounting_authority,
+            effective_caps,
+            parent_delegation_caps,
+            runtime_ref,
+            executor_ref,
+        })?)
     }
 
     pub fn execution_closure_digest(&self) -> anyhow::Result<String> {
@@ -1906,7 +1996,7 @@ mod tests {
             "source_content_digest": source_digest,
             "raw_content_digest": source_digest,
         });
-        let sealed_invocation = serde_json::json!({
+        let mut sealed_invocation = serde_json::json!({
             "schema_version": 13,
             "kind": "fixture",
             "item_ref": item_ref,
@@ -1982,6 +2072,10 @@ mod tests {
             "captured_history_policy": {"retention":"durable"},
             "candidate_evaluation": null,
         });
+        sealed_invocation
+            .as_object_mut()
+            .unwrap()
+            .insert("product_selections".to_owned(), serde_json::json!([]));
         let exact_program = project_sealed_root_exact_program(&sealed_invocation).unwrap();
         let exact_program_hash =
             lillux::sha256_hex(lillux::canonical_json(&exact_program).unwrap().as_bytes());
@@ -2189,6 +2283,66 @@ mod tests {
     }
 
     #[test]
+    fn product_receipt_changes_sealed_authority_without_changing_exact_program() {
+        use crate::external_content::products::composition::*;
+        use crate::external_content::products::transfer::ProductWitnessSource;
+        let evidence = crate::external_content::products::qualification::tests::dynamic_evidence();
+        let selections = evidence.verifier_root_selections.unwrap();
+        let (id, selection) = selections.iter().next().unwrap();
+        let raw = ProductSelectionInput {
+            target: ProductSelectionTarget::Root {},
+            selection: ProductSelection {
+                declaration_id: id.clone(),
+                witness_hash: selection.witness_hash.clone(),
+                witness_source: ProductWitnessSource::LocalCapture {},
+                qualification_hash: None,
+            },
+        };
+        let (mut local, _, _) =
+            sealed_invocation_fixture("tool:test/run", "runtime:direct", "tool:test/executor");
+        local["product_selections"] = serde_json::to_value(vec![raw]).unwrap();
+        local["resolution_output"]["composed"]["derived"]
+            [EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY] = serde_json::to_value(&selections).unwrap();
+        let expected = project_sealed_root_exact_program(&local).unwrap();
+        let mut received = local.clone();
+        let source = serde_json::json!({"kind":"received", "acceptance_hash":"a".repeat(64)});
+        received["product_selections"][0]["selection"]["witness_source"] = source.clone();
+        received["resolution_output"]["composed"]["derived"]
+            [EXTERNAL_PRODUCT_SELECTIONS_DERIVED_KEY][id]["witness_source"] = source;
+        assert_ne!(
+            crate::objects::canonical_value_digest(&local).unwrap(),
+            crate::objects::canonical_value_digest(&received).unwrap()
+        );
+        assert_eq!(
+            expected,
+            project_sealed_root_exact_program(&received).unwrap()
+        );
+        received["product_selections"][0]["selection"]["witness_source"]["acceptance_hash"] =
+            serde_json::json!("bad");
+        assert!(project_sealed_root_exact_program(&received).is_err());
+    }
+
+    #[test]
+    fn exact_program_projection_requires_current_product_selection_field() {
+        let (invocation, _, _) =
+            sealed_invocation_fixture("tool:test/run", "runtime:direct", "tool:test/executor");
+        assert!(invocation.get("product_selections").is_some());
+        project_sealed_root_exact_program(&invocation).unwrap();
+
+        let mut missing = invocation;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("product_selections");
+        assert!(
+            project_sealed_root_exact_program(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("must contain exactly")
+        );
+    }
+
+    #[test]
     fn exact_program_commits_resolved_ref_binding_content_identity() {
         let (mut invocation, original, _) =
             sealed_invocation_fixture("tool:test/run", "runtime:direct", "tool:test/executor");
@@ -2283,6 +2437,62 @@ mod tests {
         });
         let decoded = AdmittedLaunchCapsule::from_current_value(expected.to_value()).unwrap();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn product_replay_excludes_attempt_budget_ids_but_keeps_recovery_and_authority_exact() {
+        let mut authority = managed_capsule(serde_json::json!({})).launch_authority();
+        authority.accounting_scope = Some(AdmittedAccountingScope {
+            budget_authority_site_id: "site:test".into(),
+            ledger_epoch: 7,
+            execution_budget_id: "budget:first".into(),
+            directive_budget_id: Some("directive:first".into()),
+        });
+        let exact = authority.digest().unwrap();
+        let reusable = authority.product_build_replay_digest().unwrap();
+        let mut next = authority.clone();
+        let scope = next.accounting_scope.as_mut().unwrap();
+        scope.execution_budget_id = "budget:second".into();
+        scope.directive_budget_id = Some("directive:second".into());
+        assert_ne!(exact, next.digest().unwrap());
+        assert_eq!(reusable, next.product_build_replay_digest().unwrap());
+        for change in 0..8 {
+            let mut changed = authority.clone();
+            match change {
+                0 => changed.accounting_scope.as_mut().unwrap().ledger_epoch += 1,
+                1 => {
+                    changed
+                        .accounting_scope
+                        .as_mut()
+                        .unwrap()
+                        .budget_authority_site_id = "site:other".into()
+                }
+                2 => {
+                    changed
+                        .accounting_scope
+                        .as_mut()
+                        .unwrap()
+                        .directive_budget_id = None
+                }
+                3 => changed.accounting_scope = None,
+                4 => changed.effective_caps.push("ryeos.test.additional".into()),
+                5 => changed.parent_delegation_caps = Some(vec!["ryeos.test.delegate".into()]),
+                6 => changed.exact_program_hash = "f".repeat(64),
+                7 => changed.runtime_ref = "runtime:test/other".into(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                reusable,
+                changed.product_build_replay_digest().unwrap(),
+                "authority change {change}"
+            );
+        }
+        next.accounting_scope
+            .as_mut()
+            .unwrap()
+            .execution_budget_id
+            .clear();
+        assert!(next.product_build_replay_digest().is_err());
     }
 
     #[test]

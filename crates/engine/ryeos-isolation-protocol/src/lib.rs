@@ -8,7 +8,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAcc
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v7";
+pub const ISOLATION_ADAPTER_PROTOCOL: &str = "ryeos.isolation-adapter/v9";
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_WORKSPACE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -22,6 +22,7 @@ pub const MAX_ARGUMENTS: usize = 4096;
 pub const MAX_STRING_BYTES: usize = 64 * 1024;
 pub const MAX_DIAGNOSTIC_DETAILS: usize = 128;
 pub const MAX_WORKSPACE_MUTATIONS: usize = 100_000;
+pub const MAX_WORKSPACE_SYMLINK_TARGET_BYTES: usize = 4096;
 pub const MAX_JSON_DEPTH: usize = 64;
 
 /// Decode an isolation protocol document while rejecting duplicate object
@@ -151,7 +152,7 @@ impl<'de> Visitor<'de> for StrictJsonValueVisitor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IsolationAdapterProtocolVersion {
-    #[serde(rename = "ryeos.isolation-adapter/v7")]
+    #[serde(rename = "ryeos.isolation-adapter/v9")]
     Current,
 }
 
@@ -353,6 +354,7 @@ pub enum IsolationAuthorityPurpose {
     WorkspaceProject,
     WorkspaceBackendState,
     WorkspaceView,
+    WorkspaceViewDescendant,
     TargetDuplexChannel,
 }
 
@@ -471,6 +473,20 @@ pub struct IsolationProjectWorkspace {
     /// Digest of the exact descriptor's existing opaque directory identity.
     pub view_descriptor_identity: String,
     pub destination: IsolationPath,
+    /// Exact writable aliases of directories belonging to this retained view.
+    /// They are not host-located ordinary mount sources.
+    pub writable_descendant_mounts: Vec<IsolationWorkspaceDescendantMount>,
+}
+
+/// One descriptor-proven member of the enclosing workspace. Access is always
+/// writable at layer 10; callers cannot turn this relationship into another
+/// mount class or select a different overlay ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationWorkspaceDescendantMount {
+    pub source: IsolationAuthorityId,
+    pub relative_path: String,
+    pub destination: IsolationPath,
 }
 
 /// One daemon-owned connected duplex channel delivered at a fixed target
@@ -556,7 +572,11 @@ impl IsolationPlan {
         if authorities.len() > MAX_AUTHORITIES {
             return Err(ProtocolValidationError::new("too many authorities"));
         }
-        if self.mounts.len() > MAX_MOUNTS {
+        let descendant_count = self
+            .project_workspace
+            .as_ref()
+            .map_or(0, |workspace| workspace.writable_descendant_mounts.len());
+        if self.mounts.len().saturating_add(descendant_count) > MAX_MOUNTS {
             return Err(ProtocolValidationError::new("too many mounts"));
         }
         if self.fixed_parent_views.len() > MAX_MOUNTS {
@@ -745,6 +765,44 @@ impl IsolationPlan {
                 ));
             }
             used_authorities.insert(workspace.view.clone());
+            let mut previous_destination = None;
+            let mut descendant_sources = BTreeSet::new();
+            for descendant in &workspace.writable_descendant_mounts {
+                validate_relative_path("workspace descendant", &descendant.relative_path)?;
+                if authority_ids.get(&descendant.source)
+                    != Some(&IsolationAuthorityPurpose::WorkspaceViewDescendant)
+                    || !descendant_sources.insert(&descendant.source)
+                {
+                    return Err(ProtocolValidationError::new(
+                        "workspace descendant requires one unique descendant authority",
+                    ));
+                }
+                if previous_destination.is_some_and(|previous| previous >= &descendant.destination)
+                {
+                    return Err(ProtocolValidationError::new(
+                        "workspace descendants must have unique destination-sorted entries",
+                    ));
+                }
+                previous_destination = Some(&descendant.destination);
+                let destination = std::path::Path::new(descendant.destination.as_str());
+                let overlaps = |other: &IsolationPath| {
+                    let other = std::path::Path::new(other.as_str());
+                    destination.starts_with(other) || other.starts_with(destination)
+                };
+                if destination == std::path::Path::new("/")
+                    || destination.starts_with("/proc")
+                    || overlaps(&workspace.destination)
+                    || self.mounts.iter().any(|mount| overlaps(&mount.destination))
+                    || workspace.writable_descendant_mounts.iter().any(|other| {
+                        other.source != descendant.source && overlaps(&other.destination)
+                    })
+                {
+                    return Err(ProtocolValidationError::new(
+                        "workspace descendant destination conflicts with another namespace authority",
+                    ));
+                }
+                used_authorities.insert(descendant.source.clone());
+            }
             if self
                 .mounts
                 .iter()
@@ -852,6 +910,10 @@ impl IsolationPlan {
             .mounts
             .iter()
             .any(|mount| mount.access == IsolationMountAccess::Writable)
+            || self
+                .project_workspace
+                .as_ref()
+                .is_some_and(|workspace| !workspace.writable_descendant_mounts.is_empty())
         {
             capabilities.insert(IsolationCapability::FilesystemFdWritable);
         }
@@ -1081,7 +1143,7 @@ impl AdapterWorkspaceRequest {
     }
 }
 
-/// Explicit null is part of v7, not a missing-field predecessor fallback.
+/// Explicit null is part of the current protocol, not a missing-field predecessor fallback.
 fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1112,6 +1174,7 @@ impl WorkspaceViewTransferReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceMutationKind {
     UpsertRegular,
+    UpsertSymlink,
     DeletePath,
     EnsureDirectory,
     OpaqueDirectory,
@@ -1128,6 +1191,10 @@ pub struct WorkspaceMutation {
     pub size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// Exact relative link bytes, never a followed target or a content digest.
+    /// Required-null on every non-symlink mutation in the current protocol.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub target: Option<String>,
 }
 
 impl WorkspaceMutation {
@@ -1136,6 +1203,7 @@ impl WorkspaceMutation {
         match self.kind {
             WorkspaceMutationKind::UpsertRegular => {
                 if !matches!(self.normalized_mode, Some(0o644 | 0o755))
+                    || self.target.is_some()
                     || self.size.is_none()
                     || self
                         .content_hash
@@ -1148,9 +1216,31 @@ impl WorkspaceMutation {
                 }
                 Ok(())
             }
+            WorkspaceMutationKind::UpsertSymlink => {
+                let target = self.target.as_deref().ok_or_else(|| {
+                    ProtocolValidationError::new("symlink workspace mutation requires target bytes")
+                })?;
+                // Containment belongs to the declared output root, not the
+                // overlay's project-relative path. Preserve '..' for that
+                // owner to resolve within the selected product subtree.
+                if target.is_empty()
+                    || target.len() > MAX_WORKSPACE_SYMLINK_TARGET_BYTES
+                    || target.starts_with('/')
+                    || target.as_bytes().contains(&0)
+                    || self.normalized_mode.is_some()
+                    || self.size.is_some()
+                    || self.content_hash.is_some()
+                {
+                    return Err(ProtocolValidationError::new(
+                        "invalid symlink workspace mutation",
+                    ));
+                }
+                Ok(())
+            }
             _ if self.normalized_mode.is_none()
                 && self.size.is_none()
-                && self.content_hash.is_none() =>
+                && self.content_hash.is_none()
+                && self.target.is_none() =>
             {
                 Ok(())
             }
@@ -1294,7 +1384,9 @@ impl AdapterWorkspaceResponse {
             }
             if matches!(
                 mutation.kind,
-                WorkspaceMutationKind::UpsertRegular | WorkspaceMutationKind::DeletePath
+                WorkspaceMutationKind::UpsertRegular
+                    | WorkspaceMutationKind::UpsertSymlink
+                    | WorkspaceMutationKind::DeletePath
             ) {
                 non_directory_paths.insert(mutation.path.clone());
             }
@@ -1659,6 +1751,7 @@ mod tests {
             view,
             view_descriptor_identity: "c".repeat(64),
             destination: IsolationPath::new("/workspace").unwrap(),
+            writable_descendant_mounts: Vec::new(),
         });
         plan.validate(&authorities).unwrap();
         authorities.last_mut().unwrap().purpose = IsolationAuthorityPurpose::WorkspaceProject;
@@ -1669,6 +1762,205 @@ mod tests {
             .unwrap()
             .view_descriptor_identity = "not-a-digest".into();
         assert!(plan.validate(&authorities).is_err());
+    }
+
+    fn workspace_descendant_plan() -> (IsolationPlan, Vec<IsolationAuthority>) {
+        let (mut plan, mut authorities) = complete_plan();
+        plan.mounts
+            .retain(|mount| mount.destination.as_str() != "/workspace");
+        authorities.retain(|authority| authority.id.as_str() != "workspace");
+        authorities.push(authority(
+            "view",
+            5,
+            IsolationAuthorityPurpose::WorkspaceView,
+        ));
+        authorities.push(authority(
+            "cache",
+            6,
+            IsolationAuthorityPurpose::WorkspaceViewDescendant,
+        ));
+        plan.project_workspace = Some(IsolationProjectWorkspace {
+            workspace_id: "workspace-one".into(),
+            view: IsolationAuthorityId::new("view").unwrap(),
+            view_descriptor_identity: "c".repeat(64),
+            destination: IsolationPath::new("/workspace").unwrap(),
+            writable_descendant_mounts: vec![IsolationWorkspaceDescendantMount {
+                source: IsolationAuthorityId::new("cache").unwrap(),
+                relative_path: "cache/one".into(),
+                destination: IsolationPath::new("/runtime/cache").unwrap(),
+            }],
+        });
+        (plan, authorities)
+    }
+
+    #[test]
+    fn workspace_descendants_require_explicit_closed_wire_and_writable_capability() {
+        let (plan, authorities) = workspace_descendant_plan();
+        assert!(
+            plan.mounts
+                .iter()
+                .all(|mount| mount.access == IsolationMountAccess::ReadOnly)
+        );
+        let capabilities = plan.validate(&authorities).unwrap();
+        assert!(capabilities.contains(&IsolationCapability::FilesystemFdWritable));
+        let encoded = serde_json::to_value(&plan).unwrap();
+        let decoded: IsolationPlan = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, plan);
+        for field in ["access", "layer"] {
+            let mut malformed = encoded.clone();
+            malformed["project_workspace"]["writable_descendant_mounts"][0][field] =
+                serde_json::json!("not-authorable");
+            assert!(serde_json::from_value::<IsolationPlan>(malformed).is_err());
+        }
+        let mut missing = encoded;
+        missing["project_workspace"]
+            .as_object_mut()
+            .unwrap()
+            .remove("writable_descendant_mounts");
+        assert!(serde_json::from_value::<IsolationPlan>(missing).is_err());
+    }
+
+    #[test]
+    fn workspace_descendants_refuse_role_reuse_or_orphan_authority() {
+        let (plan, authorities) = workspace_descendant_plan();
+        plan.validate(&authorities).unwrap();
+        for purpose in [
+            IsolationAuthorityPurpose::WritableMount,
+            IsolationAuthorityPurpose::ReadOnlyMount,
+            IsolationAuthorityPurpose::WorkspaceView,
+            IsolationAuthorityPurpose::TargetDuplexChannel,
+        ] {
+            let mut wrong = authorities.clone();
+            wrong.last_mut().unwrap().purpose = purpose;
+            assert!(plan.validate(&wrong).is_err());
+        }
+        let mut wrong = authorities.clone();
+        wrong.last_mut().unwrap().inherited_fd = 3;
+        assert!(plan.validate(&wrong).is_err());
+        let mut orphan = plan.clone();
+        orphan.project_workspace = None;
+        assert!(orphan.validate(&authorities).is_err());
+        let mut unused = plan.clone();
+        unused
+            .project_workspace
+            .as_mut()
+            .unwrap()
+            .writable_descendant_mounts
+            .clear();
+        assert!(unused.validate(&authorities).is_err());
+        let mut unknown = plan.clone();
+        unknown
+            .project_workspace
+            .as_mut()
+            .unwrap()
+            .writable_descendant_mounts[0]
+            .source = IsolationAuthorityId::new("unknown").unwrap();
+        assert!(unknown.validate(&authorities).is_err());
+        let mut ordinary = plan;
+        ordinary.mounts.push(IsolationMount {
+            source: IsolationAuthorityId::new("cache").unwrap(),
+            destination: IsolationPath::new("/ordinary-cache").unwrap(),
+            access: IsolationMountAccess::Writable,
+            layer: 10,
+        });
+        assert!(ordinary.validate(&authorities).is_err());
+    }
+
+    #[test]
+    fn workspace_descendants_refuse_unsafe_paths_and_namespace_conflicts() {
+        let (plan, authorities) = workspace_descendant_plan();
+        for relative in [
+            "", ".", "../x", "a/../b", "a/./b", "a//b", "a/", "/a", "a\nb",
+        ] {
+            let mut invalid = plan.clone();
+            invalid
+                .project_workspace
+                .as_mut()
+                .unwrap()
+                .writable_descendant_mounts[0]
+                .relative_path = relative.into();
+            assert!(invalid.validate(&authorities).is_err(), "{relative:?}");
+        }
+        for destination in [
+            "/",
+            "/proc",
+            "/proc/x",
+            "/workspace",
+            "/workspace/child",
+            "/project",
+            "/project/hidden",
+            "/bin",
+            "/bin/python",
+            "/bin/python/child",
+        ] {
+            let mut invalid = plan.clone();
+            invalid
+                .project_workspace
+                .as_mut()
+                .unwrap()
+                .writable_descendant_mounts[0]
+                .destination = IsolationPath::new(destination).unwrap();
+            assert!(invalid.validate(&authorities).is_err(), "{destination}");
+        }
+        let mut excessive = plan;
+        excessive
+            .mounts
+            .resize(MAX_MOUNTS, excessive.mounts[0].clone());
+        assert!(
+            excessive
+                .validate(&authorities)
+                .unwrap_err()
+                .to_string()
+                .contains("too many mounts")
+        );
+    }
+
+    #[test]
+    fn workspace_descendants_require_disjoint_sorted_unique_mounts() {
+        let (plan, mut authorities) = workspace_descendant_plan();
+        authorities.push(authority(
+            "cache-two",
+            7,
+            IsolationAuthorityPurpose::WorkspaceViewDescendant,
+        ));
+        for destination in [
+            "/runtime/cache",
+            "/runtime/cache/child",
+            "/runtime",
+            "/runtime/aaa",
+        ] {
+            let mut invalid = plan.clone();
+            invalid
+                .project_workspace
+                .as_mut()
+                .unwrap()
+                .writable_descendant_mounts
+                .push(IsolationWorkspaceDescendantMount {
+                    source: IsolationAuthorityId::new("cache-two").unwrap(),
+                    relative_path: "cache/two".into(),
+                    destination: IsolationPath::new(destination).unwrap(),
+                });
+            assert!(invalid.validate(&authorities).is_err(), "{destination}");
+        }
+        let mut valid = plan;
+        valid
+            .project_workspace
+            .as_mut()
+            .unwrap()
+            .writable_descendant_mounts
+            .push(IsolationWorkspaceDescendantMount {
+                source: IsolationAuthorityId::new("cache-two").unwrap(),
+                relative_path: "cache/two".into(),
+                destination: IsolationPath::new("/runtime/zzz").unwrap(),
+            });
+        valid.validate(&authorities).unwrap();
+        valid
+            .project_workspace
+            .as_mut()
+            .unwrap()
+            .writable_descendant_mounts[1]
+            .source = IsolationAuthorityId::new("cache").unwrap();
+        assert!(valid.validate(&authorities).is_err());
     }
 
     #[test]
@@ -1812,8 +2104,8 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_duplicate_keys_at_every_depth() {
-        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v7","protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
-        let nested = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
+        let top_level = r#"{"protocol":"ryeos.isolation-adapter/v9","protocol":"ryeos.isolation-adapter/v9","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let nested = r#"{"protocol":"ryeos.isolation-adapter/v9","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3,"launcher":4}}"#;
         for document in [top_level, nested] {
             let error = from_json_str_strict::<AdapterInspectionRequest>(document).unwrap_err();
             assert!(error.to_string().contains("duplicate JSON object key"));
@@ -1822,7 +2114,7 @@ mod tests {
 
     #[test]
     fn strict_json_rejects_unknown_fields_trailing_data_and_excessive_depth() {
-        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
+        let unknown = r#"{"protocol":"ryeos.isolation-adapter/v9","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3},"extra":true}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(unknown)
                 .unwrap_err()
@@ -1830,7 +2122,7 @@ mod tests {
                 .contains("unknown field")
         );
 
-        let valid = r#"{"protocol":"ryeos.isolation-adapter/v7","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let valid = r#"{"protocol":"ryeos.isolation-adapter/v9","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         assert!(
             from_json_str_strict::<AdapterInspectionRequest>(&format!("{valid} true"))
                 .unwrap_err()
@@ -1853,7 +2145,7 @@ mod tests {
 
     #[test]
     fn predecessor_adapter_protocol_is_refused() {
-        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v6","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
+        let predecessor = r#"{"protocol":"ryeos.isolation-adapter/v8","target":"x86_64-unknown-linux-gnu","backend_id":"example","artifacts":{"launcher":3}}"#;
         let error = from_json_str_strict::<AdapterInspectionRequest>(predecessor).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
@@ -2453,7 +2745,7 @@ mod tests {
         let request = workspace_request(WorkspaceLifecycleOperation::Create);
         request.validate().unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v7");
+        assert_eq!(encoded["protocol"], "ryeos.isolation-adapter/v9");
         let purposes = encoded["authorities"]
             .as_array()
             .unwrap()
@@ -2520,6 +2812,104 @@ mod tests {
             mutations: Vec::new(),
             destroyed: request.operation == WorkspaceLifecycleOperation::Destroy,
         }
+    }
+
+    #[test]
+    fn workspace_symlink_mutation_is_bounded_exact_and_closed() {
+        let original = WorkspaceMutation {
+            path: "products/runtime/bin/program".into(),
+            kind: WorkspaceMutationKind::UpsertSymlink,
+            normalized_mode: None,
+            size: None,
+            content_hash: None,
+            target: Some("../lib/program".into()),
+        };
+        original.validate().unwrap();
+        let wire = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkspaceMutation>(wire.clone()).unwrap(),
+            original
+        );
+        for target in [
+            None,
+            Some("".into()),
+            Some("/host/bin/program".into()),
+            Some("bad\0target".into()),
+            Some("x".repeat(MAX_WORKSPACE_SYMLINK_TARGET_BYTES + 1)),
+        ] {
+            let mut mutation = original.clone();
+            mutation.target = target;
+            assert!(mutation.validate().is_err());
+        }
+        let mut at_bound = original.clone();
+        at_bound.target = Some("x".repeat(MAX_WORKSPACE_SYMLINK_TARGET_BYTES));
+        at_bound.validate().unwrap();
+        for field in ["normalized_mode", "size", "content_hash"] {
+            let mut changed = wire.clone();
+            changed[field] = if field == "content_hash" {
+                serde_json::json!("a".repeat(64))
+            } else {
+                serde_json::json!(1)
+            };
+            assert!(
+                serde_json::from_value::<WorkspaceMutation>(changed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove("target");
+        assert!(serde_json::from_value::<WorkspaceMutation>(missing).is_err());
+        let mut unknown = wire;
+        unknown["follow_target"] = true.into();
+        assert!(serde_json::from_value::<WorkspaceMutation>(unknown).is_err());
+        for kind in [
+            WorkspaceMutationKind::DeletePath,
+            WorkspaceMutationKind::EnsureDirectory,
+            WorkspaceMutationKind::OpaqueDirectory,
+        ] {
+            let mut mutation = original.clone();
+            mutation.kind = kind;
+            assert!(mutation.validate().is_err());
+            mutation.target = None;
+            mutation.validate().unwrap();
+        }
+        let mut regular = original;
+        regular.kind = WorkspaceMutationKind::UpsertRegular;
+        regular.normalized_mode = Some(0o755);
+        regular.size = Some(1);
+        regular.content_hash = Some("a".repeat(64));
+        assert!(regular.validate().is_err());
+        regular.target = None;
+        regular.validate().unwrap();
+    }
+
+    #[test]
+    fn workspace_mutations_cannot_descend_through_a_symlink() {
+        let request = workspace_request(WorkspaceLifecycleOperation::FreezeAndDiff);
+        let mut response = workspace_response(&request);
+        response.mutations = vec![
+            WorkspaceMutation {
+                path: "products/link".into(),
+                kind: WorkspaceMutationKind::UpsertSymlink,
+                normalized_mode: None,
+                size: None,
+                content_hash: None,
+                target: Some("real".into()),
+            },
+            WorkspaceMutation {
+                path: "products/link/child".into(),
+                kind: WorkspaceMutationKind::EnsureDirectory,
+                normalized_mode: None,
+                size: None,
+                content_hash: None,
+                target: None,
+            },
+        ];
+        assert!(response.validate_for(&request).is_err());
+        response.mutations.pop();
+        response.validate_for(&request).unwrap();
     }
 
     #[test]

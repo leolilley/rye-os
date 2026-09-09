@@ -1795,6 +1795,7 @@ mod tests {
         let req = DispatchActionRequest {
             thread_id: "T-test".to_string(),
             action: ActionPayload {
+                product_selections: Vec::new(),
                 operation_id: Some(TEST_OPERATION_ID.to_string()),
                 item_id: "my/tool".to_string(),
                 ref_bindings: std::collections::BTreeMap::new(),

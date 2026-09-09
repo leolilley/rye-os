@@ -413,6 +413,12 @@ async fn dispatch_managed_subprocess(
             &ctx.engine,
             &launch_contract,
             root_admission.resolution_subject_authority(),
+            handler_context.as_ref(),
+            &ctx.engine.resolution_roots(
+                root_admission
+                    .resolution_workspace()
+                    .map(std::path::Path::to_path_buf),
+            ),
         )
         .map_err(DispatchError::Internal)?;
         let dependencies_ready = dependencies.admission_ready;
@@ -436,7 +442,37 @@ async fn dispatch_managed_subprocess(
         } else {
             "not_checked"
         };
-        let runtime_preparation_ready = dependencies_ready && credentials_ready;
+        let project_result_ready =
+            crate::execution::launch_preparation::project_result_requirement_satisfied(
+                &launch_contract,
+                &request.provenance,
+            );
+        let output_partition_required =
+            crate::execution::workspace_outputs::admission::requires_output_partition(
+                &launch_contract,
+            )
+            .map_err(DispatchError::Internal)?;
+        let output_partition = if output_partition_required && project_result_ready {
+            crate::execution::workspace_outputs::admission::derive_initial_partition(
+                state,
+                &ctx.engine,
+                root_admission.resolution_output(),
+                &launch_contract,
+                request
+                    .provenance
+                    .project_authority()
+                    .operational_snapshot_projection(),
+            )
+            .map_err(DispatchError::Internal)?
+        } else {
+            None
+        };
+        let output_partition_ready = !output_partition_required
+            || (output_partition.is_some() && !state.isolation.is_enforced());
+        let runtime_preparation_ready = dependencies_ready
+            && credentials_ready
+            && project_result_ready
+            && output_partition_ready;
         let admission_ready = root_ready && runtime_preparation_ready;
         return Ok(json!({
             "validated": true,
@@ -446,6 +482,15 @@ async fn dispatch_managed_subprocess(
             "executor_ref": &prepared.executor_ref,
             "external_content": external_content,
             "runtime_preparation": {
+                "project_result": {
+                    "requirement": launch_contract.project_result_requirement,
+                    "satisfied": project_result_ready,
+                },
+                "workspace_outputs": {
+                    "required": output_partition_required,
+                    "admission_ready": output_partition_ready,
+                    "partition": output_partition,
+                },
                 "runtime_ref": verified_runtime.canonical_ref.to_string(),
                 "binding_records": dependencies.binding_records,
                 "execution_dependencies": dependencies.execution_dependencies,
@@ -480,6 +525,7 @@ async fn dispatch_managed_subprocess(
         parameters: &params,
         metadata_required_secrets: &prepared.resolved.resolved_item.metadata.required_secrets,
         pre_minted_thread_id: request.pre_minted_thread_id.as_deref(),
+        effect_authority: request.effect_authority.as_ref(),
         previous_thread_id: request.previous_thread_id.as_deref(),
         parent_execution_context: request.parent_execution_context.as_ref(),
         // Fresh launches and operator follow-ups inject their inputs as the
@@ -494,49 +540,18 @@ async fn dispatch_managed_subprocess(
         launch_handoff,
     })
     .await
-    .map_err(|e| match e {
-        launch::BuildAndLaunchError::LaunchPreparation(error) => *error,
-        launch::BuildAndLaunchError::MissingSecrets { item_ref, secrets } => {
-            let first = secrets.first().expect("missing secret error has a secret");
-            let source = first.primary_source();
-            DispatchError::RequiredSecretMissing {
-                item_ref,
-                env_var: first.name.clone(),
-                source_kind: source.kind_for_wire().to_string(),
-                source_name: source.name_for_wire(),
-                remediation: crate::dispatch_error::required_secret_remediation(&first.name),
-            }
-        }
-        launch::BuildAndLaunchError::CapabilityRejected { reason } => {
-            DispatchError::CapabilityRejected { reason }
-        }
-        launch::BuildAndLaunchError::LaunchCancelled { stage, .. } => {
-            DispatchError::LaunchCancelled { stage }
-        }
-        other => {
-            let msg = other.to_string();
-            if msg.contains("manifest")
-                || msg.contains("binary")
-                || msg.contains("blob")
-                || msg.contains("materializ")
-                || msg.contains("native executor")
-                || msg.contains("arch check")
-            {
-                DispatchError::RuntimeMaterializationFailed {
-                    executor_ref: prepared.executor_ref.clone(),
-                    detail: msg,
-                }
-            } else {
-                DispatchError::Internal(other.into())
-            }
-        }
-    })?;
+    .map_err(|error| error.into_dispatch_error(&prepared.executor_ref))?;
 
-    Ok(json!({
+    let mut response = json!({
         "thread": result.thread,
         "result": result.result,
         "result_project_snapshot_hash": result.result_project_snapshot_hash,
-    }))
+    });
+    if let Some(dispatch) = result.dispatch {
+        response["dispatch"] = serde_json::to_value(dispatch)
+            .map_err(|error| DispatchError::Internal(error.into()))?;
+    }
+    Ok(response)
 }
 
 fn validate_managed_effective_program(
@@ -681,6 +696,7 @@ async fn dispatch_tool_subprocess(
         )?;
     let node_history_policy = std::sync::Arc::new(state.node_history_policy()?.clone());
     let resolution_ref_bindings = request.ref_bindings.clone();
+    let resolution_product_selections = request.product_selections.clone();
     let resolution_launch_mode = request.launch_mode.to_owned();
     let resolution_parameters = request.params.clone();
     let resolution_usage_subject = request.usage_subject.clone();
@@ -698,6 +714,7 @@ async fn dispatch_tool_subprocess(
                     node_history_policy: &node_history_policy,
                     item_ref: &resolution_item_ref,
                     ref_bindings: resolution_ref_bindings,
+                    product_selections: resolution_product_selections,
                     launch_mode: &resolution_launch_mode,
                     parameters: resolution_parameters,
                     usage_subject: resolution_usage_subject,
@@ -854,6 +871,7 @@ async fn dispatch_tool_subprocess(
         &resolved,
         &request.provenance,
         parent_thread_id.as_deref(),
+        handler_context.as_ref(),
     )
     .map_err(DispatchError::Internal)?;
 

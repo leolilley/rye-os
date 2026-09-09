@@ -144,6 +144,15 @@ impl TempDirGuard {
         }
     }
 
+    /// Borrow the original descriptor of an owned scratch root. This never
+    /// reopens its diagnostic path or grants access to borrowed generations.
+    pub fn owned_scratch_root(&self) -> anyhow::Result<&lillux::PinnedDirectory> {
+        self.pinned_removal
+            .as_ref()
+            .map(|owned| &owned.root)
+            .ok_or_else(|| anyhow::anyhow!("temporary guard has no owned scratch descriptor"))
+    }
+
     /// Install the accepted Create result before publishing Ready. A later
     /// journal-bind failure must keep this very slot for explicit closure.
     pub fn install_workspace_view(

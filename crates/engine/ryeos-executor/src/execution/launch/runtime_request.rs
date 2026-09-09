@@ -76,15 +76,30 @@ pub(super) struct SpawnedRuntime {
     immediate_result: Option<RuntimeResult>,
 }
 
+pub(super) struct SpawnedRuntimeWaitResult {
+    pub result: Result<RuntimeProcessOutcome>,
+    /// True only after `AttachedProcessGuard::settle_after_reap` proved the
+    /// exact process group absent and compare-cleared its workspace binding.
+    /// An immediate spawn failure has no such attached-wait proof.
+    pub settled_attached_wait: bool,
+}
+
 impl SpawnedRuntime {
-    pub(super) fn wait(mut self) -> Result<RuntimeProcessOutcome> {
+    pub(super) fn wait(mut self) -> SpawnedRuntimeWaitResult {
         if let Some(result) = self.immediate_result.take() {
-            return Ok(RuntimeProcessOutcome::Terminal(result));
+            return SpawnedRuntimeWaitResult {
+                result: Ok(RuntimeProcessOutcome::Terminal(result)),
+                settled_attached_wait: false,
+            };
         }
-        let process = self
-            .process
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("spawned runtime has no process or immediate result"))?;
+        let Some(process) = self.process.take() else {
+            return SpawnedRuntimeWaitResult {
+                result: Err(anyhow::anyhow!(
+                    "spawned runtime has no process or immediate result"
+                )),
+                settled_attached_wait: false,
+            };
+        };
         let result = process.wait();
         emit_captured_child_observation_records(
             &self.thread_id,
@@ -96,22 +111,35 @@ impl SpawnedRuntime {
         // Decode/retry handling runs only after the exact reaped attachment and
         // its workspace membership settle together. Drop must not erase that
         // evidence when wait/cleanup or descendant settlement is unproved.
-        self.attached_process
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("waited runtime lost its attached process owner"))?
-            .settle_after_reap()?;
+        let settlement = match self.attached_process.as_mut() {
+            Some(attached_process) => attached_process.settle_after_reap(),
+            None => Err(anyhow::anyhow!(
+                "waited runtime lost its attached process owner"
+            )),
+        };
+        if let Err(error) = settlement {
+            return SpawnedRuntimeWaitResult {
+                result: Err(error),
+                settled_attached_wait: false,
+            };
+        }
         drop(self.attached_process.take());
         drop(self.workspace_lifeline.take());
         drop(self.external_realizations.take());
         drop(self.source_closure.take());
-        if !result.success {
-            return Ok(RuntimeProcessOutcome::Terminal(runtime_failure_result(
+        let outcome = if !result.success {
+            Ok(RuntimeProcessOutcome::Terminal(runtime_failure_result(
                 &result.stderr,
                 result.timed_out,
                 result.output_limit_exceeded.map(|limit| limit.as_str()),
-            )));
+            )))
+        } else {
+            decode_runtime_stdout(&result.stdout)
+        };
+        SpawnedRuntimeWaitResult {
+            result: outcome,
+            settled_attached_wait: true,
         }
-        decode_runtime_stdout(&result.stdout)
     }
 }
 
@@ -308,6 +336,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
                 verified_code: &[],
                 verified_command: Some(verified_command),
                 external_read_only_mounts: &admitted_mounts,
+                writable_runtime_view_mounts: &[],
                 target_channels: &[],
                 item_ref: &isolation_item_ref,
                 thread_id,
@@ -657,6 +686,28 @@ fn stdout_prefix(stdout: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immediate_spawn_result_is_not_an_attached_wait_proof() {
+        let runtime = SpawnedRuntime {
+            thread_id: "T-immediate".to_string(),
+            runtime_ref: "runtime:test/immediate".to_string(),
+            observation_declarations: BTreeMap::new(),
+            process: None,
+            attached_process: None,
+            workspace_lifeline: None,
+            external_realizations: None,
+            source_closure: None,
+            immediate_result: Some(runtime_failure_result("spawn failed", false, None)),
+        };
+
+        let waited = runtime.wait();
+        assert!(!waited.settled_attached_wait);
+        assert!(matches!(
+            waited.result,
+            Ok(RuntimeProcessOutcome::Terminal(_))
+        ));
+    }
 
     #[test]
     fn subprocess_failure_preserves_stderr_and_failed_status() {

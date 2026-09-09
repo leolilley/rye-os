@@ -1501,7 +1501,7 @@ fn run_sign(
     source: String,
     stdin_json: bool,
 ) -> anyhow::Result<()> {
-    use ryeos_core_tools::actions::sign::{BatchReport, ItemOutcome, SignSource, run_sign};
+    use ryeos_core_tools::actions::sign::{SignSource, run_sign_batch};
 
     let (item_refs, project_arg, source_str) = if stdin_json {
         if !item_refs.is_empty() {
@@ -1523,21 +1523,7 @@ fn run_sign(
     let source = SignSource::parse(&source_str)?;
     let project = project_arg.or_else(|| std::env::current_dir().ok());
 
-    let mut batch = BatchReport::default();
-    let batch_mode = item_refs.len() > 1;
-    for item_ref in item_refs {
-        let signed = run_sign(&item_ref, project.as_deref(), source);
-        match signed {
-            Ok(report) => batch.extend(report),
-            Err(e) if batch_mode => batch.failed.push(ItemOutcome {
-                item_ref,
-                signature: None,
-                error: Some(format!("{e:#}")),
-                warnings: Vec::new(),
-            }),
-            Err(e) => return Err(e),
-        }
-    }
+    let batch = run_sign_batch(&item_refs, project.as_deref(), source)?;
     println!("{}", serde_json::to_string_pretty(&batch)?);
     if !batch.is_total_success() {
         anyhow::bail!(

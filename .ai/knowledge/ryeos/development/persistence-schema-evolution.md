@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T06:05:34Z:5bdbc956c19e5f7505c296dbea51e74fb81d9bbdf18eec16fe170019e6c87986:IvYKqctQ9/9WIOoMQXNKNaNiXenSEtZR1bRPe0oowZmFy5cVy4114UR26ZvBBwqho29/cierkmZzQEHdaKgECg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T10:36:35Z:7f878456d51f2dd8f53b05d51b969b2a7f0fcc1659a8d76df4094fbe41205d66:xtogUofqllduH5lKIjD6a3JSnXPhC7qYUrkcNnRVbdncaGxI+0JXaUXEHTjASkAJp0rS5cVX3v6pcVu7yrKsBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -68,7 +68,7 @@ ceilings; recovery cannot substitute an ambient kind definition. Launch
 metadata 29 carries both this authority and the proc protocol cut; neither
 standalone v29 shape was installed before the combined generation.
 
-The shared-view workspace cut uses isolation-adapter protocol v7 and launch
+The lossless workspace-mutation cut uses isolation-adapter protocol v8 and launch
 metadata 30, because the nested protocol identity is strict. Runtime epoch 28
 adds exact per-launch workspace/view/launch-owner membership to `thread_runtime`
 and retains creator process identity in the existing construction journal.

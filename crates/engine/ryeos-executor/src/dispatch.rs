@@ -304,6 +304,10 @@ pub struct DispatchRequest<'a> {
     pub params: Value,
     /// Complete canonical secondary execution identities for this request.
     pub ref_bindings: BTreeMap<String, String>,
+    /// Invocation-time product selectors keyed by environment dependency
+    /// binding. Kept outside workload parameters and ref identity.
+    pub product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     pub acting_principal: &'a str,
     /// Effective project root used for resolution (matches
     /// `ResolvedProjectContext.effective_path`).
@@ -1905,6 +1909,11 @@ pub(crate) async fn dispatch_method(
                 "method root admission ref bindings differ from the dispatch request"
             )));
         }
+        if admission.product_selections() != &request.product_selections {
+            return Err(DispatchError::Internal(anyhow::anyhow!(
+                "method root admission product selectors differ from the dispatch request"
+            )));
+        }
         admission.clone()
     } else {
         let project_binding = ryeos_app::thread_lifecycle::AdmittedProjectBinding::from_provenance(
@@ -1945,6 +1954,7 @@ pub(crate) async fn dispatch_method(
                 .map_err(DispatchError::Internal)?,
             thread_profile_str.to_string(),
             request.ref_bindings.clone(),
+            request.product_selections.clone(),
             request.usage_subject.clone(),
             request.usage_subject_asserted_by.clone(),
             request.launch_timings.as_ref(),
@@ -2593,6 +2603,7 @@ pub(crate) async fn dispatch_method(
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],
+                    writable_runtime_view_mounts: &[],
                     target_channels: &[],
                     item_ref: &runtime_item_ref_string,
                     thread_id: &thread_id,
@@ -3314,6 +3325,7 @@ async fn dispatch_via_method_executor(
         validate_only: request.validate_only,
         params: args,
         ref_bindings: request.ref_bindings.clone(),
+        product_selections: request.product_selections.clone(),
         acting_principal: request.acting_principal,
         project_path: request.project_path,
         provenance: request.provenance.clone(),
@@ -3368,315 +3380,7 @@ async fn dispatch_via_method_executor(
 ///    requesting a cap the installed bundle or live project does not declare
 ///    fails launch.
 /// 3. Exactly the requested (manifest-backed) subset is minted.
-pub(crate) fn mint_runtime_capability_caps(
-    requires_value: Option<&Value>,
-    resolved_item: &ResolvedItem,
-    effective_trust_class: ryeos_engine::resolution::TrustClass,
-    engine: &ryeos_engine::engine::Engine,
-) -> Result<Vec<String>, String> {
-    // (1) Requirement contract. No `requires:` → no runtime callback authority.
-    let Some(requires_value) = requires_value else {
-        return Ok(Vec::new());
-    };
-    let reqs = ryeos_bundle::runtime_authority::parse_runtime_requires(requires_value)
-        .map_err(|err| format!("invalid `requires.capabilities`: {err}"))?;
-    if reqs.manifest.runtime_authority.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Single source of truth for the bundle identity: the resolved canonical
-    // ref. The callback token's `effective_bundle_id` is stamped from this same
-    // value (see `effective_bundle_id_for_request`), so the caps minted here and
-    // the token that carries them can never claim different bundles.
-    let effective_bundle_id = ryeos_app::callback_token::effective_bundle_id_from_item_ref(
-        &resolved_item.canonical_ref.to_string(),
-    )
-    .ok_or_else(|| {
-        "runtime capability requirements need a bundle-qualified item ref".to_string()
-    })?;
-    ryeos_state::objects::validate_bundle_identifier("bundle_id", &effective_bundle_id)
-        .map_err(|err| err.to_string())?;
-
-    // Deep, segment-grammar validation of each requested resource. The static
-    // shape (known keys, valid ops, non-empty arrays) was already enforced by
-    // `parse_runtime_requires`; this checks the bundle-id segment grammar that
-    // the cap-string scheme depends on.
-    let requested_authority = &reqs.manifest.runtime_authority;
-    for req in &requested_authority.bundle_events {
-        ryeos_state::objects::validate_bundle_identifier("event_kind", &req.event_kind)
-            .map_err(|err| err.to_string())?;
-    }
-    for req in &requested_authority.runtime_vault {
-        ryeos_app::vault::validate_runtime_vault_segment("namespace", &req.namespace)
-            .map_err(|err| err.to_string())?;
-    }
-    for req in &requested_authority.item_authoring {
-        ryeos_bundle::runtime_authority::validate_item_author_pattern(&req.kind, &req.namespace)?;
-    }
-
-    // (2) Authority upper bound comes from the signed manifest at the exact
-    // provenance boundary that supplied the item. Installed bundle authority
-    // remains node-trusted. A live project may use its own signed manifest,
-    // but only for a TrustedProject item physically below that exact project's
-    // `.ai/` root and only with the request engine's effective project trust
-    // store. Mixed-trust composition of an installed item therefore remains
-    // unable to acquire project authority.
-    let manifest = match resolved_item.source_space {
-        ryeos_engine::contracts::ItemSpace::Bundle => {
-            if effective_trust_class != ryeos_engine::resolution::TrustClass::TrustedBundle {
-                return Err(format!(
-                    "installed runtime capability requirements need TrustedBundle provenance; \
-                     effective trust class is {effective_trust_class:?}"
-                ));
-            }
-            let ai_dir = authoritative_runtime_authority_ai_dir(
-                resolved_item,
-                &effective_bundle_id,
-                engine,
-                &engine.node_trust_store,
-            )?;
-            ryeos_bundle::manifest::load_verified_manifest(
-                &ai_dir,
-                &effective_bundle_id,
-                &engine.node_trust_store,
-            )
-            .map_err(|err| err.to_string())?
-            .manifest
-        }
-        ryeos_engine::contracts::ItemSpace::Project => {
-            if effective_trust_class != ryeos_engine::resolution::TrustClass::TrustedProject {
-                return Err(format!(
-                    "project runtime capability requirements need TrustedProject provenance; \
-                     effective trust class is {effective_trust_class:?}"
-                ));
-            }
-            let project_root = resolved_item
-                .materialized_project_root
-                .as_deref()
-                .ok_or_else(|| {
-                    "project runtime capability item has no materialized project root".to_string()
-                })?;
-            let ai_dir =
-                authoritative_project_runtime_authority_ai_dir(resolved_item, project_root)?;
-            let project_trust = engine
-                .trust_store
-                .with_project_keys(project_root)
-                .map_err(|err| err.to_string())?;
-            ryeos_bundle::manifest::load_verified_manifest(
-                &ai_dir,
-                &effective_bundle_id,
-                project_trust.as_ref(),
-            )
-            .map_err(|err| err.to_string())?
-            .manifest
-        }
-        ryeos_engine::contracts::ItemSpace::Node => {
-            return Err(
-                "node-local configuration cannot supply runtime capability authority".to_string(),
-            );
-        }
-    };
-    manifest.runtime_authority.validate()?;
-
-    // Manifest-declared caps form the upper bound. Cap strings come from the
-    // manifest declarations' own constructors (`runtime_authority`), so the
-    // minter and the daemon callback services share one definition.
-    let manifest_caps = manifest
-        .runtime_authority
-        .declared_caps(&effective_bundle_id);
-
-    // (3) Subset check + mint exactly the requested subset. A wildcard-carrying
-    // request must be backed by an identical manifest declaration, not merely
-    // glob-matched — see `manifest_backs_requested_cap`.
-    let requested =
-        ryeos_bundle::runtime_authority::requested_runtime_caps(&reqs, &effective_bundle_id);
-    let missing: Vec<String> = requested
-        .iter()
-        .filter(|requested_cap| {
-            !ryeos_bundle::runtime_authority::manifest_backs_requested_cap(
-                &manifest_caps,
-                requested_cap,
-            )
-        })
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "requested runtime capabilities are not declared in the signed manifest \
-             (authority upper bound): {}",
-            missing.join(", ")
-        ));
-    }
-
-    Ok(requested.into_iter().collect())
-}
-
-/// Bind project runtime authority to the exact live project resolution root.
-/// This deliberately does not walk upward looking for a convenient manifest.
-fn authoritative_project_runtime_authority_ai_dir(
-    resolved_item: &ResolvedItem,
-    project_root: &Path,
-) -> Result<PathBuf, String> {
-    if resolved_item.source_space != ryeos_engine::contracts::ItemSpace::Project
-        || resolved_item.source_root != ryeos_engine::contracts::ItemSourceRoot::Project
-    {
-        return Err(format!(
-            "project runtime capability requirements need exact Project source provenance; \
-             found {:?} in {} space",
-            resolved_item.source_root,
-            resolved_item.source_space.as_str()
-        ));
-    }
-    let canonical_project = std::fs::canonicalize(project_root).map_err(|err| {
-        format!(
-            "canonicalize runtime-authority project {}: {err}",
-            project_root.display()
-        )
-    })?;
-    let ai_dir = canonical_project.join(ryeos_engine::AI_DIR);
-    let canonical_source = std::fs::canonicalize(&resolved_item.source_path).map_err(|err| {
-        format!(
-            "canonicalize resolved project runtime-authority item {}: {err}",
-            resolved_item.source_path.display()
-        )
-    })?;
-    let source_metadata = std::fs::symlink_metadata(&resolved_item.source_path).map_err(|err| {
-        format!(
-            "stat resolved project runtime-authority item {}: {err}",
-            resolved_item.source_path.display()
-        )
-    })?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
-        return Err(format!(
-            "project runtime-authority item {} must be a regular file (symlinks rejected)",
-            resolved_item.source_path.display()
-        ));
-    }
-    if !canonical_source.starts_with(&ai_dir) {
-        return Err(format!(
-            "project runtime-authority item {} is outside the exact project .ai root {}",
-            canonical_source.display(),
-            ai_dir.display()
-        ));
-    }
-    Ok(ai_dir)
-}
-
-/// Establish the only provenance permitted to mint daemon callback authority:
-/// a regular, content-pinned, node-signed item below exactly one registered
-/// installed bundle's `.ai/` directory. Returns that authoritative `.ai/`
-/// directory for manifest loading.
-fn authoritative_runtime_authority_ai_dir(
-    resolved_item: &ResolvedItem,
-    expected_bundle_id: &str,
-    engine: &ryeos_engine::engine::Engine,
-    node_trust_store: &ryeos_engine::trust::TrustStore,
-) -> Result<PathBuf, String> {
-    if resolved_item.source_space != ryeos_engine::contracts::ItemSpace::Bundle {
-        return Err(format!(
-            "runtime capability requirements require installed TrustedBundle provenance; \
-             item resolved from {} space",
-            resolved_item.source_space.as_str()
-        ));
-    }
-
-    let ryeos_engine::contracts::ItemSourceRoot::Bundle { name } = &resolved_item.source_root
-    else {
-        return Err(format!(
-            "runtime capability requirements need exact Bundle source provenance; found {:?}",
-            resolved_item.source_root
-        ));
-    };
-    if name != expected_bundle_id {
-        return Err(format!(
-            "runtime-authority item ref names bundle {expected_bundle_id}, but typed source \
-             provenance names bundle {name}"
-        ));
-    }
-    let bundle_root = engine.registered_bundle_root(name).ok_or_else(|| {
-        format!("typed runtime-authority bundle {name} is absent from the admitted generation")
-    })?;
-    let ai_dir = bundle_root.join(ryeos_engine::AI_DIR);
-    let canonical_ai_dir = std::fs::canonicalize(&ai_dir).map_err(|err| {
-        format!(
-            "canonicalize typed runtime-authority bundle root {}: {err}",
-            ai_dir.display()
-        )
-    })?;
-
-    let source_metadata = std::fs::symlink_metadata(&resolved_item.source_path).map_err(|err| {
-        format!(
-            "stat resolved runtime-authority item {}: {err}",
-            resolved_item.source_path.display()
-        )
-    })?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
-        return Err(format!(
-            "runtime-authority item {} must be a regular installed file (symlinks rejected)",
-            resolved_item.source_path.display()
-        ));
-    }
-
-    let canonical_source = std::fs::canonicalize(&resolved_item.source_path).map_err(|err| {
-        format!(
-            "canonicalize resolved runtime-authority item {}: {err}",
-            resolved_item.source_path.display()
-        )
-    })?;
-    if !canonical_source.starts_with(&canonical_ai_dir) {
-        return Err(format!(
-            "runtime-authority item {} contradicts typed bundle root {}",
-            resolved_item.source_path.display(),
-            canonical_ai_dir.display()
-        ));
-    }
-
-    // Re-read once, pin it to the bytes that produced ResolvedItem metadata,
-    // and verify the signature solely with persistent node trust. This keeps a
-    // project key/caller overlay from turning an installed-path item into node
-    // callback authority and detects a source replacement after resolution.
-    let source = std::fs::read_to_string(&canonical_source).map_err(|err| {
-        format!(
-            "read resolved runtime-authority item {}: {err}",
-            resolved_item.source_path.display()
-        )
-    })?;
-    let live_content_hash = ryeos_engine::item_resolution::content_hash(&source);
-    if live_content_hash != resolved_item.content_hash {
-        return Err(format!(
-            "runtime-authority item {} changed after resolution (expected {}, found {})",
-            resolved_item.source_path.display(),
-            resolved_item.content_hash,
-            live_content_hash
-        ));
-    }
-    let signature_header = resolved_item.signature_header.as_ref().ok_or_else(|| {
-        format!(
-            "runtime-authority item {} is unsigned; installed TrustedBundle provenance is required",
-            resolved_item.source_path.display()
-        )
-    })?;
-    let (trust_class, _) = ryeos_engine::trust::verify_item_signature(
-        &source,
-        signature_header,
-        &resolved_item.source_format.signature,
-        node_trust_store,
-    )
-    .map_err(|err| {
-        format!(
-            "node verification failed for runtime-authority item {}: {err}",
-            resolved_item.source_path.display()
-        )
-    })?;
-    if trust_class != ryeos_engine::contracts::TrustClass::Trusted {
-        return Err(format!(
-            "runtime-authority item {} is not signed by a node-trusted publisher",
-            resolved_item.source_path.display()
-        ));
-    }
-
-    Ok(canonical_ai_dir)
-}
+pub(crate) use ryeos_app::runtime_capability_admission::mint_runtime_capability_caps;
 
 /// Tool-path entry point: source the `requires` block from the resolved item's
 /// extracted metadata. Graph/directive mint from the composed/narrowed view at
@@ -3894,6 +3598,7 @@ fn dispatch_daemon_owned_inner(
     let validate_only = request.validate_only;
     let params = request.params.clone();
     let ref_bindings = request.ref_bindings.clone();
+    let product_selections = request.product_selections.clone();
     let acting_principal = request.acting_principal.to_owned();
     let project_path = request.project_path.to_path_buf();
     let provenance = request.provenance.clone();
@@ -3925,6 +3630,7 @@ fn dispatch_daemon_owned_inner(
             validate_only,
             params,
             ref_bindings,
+            product_selections,
             acting_principal: &acting_principal,
             project_path: &project_path,
             provenance,
@@ -4362,6 +4068,20 @@ pub enum LaunchContractApplicability {
     NonEnvelope { class: RootDispatchClass },
 }
 
+fn direct_root_product_selection_supported(
+    class: &RootDispatchClass,
+    external_content_contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
+    inputs: &ryeos_state::external_content::products::composition::ProductSelectionInputs,
+) -> bool {
+    // Eligibility comes from the exact registered signed kind, not its name.
+    // This routing check grants neither a selection nor a realization: the
+    // ordinary admission owners still prove each declared slot and binding.
+    matches!(class, RootDispatchClass::TerminalSubprocess) && external_content_contract.is_some()
+        && inputs.iter().all(|input| matches!(
+            &input.target, ryeos_state::external_content::products::composition::ProductSelectionTarget::Root {}
+        ))
+}
+
 /// Process-local proof that launch-contract applicability was classified by
 /// the same exact preflight that admitted the root. Its fields are private so
 /// callers can carry but cannot manufacture route evidence.
@@ -4415,6 +4135,11 @@ impl RootDispatchEvidence {
         if admission.ref_bindings() != &request.ref_bindings {
             return Err(DispatchError::Internal(anyhow::anyhow!(
                 "root dispatch request ref bindings differ from exact preflight admission"
+            )));
+        }
+        if admission.product_selections() != &request.product_selections {
+            return Err(DispatchError::Internal(anyhow::anyhow!(
+                "root dispatch request product selectors differ from exact preflight admission"
             )));
         }
         let requested_ref = CanonicalRef::parse(item_ref)
@@ -4613,6 +4338,9 @@ pub async fn admit_launch_contract(
     )
     .await?;
     if let Some(prepared) = prepared.as_ref() {
+        crate::execution::launch_preparation::require_prepared_project_result(
+            prepared, provenance,
+        )?;
         require_prepared_launch_secret_availability(
             root_admission,
             prepared,
@@ -4643,8 +4371,26 @@ pub async fn prepare_admitted_launch_contract(
 ) -> Result<Option<crate::execution::launch_preparation::PreparedRuntimeLaunch>, DispatchError> {
     let runtime = match applicability {
         LaunchContractApplicability::NonEnvelope { class } => {
-            if ref_bindings.is_empty() {
+            if ref_bindings.is_empty()
+                && (root_admission.product_selections().is_empty()
+                    || direct_root_product_selection_supported(
+                        class,
+                        ctx.engine
+                            .kinds
+                            .get(&root_admission.verified_subject().resolved.kind)
+                            .and_then(|schema| schema.external_content_contract()),
+                        root_admission.product_selections(),
+                    ))
+            {
                 return Ok(None);
+            }
+            if !root_admission.product_selections().is_empty() {
+                return Err(DispatchError::CapabilityRejected {
+                    reason: format!(
+                        "product selectors are not supported by {} execution",
+                        class.as_str()
+                    ),
+                });
             }
             return Err(DispatchError::RefBindingNotApplicable {
                 class: class.as_str().to_owned(),
@@ -4741,6 +4487,7 @@ pub async fn prepare_admitted_launch_contract(
             runtime,
             primary: root_admission.resolution_output(),
             ref_bindings,
+            product_selections: root_admission.product_selections(),
             roots: &roots,
             parsers: &request_snapshot.parser_dispatcher,
             trust_store: &request_snapshot.trust_store,
@@ -4892,12 +4639,15 @@ pub fn prepare_launch_contract(
         binding: None,
         details: Box::new(BTreeMap::new()),
     })?;
+    let product_selections =
+        ryeos_state::external_content::products::composition::ProductSelectionInputs::new();
     crate::execution::launch_preparation::prepare_runtime_launch(
         crate::execution::launch_preparation::PrepareRuntimeLaunchRequest {
             engine: &ctx.engine,
             runtime,
             primary: &resolution,
             ref_bindings,
+            product_selections: &product_selections,
             roots: &roots,
             parsers: &request_snapshot.parser_dispatcher,
             trust_store: &request_snapshot.trust_store,
@@ -5077,6 +4827,8 @@ fn finish_root_dispatch_preflight(
     root_subject: VerifiedItem,
     thread_profile: String,
     ref_bindings: &BTreeMap<String, String>,
+    product_selections:
+        &ryeos_state::external_content::products::composition::ProductSelectionInputs,
     usage_subject: Option<&ryeos_state::UsageSubject>,
     usage_subject_asserted_by: Option<&str>,
     project_binding: &ryeos_app::thread_lifecycle::AdmittedProjectBinding,
@@ -5096,6 +4848,24 @@ fn finish_root_dispatch_preflight(
     {
         return Err(DispatchError::RefBindingNotApplicable {
             class: class.as_str().to_owned(),
+        });
+    }
+    if !product_selections.is_empty()
+        && let LaunchContractApplicability::NonEnvelope { class } = &applicability
+        && !direct_root_product_selection_supported(
+            class,
+            ctx.engine
+                .kinds
+                .get(&root_subject.resolved.kind)
+                .and_then(|schema| schema.external_content_contract()),
+            product_selections,
+        )
+    {
+        return Err(DispatchError::CapabilityRejected {
+            reason: format!(
+                "product selectors are not supported by {} execution",
+                class.as_str()
+            ),
         });
     }
     let admitted_root_ref = root_subject.resolved.canonical_ref.to_string();
@@ -5146,6 +4916,7 @@ fn finish_root_dispatch_preflight(
             .map_err(DispatchError::Internal)?,
         thread_profile,
         ref_bindings.clone(),
+        product_selections.clone(),
         usage_subject.cloned(),
         usage_subject_asserted_by.map(str::to_string),
         launch_timings,
@@ -5593,6 +5364,8 @@ pub fn preflight_root_dispatch(
     original_root_kind: &str,
     params: &Value,
     ref_bindings: &BTreeMap<String, String>,
+    product_selections:
+        &ryeos_state::external_content::products::composition::ProductSelectionInputs,
     usage_subject: Option<&ryeos_state::UsageSubject>,
     usage_subject_asserted_by: Option<&str>,
     project_binding: &ryeos_app::thread_lifecycle::AdmittedProjectBinding,
@@ -5778,6 +5551,7 @@ pub fn preflight_root_dispatch(
                         subject,
                         profile,
                         ref_bindings,
+                        product_selections,
                         usage_subject,
                         usage_subject_asserted_by,
                         project_binding,
@@ -5887,6 +5661,7 @@ pub fn preflight_root_dispatch(
                                             target_canonical.kind.as_str(),
                                             &inner_params,
                                             ref_bindings,
+                                            product_selections,
                                             usage_subject,
                                             usage_subject_asserted_by,
                                             project_binding,
@@ -5918,6 +5693,7 @@ pub fn preflight_root_dispatch(
                                 })?,
                                 hop_profile,
                                 ref_bindings,
+                                product_selections,
                                 usage_subject,
                                 usage_subject_asserted_by,
                                 project_binding,
@@ -6000,6 +5776,7 @@ pub fn preflight_root_dispatch(
                                 subject,
                                 profile,
                                 ref_bindings,
+                                product_selections,
                                 usage_subject,
                                 usage_subject_asserted_by,
                                 project_binding,
@@ -6069,6 +5846,7 @@ pub fn preflight_root_dispatch(
                         detail: "method root has no execution thread profile".to_string(),
                     })?,
                     ref_bindings,
+                    product_selections,
                     usage_subject,
                     usage_subject_asserted_by,
                     project_binding,
@@ -6095,6 +5873,8 @@ pub fn preflight_root_dispatch_for_provenance(
     original_root_kind: &str,
     params: &Value,
     ref_bindings: &BTreeMap<String, String>,
+    product_selections:
+        &ryeos_state::external_content::products::composition::ProductSelectionInputs,
     usage_subject: Option<&ryeos_state::UsageSubject>,
     usage_subject_asserted_by: Option<&str>,
     project_binding: &ryeos_app::thread_lifecycle::AdmittedProjectBinding,
@@ -6109,6 +5889,7 @@ pub fn preflight_root_dispatch_for_provenance(
             original_root_kind,
             params,
             ref_bindings,
+            product_selections,
             usage_subject,
             usage_subject_asserted_by,
             project_binding,
@@ -6131,6 +5912,7 @@ pub fn preflight_root_dispatch_for_provenance(
         original_root_kind,
         params,
         ref_bindings,
+        product_selections,
         usage_subject,
         usage_subject_asserted_by,
         scope.base_project_binding(),
@@ -6281,6 +6063,64 @@ async fn dispatch_by(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_product_selection_requires_kind_contract_and_direct_root_targets() {
+        use ryeos_state::external_content::products::composition::{
+            ProductSelection, ProductSelectionInput, ProductSelectionTarget,
+        };
+        let root = vec![ProductSelectionInput {
+            target: ProductSelectionTarget::Root {},
+            selection: ProductSelection {
+                declaration_id: "subject".to_owned(),
+                witness_hash: "a".repeat(64),
+                witness_source: ryeos_state::external_content::products::transfer::ProductWitnessSource::LocalCapture {},
+                qualification_hash: None,
+            },
+        }];
+        // The registered kind supplies this contract. No kind-name argument
+        // exists: custom direct kinds use the same signed capability gate.
+        let contract = ryeos_engine::kind_registry::KindExternalContentDecl {
+            realization_derived: ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY
+                .to_owned(),
+            allowed_roots: vec!["project_files".to_owned()],
+            allowed_mount_roots: vec![
+                ryeos_engine::external_content::ExternalContentMountRoot::Project,
+            ],
+            max_declarations: 4,
+            large_content: None,
+        };
+        assert!(direct_root_product_selection_supported(
+            &RootDispatchClass::TerminalSubprocess,
+            Some(&contract),
+            &root,
+        ));
+        for class in [
+            RootDispatchClass::ManagedSubprocess,
+            RootDispatchClass::MethodDispatch,
+            RootDispatchClass::InProcess,
+        ] {
+            assert!(!direct_root_product_selection_supported(
+                &class,
+                Some(&contract),
+                &root
+            ));
+        }
+        assert!(!direct_root_product_selection_supported(
+            &RootDispatchClass::TerminalSubprocess,
+            None,
+            &root,
+        ));
+        let mut dependency = root;
+        dependency[0].target = ProductSelectionTarget::ContentDependency {
+            binding: "environment".to_owned(),
+        };
+        assert!(!direct_root_product_selection_supported(
+            &RootDispatchClass::TerminalSubprocess,
+            Some(&contract),
+            &dependency,
+        ));
+    }
     use std::fs;
     use std::path::PathBuf;
 
@@ -6872,6 +6712,7 @@ metadata:
             parameters: serde_json::Value::Null,
             root_raw_content_digest: resolved_item.raw_content_digest.clone(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             root_admission: None,
             resolved_item,
             plan_context: test_plan_context(source_root.to_path_buf()),

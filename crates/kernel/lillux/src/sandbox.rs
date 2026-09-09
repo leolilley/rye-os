@@ -26,6 +26,18 @@ pub struct LinuxSandboxMount {
     pub layer: u32,
 }
 
+/// One writable mount whose exact source is a directory below the retained
+/// never-attached overlay template. The relative coordinate is not pathname
+/// authority: the held descriptor remains the identity witness, and launch
+/// reopens this coordinate without following links only after attaching and
+/// verifying the exact template in the borrower's private namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxSandboxOverlayDescendantMount {
+    pub source_fd: u32,
+    pub relative_path: PathBuf,
+    pub destination: PathBuf,
+}
+
 /// A filtered view of one already-authorized directory mount. Parent entries
 /// along `denied_paths` are fixed for this launch; permitted mounted children
 /// retain the access of the original mount. No policy paths are chosen here.
@@ -43,6 +55,7 @@ pub struct LinuxSandboxFixedParentView {
 pub struct LinuxSandboxOverlay {
     pub template: LinuxOverlayTemplate,
     pub destination: PathBuf,
+    pub writable_descendant_mounts: Vec<LinuxSandboxOverlayDescendantMount>,
 }
 
 /// One never-attached overlay mount retained by exact descriptor authority.
@@ -255,10 +268,16 @@ pub enum LinuxOverlayMutationKind {
         size: u64,
         sha256: String,
     },
+    UpsertSymlink {
+        target: String,
+    },
     DeletePath,
     EnsureDirectory,
     OpaqueDirectory,
 }
+
+/// Portable retained-output link bound, applied before allocating its target.
+pub const MAX_LINUX_OVERLAY_SYMLINK_TARGET_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxOverlayMutation {
@@ -599,6 +618,19 @@ mod imp {
             mount_overlay(overlay)?;
         }
         let mut mounts = request.mounts.clone();
+        let mut overlay_descendant_sources = Vec::new();
+        if let Some(overlay) = &request.overlay {
+            for descendant in &overlay.writable_descendant_mounts {
+                let source = reanchor_overlay_descendant_source(&overlay.destination, descendant)?;
+                mounts.push(LinuxSandboxMount {
+                    source_fd: source.inherited_descriptor()?,
+                    destination: descendant.destination.clone(),
+                    access: LinuxSandboxMountAccess::Writable,
+                    layer: 10,
+                });
+                overlay_descendant_sources.push(source);
+            }
+        }
         mounts.sort_by(|left, right| {
             left.layer
                 .cmp(&right.layer)
@@ -630,6 +662,9 @@ mod imp {
         if let Some(staging) = sealed_staging {
             staging.detach()?;
         }
+        // Exact reopened descendants must remain live until their detached
+        // bind mounts have been attached. They grant no authority afterward.
+        drop(overlay_descendant_sources);
         let executable = rooted(&request.executable)?;
         ensure_regular_path(&executable, "sandbox executable")?;
         let cwd = rooted(&request.cwd)?;
@@ -638,6 +673,19 @@ mod imp {
     }
 
     fn validate_request(request: &LinuxSandboxRequest) -> Result<(), String> {
+        const MAX_SANDBOX_MOUNTS: usize = 4096;
+        let descendant_mount_count = request
+            .overlay
+            .as_ref()
+            .map_or(0, |overlay| overlay.writable_descendant_mounts.len());
+        if request
+            .mounts
+            .len()
+            .checked_add(descendant_mount_count)
+            .is_none_or(|count| count > MAX_SANDBOX_MOUNTS)
+        {
+            return Err("sandbox mount count exceeds its bound".to_string());
+        }
         let staging_path = PathBuf::from(format!("/{SEALED_STAGING_NAME}"));
         if request
             .mounts
@@ -646,6 +694,10 @@ mod imp {
             || request.overlay.as_ref().is_some_and(|overlay| {
                 overlay.destination.starts_with(&staging_path)
                     || staging_path.starts_with(&overlay.destination)
+                    || overlay.writable_descendant_mounts.iter().any(|mount| {
+                        mount.destination.starts_with(&staging_path)
+                            || staging_path.starts_with(&mount.destination)
+                    })
             })
         {
             return Err("mount conflicts with private sealed-source staging".to_string());
@@ -661,6 +713,10 @@ mod imp {
                 || request.overlay.as_ref().is_some_and(|overlay| {
                     overlay.destination.starts_with(proc_path)
                         || proc_path.starts_with(&overlay.destination)
+                        || overlay.writable_descendant_mounts.iter().any(|mount| {
+                            mount.destination.starts_with(proc_path)
+                                || proc_path.starts_with(&mount.destination)
+                        })
                 })
             {
                 return Err("mount conflicts with reserved PID procfs".to_string());
@@ -715,6 +771,50 @@ mod imp {
                 || !destinations.insert(overlay.destination.clone())
             {
                 return Err("sandbox overlay destination is invalid or duplicated".to_string());
+            }
+            let mut previous_destination: Option<&PathBuf> = None;
+            let mut descendant_descriptors = BTreeSet::new();
+            let mut descendant_destinations: Vec<&PathBuf> = Vec::new();
+            for descendant in &overlay.writable_descendant_mounts {
+                validate_inherited_fd(descendant.source_fd, "sandbox overlay-descendant mount")?;
+                if descriptor_kind(descendant.source_fd)? != DescriptorKind::Directory {
+                    return Err("sandbox overlay-descendant source must be a directory".to_string());
+                }
+                if !descendant_descriptors.insert(descendant.source_fd)
+                    || !descriptor_roles.insert(descendant.source_fd)
+                {
+                    return Err(
+                        "overlay-descendant descriptor aliases another authority role".to_string(),
+                    );
+                }
+                validate_relative_path(
+                    &descendant.relative_path,
+                    "sandbox overlay-descendant source",
+                )?;
+                validate_absolute_path(
+                    &descendant.destination,
+                    "sandbox overlay-descendant destination",
+                )?;
+                if descendant.destination == PathBuf::from("/")
+                    || previous_destination
+                        .is_some_and(|previous| previous >= &descendant.destination)
+                    || !destinations.insert(descendant.destination.clone())
+                    || paths_overlap(&descendant.destination, &overlay.destination)
+                    || request
+                        .mounts
+                        .iter()
+                        .any(|mount| paths_overlap(&descendant.destination, &mount.destination))
+                    || descendant_destinations
+                        .iter()
+                        .any(|other| paths_overlap(&descendant.destination, other))
+                {
+                    return Err(
+                        "overlay-descendant destinations must be sorted, unique, and nonoverlapping with other mounts"
+                            .to_string(),
+                    );
+                }
+                previous_destination = Some(&descendant.destination);
+                descendant_destinations.push(&descendant.destination);
             }
         }
         let mut previous_target = None;
@@ -922,6 +1022,45 @@ mod imp {
             sources.insert(descriptor, reanchor_mount_source_at(fd, &path)?);
         }
         Ok(sources)
+    }
+
+    fn reanchor_overlay_descendant_source(
+        overlay_destination: &PathBuf,
+        descendant: &LinuxSandboxOverlayDescendantMount,
+    ) -> Result<crate::InheritedDescriptorAuthority, String> {
+        let mounted = open_mount_target_no_symlinks(overlay_destination)?;
+        let mut current =
+            crate::PinnedDirectory::from_open_directory(rooted(overlay_destination)?, mounted)
+                .map_err(|error| format!("pin mounted overlay root: {error}"))?;
+        for component in descendant.relative_path.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(
+                    "sandbox overlay-descendant source must be a normalized relative path"
+                        .to_string(),
+                );
+            };
+            current = current
+                .open_child_directory(name)
+                .map_err(|error| format!("open mounted overlay descendant: {error}"))?
+                .ok_or_else(|| "mounted overlay descendant is missing".to_string())?;
+        }
+        let expected = mount_source_stat(raw_fd(descendant.source_fd)?)?;
+        let observed_descriptor = current
+            .try_clone_descriptor()
+            .map_err(|error| format!("inspect mounted overlay descendant: {error}"))?;
+        let observed = mount_source_stat(observed_descriptor.as_raw_fd())?;
+        if expected.st_dev != observed.st_dev
+            || expected.st_ino != observed.st_ino
+            || expected.st_mode & libc::S_IFMT != observed.st_mode & libc::S_IFMT
+        {
+            return Err(
+                "overlay descendant changed between retained authority and mounted template"
+                    .to_string(),
+            );
+        }
+        current
+            .into_inherited_descriptor_path()
+            .map_err(|error| format!("retain mounted overlay descendant: {error}"))
     }
 
     struct SealedSourceStaging {
@@ -1539,7 +1678,12 @@ mod imp {
         syscall_zero(
             unsafe { libc::rmdir(c"/.lillux-old-root".as_ptr()) },
             "remove former-root mountpoint",
-        )
+        )?;
+        // Seal the synthetic namespace scaffolding only after setup and
+        // former-root removal. Nonrecursive is essential: explicitly mounted
+        // writable workspaces and private /tmp keep their admitted access.
+        // The target's confinement filter subsequently prevents remounts.
+        set_mount_attributes(&PathBuf::from("/"), true, true, false)
     }
 
     fn probe_isolated_pid_child() -> Result<(), String> {
@@ -1566,6 +1710,13 @@ mod imp {
                 }
                 mount_pid_namespace_proc()?;
                 pivot_into_private_root()?;
+                if !matches!(std::fs::create_dir("/namespace-replacement"), Err(ref error)
+                    if error.raw_os_error() == Some(libc::EROFS))
+                {
+                    return Err("synthetic namespace root is not read-only".to_string());
+                }
+                std::fs::write("/tmp/namespace-writable-probe", b"writable")
+                    .map_err(|error| format!("private tmp lost writable access: {error}"))?;
                 if std::fs::read_link("/proc/self").map_err(|error| error.to_string())?
                     != PathBuf::from("1")
                     || std::path::Path::new(&format!("/proc/{parent_pid}")).exists()
@@ -2075,7 +2226,44 @@ mod imp {
         max_mutations: usize,
     ) -> Result<Vec<LinuxOverlayMutation>, String> {
         let mut mutations = Vec::new();
-        scan_overlay_directory(directory_fd, "", &mut mutations, max_mutations)?;
+        let root = inherited_directory(directory_fd as u32, "overlay scan root")?;
+        let mut pending = vec![(
+            String::new(),
+            root.identity()
+                .map_err(|error| format!("inspect overlay scan root: {error:#}"))?,
+        )];
+        // Keep paths, not open ancestors. The lifecycle adapter has a bounded
+        // descriptor budget independent of the admitted tree's depth. Every
+        // component is reopened beneath the pinned root without following links,
+        // and the selected directory must still be the inode we inventoried.
+        while let Some((prefix, expected)) = pending.pop() {
+            let mut directory = root
+                .try_clone()
+                .map_err(|error| format!("clone overlay scan root: {error:#}"))?;
+            for component in prefix.split('/').filter(|component| !component.is_empty()) {
+                directory = directory
+                    .open_child_directory(OsStr::new(component))
+                    .map_err(|error| format!("reopen overlay directory {prefix}: {error:#}"))?
+                    .ok_or_else(|| format!("overlay directory disappeared: {prefix}"))?;
+            }
+            if directory
+                .identity()
+                .map_err(|error| format!("inspect overlay directory {prefix}: {error:#}"))?
+                != expected
+            {
+                return Err(format!("overlay directory changed during scan: {prefix}"));
+            }
+            let descriptor = directory
+                .try_clone_descriptor()
+                .map_err(|error| format!("clone overlay directory {prefix}: {error:#}"))?;
+            scan_overlay_directory(
+                descriptor.as_raw_fd(),
+                &prefix,
+                &mut mutations,
+                &mut pending,
+                max_mutations,
+            )?;
+        }
         mutations.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(mutations)
     }
@@ -2084,12 +2272,13 @@ mod imp {
         directory_fd: RawFd,
         prefix: &str,
         mutations: &mut Vec<LinuxOverlayMutation>,
+        pending: &mut Vec<(String, crate::PinnedDirectoryIdentity)>,
         max_mutations: usize,
     ) -> Result<(), String> {
         let directory = inherited_directory(directory_fd as u32, "overlay scan root")?;
         let entries = directory
             .entries_no_follow_bounded(max_mutations.saturating_add(1))
-            .map_err(|error| format!("read overlay upper directory: {error}"))?;
+            .map_err(|error| format!("read overlay upper directory: {error:#}"))?;
         for entry in entries {
             if mutations.len() >= max_mutations {
                 return Err(format!("overlay delta exceeds {max_mutations} mutations"));
@@ -2133,6 +2322,9 @@ mod imp {
                         sha256,
                     }
                 }
+                libc::S_IFLNK => LinuxOverlayMutationKind::UpsertSymlink {
+                    target: read_overlay_symlink_at(directory_fd, &name_c, &stat, &relative)?,
+                },
                 libc::S_IFDIR => {
                     let child = unsafe {
                         libc::openat(
@@ -2147,7 +2339,25 @@ mod imp {
                             std::io::Error::last_os_error()
                         ));
                     }
-                    let opaque = directory_is_opaque(child)?;
+                    let child = unsafe { File::from_raw_fd(child) };
+                    let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    syscall_zero(
+                        unsafe { libc::fstat(child.as_raw_fd(), opened.as_mut_ptr()) },
+                        "inspect opened overlay directory",
+                    )?;
+                    let opened = unsafe { opened.assume_init() };
+                    if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
+                        return Err(format!("overlay directory changed before scan: {relative}"));
+                    }
+                    let opaque = directory_is_opaque(child.as_raw_fd())?;
+                    let pinned = crate::PinnedDirectory::from_open_directory(
+                        PathBuf::from(&relative),
+                        child,
+                    )
+                    .map_err(|error| format!("pin overlay directory {relative}: {error:#}"))?;
+                    let identity = pinned.identity().map_err(|error| {
+                        format!("inspect overlay directory {relative}: {error:#}")
+                    })?;
                     mutations.push(LinuxOverlayMutation {
                         path: relative.clone(),
                         kind: if opaque {
@@ -2156,9 +2366,7 @@ mod imp {
                             LinuxOverlayMutationKind::EnsureDirectory
                         },
                     });
-                    let result = scan_overlay_directory(child, &relative, mutations, max_mutations);
-                    close_fd(child);
-                    result?;
+                    pending.push((relative, identity));
                     continue;
                 }
                 libc::S_IFCHR if stat.st_rdev == 0 => LinuxOverlayMutationKind::DeletePath,
@@ -2174,6 +2382,204 @@ mod imp {
             });
         }
         Ok(())
+    }
+
+    fn read_overlay_symlink_at(
+        directory_fd: RawFd,
+        name: &CStr,
+        expected: &libc::stat,
+        relative: &str,
+    ) -> Result<String, String> {
+        if expected.st_size < 1
+            || expected.st_size as u64 > MAX_LINUX_OVERLAY_SYMLINK_TARGET_BYTES as u64
+        {
+            return Err(format!(
+                "overlay symlink target exceeds its bound: {relative}"
+            ));
+        }
+        // Pin the link inode itself. A directory-relative readlink alone could
+        // read a replacement between two equal observations of the original.
+        let fd = unsafe {
+            libc::openat(
+                directory_fd,
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "pin overlay symlink {relative}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let link = unsafe { File::from_raw_fd(fd) };
+        let observe_link = || -> Result<libc::stat, String> {
+            let mut observed = std::mem::MaybeUninit::<libc::stat>::uninit();
+            syscall_zero(
+                unsafe { libc::fstat(link.as_raw_fd(), observed.as_mut_ptr()) },
+                "inspect pinned overlay symlink",
+            )?;
+            Ok(unsafe { observed.assume_init() })
+        };
+        let same_identity = |observed: &libc::stat| {
+            observed.st_dev == expected.st_dev
+                && observed.st_ino == expected.st_ino
+                && observed.st_mode == expected.st_mode
+                && observed.st_mode & libc::S_IFMT == libc::S_IFLNK
+                && observed.st_size == expected.st_size
+                && observed.st_mtime == expected.st_mtime
+                && observed.st_mtime_nsec == expected.st_mtime_nsec
+                && observed.st_ctime == expected.st_ctime
+                && observed.st_ctime_nsec == expected.st_ctime_nsec
+        };
+        if !same_identity(&observe_link()?) {
+            return Err(format!(
+                "overlay symlink changed before target capture: {relative}"
+            ));
+        }
+        let mut bytes = vec![0_u8; MAX_LINUX_OVERLAY_SYMLINK_TARGET_BYTES + 1];
+        let read = unsafe {
+            libc::readlinkat(
+                link.as_raw_fd(),
+                c"".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if read < 0 {
+            return Err(format!(
+                "read pinned overlay symlink {relative}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if read as usize > MAX_LINUX_OVERLAY_SYMLINK_TARGET_BYTES || read as i64 != expected.st_size
+        {
+            return Err(format!(
+                "overlay symlink target changed or exceeds its bound: {relative}"
+            ));
+        }
+        let mut selected = std::mem::MaybeUninit::<libc::stat>::uninit();
+        syscall_zero(
+            unsafe {
+                libc::fstatat(
+                    directory_fd,
+                    name.as_ptr(),
+                    selected.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            "recheck selected overlay symlink",
+        )?;
+        if !same_identity(&observe_link()?) || !same_identity(&unsafe { selected.assume_init() }) {
+            return Err(format!(
+                "overlay symlink changed during target capture: {relative}"
+            ));
+        }
+        bytes.truncate(read as usize);
+        let target = String::from_utf8(bytes)
+            .map_err(|_| format!("overlay symlink target is not UTF-8: {relative}"))?;
+        if target.is_empty() || target.starts_with('/') || target.as_bytes().contains(&0) {
+            return Err(format!(
+                "overlay symlink target is not portable relative content: {relative}"
+            ));
+        }
+        Ok(target)
+    }
+
+    #[cfg(test)]
+    mod overlay_symlink_tests {
+        use super::*;
+
+        #[test]
+        fn overlay_scan_depth_does_not_consume_descriptor_budget() {
+            const CHILD_ROOT: &str = "RYEOS_OVERLAY_SCAN_DESCRIPTOR_TEST_ROOT";
+            if let Some(path) = std::env::var_os(CHILD_ROOT) {
+                let root = crate::PinnedDirectory::open(std::path::Path::new(&path))
+                    .unwrap()
+                    .unwrap();
+                let descriptor = root.try_clone_descriptor().unwrap();
+                let limit = libc::rlimit {
+                    rlim_cur: 32,
+                    rlim_max: 32,
+                };
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+                let mutations = scan_overlay_upper(descriptor.as_raw_fd(), 65).unwrap();
+                assert_eq!(mutations.len(), 65);
+                assert!(matches!(
+                    mutations.last().unwrap().kind,
+                    LinuxOverlayMutationKind::UpsertRegular { size: 5, .. }
+                ));
+                assert!(
+                    scan_overlay_upper(descriptor.as_raw_fd(), 64)
+                        .unwrap_err()
+                        .contains("exceeds 64 mutations")
+                );
+                return;
+            }
+            let temporary = tempfile::tempdir().unwrap();
+            let mut leaf = temporary.path().to_path_buf();
+            for _ in 0..64 {
+                leaf.push("child");
+                std::fs::create_dir(&leaf).unwrap();
+            }
+            std::fs::write(leaf.join("value"), b"value").unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "overlay_scan_depth_does_not_consume_descriptor_budget",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, temporary.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        #[test]
+        fn captured_symlink_refuses_replaced_inode_and_overbound_identity() {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = crate::PinnedDirectory::open(temporary.path())
+                .unwrap()
+                .unwrap();
+            root.create_symlink(OsStr::new("link"), b"first").unwrap();
+            let descriptor = root.try_clone_descriptor().unwrap();
+            let mut expected = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(
+                unsafe {
+                    libc::fstatat(
+                        descriptor.as_raw_fd(),
+                        c"link".as_ptr(),
+                        expected.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                },
+                0
+            );
+            let expected = unsafe { expected.assume_init() };
+            assert_eq!(
+                read_overlay_symlink_at(descriptor.as_raw_fd(), c"link", &expected, "link")
+                    .unwrap(),
+                "first"
+            );
+            // Keep the selected original inode alive under another name so
+            // replacement cannot accidentally reuse its inode coordinate.
+            std::fs::rename(
+                temporary.path().join("link"),
+                temporary.path().join("old-link"),
+            )
+            .unwrap();
+            root.create_symlink(OsStr::new("link"), b"other").unwrap();
+            assert!(
+                read_overlay_symlink_at(descriptor.as_raw_fd(), c"link", &expected, "link")
+                    .is_err()
+            );
+            let mut oversized = expected;
+            oversized.st_size = MAX_LINUX_OVERLAY_SYMLINK_TARGET_BYTES as i64 + 1;
+            assert!(
+                read_overlay_symlink_at(descriptor.as_raw_fd(), c"link", &oversized, "link")
+                    .unwrap_err()
+                    .contains("bound")
+            );
+        }
     }
 
     fn hash_regular_at(
@@ -2489,6 +2895,27 @@ mod imp {
             return Err(format!("{label} must be lexically normalized"));
         }
         Ok(())
+    }
+
+    fn validate_relative_path(path: &PathBuf, label: &str) -> Result<(), String> {
+        let bytes = path.as_os_str().as_bytes();
+        let normalized = path.components().collect::<PathBuf>();
+        if bytes.is_empty()
+            || bytes.len() >= libc::PATH_MAX as usize
+            || bytes.contains(&0)
+            || path.is_absolute()
+            || normalized.as_os_str().as_bytes() != bytes
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!("{label} must be a bounded canonical relative path"));
+        }
+        Ok(())
+    }
+
+    fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+        left.starts_with(right) || right.starts_with(left)
     }
 
     fn open_mount_target_no_symlinks(destination: &PathBuf) -> Result<File, String> {
@@ -2876,6 +3303,68 @@ mod imp {
         }
 
         #[test]
+        fn overlay_descendant_reanchor_requires_exact_relative_identity() {
+            let temporary = tempfile::tempdir_in(ROOT).unwrap();
+            let overlay_destination = PathBuf::from("/").join(
+                temporary
+                    .path()
+                    .file_name()
+                    .expect("temporary root has a name"),
+            );
+            std::fs::create_dir_all(temporary.path().join(".ai/cache/runtime-view")).unwrap();
+            let mounted_root = crate::PinnedDirectory::open(temporary.path())
+                .unwrap()
+                .unwrap();
+            let exact = mounted_root
+                .open_child_directory(OsStr::new(".ai"))
+                .unwrap()
+                .unwrap()
+                .open_child_directory(OsStr::new("cache"))
+                .unwrap()
+                .unwrap()
+                .open_child_directory(OsStr::new("runtime-view"))
+                .unwrap()
+                .unwrap()
+                .into_inherited_descriptor_path()
+                .unwrap();
+            let descendant = LinuxSandboxOverlayDescendantMount {
+                source_fd: exact.inherited_descriptor().unwrap(),
+                relative_path: PathBuf::from(".ai/cache/runtime-view"),
+                destination: PathBuf::from("/ryeos/runtime-views/TMPDIR"),
+            };
+            let reopened =
+                reanchor_overlay_descendant_source(&overlay_destination, &descendant).unwrap();
+            assert!(exact.same_file_identity(&reopened).unwrap());
+
+            std::fs::rename(
+                temporary.path().join(".ai/cache/runtime-view"),
+                temporary.path().join(".ai/cache/retained"),
+            )
+            .unwrap();
+            std::fs::create_dir(temporary.path().join(".ai/cache/runtime-view")).unwrap();
+            assert!(
+                reanchor_overlay_descendant_source(&overlay_destination, &descendant)
+                    .unwrap_err()
+                    .contains("changed between retained authority")
+            );
+            std::fs::remove_dir(temporary.path().join(".ai/cache/runtime-view")).unwrap();
+            std::os::unix::fs::symlink("retained", temporary.path().join(".ai/cache/runtime-view"))
+                .unwrap();
+            assert!(reanchor_overlay_descendant_source(&overlay_destination, &descendant).is_err());
+        }
+
+        #[test]
+        fn overlay_descendant_relative_paths_are_strictly_canonical() {
+            assert!(validate_relative_path(&PathBuf::from(".ai/cache/view"), "test").is_ok());
+            for path in ["", "/absolute", ".", "a/../b", "a//b", "a/"] {
+                assert!(
+                    validate_relative_path(&PathBuf::from(path), "test").is_err(),
+                    "accepted {path:?}"
+                );
+            }
+        }
+
+        #[test]
         fn private_mount_copy_refuses_unsealed_source() {
             let temporary = tempfile::tempfile().unwrap();
             let directory = tempfile::tempdir().unwrap();
@@ -2957,6 +3446,21 @@ mod imp {
             let Ok(stage) = std::env::var("LILLUX_PROC_EXEC_PROBE") else {
                 return;
             };
+            if stage == "child" {
+                // Check before this target opens any files. The parent made
+                // this exact directory descriptor inheritable deliberately;
+                // ordinary descendant exec must still close it.
+                let fd: RawFd = std::env::var("LILLUX_DESCENDANT_CLOSED_FD")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(fd >= 300);
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF)
+                );
+            }
             let executable = std::env::current_exe().unwrap();
             assert_eq!(executable, PathBuf::from("/probe"));
             assert!(std::fs::File::open(&executable).is_ok());
@@ -2980,6 +3484,117 @@ mod imp {
                 unsafe { filesystem.assume_init() }.f_flag & libc::ST_RDONLY,
                 0
             );
+            // Namespace spelling is immutable independently of descriptor
+            // inheritance, including after an ordinary child exec.
+            let runtime = crate::secure_fs::PinnedDirectory::open(std::path::Path::new(
+                "/ryeos/realizations/runtime",
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                runtime.verified_read_only_namespace_path().unwrap(),
+                PathBuf::from("/ryeos/realizations/runtime")
+            );
+            let member = runtime
+                .open_pinned_regular(std::ffi::OsStr::new("member"), false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                member.verified_read_only_namespace_path().unwrap(),
+                PathBuf::from("/ryeos/realizations/runtime/member")
+            );
+            assert_eq!(
+                std::fs::read(member.path()).unwrap(),
+                b"exact runtime member"
+            );
+            for outcome in [
+                std::fs::create_dir("/replacement"),
+                std::fs::rename("/ryeos", "/replacement"),
+                std::fs::rename("/ryeos/realizations", "/ryeos/replacement"),
+            ] {
+                assert_eq!(outcome.unwrap_err().raw_os_error(), Some(libc::EROFS));
+            }
+            // A read-only leaf below a writable ancestor is insufficient.
+            let unsafe_leaf = crate::secure_fs::open_pinned_regular_file_no_follow(
+                std::path::Path::new("/tmp/readonly-probe"),
+            )
+            .unwrap();
+            assert!(unsafe_leaf.verified_read_only_namespace_path().is_err());
+            for writable in ["/tmp", "/work"] {
+                let path = PathBuf::from(writable).join(format!("write-{stage}"));
+                std::fs::write(&path, b"writable child mount").unwrap();
+                std::fs::rename(&path, path.with_extension("renamed")).unwrap();
+                let directory =
+                    crate::secure_fs::PinnedDirectory::open(std::path::Path::new(writable))
+                        .unwrap()
+                        .unwrap();
+                assert!(directory.verified_read_only_namespace_path().is_err());
+                assert_eq!(
+                    directory
+                        .verified_writable_mount_namespace_path(std::path::Path::new(writable),)
+                        .unwrap(),
+                    PathBuf::from(writable),
+                );
+            }
+            let writable = crate::secure_fs::PinnedDirectory::open(std::path::Path::new("/work"))
+                .unwrap()
+                .unwrap();
+            assert!(
+                writable
+                    .verified_writable_mount_namespace_path(runtime.path())
+                    .is_err()
+            );
+            assert!(
+                writable
+                    .verified_writable_mount_namespace_path(std::path::Path::new(
+                        "/ryeos/realizations/runtime/alias"
+                    ),)
+                    .is_err()
+            );
+            if stage == "root" {
+                let source =
+                    crate::secure_fs::PinnedDirectory::open(std::path::Path::new("/mutable/view"))
+                        .unwrap()
+                        .unwrap();
+                assert!(
+                    source
+                        .verified_writable_mount_namespace_path(source.path())
+                        .is_err()
+                );
+                assert_eq!(
+                    source
+                        .verified_writable_mount_namespace_path(std::path::Path::new("/work"))
+                        .unwrap(),
+                    PathBuf::from("/work"),
+                );
+                std::fs::rename("/mutable/view", "/mutable/prior").unwrap();
+                std::fs::create_dir("/mutable/view").unwrap();
+                // A writable source alias can move, but cannot retarget the
+                // mounted directory seen by descendants.
+                source
+                    .verified_writable_mount_namespace_path(std::path::Path::new("/work"))
+                    .unwrap();
+                let replacement =
+                    crate::secure_fs::PinnedDirectory::open(std::path::Path::new("/mutable/view"))
+                        .unwrap()
+                        .unwrap();
+                assert!(
+                    replacement
+                        .verified_writable_mount_namespace_path(std::path::Path::new("/work"),)
+                        .is_err()
+                );
+                std::fs::write("/work/exact-view", b"original inode").unwrap();
+                assert!(!std::path::Path::new("/mutable/view/exact-view").exists());
+                assert_eq!(
+                    std::fs::read("/mutable/prior/exact-view").unwrap(),
+                    b"original inode"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read("/work/exact-view").unwrap(),
+                    b"original inode"
+                );
+            }
             assert!(!std::path::Path::new("/.lillux-old-root").exists());
             assert!(!std::path::Path::new("/proc/sys").exists());
             assert!(!std::path::Path::new("/proc/meminfo").exists());
@@ -3022,18 +3637,54 @@ mod imp {
                 let mut bytes = String::new();
                 channel.take(64).read_to_string(&mut bytes).unwrap();
                 assert_eq!(bytes, "native-target-channel");
-                assert!(
-                    std::process::Command::new(executable)
+                use std::os::unix::process::CommandExt as _;
+                let directory = File::open("/work").unwrap();
+                let fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD, 300) };
+                assert!(fd >= 300);
+                let sentinel = unsafe { File::from_raw_fd(fd) };
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+                for command in [executable.as_os_str(), OsStr::new("probe")] {
+                    let mut child = std::process::Command::new(command);
+                    child
                         .args([
                             "--exact",
                             "sandbox::imp::namespace_source_tests::pid_proc_after_exec_target",
-                            "--nocapture"
+                            "--nocapture",
                         ])
+                        .env("PATH", "/")
                         .env("LILLUX_PROC_EXEC_PROBE", "child")
-                        .status()
-                        .unwrap()
-                        .success()
-                );
+                        .env("LILLUX_DESCENDANT_CLOSED_FD", fd.to_string());
+                    unsafe {
+                        child.pre_exec(|| {
+                            // Linux CLOSE_RANGE_CLOEXEC: preserve Command's
+                            // error pipe until exec, but close every nonstdio
+                            // descriptor in the successfully executed child.
+                            // No pass_fds or descriptor-holder fallback is
+                            // needed by either namespace path form.
+                            const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+                            if libc::syscall(
+                                libc::SYS_close_range,
+                                3_u32,
+                                u32::MAX,
+                                CLOSE_RANGE_CLOEXEC,
+                            ) != 0
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                    assert!(child.status().unwrap().success(), "command={command:?}");
+                    // Child-only closure must not revoke the parent's owner.
+                    assert_eq!(
+                        unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) }
+                            & libc::FD_CLOEXEC,
+                        0
+                    );
+                }
             } else {
                 assert_eq!(stage, "child");
                 assert!(unsafe { libc::getpid() } > 1);
@@ -3067,6 +3718,23 @@ mod imp {
             #[cfg(target_arch = "aarch64")]
             libraries.insert(PathBuf::from("/lib/ld-linux-aarch64.so.1"));
             for sealed in [false, true] {
+                let runtime_fixture = tempfile::tempdir().unwrap();
+                std::os::unix::fs::symlink("/work", runtime_fixture.path().join("alias")).unwrap();
+                std::fs::write(
+                    runtime_fixture.path().join("member"),
+                    b"exact runtime member",
+                )
+                .unwrap();
+                let runtime_source =
+                    crate::secure_fs::pin_canonical_mount_source(runtime_fixture.path()).unwrap();
+                let writable_fixture = tempfile::tempdir().unwrap();
+                std::fs::create_dir(writable_fixture.path().join("view")).unwrap();
+                let writable_parent =
+                    crate::secure_fs::pin_canonical_mount_source(writable_fixture.path()).unwrap();
+                let writable_source = crate::secure_fs::pin_canonical_mount_source(
+                    &writable_fixture.path().join("view"),
+                )
+                .unwrap();
                 let entry = if sealed {
                     crate::sealed_memfd(c"proc-exec-test", &std::fs::read(&executable).unwrap())
                         .unwrap()
@@ -3138,6 +3806,32 @@ mod imp {
                     access: LinuxSandboxMountAccess::ReadOnly,
                     layer: 0,
                 });
+                request.mounts.extend([
+                    LinuxSandboxMount {
+                        source_fd: writable_parent.inherited_descriptor().unwrap(),
+                        destination: PathBuf::from("/mutable"),
+                        access: LinuxSandboxMountAccess::Writable,
+                        layer: 0,
+                    },
+                    LinuxSandboxMount {
+                        source_fd: runtime_source.inherited_descriptor().unwrap(),
+                        destination: PathBuf::from("/ryeos/realizations/runtime"),
+                        access: LinuxSandboxMountAccess::ReadOnly,
+                        layer: 0,
+                    },
+                    LinuxSandboxMount {
+                        source_fd: writable_source.inherited_descriptor().unwrap(),
+                        destination: PathBuf::from("/work"),
+                        access: LinuxSandboxMountAccess::Writable,
+                        layer: 0,
+                    },
+                    LinuxSandboxMount {
+                        source_fd: entry.inherited_descriptor().unwrap(),
+                        destination: PathBuf::from("/tmp/readonly-probe"),
+                        access: LinuxSandboxMountAccess::ReadOnly,
+                        layer: 0,
+                    },
+                ]);
                 let pid = unsafe { libc::fork() };
                 assert!(pid >= 0);
                 if pid == 0 {
@@ -3262,6 +3956,64 @@ mod tests {
             std::fs::read(state_path.join("upper/result.txt")).unwrap(),
             b"retained bytes"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_observation_preserves_relative_links_without_following_them() {
+        use std::ffi::OsStr;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let project_path = temporary.path().join("project");
+        let state_path = temporary.path().join("state");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(state_path.join("upper/bin")).unwrap();
+        std::fs::create_dir_all(state_path.join("upper/empty")).unwrap();
+        std::fs::create_dir_all(state_path.join("work")).unwrap();
+        let bin = crate::PinnedDirectory::open(&state_path.join("upper/bin"))
+            .unwrap()
+            .unwrap();
+        // No referent exists. Observation retains the target, never dereferences
+        // it or interprets product-subtree containment as a kernel concern.
+        bin.create_symlink(OsStr::new("program"), b"../lib/missing")
+            .unwrap();
+        let project = crate::PinnedDirectory::open(&project_path)
+            .unwrap()
+            .unwrap();
+        let state = crate::PinnedDirectory::open(&state_path).unwrap().unwrap();
+        let project_fd = project.try_clone_descriptor().unwrap();
+        let state_fd = state.try_clone_descriptor().unwrap();
+        let observe = || {
+            operate_linux_overlay_workspace(
+                project_fd.as_raw_fd() as u32,
+                state_fd.as_raw_fd() as u32,
+                LinuxOverlayWorkspaceOperation::Observe,
+                8,
+            )
+        };
+        let observed = observe().unwrap();
+        assert!(observed.mutations.contains(&LinuxOverlayMutation {
+            path: "bin/program".into(),
+            kind: LinuxOverlayMutationKind::UpsertSymlink {
+                target: "../lib/missing".into()
+            },
+        }));
+        assert!(observed.mutations.contains(&LinuxOverlayMutation {
+            path: "empty".into(),
+            kind: LinuxOverlayMutationKind::EnsureDirectory,
+        }));
+        assert!(
+            operate_linux_overlay_workspace(
+                project_fd.as_raw_fd() as u32,
+                state_fd.as_raw_fd() as u32,
+                LinuxOverlayWorkspaceOperation::Observe,
+                1
+            )
+            .is_err()
+        );
+        bin.create_symlink(OsStr::new("absolute"), b"/outside")
+            .unwrap();
+        assert!(observe().unwrap_err().contains("relative"));
     }
 
     #[cfg(target_os = "linux")]

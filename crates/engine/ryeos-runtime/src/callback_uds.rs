@@ -894,6 +894,7 @@ mod tests {
         let request = DispatchActionRequest {
             thread_id: "T-1".to_string(),
             action: ActionPayload {
+                product_selections: Vec::new(),
                 operation_id: None,
                 item_id: "tool:test/audit".to_string(),
                 ref_bindings: std::collections::BTreeMap::new(),
@@ -921,6 +922,7 @@ mod tests {
         let request = DispatchActionRequest {
             thread_id: "T-1".to_string(),
             action: ActionPayload {
+                product_selections: Vec::new(),
                 operation_id: Some("1".repeat(64)),
                 item_id: "tool:test/noop".to_string(),
                 ref_bindings: std::collections::BTreeMap::new(),
@@ -945,6 +947,7 @@ mod tests {
             thread_id: "T-1".to_string(),
             action: ActionPayload {
                 operation_id,
+                product_selections: Vec::new(),
                 item_id: "tool:test/noop".to_string(),
                 ref_bindings: std::collections::BTreeMap::new(),
                 params: json!({}),

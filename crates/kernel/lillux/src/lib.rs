@@ -21,12 +21,12 @@ pub use exec::{
     ProcessObservationError, ProcessStdoutReader, RunningProcess, SpawnResult, SubprocessLimits,
     SubprocessRequest, SubprocessResult, SupervisedLauncherAttachmentStatusPipe,
     SupervisedLauncherStatusPipe, SupervisedProcessStatus, configure_command_argv0,
-    configure_inherited_descriptor_authorities, configure_inherited_fds,
-    configure_owner_private_creation_mask, configure_subprocess_limits, disable_process_core_dumps,
-    inherited_descriptor_coordinate, inherited_descriptor_path_for, inherited_duplex_channel_pair,
-    protect_descriptor_from_exec, replace_current_process, sealed_executable_memfd, sealed_memfd,
-    supervised_launcher_attachment_status_pipe, supervised_launcher_status_pipe,
-    validate_subprocess_limits,
+    configure_command_piped_stdio, configure_inherited_descriptor_authorities,
+    configure_inherited_fds, configure_owner_private_creation_mask, configure_subprocess_limits,
+    disable_process_core_dumps, inherited_descriptor_coordinate, inherited_descriptor_path_for,
+    inherited_duplex_channel_pair, protect_descriptor_from_exec, replace_current_process,
+    sealed_executable_memfd, sealed_memfd, supervised_launcher_attachment_status_pipe,
+    supervised_launcher_status_pipe, validate_subprocess_limits,
 };
 pub use exec::{retain_fork_sensitive_descriptors, retain_fork_sensitive_descriptors_until};
 
@@ -78,11 +78,11 @@ pub use sandbox::{
     LinuxOverlayWorkspaceObservation, LinuxOverlayWorkspaceOperation, LinuxSandboxAggregateLimits,
     LinuxSandboxExit, LinuxSandboxFixedParentView, LinuxSandboxInspection, LinuxSandboxLifecycle,
     LinuxSandboxMount, LinuxSandboxMountAccess, LinuxSandboxNetwork, LinuxSandboxOverlay,
-    LinuxSandboxProcFilesystem, LinuxSandboxProcess, LinuxSandboxRequest,
-    create_linux_overlay_template, exit_with_linux_sandbox_status, inspect_linux_sandbox,
-    launch_linux_sandbox, operate_linux_overlay_workspace, read_sealed_inherited_descriptor,
-    validate_connected_unix_stream_descriptor, validate_current_executable_descriptor,
-    write_inherited_descriptor,
+    LinuxSandboxOverlayDescendantMount, LinuxSandboxProcFilesystem, LinuxSandboxProcess,
+    LinuxSandboxRequest, create_linux_overlay_template, exit_with_linux_sandbox_status,
+    inspect_linux_sandbox, launch_linux_sandbox, operate_linux_overlay_workspace,
+    read_sealed_inherited_descriptor, validate_connected_unix_stream_descriptor,
+    validate_current_executable_descriptor, write_inherited_descriptor,
 };
 
 pub use identity::envelope::{

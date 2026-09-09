@@ -1,14 +1,18 @@
-<!-- ryeos:signed:2026-09-05T02:30:04Z:2f32504805760b564f85bde444868e160753492bd28d139b1aa4263b2bb819c1:FnkbCxYpaQzPg6kBf6I6MdhcWcvX5YDKDZJ0mfid5W+O9knwtJqEEkJNzTB/pGP4OnjpeR5Jx+n89VGBj1wdBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T01:20:10Z:e6e4c240c84e2e683da780e5c09cd5e23bb5e9212883d5370dafd7e86a8746cb:Q6ijfa8siMsrXGmoL4N/togG2fmSLjwbfYB4omqkvs9GnPxE4B6joocMpH/llOJNRadE41Lyqe0zIWot0T+fCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [codex, hosted-execution, structured-session, credentials, acceptance]
-version: "1.8.0"
+version: "1.8.1"
 description: >
   Activation, credential ceremony, command routes, and release acceptance for
   the pinned Codex structured-session workload.
 ---
 
 # Hosted Codex activation and acceptance
+
+The worker-environment v5 sources explicitly set `external_product_slots: []`.
+These installed bundle environments retain literal pins; dynamic product slots
+are limited to separately admitted pinned-project environment Configs.
 
 The Codex bundle hosts the pinned Codex App Server using ChatGPT subscription
 authentication managed by Codex. It does not route Codex through RyeOS local
@@ -142,7 +146,7 @@ configured-operator forwarding route to inspect profiles on a remote node.
    cache.
 
    `config:codex/environments/default` uses the closed
-   `ryeos.worker_environment.v4` contract. Its `executable_search` contributes
+   `ryeos.worker_environment.v5` contract. Its `executable_search` contributes
    only the exact activated command-tool tree to `PATH`. Its independent
    `process_environment` map may contribute bounded literals, paths inside an
    explicitly named activated realization, or directories below the

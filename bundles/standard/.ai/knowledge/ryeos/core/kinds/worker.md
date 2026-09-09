@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T03:45:22Z:743446af0f06a769b0fd468dd3fb57da6c243caf47b42f9dd38b8379f4dd2cbd:D3KEfSsNm1K5jzD6YR4vMkhLJabDu+OPwSWJQ5EBe7466+AslBwTTGdwAGtkMB7c5LXtuVEw35vf6auGfdk5BA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T08:44:49Z:12e932e726bfa880d058fb39bb6b676c5c80e10bc915d676ec7f11494547020b:KOuYzLYep7fE36/YB/2yJJzgstaPLpA+lD5CrI32Wv9CUeHjgPM1vv/+3f8KAIKW3enVOZ2BAEFNsC+feOWVCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/kinds
 tags: [kind, worker, persistent-session, source]
@@ -37,6 +37,11 @@ Worker content and selected environment content can use either `project` or
 `/ryeos/realizations/<mount>` namespace and requires enforced isolation; it is
 never copied into the project as a substitute. Project-root execution remains
 available with disabled isolation under its admitted private-workspace policy.
+
+For structured-session profiles, `workload_executable` is an exact canonical
+relative member of the selected workload realization, such as `bin/program`
+for a Tree. A File realization requires its exact single filename. RyeOS does
+not search PATH, flatten the product layout, or follow executable symlinks.
 
 Executable search, workload executables and environment-file paths resolve from
 the retained realization's own mount root. Their descriptor handles retain the

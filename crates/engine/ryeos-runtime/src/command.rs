@@ -335,6 +335,10 @@ pub enum ControlFlagBinding {
     /// Takes a `name=canonical-ref` value and inserts it into the request's
     /// complete secondary execution identity map.
     RefBinding,
+    /// Takes one closed JSON object and routes it to the invocation-time
+    /// product selector control field. Semantic validation remains at the
+    /// execution admission boundary.
+    ProductSelections,
 }
 
 impl ControlFlagBinding {
@@ -342,7 +346,11 @@ impl ControlFlagBinding {
     pub fn takes_value(self) -> bool {
         matches!(
             self,
-            Self::CallMethod | Self::CallArgs | Self::StateRoot | Self::RefBinding
+            Self::CallMethod
+                | Self::CallArgs
+                | Self::StateRoot
+                | Self::RefBinding
+                | Self::ProductSelections
         )
     }
 }

@@ -1,10 +1,26 @@
-# ryeos:signed:2026-09-06T22:36:36Z:49949beb5029bce0443c7669263e50d29e782658a22ca9626a092234fefef0d9:EA5yza8K0pnGMTvGsAgtIcCVhEi8D8xR7R/6xhKxMPcBO8KMGU0ybdg/QXd2iKtm/XHl7sYfUziQvlSSrBIzDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:36:33Z:49f83c32e987ce4ddc59a924249e40d91b9ea0b9195cc0c1b1286a509c70ea27:XKQkGCvKczGurXuFcdoGVRZufWmeRqSF7tCl0jPKq+d6p6/3qMpbL8m4HDdEtJjfa614pqwhfPRNYgrZRiMNAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 version: "1.0.0"
 category: ryeos/development
 description: Assemble and independently verify the authoring environment in one retained private workspace
+effects: recorded
+product_recipe: config:development/ryeos/authoring-environment-products
+external_product_slots:
+  - id: assembly-inputs
+    relationship_ref: config:development/ryeos/authoring-prepared-input-products
+    relationship: prepared_inputs_to_environment_production
+    kind: tree
+    mount_root: execution_runtime
+    mount: authoring-inputs
+  - id: built-utilities
+    relationship_ref: config:development/ryeos/authoring-built-utilities-products
+    relationship: built_utilities_to_environment_production
+    kind: tree
+    mount_root: execution_runtime
+    mount: authoring-built-utilities
 requires:
   capabilities:
     declared:
+      - ryeos.execute.config.development/ryeos/authoring-environment-products
       - ryeos.execute.tool.ryeos/development/authoring-environment-production/assemble
       - ryeos.execute.tool.ryeos/development/authoring-environment-production/verify
 config:

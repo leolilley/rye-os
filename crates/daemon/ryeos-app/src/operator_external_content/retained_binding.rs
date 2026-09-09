@@ -197,7 +197,7 @@ fn validate_request(request: &RetainedBindingImportRequest) -> anyhow::Result<()
     Ok(())
 }
 
-fn validate_bounds<'a>(
+pub(super) fn validate_bounds<'a>(
     limits: &ExternalContentImportLimits,
     maximum_bytes: u64,
     entry_count: usize,

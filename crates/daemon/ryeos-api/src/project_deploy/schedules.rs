@@ -1446,7 +1446,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let schedule_root = root.path().join(".ai/node/schedules");
         std::fs::create_dir_all(&schedule_root).unwrap();
-        let directory = lillux::PinnedDirectory::open(&schedule_root).unwrap().unwrap();
+        let directory = lillux::PinnedDirectory::open(&schedule_root)
+            .unwrap()
+            .unwrap();
         let _lock = directory.lock_exclusive().unwrap();
         let db = ryeos_scheduler::db::SchedulerDb::new_in_memory().unwrap();
         let key = [37_u8; 32];

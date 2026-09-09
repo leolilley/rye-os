@@ -44,12 +44,14 @@ use ryeos_state::objects::ThreadStatus;
 pub use ryeos_state::queries::{ThreadListFilter, ThreadSort};
 
 mod direct_execution;
+pub mod managed_runtime_identity;
 mod sealed_request;
 mod validation;
 
 pub use direct_execution::{
     ADMITTED_DIRECT_PROJECT_ROOT, PreparedItemPlan, RunningItem, SpawnItemParams,
     SpawnedItemAwaitingAttachment, SpawnedPersistentSessionAwaitingAttachment,
+    effective_child_external_content_declarations, prepare_bundle_item_plan_for_qualification,
     prepare_captured_item_plan, prepare_item_plan, spawn_item,
 };
 #[cfg(test)]
@@ -829,6 +831,11 @@ pub struct ResolvedExecutionRequest {
     pub usage_subject_asserted_by: Option<String>,
     pub parameters: Value,
     pub ref_bindings: BTreeMap<String, String>,
+    /// Invocation-time product selectors, keyed by the exact environment
+    /// dependency binding. This control input is distinct from workload
+    /// parameters and canonical item ref bindings.
+    pub product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     /// The engine's resolved item — carried through for verify/build_plan/execute.
     pub resolved_item: ResolvedItem,
     /// Digest of the verified signature-stripped root bytes supplied to the
@@ -2059,6 +2066,8 @@ pub struct RootExecutionAdmission {
     usage_subject: Option<UsageSubject>,
     usage_subject_asserted_by: Option<String>,
     ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     resolved_history_policy: ResolvedThreadHistoryPolicy,
     resolved_result_policy: ryeos_engine::history_policy::ResolvedThreadResultPolicy,
     captured_history_policy: ryeos_state::objects::CapturedThreadHistoryPolicy,
@@ -2100,6 +2109,12 @@ impl RootExecutionAdmission {
 
     pub fn ref_bindings(&self) -> &BTreeMap<String, String> {
         &self.ref_bindings
+    }
+
+    pub fn product_selections(
+        &self,
+    ) -> &ryeos_state::external_content::products::composition::ProductSelectionInputs {
+        &self.product_selections
     }
 
     /// Exact planning authority captured during synchronous admission.
@@ -2145,6 +2160,59 @@ impl RootExecutionAdmission {
         &self,
     ) -> Option<&Arc<ryeos_engine::engine::AdmittedRequestAuthoritySnapshot>> {
         self.admitted_request_snapshot.as_ref()
+    }
+
+    /// Rebind this still-in-memory root admission to the exact output
+    /// authority conditioned on its provenance before first capsule or row
+    /// publication. The state constructor proves that workspace outputs are
+    /// the only authority change; the already-verified subject, resolution
+    /// closure, request snapshot, and materialization therefore remain exact.
+    pub fn rebind_conditioned_workspace_outputs(
+        mut self,
+        provenance: &crate::execution_provenance::ExecutionProvenance,
+    ) -> Result<Self> {
+        self.validate()?;
+        if self.candidate_evaluation.is_some()
+            || provenance.is_borrowed_child()
+            || provenance.candidate_evaluation_scope().is_some()
+        {
+            bail!("workspace output authority requires a fresh non-borrowed root admission");
+        }
+        if !Arc::ptr_eq(self.request_engine(), provenance.request_engine()) {
+            bail!("conditioned workspace output provenance uses another request engine");
+        }
+        let conditioned_outputs = provenance
+            .project_authority()
+            .workspace_outputs()
+            .ok_or_else(|| anyhow!("conditioned provenance has no workspace output authority"))?;
+        let expected = self
+            .project_authority()
+            .condition_initial_workspace_outputs(conditioned_outputs.partition.clone())?;
+        if &expected != provenance.project_authority() {
+            bail!("conditioned provenance changed project authority beyond workspace outputs");
+        }
+        let rebound = AdmittedProjectBinding::from_provenance(
+            self.request_engine(),
+            &self.plan_context,
+            provenance,
+        )?;
+        if rebound.execution_workspace() != self.project_binding.execution_workspace()
+            || rebound.subject_resolution_authority()
+                != self.project_binding.subject_resolution_authority()
+            || rebound
+                .pinned_materialization_proof()
+                .map(|proof| proof.snapshot_hash())
+                != self
+                    .project_binding
+                    .pinned_materialization_proof()
+                    .map(|proof| proof.snapshot_hash())
+        {
+            bail!("conditioned workspace output authority changed admitted materialization");
+        }
+        self.project_binding = rebound;
+        self.validate()?;
+        self.ensure_matches_provenance(provenance)?;
+        Ok(self)
     }
 
     /// Current trust-policy narrowing for recovery, without rebuilding parser,
@@ -2390,6 +2458,7 @@ impl RootExecutionAdmission {
             usage_subject_asserted_by: self.usage_subject_asserted_by.clone(),
             parameters,
             ref_bindings: self.ref_bindings.clone(),
+            product_selections: self.product_selections.clone(),
             root_raw_content_digest: resolved.raw_content_digest.clone(),
             resolved_item: resolved.clone(),
             plan_context: self.plan_context.clone(),
@@ -2605,6 +2674,26 @@ impl RootExecutionAdmission {
     }
 
     pub fn validate(&self) -> Result<()> {
+        ryeos_state::external_content::products::composition::validate_product_selection_inputs(
+            &self.product_selections,
+        )?;
+        if !self.product_selections.is_empty() {
+            if self.plan_context.scheduled_fire.is_some() {
+                bail!(
+                    "scheduled execution cannot carry product selectors in the first composition lane"
+                );
+            }
+            if self.plan_context.current_site_id != self.plan_context.origin_site_id {
+                bail!(
+                    "cross-site execution cannot carry product selectors in the first composition lane"
+                );
+            }
+            if self.candidate_evaluation.is_some() {
+                bail!(
+                    "candidate execution cannot carry product selectors in the first composition lane"
+                );
+            }
+        }
         validate_principal_identifier(
             "admitted root planning principal",
             plan_principal_identifier(&self.plan_context),
@@ -2838,6 +2927,11 @@ impl RootExecutionAdmission {
         if request.ref_bindings != self.ref_bindings {
             bail!(
                 "resolved execution request secondary identities do not match the sealed root admission"
+            );
+        }
+        if request.product_selections != self.product_selections {
+            bail!(
+                "resolved execution request product selectors do not match the sealed root admission"
             );
         }
         if request.current_site_id != self.plan_context.current_site_id
@@ -4319,11 +4413,15 @@ impl ThreadLifecycleService {
         managed_envelope: Option<Value>,
         result_project_snapshot_hash: &str,
     ) -> Result<ThreadDetail> {
+        let generation = ryeos_state::objects::WorkspaceGenerationPair {
+            snapshot_hash: result_project_snapshot_hash.to_owned(),
+            output_capture_hash: None,
+        };
         self.finalize_from_completion_inner(
             thread_id,
             completion,
             managed_envelope,
-            Some(result_project_snapshot_hash),
+            Some(&generation),
             None,
         )
     }
@@ -4333,13 +4431,13 @@ impl ThreadLifecycleService {
         thread_id: &str,
         launch_owner: &str,
         completion: &ExecutionCompletion,
-        result_project_snapshot_hash: Option<&str>,
+        result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
     ) -> Result<ThreadDetail> {
         self.finalize_from_completion_inner(
             thread_id,
             completion,
             None,
-            result_project_snapshot_hash,
+            result_generation,
             Some(launch_owner),
         )
     }
@@ -4355,13 +4453,13 @@ impl ThreadLifecycleService {
         launch_owner: &str,
         completion: &ExecutionCompletion,
         managed_envelope: Option<Value>,
-        result_project_snapshot_hash: Option<&str>,
+        result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
     ) -> Result<ThreadDetail> {
         self.finalize_from_completion_inner(
             thread_id,
             completion,
             managed_envelope,
-            result_project_snapshot_hash,
+            result_generation,
             Some(launch_owner),
         )
     }
@@ -4371,7 +4469,7 @@ impl ThreadLifecycleService {
         thread_id: &str,
         completion: &ExecutionCompletion,
         managed_envelope: Option<Value>,
-        result_project_snapshot_hash: Option<&str>,
+        result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
         launch_owner: Option<&str>,
     ) -> Result<ThreadDetail> {
         let reported_status = completion.status.as_str();
@@ -4394,7 +4492,9 @@ impl ThreadLifecycleService {
                 .collect(),
             final_cost: completion.final_cost.clone(),
             managed_envelope: managed_envelope.clone(),
-            result_project_snapshot_hash: result_project_snapshot_hash.map(ToOwned::to_owned),
+            result_project_snapshot_hash: result_generation.map(|pair| pair.snapshot_hash.clone()),
+            result_workspace_output_capture_hash: result_generation
+                .and_then(|pair| pair.output_capture_hash.clone()),
         };
         let (persisted, effective) = if let Some(launch_owner) = launch_owner {
             self.state_store
@@ -4536,12 +4636,12 @@ impl ThreadLifecycleService {
         params: &ThreadFinalizeParams,
         managed_envelope: Value,
         launch_owner: &str,
-        result_project_snapshot_hash: Option<&str>,
+        result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
     ) -> Result<ThreadDetail> {
         self.finalize_thread_inner(
             params,
             Some(managed_envelope),
-            result_project_snapshot_hash,
+            result_generation,
             Some(launch_owner),
         )
     }
@@ -4564,6 +4664,7 @@ impl ThreadLifecycleService {
             final_cost: params.final_cost.clone(),
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
         };
         match self
             .state_store
@@ -4623,6 +4724,7 @@ impl ThreadLifecycleService {
             final_cost: params.final_cost.clone(),
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
         };
         match self
             .state_store
@@ -4660,6 +4762,7 @@ impl ThreadLifecycleService {
             final_cost: params.final_cost.clone(),
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
         };
         match self
             .state_store
@@ -4698,6 +4801,7 @@ impl ThreadLifecycleService {
             final_cost: params.final_cost.clone(),
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
         };
         match self.state_store.finalize_if_nonterminal_owned(
             &params.thread_id,
@@ -4734,6 +4838,7 @@ impl ThreadLifecycleService {
             final_cost: params.final_cost.clone(),
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
         };
         match self.state_store.finalize_in_process_handler_owned(
             &params.thread_id,
@@ -4827,6 +4932,7 @@ impl ThreadLifecycleService {
             final_cost: None,
             managed_envelope: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
         };
         self.publish_records(&[terminal]);
         self.close_live_input(&params.thread_id);
@@ -4855,7 +4961,7 @@ impl ThreadLifecycleService {
         &self,
         params: &ThreadFinalizeParams,
         managed_envelope: Option<Value>,
-        result_project_snapshot_hash: Option<&str>,
+        result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
         launch_owner: Option<&str>,
     ) -> Result<ThreadDetail> {
         let reported_status = normalize_terminal_status(&params.status)?;
@@ -4867,7 +4973,9 @@ impl ThreadLifecycleService {
             artifacts: params.artifacts.iter().map(artifact_to_record).collect(),
             final_cost: params.final_cost.clone(),
             managed_envelope: managed_envelope.clone(),
-            result_project_snapshot_hash: result_project_snapshot_hash.map(ToOwned::to_owned),
+            result_project_snapshot_hash: result_generation.map(|pair| pair.snapshot_hash.clone()),
+            result_workspace_output_capture_hash: result_generation
+                .and_then(|pair| pair.output_capture_hash.clone()),
         };
         let (persisted, effective) = if let Some(launch_owner) = launch_owner {
             self.state_store.finalize_thread_effective_owned(
@@ -5766,7 +5874,7 @@ impl ThreadLifecycleService {
         chain_root_id: &str,
         completion: &ryeos_runtime::TerminalCompletion,
         successor_launch_metadata: &crate::launch_metadata::RuntimeLaunchMetadata,
-        result_project_snapshot_hash: Option<&str>,
+        result_generation: Option<&ryeos_state::objects::WorkspaceGenerationPair>,
     ) -> Result<()> {
         validate_continued_completion(completion)?;
         let persisted = self
@@ -5776,7 +5884,7 @@ impl ThreadLifecycleService {
                 source_thread_id,
                 chain_root_id,
                 successor_launch_metadata,
-                result_project_snapshot_hash,
+                result_generation,
             )?;
         self.publish_records(&persisted);
         Ok(())
@@ -6255,6 +6363,8 @@ pub struct ResolveRootExecutionParams<'a> {
     pub node_history_policy: &'a ResolvedNodeThreadHistoryPolicy,
     pub item_ref: &'a str,
     pub ref_bindings: BTreeMap<String, String>,
+    pub product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     pub launch_mode: &'a str,
     pub parameters: Value,
     pub usage_subject: Option<UsageSubject>,
@@ -6314,6 +6424,7 @@ pub fn resolve_root_execution(
         node_history_policy,
         item_ref,
         ref_bindings,
+        product_selections,
         launch_mode,
         parameters,
         usage_subject,
@@ -6368,6 +6479,7 @@ pub fn resolve_root_execution(
                 node_history_policy,
                 thread_kind.clone(),
                 ref_bindings.clone(),
+                product_selections.clone(),
                 usage_subject.clone(),
                 usage_subject_asserted_by.clone(),
                 None,
@@ -6409,6 +6521,7 @@ pub fn resolve_root_execution(
                 usage_subject_asserted_by,
                 parameters,
                 ref_bindings,
+                product_selections,
                 resolved_item: resolved,
                 root_raw_content_digest,
                 plan_context: plan_ctx,
@@ -6482,6 +6595,8 @@ pub fn admit_verified_root_execution(
     node_history_policy: &ResolvedNodeThreadHistoryPolicy,
     thread_profile: String,
     ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     usage_subject: Option<UsageSubject>,
     usage_subject_asserted_by: Option<String>,
 ) -> Result<RootExecutionAdmission> {
@@ -6494,6 +6609,7 @@ pub fn admit_verified_root_execution(
         node_history_policy,
         thread_profile,
         ref_bindings,
+        product_selections,
         usage_subject,
         usage_subject_asserted_by,
         None,
@@ -6516,6 +6632,8 @@ pub fn admit_verified_root_execution_with_timings(
     node_history_policy: &ResolvedNodeThreadHistoryPolicy,
     thread_profile: String,
     ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     usage_subject: Option<UsageSubject>,
     usage_subject_asserted_by: Option<String>,
     launch_timings: Option<&crate::launch_stage_timings::LaunchStageTimings>,
@@ -6532,6 +6650,7 @@ pub fn admit_verified_root_execution_with_timings(
         node_history_policy,
         thread_profile,
         ref_bindings,
+        product_selections,
         usage_subject,
         usage_subject_asserted_by,
         launch_timings,
@@ -6905,6 +7024,8 @@ fn admit_verified_root_execution_inner(
     node_history_policy: &ResolvedNodeThreadHistoryPolicy,
     thread_profile: String,
     ref_bindings: BTreeMap<String, String>,
+    product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     usage_subject: Option<UsageSubject>,
     usage_subject_asserted_by: Option<String>,
     launch_timings: Option<&crate::launch_stage_timings::LaunchStageTimings>,
@@ -6971,6 +7092,7 @@ fn admit_verified_root_execution_inner(
         usage_subject,
         usage_subject_asserted_by,
         ref_bindings,
+        product_selections,
         captured_history_policy: capture_thread_history_policy(&history)?,
         resolved_history_policy: history,
         resolved_result_policy: launch_policy.result,
@@ -7133,6 +7255,7 @@ pub fn preflight_root_execution(
         node_history_policy,
         item_ref,
         ref_bindings,
+        product_selections,
         launch_mode,
         usage_subject,
         usage_subject_asserted_by,
@@ -7184,6 +7307,7 @@ pub fn preflight_root_execution(
         node_history_policy,
         thread_profile,
         ref_bindings,
+        product_selections,
         usage_subject,
         usage_subject_asserted_by,
         None,
@@ -7214,6 +7338,7 @@ pub fn preflight_root_execution_for_provenance(
         node_history_policy,
         item_ref,
         ref_bindings,
+        product_selections,
         launch_mode,
         parameters,
         usage_subject,
@@ -7228,6 +7353,7 @@ pub fn preflight_root_execution_for_provenance(
         node_history_policy,
         item_ref,
         ref_bindings,
+        product_selections,
         launch_mode,
         parameters,
         usage_subject,
@@ -7272,6 +7398,51 @@ fn verified_execution_subject(
     }
 }
 
+/// Resolve the exact current signed protocol selected by a direct item's kind
+/// and composed definition. This is the non-spawning identity owner shared by
+/// ordinary execution and independent product-qualification rechecks; wire and
+/// result-retention policy remain with the executor.
+pub fn resolve_direct_terminator_protocol<'a>(
+    engine: &'a Engine,
+    resolved: &ResolvedExecutionRequest,
+) -> Result<&'a ryeos_engine::protocols::VerifiedProtocol> {
+    let kind = &resolved.resolved_item.kind;
+    let schema = engine
+        .kinds
+        .get(kind)
+        .ok_or_else(|| anyhow!("execution kind schema not registered: {kind}"))?;
+    let terminator = schema
+        .execution()
+        .and_then(|execution| execution.terminator.as_ref())
+        .ok_or_else(|| anyhow!("execution kind '{kind}' has no terminator"))?;
+    let protocol_ref = match terminator {
+        ryeos_engine::kind_registry::TerminatorDecl::Subprocess { protocol } => {
+            let effective = engine.effective_item(ryeos_engine::engine::EffectiveItemRequest {
+                item_ref: resolved.resolved_item.canonical_ref.clone(),
+                expected_kind: Some(kind.clone()),
+                project_root: resolved.resolved_item.materialized_project_root.clone(),
+                subject_resolution_authority: resolved
+                    .resolved_item
+                    .subject_resolution_authority
+                    .clone(),
+            })?;
+            if effective.source.content_hash != resolved.resolved_item.content_hash {
+                bail!("effective subprocess protocol selection changed the verified root bytes");
+            }
+            protocol
+                .resolve(&effective.composed_value)
+                .map_err(anyhow::Error::msg)?
+        }
+        ryeos_engine::kind_registry::TerminatorDecl::InProcess { .. } => {
+            bail!("execution kind '{kind}' has an in-process terminator")
+        }
+    };
+    engine
+        .protocols
+        .require(&protocol_ref)
+        .map_err(|error| anyhow!("protocol lookup failed for '{protocol_ref}': {error}"))
+}
+
 pub(super) fn build_execution_plan_for_request(
     engine: &Engine,
     resolved: &ResolvedExecutionRequest,
@@ -7279,55 +7450,88 @@ pub(super) fn build_execution_plan_for_request(
     sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
     parent_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
 ) -> Result<ryeos_engine::contracts::ExecutionPlan> {
+    build_execution_plan_for_request_with_logical_context(
+        engine,
+        resolved,
+        verified,
+        sealed_content,
+        parent_filesystem_ceiling,
+        None,
+    )
+}
+
+pub(super) fn build_execution_plan_for_request_with_logical_context(
+    engine: &Engine,
+    resolved: &ResolvedExecutionRequest,
+    verified: &VerifiedItem,
+    sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
+    parent_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
+    logical_context: Option<(&str, Option<&std::path::Path>)>,
+) -> Result<ryeos_engine::contracts::ExecutionPlan> {
     let filesystem_ceiling = project_execution_filesystem_authority_ceiling(engine, resolved)?
         .intersect(parent_filesystem_ceiling);
-    let mut plan = match resolved
-        .root_admission
-        .as_ref()
-        .and_then(|admission| admission.admitted_request_snapshot())
-    {
-        Some(authority) => {
-            let project_root = resolved
-                .root_admission
-                .as_ref()
-                .and_then(|admission| admission.execution_workspace())
-                .ok_or_else(|| {
-                    anyhow!("content-addressed execution plan has no admitted project root")
-                })?;
-            engine
-                .build_plan_under_admitted_authority(
-                    &resolved.plan_context,
-                    verified,
-                    &resolved.parameters,
-                    &resolved.plan_context.execution_hints,
-                    project_root,
-                    authority,
-                    sealed_content,
-                    filesystem_ceiling,
-                )
-                .map_err(|e| anyhow!("plan build failed: {e}"))
-        }
-        None if resolved
-            .plan_context
-            .subject_resolution_authority
-            .operational_generation()
-            .is_some() =>
-        {
-            bail!(
-                "content-addressed execution request has no admitted plan authority; path-backed plan construction is forbidden"
-            )
-        }
-        None => engine
-            .build_plan(
+    let mut plan = if let Some((root_source, logical_project_root)) = logical_context {
+        engine
+            .build_bundle_plan_from_captured_root_with_logical_project_root(
                 &resolved.plan_context,
                 verified,
+                root_source,
                 &resolved.parameters,
                 &resolved.plan_context.execution_hints,
                 sealed_content,
                 filesystem_ceiling,
+                logical_project_root,
             )
-            .map_err(|e| anyhow!("plan build failed: {e}")),
-    }?;
+            .map_err(|e| anyhow!("current Bundle plan build failed: {e}"))?
+    } else {
+        match resolved
+            .root_admission
+            .as_ref()
+            .and_then(|admission| admission.admitted_request_snapshot())
+        {
+            Some(authority) => {
+                let project_root = resolved
+                    .root_admission
+                    .as_ref()
+                    .and_then(|admission| admission.execution_workspace())
+                    .ok_or_else(|| {
+                        anyhow!("content-addressed execution plan has no admitted project root")
+                    })?;
+                engine
+                    .build_plan_under_admitted_authority(
+                        &resolved.plan_context,
+                        verified,
+                        &resolved.parameters,
+                        &resolved.plan_context.execution_hints,
+                        project_root,
+                        authority,
+                        sealed_content,
+                        filesystem_ceiling,
+                    )
+                    .map_err(|e| anyhow!("plan build failed: {e}"))
+            }
+            None if resolved
+                .plan_context
+                .subject_resolution_authority
+                .operational_generation()
+                .is_some() =>
+            {
+                bail!(
+                    "content-addressed execution request has no admitted plan authority; path-backed plan construction is forbidden"
+                )
+            }
+            None => engine
+                .build_plan(
+                    &resolved.plan_context,
+                    verified,
+                    &resolved.parameters,
+                    &resolved.plan_context.execution_hints,
+                    sealed_content,
+                    filesystem_ceiling,
+                )
+                .map_err(|e| anyhow!("plan build failed: {e}")),
+        }?
+    };
     plan.network_authority_ceiling = project_execution_network_authority_ceiling(engine, resolved)?;
     plan.filesystem_authority_ceiling = plan
         .filesystem_authority_ceiling

@@ -22,7 +22,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 pub const HANDLER_PROTOCOL_JSON_MAX_DEPTH: usize = 32;
-pub const HANDLER_PROTOCOL_SCHEMA_VERSION: u32 = 4;
+pub const HANDLER_PROTOCOL_SCHEMA_VERSION: u32 = 6;
+
+pub const EXECUTION_EVIDENCE_MAX_REQUEST_BYTES: u32 = 2 * 1024 * 1024;
+pub const EXECUTION_EVIDENCE_MAX_RESPONSE_BYTES: u32 = 2 * 1024 * 1024;
+pub const EXECUTION_EVIDENCE_MAX_EVENTS: u16 = 128;
+pub const EXECUTION_EVIDENCE_MAX_EVENT_BYTES: u32 = 64 * 1024;
+pub const EXECUTION_EVIDENCE_MAX_CALLS: u16 = 16;
+pub const EXECUTION_EVIDENCE_MAX_CALL_BYTES: u32 = 64 * 1024;
+pub const EXECUTION_EVIDENCE_MAX_CALL_ID_BYTES: usize = 128;
 
 // ── Request / Response envelope ──────────────────────────────────
 
@@ -37,6 +45,8 @@ pub enum HandlerRequest {
     LaunchPrepare(LaunchPrepareRequest),
     ValidateLaunchPreparerConfig(ValidateLaunchPreparerConfigRequest),
     EffectiveValidate(EffectiveValidateRequest),
+    ExecutionEvidenceDescribe(ExecutionEvidenceDescribeRequest),
+    ExecutionEvidenceProject(ExecutionEvidenceProjectRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +91,203 @@ pub enum HandlerResponse {
     },
     EffectiveValidate {
         response: EffectiveValidateResponse,
+    },
+    ExecutionEvidenceDescribe {
+        response: ExecutionEvidenceDescribeResponse,
+    },
+    ExecutionEvidenceProject {
+        response: ExecutionEvidenceProjectResponse,
+    },
+}
+
+// ── Execution evidence projection ───────────────────────────────
+
+/// Signed, mechanically bounded selection of a pure execution-evidence
+/// projector. Runtime and protocol descriptors embed this same declaration;
+/// the daemon selects it through the exact admitted artifact contract rather
+/// than through an executable-kind branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceProjectorDeclWire {
+    pub handler: String,
+    pub config: Value,
+    pub limits: ExecutionEvidenceLimitsWire,
+}
+
+impl ExecutionEvidenceProjectorDeclWire {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.handler.is_empty()
+            || self.handler.len() > 512
+            || self.handler.trim() != self.handler
+            || !self.handler.starts_with("handler:")
+            || self.handler.chars().any(char::is_control)
+        {
+            return Err(
+                "execution evidence handler must be a canonical bounded handler ref".to_owned(),
+            );
+        }
+        self.limits.validate()?;
+        let config_bytes = serde_json::to_vec(&self.config)
+            .map_err(|error| format!("encode execution evidence config: {error}"))?
+            .len();
+        if config_bytes > self.limits.max_request_bytes as usize {
+            return Err(format!(
+                "execution evidence config is {config_bytes} bytes (max {})",
+                self.limits.max_request_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceLimitsWire {
+    pub max_request_bytes: u32,
+    pub max_response_bytes: u32,
+    pub max_events: u16,
+    pub max_event_bytes: u32,
+    pub max_calls: u16,
+    pub max_call_bytes: u32,
+}
+
+impl ExecutionEvidenceLimitsWire {
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, value, maximum) in [
+            (
+                "max_request_bytes",
+                self.max_request_bytes,
+                EXECUTION_EVIDENCE_MAX_REQUEST_BYTES,
+            ),
+            (
+                "max_response_bytes",
+                self.max_response_bytes,
+                EXECUTION_EVIDENCE_MAX_RESPONSE_BYTES,
+            ),
+            (
+                "max_event_bytes",
+                self.max_event_bytes,
+                EXECUTION_EVIDENCE_MAX_EVENT_BYTES,
+            ),
+            (
+                "max_call_bytes",
+                self.max_call_bytes,
+                EXECUTION_EVIDENCE_MAX_CALL_BYTES,
+            ),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(format!(
+                    "execution evidence {label} must be within 1..={maximum}"
+                ));
+            }
+        }
+        if self.max_events == 0 || self.max_events > EXECUTION_EVIDENCE_MAX_EVENTS {
+            return Err(format!(
+                "execution evidence max_events must be within 1..={EXECUTION_EVIDENCE_MAX_EVENTS}"
+            ));
+        }
+        if self.max_calls == 0 || self.max_calls > EXECUTION_EVIDENCE_MAX_CALLS {
+            return Err(format!(
+                "execution evidence max_calls must be within 1..={EXECUTION_EVIDENCE_MAX_CALLS}"
+            ));
+        }
+        if self.max_event_bytes > self.max_request_bytes {
+            return Err("execution evidence max_event_bytes exceeds max_request_bytes".to_owned());
+        }
+        if self.max_call_bytes > self.max_response_bytes {
+            return Err("execution evidence max_call_bytes exceeds max_response_bytes".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Bounded semantic program view supplied to the owning projector. The
+/// effective resolution remains daemon-authenticated; this wire is not an
+/// authority-bearing replacement for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceProgramWire {
+    pub canonical_ref: String,
+    pub effective_definition_digest: String,
+    pub composed: LaunchComposedViewWire,
+    pub ancestor_requested_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceDescribeRequest {
+    pub config: Value,
+    pub effective_program: ExecutionEvidenceProgramWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceRequiredCallWire {
+    /// Opaque projector-local identifier used to join Describe and Project.
+    pub call_id: String,
+    /// Normalized static call request. The daemon decodes, hashes and
+    /// authorizes this value independently; a handler cannot grant a call.
+    pub request: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionEvidenceDescribeResponse {
+    Described {
+        required_calls: Vec<ExecutionEvidenceRequiredCallWire>,
+    },
+    Refused {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceTerminalWire {
+    pub status: String,
+    /// Explicit JSON null represents an absent terminal result.
+    pub result: Value,
+    /// Explicit JSON null represents an absent terminal error.
+    pub error: Value,
+    pub artifacts: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceEventWire {
+    pub thread_seq: u64,
+    pub event_type: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceProjectRequest {
+    pub config: Value,
+    pub effective_program: ExecutionEvidenceProgramWire,
+    pub terminal: ExecutionEvidenceTerminalWire,
+    pub events: Vec<ExecutionEvidenceEventWire>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionEvidenceCandidateCallWire {
+    pub call_id: String,
+    pub operation_id: String,
+    pub action_digest: String,
+    pub child_thread_id: String,
+    pub result_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionEvidenceProjectResponse {
+    Projected {
+        result: Value,
+        calls: Vec<ExecutionEvidenceCandidateCallWire>,
+    },
+    Refused {
+        message: String,
     },
 }
 
@@ -340,7 +547,7 @@ pub struct LaunchPreparedItemWire {
 }
 
 /// Path-free composed view exposed to the launch preparer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchComposedViewWire {
     pub composed: Value,
@@ -688,9 +895,28 @@ pub struct LaunchContentExternalPolicyWire {
 #[serde(deny_unknown_fields)]
 pub struct RefBindingDeclWire {
     pub required: bool,
+    pub source: RefBindingSourceWire,
+    pub project_result_requirement: ProjectResultRequirement,
     pub allowed_kinds: Vec<String>,
     pub allowed_spaces: Vec<ItemSpaceWire>,
     pub allowed_trust: Vec<TrustClassWire>,
+}
+
+/// Restrictive condition activated by a present resolved ref binding. This
+/// selects no policy and grants no project access; admission checks the
+/// execution's independently selected project and workspace ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectResultRequirement {
+    None,
+    RetainedGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RefBindingSourceWire {
+    Caller,
+    PrimaryField { path: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1027,5 +1253,49 @@ mod tests {
         let mut widened = value;
         widened["replace"] = serde_json::json!(true);
         assert!(serde_json::from_value::<EvidenceAttachmentRequestWire>(widened).is_err());
+    }
+
+    #[test]
+    fn execution_evidence_limits_are_finite_and_internally_narrowed() {
+        let valid = ExecutionEvidenceLimitsWire {
+            max_request_bytes: 4096,
+            max_response_bytes: 4096,
+            max_events: 4,
+            max_event_bytes: 1024,
+            max_calls: 2,
+            max_call_bytes: 1024,
+        };
+        valid.validate().unwrap();
+
+        let mut zero_calls = valid;
+        zero_calls.max_calls = 0;
+        assert!(zero_calls.validate().is_err());
+
+        let mut event_exceeds_request = valid;
+        event_exceeds_request.max_event_bytes = event_exceeds_request.max_request_bytes + 1;
+        assert!(event_exceeds_request.validate().is_err());
+    }
+
+    #[test]
+    fn execution_evidence_wire_is_closed_and_uses_full_composed_view() {
+        let value = serde_json::json!({
+            "command": "execution_evidence_describe",
+            "config": {},
+            "effective_program": {
+                "canonical_ref": "graph:test/verifier",
+                "effective_definition_digest": "1".repeat(64),
+                "composed": {
+                    "composed": {"steps": []},
+                    "derived": {"effective_hook_plan": {"hooks": []}},
+                    "policy_facts": {"effective_caps": []}
+                },
+                "ancestor_requested_ids": []
+            }
+        });
+        assert!(serde_json::from_value::<HandlerRequest>(value.clone()).is_ok());
+
+        let mut widened = value;
+        widened["effective_program"]["hidden_hooks"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<HandlerRequest>(widened).is_err());
     }
 }

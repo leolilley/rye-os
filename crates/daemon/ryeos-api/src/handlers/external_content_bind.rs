@@ -14,6 +14,61 @@ pub type Request = ryeos_app::operator_external_content::BindRequest;
 
 pub async fn handle(req: Request, ctx: HandlerContext, state: Arc<AppState>) -> Result<Value> {
     req.validate_consumer_request()?;
+    if let Some(selections) = req.product_selections.clone() {
+        ryeos_app::operator_authority::require_local_configured_operator(&state, &ctx)?;
+        let preparation_state = Arc::clone(&state);
+        let preparation_context = ctx.clone();
+        let preparation_consumer_ref = req.consumer_ref.clone();
+        let preparation_kind = req.consumer_kind;
+        let preparation_snapshot_hash = req.project_snapshot_hash.clone();
+        let preparation_project_path = req.project_path.clone();
+        let checkout_id = format!("external-content-selected-bind-{}", uuid::Uuid::new_v4());
+        let prepared = tokio::task::spawn_blocking(move || {
+            let mut prepared = match preparation_kind {
+                ryeos_app::operator_external_content::BindConsumerKind::InstalledBundle => {
+                    ryeos_executor::execution::project_source::prepare_installed_bundle_external_consumer(
+                        &preparation_state,
+                        &preparation_consumer_ref,
+                        preparation_context.fingerprint.clone(),
+                        preparation_context.scopes.clone(),
+                    )?
+                }
+                ryeos_app::operator_external_content::BindConsumerKind::PinnedProject => {
+                    ryeos_executor::execution::project_source::prepare_pinned_project_external_consumer(
+                        &preparation_state,
+                        &preparation_consumer_ref,
+                        preparation_snapshot_hash
+                            .as_deref()
+                            .expect("validated pinned-project request"),
+                        preparation_project_path
+                            .expect("validated pinned-project request"),
+                        preparation_context.fingerprint.clone(),
+                        preparation_context.scopes.clone(),
+                        &checkout_id,
+                    )?
+                }
+            };
+            prepared.select_products_only(
+                &preparation_state,
+                &preparation_context,
+                &selections,
+            )?;
+            anyhow::Ok(prepared)
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("selected external-content consumer preparation panicked: {error}")
+        })??;
+        return Ok(serde_json::to_value(
+            ryeos_app::operator_external_content::bind_selected_literal_resolution(
+                state,
+                ctx,
+                req,
+                prepared.resolution(),
+            )
+            .await?,
+        )?);
+    }
     let response = match req.consumer_kind {
         ryeos_app::operator_external_content::BindConsumerKind::InstalledBundle => {
             ryeos_app::operator_external_content::bind(state, ctx, req).await?

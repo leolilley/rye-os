@@ -34,9 +34,9 @@ async fn exec(
         let object = params
             .as_object_mut()
             .expect("scheduler registration params must be an object");
-        object.entry("capabilities").or_insert_with(|| {
-            json!(["ryeos.execute.directive.test/*"])
-        });
+        object
+            .entry("capabilities")
+            .or_insert_with(|| json!(["ryeos.execute.directive.test/*"]));
         object.entry("execution_policy").or_insert_with(|| {
             json!({
                 "schema_version": 2,

@@ -555,6 +555,7 @@ pub async fn run(
                 .map_err(|error| LaunchAugmentationError::Threads(error.to_string()))?,
             child_thread_kind.to_string(),
             BTreeMap::new(),
+            Vec::new(),
             None,
             None,
         )
@@ -838,6 +839,7 @@ pub async fn run(
                     verified_code: &[],
                     verified_command: Some(&isolation_verified_command),
                     external_read_only_mounts: &[],
+                    writable_runtime_view_mounts: &[],
                     target_channels: &[],
                     item_ref: &runtime_item_ref_string,
                     thread_id: &child_thread_id,

@@ -145,6 +145,7 @@ pub async fn handle(
         validate_only,
         params: parameters,
         ref_bindings: req.ref_bindings,
+        product_selections: Vec::new(),
         acting_principal: ctx.fingerprint.as_str(),
         project_path: &project_ctx.effective_path,
         provenance,

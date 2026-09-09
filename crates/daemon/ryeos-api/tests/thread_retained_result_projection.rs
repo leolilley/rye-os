@@ -77,6 +77,7 @@ fn complete(state: &AppState, thread_id: &str, result: Option<&str>) {
                 final_cost: None,
                 managed_envelope: None,
                 result_project_snapshot_hash: result.map(str::to_owned),
+                result_workspace_output_capture_hash: None,
             },
         )
         .unwrap();

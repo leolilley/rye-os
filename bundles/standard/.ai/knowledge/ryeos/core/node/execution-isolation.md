@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-06T11:12:46Z:b74f690f6252caf377369e87c2fd2964224aeaba3ea2607ba3db80b34e7653e7:zlCt5szBuU0ISWaDTl3p3a99uQ8tEOSgoqV2Cw4IkkaGfEIetLgYabTIaTHhgYrZyPNSYcF5eRMpiaJIH1n5Cg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-08T01:19:48Z:e081aeb9872801c56e02f2d56673181473b1ef2d8f2476de55853f1714beab49:qjqiMI6Kjdqjh26UC1RLZp2uDgqtDr8WrPEDQ4oAfnM2l45rluT3LORQCxo+PBn5bQH2O6Aob+LCgrkaZuTICA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -24,7 +24,7 @@ compilation. Core ships the self-contained `linux-lillux` implementation as
 available signed data. The explicit development profile selects enforced
 execution; the general installation profiles retain their explicit disabled choice.
 
-Durable execution workspaces use the isolation-adapter v7 contract. RyeOS owns
+Durable execution workspaces use the isolation-adapter v8 contract. RyeOS owns
 one canonical private `project/` generation. Disabled/native execution creates
 no other workspace directory and uses Lillux descriptor-relative filesystem
 mechanics directly. Enforced execution additionally grants the selected signed

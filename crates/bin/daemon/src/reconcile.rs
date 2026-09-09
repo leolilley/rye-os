@@ -1121,7 +1121,7 @@ async fn reconcile_active_threads_inner(
     reconcile_abandoned_workspace_members(state)?;
     let blocked_workspace_operations =
         reconcile_runtime_workspace_operations_before_thread_recovery(state, mode)?;
-    repair_detached_runtime_action_links(state)?;
+    repair_root_runtime_action_links(state)?;
     reconcile_accounting(state)?;
     let blocked_freezes = reconcile_execution_workspaces(state, mode)?;
     if mode == ActiveReconcileMode::Startup {
@@ -2457,9 +2457,81 @@ fn quiesce_dedicated_workers(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn repair_detached_runtime_action_links(state: &AppState) -> Result<()> {
+fn awaited_action_parent_is_open(
+    state: &AppState,
+    intent: &ryeos_app::runtime_db::RuntimeActionIntent,
+) -> Result<bool> {
+    let caller = state
+        .state_store
+        .get_thread(&intent.first_caller_thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("awaited action caller disappeared"))?;
+    if caller.chain_root_id != intent.chain_root_id {
+        anyhow::bail!("awaited action caller escaped its admitted chain");
+    }
+    if caller.runtime.stop_intent.is_some()
+        || !matches!(caller.status.as_str(), "created" | "running" | "continued")
+    {
+        return Ok(false);
+    }
+    let placement = state
+        .state_store
+        .current_chain_placement_thread_id(&intent.chain_root_id)?
+        .ok_or_else(|| anyhow::anyhow!("awaited action parent chain disappeared"))?;
+    let authority = state.state_store.pinned_state_authority()?;
+    let guard = authority.acquire_shared_guard()?;
+    match state
+        .state_store
+        .get_authoritative_machine_continuation_segment(
+            &intent.chain_root_id,
+            &intent.first_caller_thread_id,
+            &placement,
+            &guard,
+        ) {
+        Ok(Some(_)) => {}
+        Ok(None) => anyhow::bail!("awaited action parent segment disappeared"),
+        Err(error)
+            if error
+                .downcast_ref::<ryeos_state::state_db::MachineContinuationBoundary>()
+                .is_some() =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    }
+    let current = state
+        .state_store
+        .get_thread(&placement)?
+        .ok_or_else(|| anyhow::anyhow!("awaited action current parent disappeared"))?;
+    Ok(current.runtime.stop_intent.is_none()
+        && matches!(current.status.as_str(), "created" | "running"))
+}
+
+fn repair_root_runtime_action_links(state: &AppState) -> Result<()> {
     for intent in state.state_store.runtime_action_intents()? {
-        if intent.mode != ryeos_app::runtime_db::RuntimeActionMode::Detached {
+        if !matches!(
+            intent.mode,
+            ryeos_app::runtime_db::RuntimeActionMode::Detached
+                | ryeos_app::runtime_db::RuntimeActionMode::AwaitedRoot
+        ) {
+            continue;
+        }
+        // Detached execution has independent lifetime. An awaited producer
+        // does not: recovery may never create it after its owning action's
+        // parent has settled or been stopped. Preserve the intent for exact
+        // history, and stop an already-born child through ordinary cascade.
+        if intent.mode == ryeos_app::runtime_db::RuntimeActionMode::AwaitedRoot
+            && !awaited_action_parent_is_open(state, &intent)?
+        {
+            if let Some(child) = state.state_store.get_thread(&intent.child_thread_id)?
+                && (child.status == "continued"
+                    || !ryeos_app::state_store::is_terminal_status(&child.status))
+            {
+                ryeos_app::cascade::stop_thread_and_descendants(
+                    state,
+                    &intent.child_thread_id,
+                    ryeos_app::cascade::CascadeMode::Hard,
+                )?;
+            }
             continue;
         }
         if intent
@@ -2486,6 +2558,13 @@ fn repair_detached_runtime_action_links(state: &AppState) -> Result<()> {
         }
         let child = match state.state_store.get_thread(&intent.child_thread_id)? {
             Some(child) => child,
+            None if intent.mode == ryeos_app::runtime_db::RuntimeActionMode::AwaitedRoot => {
+                // Only the recovered Graph callback may re-drive this exact
+                // pending action with its current authenticated capability.
+                // A sealed intent is one-child ownership, not permission for
+                // reconciliation to restart an obsolete parent action.
+                continue;
+            }
             None => {
                 let (Some(authority), Some(capsule_hash), Some(metadata), Some(initial_events)) = (
                     intent.child_project_authority.as_ref(),
@@ -2573,11 +2652,14 @@ fn repair_detached_runtime_action_links(state: &AppState) -> Result<()> {
                 child.thread_id
             );
         }
-        let _inherited_stop = state.state_store.record_child_link(
+        let inherited_stop = state.state_store.record_child_link(
             &intent.first_caller_thread_id,
             &intent.child_thread_id,
             "dispatch",
         )?;
+        if inherited_stop.is_some() {
+            continue;
+        }
         if child.status == ryeos_state::objects::ThreadStatus::Created.as_str()
             && child.runtime.process_identity.is_none()
             && state
@@ -2835,14 +2917,6 @@ fn reconcile_execution_workspaces(
             .map(execution_group_liveness)
             .unwrap_or(IdentityLiveness::DeadOrStale);
         if workspace.state == WorkspaceState::Freezing {
-            if workspace.frozen_snapshot_hash.is_none() {
-                if let Some(thread_id) = workspace.thread_id.as_ref() {
-                    blocked_freezes.insert(thread_id.clone());
-                }
-                tracing::warn!(workspace_id = %workspace.workspace_id,
-                    "interrupted workspace freeze has no committed generation; preserving quarantine");
-                continue;
-            }
             let nonterminal_owner = workspace
                 .thread_id
                 .as_deref()
@@ -2850,7 +2924,22 @@ fn reconcile_execution_workspaces(
                 .transpose()?
                 .flatten()
                 .is_some_and(|thread| matches!(thread.status.as_str(), "created" | "running"));
-            if nonterminal_owner && !owner_was_replaced {
+            let recoverable = match should_recover_interrupted_freeze(
+                &workspace,
+                nonterminal_owner,
+                owner_was_replaced,
+            ) {
+                Ok(recoverable) => recoverable,
+                Err(error) => {
+                    if let Some(thread_id) = workspace.thread_id.as_ref() {
+                        blocked_freezes.insert(thread_id.clone());
+                    }
+                    tracing::error!(workspace_id = %workspace.workspace_id, %error,
+                        "interrupted workspace freeze has contradictory generation authority; preserving quarantine");
+                    continue;
+                }
+            };
+            if recoverable {
                 let identity = runtime_identity.as_ref().or(recorded_identity.as_ref());
                 let mut quiesced_group = None;
                 if liveness == IdentityLiveness::Alive {
@@ -2879,14 +2968,13 @@ fn reconcile_execution_workspaces(
                     );
                     continue;
                 }
-                let recovered = if mode == ActiveReconcileMode::Startup && workspace_claim.is_none()
-                {
-                    // Startup deliberately clears dead-generation launch
-                    // claims before driving any replacement launch. A
-                    // freezing journal remains fenced by its exact immutable
-                    // old owner, so finish that already-contacted operation
-                    // through the distinct abandoned-owner bind instead of
-                    // weakening the ordinary live claim check.
+                let recovered = if workspace_claim.is_none() {
+                    // Contact settlement above proves the old generation,
+                    // all exact writers, and absence of a replacement owner.
+                    // A startup-cleared claim stays absent on a later sweep;
+                    // it does not become a live-claim operation with time.
+                    // Freezing is the write-ahead boundary, so a missing pair
+                    // is precisely the capture this existing owner must finish.
                     ryeos_executor::execution::recover_abandoned_interrupted_workspace_freeze(
                         state, &workspace,
                     )
@@ -2896,7 +2984,7 @@ fn reconcile_execution_workspaces(
                     )
                 };
                 match recovered {
-                    Ok(snapshot_hash) => {
+                    Ok(generation) => {
                         if let Some(authority) = quiesced_group.take() {
                             authority
                                 .terminate(lillux::time::Duration::from_secs(2))
@@ -2904,7 +2992,8 @@ fn reconcile_execution_workspaces(
                         }
                         tracing::warn!(
                             workspace_id = %workspace.workspace_id,
-                            %snapshot_hash,
+                            snapshot_hash = %generation.snapshot_hash,
+                            output_capture_hash = ?generation.output_capture_hash,
                             "recovered interrupted callback freeze and terminated its exact orphan process set"
                         );
                     }
@@ -2919,6 +3008,14 @@ fn reconcile_execution_workspaces(
                         );
                     }
                 }
+                continue;
+            }
+            if workspace.frozen_snapshot_hash.is_none() {
+                if let Some(thread_id) = workspace.thread_id.as_ref() {
+                    blocked_freezes.insert(thread_id.clone());
+                }
+                tracing::warn!(workspace_id = %workspace.workspace_id,
+                    "uncommitted workspace freeze has no eligible exact source owner; preserving quarantine");
                 continue;
             }
         }
@@ -2990,6 +3087,18 @@ fn reconcile_execution_workspaces(
         }
     }
     Ok(blocked_freezes)
+}
+
+/// Called only after abandoned-owner and exact writer settlement. A missing
+/// pair is an interrupted publication, not missing ownership; a partial pair
+/// is contradictory authority and must never be repaired by guessing.
+fn should_recover_interrupted_freeze(
+    workspace: &ryeos_app::runtime_db::WorkspaceRecord,
+    nonterminal_owner: bool,
+    owner_was_replaced: bool,
+) -> Result<bool> {
+    workspace.frozen_generation()?;
+    Ok(workspace.state == WorkspaceState::Freezing && nonterminal_owner && !owner_was_replaced)
 }
 
 fn should_retain_workspace_for_native_resume(
@@ -3604,6 +3713,7 @@ mod tests {
             kind: "tool_run".into(),
             item_ref: "ns/foo".into(),
             ref_bindings: std::collections::BTreeMap::new(),
+            product_selections: Vec::new(),
             launch_mode: "detached".into(),
             parameters: serde_json::json!({}),
             project_context,
@@ -3704,6 +3814,55 @@ mod tests {
         ));
     }
 
+    fn interrupted_freeze_journal() -> ryeos_app::runtime_db::WorkspaceRecord {
+        ryeos_app::runtime_db::WorkspaceRecord {
+            workspace_id: "W-frozen".into(),
+            thread_id: Some("T-frozen".into()),
+            launch_owner: Some("prior-generation-owner".into()),
+            backend_id: Some("native".into()),
+            backend_version: Some("1".into()),
+            pinned_root_identities: Some("{}".into()),
+            mount_identity: Some("retained-view".into()),
+            base_snapshot: "a".repeat(64),
+            workspace_output_partition_identity: Some("b".repeat(64)),
+            base_output_capture_hash: None,
+            frozen_snapshot_hash: None,
+            frozen_output_capture_hash: None,
+            root_path: "/private/W-frozen".into(),
+            state: WorkspaceState::Freezing,
+            process_identity: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn interrupted_freeze_can_finish_missing_pair_only_for_its_unreplaced_nonterminal_owner() {
+        let mut workspace = interrupted_freeze_journal();
+        assert!(should_recover_interrupted_freeze(&workspace, true, false).unwrap());
+        assert!(!should_recover_interrupted_freeze(&workspace, false, false).unwrap());
+        assert!(!should_recover_interrupted_freeze(&workspace, true, true).unwrap());
+        workspace.state = WorkspaceState::Active;
+        assert!(!should_recover_interrupted_freeze(&workspace, true, false).unwrap());
+        workspace.state = WorkspaceState::Freezing;
+        workspace.frozen_snapshot_hash = Some("c".repeat(64));
+        workspace.frozen_output_capture_hash = Some("d".repeat(64));
+        assert!(should_recover_interrupted_freeze(&workspace, true, false).unwrap());
+    }
+
+    #[test]
+    fn interrupted_freeze_does_not_invent_missing_half_of_a_committed_generation() {
+        let mut workspace = interrupted_freeze_journal();
+        workspace.frozen_snapshot_hash = Some("c".repeat(64));
+        assert!(should_recover_interrupted_freeze(&workspace, true, false).is_err());
+        workspace.frozen_snapshot_hash = None;
+        workspace.frozen_output_capture_hash = Some("d".repeat(64));
+        assert!(should_recover_interrupted_freeze(&workspace, true, false).is_err());
+        workspace.workspace_output_partition_identity = None;
+        workspace.frozen_output_capture_hash = None;
+        assert!(should_recover_interrupted_freeze(&workspace, true, false).unwrap());
+    }
+
     fn thread_detail(
         thread_id: &str,
         status: &str,
@@ -3727,6 +3886,7 @@ mod tests {
             project_root: None,
             project_authority: None,
             result_project_snapshot_hash: None,
+            result_workspace_output_capture_hash: None,
             lifecycle_authority: None,
             admitted_launch_capsule_hash: None,
             created_at: "t".into(),

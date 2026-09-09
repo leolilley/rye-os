@@ -115,7 +115,11 @@ pub struct ProjectObservationPublishParams {
 pub fn dispatch_action_digest(action: &ActionPayload) -> anyhow::Result<String> {
     let mut behavior = action.clone();
     behavior.operation_id = None;
-    let value = serde_json::to_value(behavior)?;
+    let semantic_product_selections = ryeos_state::external_content::products::composition::product_selection_inputs_semantic_identity(
+        &behavior.product_selections,
+    )?;
+    let mut value = serde_json::to_value(behavior)?;
+    value["product_selections"] = semantic_product_selections;
     let canonical = lillux::cas::canonical_json(&value)?;
     Ok(lillux::sha256_hex(canonical.as_bytes()))
 }
@@ -456,6 +460,10 @@ pub struct ActionPayload {
     pub operation_id: Option<String>,
     pub item_id: String,
     pub ref_bindings: BTreeMap<String, String>,
+    /// Exact input-product selection, separate from the callee's parameters.
+    /// Callbacks retain the canonical complete set in their action identity.
+    pub product_selections:
+        ryeos_state::external_content::products::composition::ProductSelectionInputs,
     #[serde(default)]
     pub params: Value,
     pub thread: String,
@@ -481,6 +489,8 @@ pub struct ActionPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_window: Option<LaunchWindow>,
 }
+
+pub use ryeos_state::external_content::products::composition::canonicalize_product_selection_inputs;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -544,6 +554,7 @@ pub fn parse_hook_action(action: Value) -> Result<ActionPayload, String> {
         operation_id: None,
         item_id,
         ref_bindings,
+        product_selections: Vec::new(),
         params,
         thread,
         call,
@@ -570,6 +581,7 @@ pub mod action_keys {
     pub const OPERATION_ID: &str = "operation_id";
     pub const ITEM_ID: &str = "item_id";
     pub const REF_BINDINGS: &str = "ref_bindings";
+    pub const PRODUCT_SELECTIONS: &str = "product_selections";
     pub const PARAMS: &str = "params";
     pub const THREAD: &str = "thread";
     pub const CALL: &str = "call";
@@ -580,7 +592,14 @@ pub mod action_keys {
     /// `CompiledActionTemplate`. `THREAD` stays literal (a dispatch mode,
     /// never a template); the callback-owned ref bindings and `CALL` block may
     /// contain templates, so those complete values are included.
-    pub const INTERPOLATED: &[&str] = &[ITEM_ID, REF_BINDINGS, PARAMS, CALL, FACETS];
+    pub const INTERPOLATED: &[&str] = &[
+        ITEM_ID,
+        REF_BINDINGS,
+        PRODUCT_SELECTIONS,
+        PARAMS,
+        CALL,
+        FACETS,
+    ];
 }
 
 /// Runtime-owned control keys carried in dispatch/launch params — parent budget,
@@ -1205,6 +1224,7 @@ mod tests {
     #[test]
     fn action_payload_omits_call_when_none() {
         let payload = ActionPayload {
+            product_selections: Vec::new(),
             operation_id: None,
             item_id: "tool:t/echo".to_string(),
             ref_bindings: BTreeMap::new(),
@@ -1224,7 +1244,8 @@ mod tests {
     #[test]
     fn action_payload_round_trips_call() {
         let wire = json!({
-            "item_id": "knowledge:arc/resources",
+            "item_id": "knowledge:test/resources",
+            "product_selections": [],
             "ref_bindings": {},
             "params": {},
             "thread": "inline",
@@ -1241,6 +1262,7 @@ mod tests {
         // A wire payload with no `call` (the common case) deserializes fine.
         let wire = json!({
             "item_id": "tool:t/echo",
+            "product_selections": [],
             "ref_bindings": {},
             "thread": "inline"
         });
@@ -1323,6 +1345,7 @@ mod tests {
         let request = DispatchActionRequest {
             thread_id: "T-hook".to_string(),
             action: ActionPayload {
+                product_selections: Vec::new(),
                 operation_id: None,
                 item_id: "tool:test/hook".to_string(),
                 ref_bindings: BTreeMap::new(),
@@ -1361,6 +1384,7 @@ mod tests {
     #[test]
     fn action_digest_excludes_occurrence_but_binds_behavior() {
         let action = ActionPayload {
+            product_selections: Vec::new(),
             operation_id: Some("1".repeat(64)),
             item_id: "tool:test/mutate".to_string(),
             ref_bindings: BTreeMap::new(),
@@ -1378,6 +1402,56 @@ mod tests {
             dispatch_action_digest(&different_occurrence).unwrap(),
             original
         );
+
+        let mut selected_behavior = action.clone();
+        selected_behavior.product_selections = serde_json::from_value(json!([{
+            "target": {"kind": "root"},
+            "selection": {
+                "declaration_id": "subject",
+                "witness_hash": "a".repeat(64),
+                "witness_source": {"kind": "local_capture"},
+                "qualification_hash": null
+            }
+        }]))
+        .unwrap();
+        let selected_digest = dispatch_action_digest(&selected_behavior).unwrap();
+        assert_ne!(selected_digest, original);
+        let mut received_selection = selected_behavior.clone();
+        received_selection.product_selections[0]
+            .selection
+            .witness_source =
+            ryeos_state::external_content::products::transfer::ProductWitnessSource::Received {
+                acceptance_hash: "b".repeat(64),
+            };
+        assert_ne!(
+            serde_json::to_value(&received_selection.product_selections).unwrap(),
+            serde_json::to_value(&selected_behavior.product_selections).unwrap(),
+            "sealed selector input must retain its exact witness source"
+        );
+        assert_eq!(
+            dispatch_action_digest(&received_selection).unwrap(),
+            selected_digest,
+            "receiver-local redemption proof is not behavior identity"
+        );
+        let mut changed_witness = selected_behavior.clone();
+        changed_witness.product_selections[0].selection.witness_hash = "c".repeat(64);
+        assert_ne!(
+            dispatch_action_digest(&changed_witness).unwrap(),
+            selected_digest,
+            "the selected immutable product remains behavior identity"
+        );
+        let mut missing_source = serde_json::to_value(&selected_behavior).unwrap();
+        missing_source["product_selections"][0]["selection"]
+            .as_object_mut()
+            .unwrap()
+            .remove("witness_source");
+        assert!(serde_json::from_value::<ActionPayload>(missing_source).is_err());
+        let mut missing_control = serde_json::to_value(&selected_behavior).unwrap();
+        missing_control
+            .as_object_mut()
+            .unwrap()
+            .remove("product_selections");
+        assert!(serde_json::from_value::<ActionPayload>(missing_control).is_err());
 
         let mut different_behavior = action;
         different_behavior.params = json!({"value": 2});

@@ -382,6 +382,11 @@ pub struct CompletedHookDispatch {
 pub enum RuntimeActionMode {
     Inline,
     Detached,
+    /// Unary callback action whose admitted subject runs as an independently
+    /// reconstructable managed root. The caller still waits for one terminal
+    /// answer, but the intent owns the child's project/capsule launch authority
+    /// just like a detached root so retries cannot mint another producer.
+    AwaitedRoot,
 }
 
 impl RuntimeActionMode {
@@ -389,6 +394,7 @@ impl RuntimeActionMode {
         match self {
             Self::Inline => "inline",
             Self::Detached => "detached",
+            Self::AwaitedRoot => "awaited_root",
         }
     }
 
@@ -396,6 +402,7 @@ impl RuntimeActionMode {
         match value {
             "inline" => Ok(Self::Inline),
             "detached" => Ok(Self::Detached),
+            "awaited_root" => Ok(Self::AwaitedRoot),
             other => bail!("invalid runtime action mode `{other}`"),
         }
     }
@@ -466,6 +473,7 @@ pub struct RuntimeWorkspaceOperation {
     pub project_authority_digest: String,
     pub workload_client_grant_digest: String,
     pub input_snapshot_hash: Option<String>,
+    pub input_output_capture_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +553,7 @@ fn decode_runtime_action_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run
                 project_authority_digest: row.get(16)?,
                 workload_client_grant_digest: row.get(17)?,
                 input_snapshot_hash: row.get(18)?,
+                input_output_capture_hash: row.get(19)?,
             })
         })
         .transpose()?;
@@ -777,15 +786,46 @@ pub struct WorkspaceRecord {
     pub pinned_root_identities: Option<String>,
     pub mount_identity: Option<String>,
     pub base_snapshot: String,
-    /// Post-freeze snapshot bound atomically with the owning thread's
-    /// ResumeContext. Present only once a `freezing` workspace has a durable
-    /// generation from which recovery may continue.
+    pub workspace_output_partition_identity: Option<String>,
+    pub base_output_capture_hash: Option<String>,
+    /// Post-freeze source generation bound atomically with its output capture.
+    /// Launch metadata remains the unchanged admitted recovery seed.
     pub frozen_snapshot_hash: Option<String>,
+    pub frozen_output_capture_hash: Option<String>,
     pub root_path: String,
     pub state: WorkspaceState,
     pub process_identity: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+impl WorkspaceRecord {
+    pub fn base_generation(&self) -> Result<ryeos_state::objects::WorkspaceGenerationPair> {
+        validate_workspace_output_coordinates(self)?;
+        let generation = ryeos_state::objects::WorkspaceGenerationPair {
+            snapshot_hash: self.base_snapshot.clone(),
+            output_capture_hash: self.base_output_capture_hash.clone(),
+        };
+        generation.validate()?;
+        Ok(generation)
+    }
+
+    pub fn frozen_generation(
+        &self,
+    ) -> Result<Option<ryeos_state::objects::WorkspaceGenerationPair>> {
+        validate_workspace_output_coordinates(self)?;
+        self.frozen_snapshot_hash
+            .as_ref()
+            .map(|snapshot_hash| {
+                let generation = ryeos_state::objects::WorkspaceGenerationPair {
+                    snapshot_hash: snapshot_hash.clone(),
+                    output_capture_hash: self.frozen_output_capture_hash.clone(),
+                };
+                generation.validate()?;
+                Ok(generation)
+            })
+            .transpose()
+    }
 }
 
 /// Complete durable evidence published when a constructed workspace becomes
@@ -800,6 +840,44 @@ pub struct WorkspaceBinding<'a> {
     pub backend_version: Option<&'a str>,
     pub pinned_root_identities: Option<&'a str>,
     pub mount_identity: Option<&'a str>,
+    pub workspace_output_partition_identity: Option<&'a str>,
+    pub base_output_capture_hash: Option<&'a str>,
+}
+
+fn validate_workspace_output_coordinates(workspace: &WorkspaceRecord) -> Result<()> {
+    if let Some(identity) = workspace.workspace_output_partition_identity.as_deref() {
+        validate_sha256("workspace output partition identity", identity)?;
+    }
+    for (label, hash) in [
+        (
+            "workspace base output capture",
+            workspace.base_output_capture_hash.as_deref(),
+        ),
+        (
+            "workspace frozen output capture",
+            workspace.frozen_output_capture_hash.as_deref(),
+        ),
+    ] {
+        if let Some(hash) = hash {
+            validate_sha256(label, hash)?;
+        }
+    }
+    if workspace.workspace_output_partition_identity.is_none()
+        && (workspace.base_output_capture_hash.is_some()
+            || workspace.frozen_output_capture_hash.is_some())
+    {
+        bail!("ordinary workspace carries output capture coordinates");
+    }
+    if workspace.frozen_snapshot_hash.is_none() && workspace.frozen_output_capture_hash.is_some() {
+        bail!("workspace carries a frozen output capture without a frozen snapshot");
+    }
+    if workspace.frozen_snapshot_hash.is_some()
+        && (workspace.workspace_output_partition_identity.is_some()
+            != workspace.frozen_output_capture_hash.is_some())
+    {
+        bail!("workspace frozen snapshot/output capture pair is incomplete");
+    }
+    Ok(())
 }
 
 /// Canonical durable execution-workspace lifecycle. SQLite stores the stable
@@ -1089,7 +1167,7 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
     operation_id TEXT PRIMARY KEY,
     chain_root_id TEXT NOT NULL,
     first_caller_thread_id TEXT NOT NULL,
-    mode TEXT NOT NULL CHECK (mode IN ('inline', 'detached')),
+    mode TEXT NOT NULL CHECK (mode IN ('inline', 'detached', 'awaited_root')),
     request_hash TEXT NOT NULL,
     child_thread_id TEXT NOT NULL UNIQUE,
     child_project_authority TEXT,
@@ -1105,9 +1183,10 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
     workspace_project_authority_digest TEXT,
     workspace_grant_digest TEXT,
     workspace_input_snapshot_hash TEXT,
+    workspace_input_output_capture_hash TEXT,
     created_at_ms INTEGER NOT NULL,
     CHECK (
-        mode = 'detached'
+        mode IN ('detached', 'awaited_root')
         OR (
             child_project_authority IS NULL
             AND admitted_launch_capsule_hash IS NULL
@@ -1126,6 +1205,7 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
             AND workspace_project_authority_digest IS NULL
             AND workspace_grant_digest IS NULL
             AND workspace_input_snapshot_hash IS NULL
+            AND workspace_input_output_capture_hash IS NULL
         )
         OR
         (
@@ -1142,6 +1222,13 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
             AND (
                 workspace_input_snapshot_hash IS NULL
                 OR workspace_access = 'immutable_current_generation'
+            )
+            AND (
+                workspace_input_output_capture_hash IS NULL
+                OR (
+                    workspace_access = 'immutable_current_generation'
+                    AND workspace_input_snapshot_hash IS NOT NULL
+                )
             )
         )
     )
@@ -1191,7 +1278,10 @@ CREATE TABLE IF NOT EXISTS execution_workspace (
     launch_owner TEXT,
     backend_id TEXT,
     base_snapshot TEXT NOT NULL,
+    workspace_output_partition_identity TEXT,
+    base_output_capture_hash TEXT,
     frozen_snapshot_hash TEXT,
+    frozen_output_capture_hash TEXT,
     root_path TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('reserved', 'constructing', 'ready', 'active', 'freezing', 'destroying', 'closing', 'closed', 'orphaned')),
     process_identity TEXT,
@@ -1199,7 +1289,21 @@ CREATE TABLE IF NOT EXISTS execution_workspace (
     updated_at_ms INTEGER NOT NULL,
     backend_version TEXT,
     pinned_root_identities TEXT,
-    mount_identity TEXT
+    mount_identity TEXT,
+    CHECK (
+        workspace_output_partition_identity IS NOT NULL
+        OR (base_output_capture_hash IS NULL AND frozen_output_capture_hash IS NULL)
+    ),
+    CHECK (
+        (frozen_snapshot_hash IS NULL AND frozen_output_capture_hash IS NULL)
+        OR (
+            frozen_snapshot_hash IS NOT NULL
+            AND ((workspace_output_partition_identity IS NULL
+                  AND frozen_output_capture_hash IS NULL)
+                 OR (workspace_output_partition_identity IS NOT NULL
+                     AND frozen_output_capture_hash IS NOT NULL))
+        )
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_execution_workspace_thread
@@ -1586,7 +1690,8 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // coordinating fixed-parent confinement cut. No ambient-kind recovery substitution.
 // Epoch 28 records exact per-launch shared-view membership and creator
 // attachment. No predecessor row can imply borrower absence or mount ownership.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 28;
+// Epoch 32 requires exact product receipt authority and semantic definition v3.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 32;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -1977,6 +2082,12 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                         not_null: false,
                     },
                     sqlite_schema::ColumnSpec {
+                        name: "workspace_input_output_capture_hash",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
                         name: "created_at_ms",
                         col_type: "INTEGER",
                         pk: false,
@@ -2111,7 +2222,25 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                         not_null: true,
                     },
                     sqlite_schema::ColumnSpec {
+                        name: "workspace_output_partition_identity",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "base_output_capture_hash",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
                         name: "frozen_snapshot_hash",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "frozen_output_capture_hash",
                         col_type: "TEXT",
                         pk: false,
                         not_null: false,
@@ -3398,7 +3527,7 @@ const PROJECT_AUTHORITY_ENVELOPE_KIND: &str = "execution_project_authority";
 // retained-current-HEAD publication. There is deliberately no compatibility
 // reader: a predecessor authority cannot be upgraded into publication rights.
 // Epoch 4 records fixed-parent rather than path-mask live confinement.
-const PROJECT_AUTHORITY_SCHEMA_EPOCH: u32 = 4;
+const PROJECT_AUTHORITY_SCHEMA_EPOCH: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncompatibleRuntimeExecutionSchema {
@@ -4647,7 +4776,7 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
             || intent.initial_events.is_some())
     {
         bail!(
-            "inline runtime action `{}` contains detached launch authority",
+            "inline runtime action `{}` contains root launch authority",
             intent.operation_id
         );
     }
@@ -4665,7 +4794,7 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
     }
     if intent.launch_metadata.is_some() && intent.incompatible_launch_metadata.is_some() {
         bail!(
-            "detached operation `{}` has both current and incompatible launch authority",
+            "root-carrying operation `{}` has both current and incompatible launch authority",
             intent.operation_id
         );
     }
@@ -4683,13 +4812,15 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
         && intent.launch_metadata.is_none()
         && intent.incompatible_launch_metadata.is_none()
         && intent.initial_events.is_none();
-    if matches!(intent.mode, RuntimeActionMode::Detached)
-        && !current_sealed_fields_complete
+    if matches!(
+        intent.mode,
+        RuntimeActionMode::Detached | RuntimeActionMode::AwaitedRoot
+    ) && !current_sealed_fields_complete
         && !incompatible_sealed_fields_complete
         && !unsealed_fields_empty
     {
         bail!(
-            "detached operation `{}` has an incomplete sealed authority",
+            "root-carrying operation `{}` has an incomplete sealed authority",
             intent.operation_id
         );
     }
@@ -4697,11 +4828,11 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
         metadata.validate()?;
         let expected = metadata
             .admitted_launch_capsule()?
-            .ok_or_else(|| anyhow!("detached operation has no admitted launch capsule"))?
+            .ok_or_else(|| anyhow!("root action has no admitted launch capsule"))?
             .content_hash()?;
         if intent.admitted_launch_capsule_hash.as_deref() != Some(expected.as_str()) {
             bail!(
-                "detached operation `{}` admitted capsule hash is not canonical",
+                "root-carrying operation `{}` admitted capsule hash is not canonical",
                 intent.operation_id
             );
         }
@@ -4751,6 +4882,18 @@ fn validate_runtime_workspace_operation(operation: &RuntimeWorkspaceOperation) -
             != ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
         {
             bail!("exclusive runtime workspace operation cannot carry an input snapshot");
+        }
+    }
+    if let Some(capture_hash) = operation.input_output_capture_hash.as_deref() {
+        validate_sha256(
+            "runtime workspace-operation input output capture",
+            capture_hash,
+        )?;
+        if operation.input_snapshot_hash.is_none()
+            || operation.access
+                != ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration
+        {
+            bail!("runtime workspace output capture has no immutable input snapshot");
         }
     }
     // A rejected operation may release before capture and therefore has no
@@ -5413,6 +5556,51 @@ impl RuntimeDb {
     }
 
     pub fn retained_candidate_snapshot_roots(&self) -> Result<Vec<String>> {
+        let mut roots = BTreeSet::new();
+        // Closing a verified candidate view and binding its immutable session
+        // result are separate durable steps. Preserve the exact frozen source
+        // through that existing reconciliation window, including when no
+        // in-process publication lease survived a restart.
+        let mut pending = self.conn.prepare(
+            "SELECT placement_thread_id, workspace_id FROM dedicated_session
+               WHERE state='freezing' AND terminal_reason='completed'
+                 AND candidate_required=1 AND candidate_snapshot_hash IS NULL
+               ORDER BY placement_thread_id",
+        )?;
+        let pending = pending
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (placement, workspace_id) in pending {
+            let workspace = self.workspace(&workspace_id)?.ok_or_else(|| {
+                anyhow!("pending dedicated candidate lost its exact workspace journal")
+            })?;
+            if workspace.thread_id.as_deref() != Some(placement.as_str())
+                || workspace.launch_owner.is_none()
+            {
+                bail!("pending dedicated candidate workspace has contradictory ownership");
+            }
+            if workspace.workspace_output_partition_identity.is_some() {
+                bail!("dedicated candidate owner does not support workspace output partitions");
+            }
+            if let Some(hash) = workspace.frozen_snapshot_hash {
+                if !matches!(
+                    workspace.state,
+                    WorkspaceState::Freezing
+                        | WorkspaceState::Destroying
+                        | WorkspaceState::Closing
+                        | WorkspaceState::Closed
+                        | WorkspaceState::Orphaned
+                ) {
+                    bail!(
+                        "pending dedicated candidate frozen generation has an invalid workspace state"
+                    );
+                }
+                validate_sha256("pending dedicated candidate frozen snapshot", &hash)?;
+                roots.insert(hash);
+            }
+        }
         let mut statement = self.conn.prepare(
             "SELECT candidate_snapshot_hash, candidate_evaluation_json,
                     candidate_qualification_json FROM dedicated_session
@@ -5430,7 +5618,6 @@ impl RuntimeDb {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut roots = BTreeSet::new();
         for (source_candidate, evaluation_json, qualification_json) in rows {
             if !lillux::valid_hash(&source_candidate) {
                 bail!("retained dedicated candidate root is not canonical");
@@ -6037,6 +6224,167 @@ impl RuntimeDb {
         )?;
         self.credential_profile_projection(&stable.profile_id)?
             .ok_or_else(|| anyhow!("reconciled credential profile projection disappeared"))
+    }
+
+    /// Reconcile the one current-contract crash shape in which terminal
+    /// settlement durably cancelled an enrolling ceremony but did not advance
+    /// its stable-authority revision. The terminal session and exact reaped
+    /// worker are the authority for that cancellation; arbitrary equal-revision
+    /// divergence remains an integrity error in the ordinary merge owner.
+    pub(crate) fn reconcile_terminal_credential_profile_authority(
+        &self,
+        stable: &ryeos_state::OperationalCredentialProfileRecord,
+    ) -> Result<bool> {
+        let Some(runtime) = self.credential_profile_projection(&stable.profile_id)? else {
+            return Ok(false);
+        };
+        let repair_shape = runtime.profile_id == stable.profile_id
+            && runtime.owner_principal == stable.owner_principal
+            && runtime.home_id == stable.home_id
+            && runtime.authority_revision == stable.authority_revision
+            && runtime.credential_generation == stable.credential_generation
+            && runtime.login_epoch == stable.login_epoch
+            && runtime.created_at_ms == stable.created_at_ms
+            && stable.state == "enrolling"
+            && stable.active_login_id.is_some()
+            && stable.login_expires_at_ms.is_some()
+            && stable.sanitized_account.is_none()
+            && stable.updated_at_ms <= runtime.updated_at_ms
+            && runtime.state == "unauthenticated"
+            && runtime.active_login_id.is_none()
+            && runtime.login_expires_at_ms.is_none()
+            && runtime.sanitized_account.is_none()
+            && runtime.lock_owner.is_none();
+        if !repair_shape {
+            return Ok(false);
+        }
+        let next_revision = runtime
+            .authority_revision
+            .checked_add(1)
+            .context("credential authority revision overflow during terminal reconciliation")?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("begin terminal credential-profile authority reconciliation")?;
+        let evidence = {
+            let mut statement = tx.prepare(
+                "SELECT session.placement_thread_id, session.worker_instance_id,
+                    session.worker_boot_epoch
+               FROM dedicated_session AS session
+               JOIN worker_process AS worker
+                 ON worker.worker_instance_id=session.worker_instance_id
+                AND worker.placement_thread_id=session.placement_thread_id
+                AND worker.boot_epoch=session.worker_boot_epoch
+              WHERE session.credential_profile_id=?1
+                AND session.owner_principal=?2
+                AND session.credential_generation=?3
+                AND session.chain_root_id=session.placement_thread_id
+                AND session.state='terminal'
+                AND session.terminal_reason IS NOT NULL
+                AND length(session.terminal_reason)>0
+                AND session.terminal_reason!='completed'
+                AND session.current_turn_id IS NULL
+                AND session.updated_at_ms=?4
+                AND worker.state='dead' AND worker.cleanup_state='reaped'
+                AND worker.updated_at_ms<=?4
+              ORDER BY session.placement_thread_id",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        &runtime.profile_id,
+                        &runtime.owner_principal,
+                        i64::try_from(runtime.credential_generation)?,
+                        runtime.updated_at_ms,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if evidence.len() != 1 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let (placement_thread_id, worker_instance_id, worker_boot_epoch) = &evidence[0];
+        let conflicts: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM dedicated_session
+                  WHERE credential_profile_id=?1 AND state!='terminal'
+               ) OR EXISTS(
+                 SELECT 1 FROM dedicated_session
+                  WHERE credential_profile_id=?1
+                    AND placement_thread_id!=?2 AND updated_at_ms>=?3
+               ) OR EXISTS(
+                 SELECT 1 FROM credential_profile_reservation
+                  WHERE profile_id=?1
+                    AND (state='reserved' OR project_fence_state='active')
+               )",
+            params![
+                &runtime.profile_id,
+                placement_thread_id,
+                runtime.updated_at_ms
+            ],
+            |row| row.get(0),
+        )?;
+        if conflicts {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE credential_profile
+                SET authority_revision=?12
+              WHERE profile_id=?1 AND owner_principal=?2 AND home_id=?3
+                AND authority_revision=?4 AND credential_generation=?5
+                AND state='unauthenticated' AND active_login_id IS NULL
+                AND login_epoch=?6 AND login_expires_at_ms IS NULL
+                AND sanitized_account_json IS NULL AND lock_owner IS NULL
+                AND created_at_ms=?7 AND updated_at_ms=?8
+                AND EXISTS(SELECT 1 FROM dedicated_session AS session
+                    JOIN worker_process AS worker
+                      ON worker.worker_instance_id=session.worker_instance_id
+                     AND worker.placement_thread_id=session.placement_thread_id
+                     AND worker.boot_epoch=session.worker_boot_epoch
+                   WHERE session.placement_thread_id=?9
+                     AND session.chain_root_id=?9
+                     AND session.worker_instance_id=?10
+                     AND session.worker_boot_epoch=?11
+                     AND session.credential_profile_id=?1
+                     AND session.owner_principal=?2
+                     AND session.credential_generation=?5
+                     AND session.state='terminal'
+                     AND session.terminal_reason IS NOT NULL
+                     AND length(session.terminal_reason)>0
+                     AND session.terminal_reason!='completed'
+                     AND session.current_turn_id IS NULL
+                     AND session.updated_at_ms=?8
+                     AND worker.state='dead' AND worker.cleanup_state='reaped'
+                     AND worker.updated_at_ms<=?8)",
+            params![
+                &runtime.profile_id,
+                &runtime.owner_principal,
+                &runtime.home_id,
+                i64::try_from(runtime.authority_revision)?,
+                i64::try_from(runtime.credential_generation)?,
+                i64::try_from(runtime.login_epoch)?,
+                runtime.created_at_ms,
+                runtime.updated_at_ms,
+                placement_thread_id,
+                worker_instance_id,
+                worker_boot_epoch,
+                i64::try_from(next_revision)?,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!(
+                "terminal credential-profile authority reconciliation lost its exact evidence"
+            );
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn acquire_credential_profile(
@@ -9387,19 +9735,24 @@ impl RuntimeDb {
         worker_instance_id: &str,
         boot_epoch: u64,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         validate_bounded_runtime_text("dedicated placement thread id", placement_thread_id, 256)?;
         validate_bounded_runtime_text("worker instance id", worker_instance_id, 256)?;
         validate_bounded_runtime_text("dedicated terminal reason", reason, 2048)?;
         let now = lillux::time::timestamp_millis() as i64;
         let tx = self.conn.unchecked_transaction()?;
-        let (candidate_required, has_completion_fence): (bool, bool) = tx.query_row(
+        let (candidate_required, has_completion_fence, credential_profile_id): (
+            bool,
+            bool,
+            String,
+        ) = tx.query_row(
             "SELECT candidate_required != 0,
                     completion_worker_boot_epoch IS NOT NULL
                     AND completion_command_sequence IS NOT NULL
                     AND completion_request_digest IS NOT NULL
                     AND completion_turn_id IS NOT NULL
-                    AND completion_operation_id IS NOT NULL
+                    AND completion_operation_id IS NOT NULL,
+                    credential_profile_id
                FROM dedicated_session
               WHERE placement_thread_id=?1 AND worker_instance_id=?2 AND worker_boot_epoch=?3",
             params![
@@ -9407,7 +9760,7 @@ impl RuntimeDb {
                 worker_instance_id,
                 i64::try_from(boot_epoch)?
             ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         if reason == "completed" && !has_completion_fence {
             bail!("completed dedicated session has no durable completion fence");
@@ -9465,21 +9818,40 @@ impl RuntimeDb {
         // Terminal settlement owns the credential lease release in the same
         // durable transaction. This closes the crash window where a dead
         // worker had terminalized its session but left the profile fenced.
-        tx.execute(
+        let credential_authority_changed = tx.execute(
             "UPDATE credential_profile
                 SET state=CASE WHEN state='enrolling' THEN 'unauthenticated' ELSE state END,
                     active_login_id=CASE WHEN state='enrolling' THEN NULL ELSE active_login_id END,
                     login_expires_at_ms=CASE WHEN state='enrolling' THEN NULL ELSE login_expires_at_ms END,
+                    authority_revision=authority_revision
+                        + CASE WHEN state='enrolling' THEN 1 ELSE 0 END,
                     lock_owner=NULL, updated_at_ms=?4
               WHERE profile_id=(SELECT credential_profile_id FROM dedicated_session
                                   WHERE placement_thread_id=?1)
                 AND lock_owner=?2
+                AND state='enrolling'
                 AND EXISTS(SELECT 1 FROM dedicated_session
                   WHERE placement_thread_id=?1 AND worker_boot_epoch=?3)",
             params![placement_thread_id, worker_instance_id, i64::try_from(boot_epoch)?, now],
+        )? != 0;
+        // Releasing an ordinary active/unauthenticated profile lock is a
+        // runtime-only transition. It must not advance stable credential
+        // authority, but still belongs in this terminal transaction.
+        tx.execute(
+            "UPDATE credential_profile SET lock_owner=NULL, updated_at_ms=?4
+              WHERE profile_id=?1 AND lock_owner=?2 AND state!='enrolling'
+                AND EXISTS(SELECT 1 FROM dedicated_session
+                  WHERE placement_thread_id=?3 AND worker_boot_epoch=?5)",
+            params![
+                &credential_profile_id,
+                worker_instance_id,
+                placement_thread_id,
+                now,
+                i64::try_from(boot_epoch)?
+            ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(credential_authority_changed.then_some(credential_profile_id))
     }
 
     pub fn bind_dedicated_session_candidate(
@@ -9506,7 +9878,11 @@ impl RuntimeDb {
                 AND candidate_required=1
                 AND candidate_snapshot_hash IS NULL
                 AND EXISTS(SELECT 1 FROM execution_workspace
-                    WHERE workspace_id=dedicated_session.workspace_id AND state='closed')",
+                    WHERE workspace_id=dedicated_session.workspace_id AND state='closed'
+                      AND thread_id=dedicated_session.placement_thread_id
+                      AND frozen_snapshot_hash=?2
+                      AND workspace_output_partition_identity IS NULL
+                      AND frozen_output_capture_hash IS NULL)",
             params![
                 placement_thread_id,
                 snapshot_hash,
@@ -10750,7 +11126,7 @@ impl RuntimeDb {
         workspace_operation: Option<&NewRuntimeWorkspaceOperation<'_>>,
     ) -> Result<String> {
         if matches!(mode, RuntimeActionMode::Inline) && child_project_authority.is_some() {
-            bail!("inline runtime action cannot carry detached project authority");
+            bail!("inline runtime action cannot carry root project authority");
         }
         if workspace_operation.is_some() && !matches!(mode, RuntimeActionMode::Inline) {
             bail!("shared-workspace runtime action must use unary inline child execution");
@@ -10774,6 +11150,7 @@ impl RuntimeDb {
                 project_authority_digest: seed.project_authority_digest.to_owned(),
                 workload_client_grant_digest: seed.workload_client_grant_digest.to_owned(),
                 input_snapshot_hash: None,
+                input_output_capture_hash: None,
             })
             .map(|operation| {
                 validate_runtime_workspace_operation(&operation)?;
@@ -10840,7 +11217,7 @@ impl RuntimeDb {
                     workspace_worker_instance_id, workspace_worker_boot_epoch,
                     workspace_worker_boot_identity_hash,
                     workspace_project_authority_digest, workspace_grant_digest,
-                    workspace_input_snapshot_hash
+                    workspace_input_snapshot_hash, workspace_input_output_capture_hash
                FROM runtime_action_intent WHERE operation_id=?1",
             params![operation_id],
             decode_runtime_action_intent,
@@ -10882,13 +11259,13 @@ impl RuntimeDb {
         Ok(persisted.child_thread_id)
     }
 
-    /// Bind the project authority selected for a previously-reserved detached
+    /// Bind the project authority selected for a previously-reserved root
     /// operation. Reservation and authority selection are deliberately two
     /// phases: the stable child identity is durable before an explicit project
     /// capture starts, while the capture itself is not authoritative until its
     /// exact snapshot authority is sealed here. Concurrent retries may bind the
     /// same value; a different value is an authority conflict.
-    pub fn bind_detached_action_project_authority(
+    pub fn bind_root_action_project_authority(
         &self,
         operation_id: &str,
         child_project_authority: &ryeos_state::objects::ExecutionProjectAuthority,
@@ -10898,35 +11275,37 @@ impl RuntimeDb {
         let changed = tx.execute(
             "UPDATE runtime_action_intent
                 SET child_project_authority=?2
-              WHERE operation_id=?1 AND mode='detached'
+              WHERE operation_id=?1 AND mode IN ('detached', 'awaited_root')
                 AND child_project_authority IS NULL",
             params![operation_id, encoded],
         )?;
         let stored: Option<String> = tx
             .query_row(
                 "SELECT child_project_authority FROM runtime_action_intent
-                  WHERE operation_id=?1 AND mode='detached'",
+                  WHERE operation_id=?1 AND mode IN ('detached', 'awaited_root')",
                 params![operation_id],
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow!("detached operation `{operation_id}` is not reserved"))?;
+            .ok_or_else(|| anyhow!("root-carrying operation `{operation_id}` is not reserved"))?;
         let stored: ryeos_state::objects::ExecutionProjectAuthority = stored
             .as_deref()
             .map(decode_current_project_authority)
             .transpose()?
             .ok_or_else(|| {
-                anyhow!("detached operation `{operation_id}` project authority was not bound")
+                anyhow!("root-carrying operation `{operation_id}` project authority was not bound")
             })?;
         if stored != *child_project_authority {
-            bail!("detached operation `{operation_id}` was bound to different project authority");
+            bail!(
+                "root-carrying operation `{operation_id}` was bound to different project authority"
+            );
         }
         debug_assert!(changed <= 1);
         tx.commit()?;
         Ok(())
     }
 
-    pub fn seal_detached_action_intent(
+    pub fn seal_root_action_intent(
         &self,
         operation_id: &str,
         child_project_authority: &ryeos_state::objects::ExecutionProjectAuthority,
@@ -10937,16 +11316,16 @@ impl RuntimeDb {
         child_project_authority.validate()?;
         launch_metadata.validate()?;
         validate_sha256(
-            "detached admitted_launch_capsule_hash",
+            "root action admitted_launch_capsule_hash",
             admitted_launch_capsule_hash,
         )?;
         let expected_capsule_hash = launch_metadata
             .admitted_launch_capsule()?
-            .ok_or_else(|| anyhow!("detached sealed launch has no admitted capsule"))?
+            .ok_or_else(|| anyhow!("root action sealed launch has no admitted capsule"))?
             .content_hash()?;
         if admitted_launch_capsule_hash != expected_capsule_hash {
             bail!(
-                "detached admitted capsule hash mismatch: expected {expected_capsule_hash}, got {admitted_launch_capsule_hash}"
+                "root action admitted capsule hash mismatch: expected {expected_capsule_hash}, got {admitted_launch_capsule_hash}"
             );
         }
         let authority = encode_current_project_authority(child_project_authority)?;
@@ -10957,7 +11336,8 @@ impl RuntimeDb {
             "UPDATE runtime_action_intent
              SET child_project_authority=?2, admitted_launch_capsule_hash=?3,
                  launch_metadata=?4, initial_events=?5
-             WHERE operation_id=?1 AND mode='detached' AND launch_metadata IS NULL",
+             WHERE operation_id=?1 AND mode IN ('detached', 'awaited_root')
+               AND launch_metadata IS NULL",
             params![
                 operation_id,
                 authority,
@@ -10976,13 +11356,14 @@ impl RuntimeDb {
                         workspace_worker_instance_id, workspace_worker_boot_epoch,
                         workspace_worker_boot_identity_hash,
                         workspace_project_authority_digest, workspace_grant_digest,
-                        workspace_input_snapshot_hash
-                 FROM runtime_action_intent WHERE operation_id=?1 AND mode='detached'",
+                        workspace_input_snapshot_hash, workspace_input_output_capture_hash
+                 FROM runtime_action_intent
+                 WHERE operation_id=?1 AND mode IN ('detached', 'awaited_root')",
                 params![operation_id],
                 decode_runtime_action_intent,
             )
             .optional()?
-            .ok_or_else(|| anyhow!("detached operation `{operation_id}` is not reserved"))?;
+            .ok_or_else(|| anyhow!("root-carrying operation `{operation_id}` is not reserved"))?;
         if persisted
             .child_project_authority
             .as_ref()
@@ -11007,7 +11388,9 @@ impl RuntimeDb {
                 .as_deref()
                 != Some(events.as_str())
         {
-            bail!("detached operation `{operation_id}` was sealed with different launch authority");
+            bail!(
+                "root-carrying operation `{operation_id}` was sealed with different launch authority"
+            );
         }
         tx.commit()?;
         Ok(())
@@ -11028,9 +11411,36 @@ impl RuntimeDb {
                         workspace_worker_instance_id, workspace_worker_boot_epoch,
                         workspace_worker_boot_identity_hash,
                         workspace_project_authority_digest, workspace_grant_digest,
-                        workspace_input_snapshot_hash
+                        workspace_input_snapshot_hash, workspace_input_output_capture_hash
                    FROM runtime_action_intent WHERE operation_id=?1",
                 params![operation_id],
+                decode_runtime_action_intent,
+            )
+            .optional()?;
+        if let Some(intent) = &row {
+            validate_runtime_action_intent_record(intent)?;
+        }
+        Ok(row)
+    }
+
+    pub fn get_runtime_action_intent_by_child(
+        &self,
+        child_thread_id: &str,
+    ) -> Result<Option<RuntimeActionIntent>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT operation_id, chain_root_id, first_caller_thread_id, mode,
+                        request_hash, child_thread_id,
+                        child_project_authority, admitted_launch_capsule_hash,
+                        launch_metadata, initial_events,
+                        workspace_id, workspace_access, workspace_operation_phase,
+                        workspace_worker_instance_id, workspace_worker_boot_epoch,
+                        workspace_worker_boot_identity_hash,
+                        workspace_project_authority_digest, workspace_grant_digest,
+                        workspace_input_snapshot_hash, workspace_input_output_capture_hash
+                   FROM runtime_action_intent WHERE child_thread_id=?1",
+                params![child_thread_id],
                 decode_runtime_action_intent,
             )
             .optional()?;
@@ -11050,7 +11460,7 @@ impl RuntimeDb {
                     workspace_worker_instance_id, workspace_worker_boot_epoch,
                     workspace_worker_boot_identity_hash,
                     workspace_project_authority_digest, workspace_grant_digest,
-                    workspace_input_snapshot_hash
+                    workspace_input_snapshot_hash, workspace_input_output_capture_hash
                FROM runtime_action_intent ORDER BY created_at_ms, operation_id",
         )?;
         let intents = statement
@@ -11150,32 +11560,38 @@ impl RuntimeDb {
     /// Bind the immutable generation captured while the parent worker was
     /// quiesced. The operation intent becomes its durable recovery/GC owner;
     /// no second snapshot-selection ledger may be added around this write.
-    pub fn bind_runtime_workspace_input_snapshot(
+    pub fn bind_runtime_workspace_input_generation(
         &self,
         operation_id: &str,
-        snapshot_hash: &str,
+        generation: &ryeos_state::objects::WorkspaceGenerationPair,
     ) -> Result<()> {
-        validate_sha256("runtime workspace-operation input snapshot", snapshot_hash)?;
+        generation.validate()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE runtime_action_intent
                 SET workspace_input_snapshot_hash=?2,
+                    workspace_input_output_capture_hash=?3,
                     workspace_operation_phase='quiesced'
               WHERE operation_id=?1
                 AND workspace_access='immutable_current_generation'
                 AND workspace_operation_phase='quiescing'
-                AND workspace_input_snapshot_hash IS NULL",
-            params![operation_id, snapshot_hash],
+                AND workspace_input_snapshot_hash IS NULL
+                AND workspace_input_output_capture_hash IS NULL",
+            params![
+                operation_id,
+                generation.snapshot_hash,
+                generation.output_capture_hash,
+            ],
         )?;
-        let stored: String = tx
+        let stored: (String, Option<String>) = tx
             .query_row(
-                "SELECT workspace_input_snapshot_hash
+                "SELECT workspace_input_snapshot_hash, workspace_input_output_capture_hash
                    FROM runtime_action_intent
                   WHERE operation_id=?1
                     AND workspace_access='immutable_current_generation'
                     AND workspace_operation_phase='quiesced'",
                 params![operation_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -11183,7 +11599,7 @@ impl RuntimeDb {
                     "runtime workspace operation `{operation_id}` is not awaiting immutable input"
                 )
             })?;
-        if stored != snapshot_hash {
+        if stored.0 != generation.snapshot_hash || stored.1 != generation.output_capture_hash {
             bail!("runtime workspace operation `{operation_id}` selected a different input");
         }
         tx.commit()?;
@@ -11207,6 +11623,12 @@ impl RuntimeDb {
                 if let Some(hash) = authority.operational_snapshot_projection() {
                     roots.insert(hash.to_string());
                 }
+                if let Some(hash) = authority
+                    .workspace_outputs()
+                    .and_then(|outputs| outputs.capture_hash.as_ref())
+                {
+                    roots.insert(hash.clone());
+                }
             }
             if let Some(snapshot_hash) = intent.workspace_operation.as_ref().and_then(|operation| {
                 (operation.phase != RuntimeWorkspaceOperationPhase::Released)
@@ -11214,6 +11636,13 @@ impl RuntimeDb {
                     .flatten()
             }) {
                 roots.insert(snapshot_hash.clone());
+            }
+            if let Some(capture_hash) = intent.workspace_operation.as_ref().and_then(|operation| {
+                (operation.phase != RuntimeWorkspaceOperationPhase::Released)
+                    .then_some(operation.input_output_capture_hash.as_ref())
+                    .flatten()
+            }) {
+                roots.insert(capture_hash.clone());
             }
         }
         for waiter in self.list_follow_waiters()? {
@@ -11223,6 +11652,12 @@ impl RuntimeDb {
                 }
                 if let Some(hash) = authority.operational_snapshot_projection() {
                     roots.insert(hash.to_string());
+                }
+                if let Some(hash) = authority
+                    .workspace_outputs()
+                    .and_then(|outputs| outputs.capture_hash.as_ref())
+                {
+                    roots.insert(hash.clone());
                 }
             }
         }
@@ -13372,6 +13807,8 @@ impl RuntimeDb {
 
     /// Clear live process ownership only if it is still the exact incarnation
     /// the caller finished waiting/reaping. This cannot erase a later attach.
+    /// Workspace borrowers must use atomic workspace/process settlement instead:
+    /// clearing only the identity destroys cold recovery's exact death proof.
     pub fn clear_process_if_matches(
         &self,
         thread_id: &str,
@@ -13383,7 +13820,9 @@ impl RuntimeDb {
             "UPDATE thread_runtime
                 SET pid = NULL, pgid = NULL, process_identity = NULL,
                     process_dead_observed_at_ms = NULL
-              WHERE thread_id = ?1 AND process_identity = ?2",
+              WHERE thread_id = ?1 AND process_identity = ?2
+                AND workspace_id IS NULL AND workspace_view_identity IS NULL
+                AND workspace_borrower_launch_owner IS NULL",
             params![thread_id, identity_json],
         )? > 0)
     }
@@ -14098,14 +14537,27 @@ impl RuntimeDb {
             backend_version,
             pinned_root_identities,
             mount_identity,
+            workspace_output_partition_identity,
+            base_output_capture_hash,
         } = binding;
+        if workspace_output_partition_identity.is_none() && base_output_capture_hash.is_some() {
+            bail!("ordinary workspace cannot carry an output capture");
+        }
+        if let Some(identity) = workspace_output_partition_identity {
+            validate_sha256("workspace output partition identity", identity)?;
+        }
+        if let Some(hash) = base_output_capture_hash {
+            validate_sha256("workspace base output capture", hash)?;
+        }
         let changed = self.conn.execute(
             "UPDATE execution_workspace
                 SET backend_id=?4,
                     backend_version=?5, pinned_root_identities=?6, mount_identity=?7,
-                    state=?8, updated_at_ms=?9, process_identity=NULL
+                    workspace_output_partition_identity=?8,
+                    base_output_capture_hash=?9,
+                    state=?10, updated_at_ms=?11, process_identity=NULL
               WHERE workspace_id=?1 AND thread_id=?2 AND launch_owner=?3
-                AND state=?10",
+                AND state=?12",
             params![
                 workspace_id,
                 thread_id,
@@ -14114,6 +14566,8 @@ impl RuntimeDb {
                 backend_version,
                 pinned_root_identities,
                 mount_identity,
+                workspace_output_partition_identity,
+                base_output_capture_hash,
                 WorkspaceState::Ready.as_str(),
                 lillux::time::timestamp_millis(),
                 WorkspaceState::Constructing.as_str()
@@ -14129,6 +14583,9 @@ impl RuntimeDb {
                 || existing.backend_version.as_deref() != backend_version
                 || existing.pinned_root_identities.as_deref() != pinned_root_identities
                 || existing.mount_identity.as_deref() != mount_identity
+                || existing.workspace_output_partition_identity.as_deref()
+                    != workspace_output_partition_identity
+                || existing.base_output_capture_hash.as_deref() != base_output_capture_hash
                 || existing.state != WorkspaceState::Ready
             {
                 bail!("workspace {workspace_id} cannot be bound from its current state");
@@ -14319,8 +14776,14 @@ impl RuntimeDb {
         }
         if expected_state == WorkspaceState::Freezing {
             let captured: bool = tx.query_row(
-                "SELECT frozen_snapshot_hash IS NOT NULL FROM execution_workspace WHERE workspace_id=?1",
-                [workspace_id], |row| row.get(0),
+                "SELECT frozen_snapshot_hash IS NOT NULL
+                        AND ((workspace_output_partition_identity IS NULL
+                              AND frozen_output_capture_hash IS NULL)
+                             OR (workspace_output_partition_identity IS NOT NULL
+                                 AND frozen_output_capture_hash IS NOT NULL))
+                   FROM execution_workspace WHERE workspace_id=?1",
+                [workspace_id],
+                |row| row.get(0),
             )?;
             if !captured {
                 bail!("uncommitted workspace freeze remains quarantined during cold recovery");
@@ -14392,13 +14855,13 @@ impl RuntimeDb {
         workspace_id: &str,
         thread_id: &str,
         launch_owner: &str,
-        snapshot_hash: &str,
+        generation: &ryeos_state::objects::WorkspaceGenerationPair,
     ) -> Result<()> {
         self.bind_frozen_workspace_generation_inner(
             workspace_id,
             thread_id,
             launch_owner,
-            snapshot_hash,
+            generation,
             Some(launch_owner),
         )
     }
@@ -14411,13 +14874,13 @@ impl RuntimeDb {
         workspace_id: &str,
         thread_id: &str,
         launch_owner: &str,
-        snapshot_hash: &str,
+        generation: &ryeos_state::objects::WorkspaceGenerationPair,
     ) -> Result<()> {
         self.bind_frozen_workspace_generation_inner(
             workspace_id,
             thread_id,
             launch_owner,
-            snapshot_hash,
+            generation,
             None,
         )
     }
@@ -14427,10 +14890,10 @@ impl RuntimeDb {
         workspace_id: &str,
         thread_id: &str,
         launch_owner: &str,
-        snapshot_hash: &str,
+        generation: &ryeos_state::objects::WorkspaceGenerationPair,
         expected_claim_owner: Option<&str>,
     ) -> Result<()> {
-        validate_sha256("frozen workspace snapshot hash", snapshot_hash)?;
+        generation.validate()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("begin atomic frozen workspace binding")?;
         let claim_owner: Option<String> = tx
@@ -14452,15 +14915,29 @@ impl RuntimeDb {
                 bail!("current or contradictory launch owner cannot use abandoned freeze recovery");
             }
         }
-        let (workspace_thread, workspace_owner, state, base_snapshot, existing_frozen): (
+        let (
+            workspace_thread,
+            workspace_owner,
+            state,
+            base_snapshot,
+            output_partition_identity,
+            base_output_capture,
+            existing_frozen,
+            existing_frozen_capture,
+        ): (
             Option<String>,
             Option<String>,
             WorkspaceState,
             String,
             Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
         ) = tx
             .query_row(
-                "SELECT thread_id, launch_owner, state, base_snapshot, frozen_snapshot_hash
+                "SELECT thread_id, launch_owner, state, base_snapshot,
+                        workspace_output_partition_identity, base_output_capture_hash,
+                        frozen_snapshot_hash, frozen_output_capture_hash
                    FROM execution_workspace WHERE workspace_id=?1",
                 params![workspace_id],
                 |row| {
@@ -14470,6 +14947,9 @@ impl RuntimeDb {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -14480,9 +14960,14 @@ impl RuntimeDb {
             || state != WorkspaceState::Freezing
             || existing_frozen
                 .as_deref()
-                .is_some_and(|existing| existing != snapshot_hash)
+                .is_some_and(|existing| existing != generation.snapshot_hash)
+            || (existing_frozen_capture != generation.output_capture_hash
+                && existing_frozen.is_some())
         {
             bail!("workspace {workspace_id} cannot bind a conflicting frozen generation");
+        }
+        if output_partition_identity.is_some() != generation.output_capture_hash.is_some() {
+            bail!("frozen workspace output generation contradicts its admitted partition");
         }
         let launch_metadata_json: Option<String> = tx
             .query_row(
@@ -14510,17 +14995,27 @@ impl RuntimeDb {
         {
             bail!("workspace base snapshot and admitted launch authority contradict");
         }
+        let admitted_outputs = admitted_project_authority.workspace_outputs();
+        if output_partition_identity.as_deref()
+            != admitted_outputs.map(|outputs| outputs.partition.partition_identity.as_str())
+            || base_output_capture.as_deref()
+                != admitted_outputs.and_then(|outputs| outputs.capture_hash.as_deref())
+        {
+            bail!("workspace output generation and admitted launch authority contradict");
+        }
         let workspace_updated = tx.execute(
             "UPDATE execution_workspace
-                SET frozen_snapshot_hash=?4, updated_at_ms=?5
+                SET frozen_snapshot_hash=?4, frozen_output_capture_hash=?5, updated_at_ms=?6
               WHERE workspace_id=?1 AND thread_id=?2 AND launch_owner=?3
-                AND state=?6
-                AND (frozen_snapshot_hash IS NULL OR frozen_snapshot_hash=?4)",
+                AND state=?7
+                AND (frozen_snapshot_hash IS NULL OR frozen_snapshot_hash=?4)
+                AND (frozen_output_capture_hash IS NULL OR frozen_output_capture_hash=?5)",
             params![
                 workspace_id,
                 thread_id,
                 launch_owner,
-                snapshot_hash,
+                generation.snapshot_hash,
+                generation.output_capture_hash,
                 lillux::time::timestamp_millis(),
                 WorkspaceState::Freezing.as_str()
             ],
@@ -14533,11 +15028,14 @@ impl RuntimeDb {
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
-        self.conn
+        let workspace = self
+            .conn
             .query_row(
                 "SELECT workspace_id, thread_id, launch_owner, backend_id, backend_version,
                         pinned_root_identities, mount_identity, base_snapshot,
-                        frozen_snapshot_hash, root_path, state, process_identity, created_at_ms, updated_at_ms
+                        workspace_output_partition_identity, base_output_capture_hash,
+                        frozen_snapshot_hash, frozen_output_capture_hash,
+                        root_path, state, process_identity, created_at_ms, updated_at_ms
                    FROM execution_workspace WHERE workspace_id=?1",
                 params![workspace_id],
                 |row| {
@@ -14550,24 +15048,32 @@ impl RuntimeDb {
                         pinned_root_identities: row.get(5)?,
                         mount_identity: row.get(6)?,
                         base_snapshot: row.get(7)?,
-                        frozen_snapshot_hash: row.get(8)?,
-                        root_path: row.get(9)?,
-                        state: row.get(10)?,
-                        process_identity: row.get(11)?,
-                        created_at_ms: row.get(12)?,
-                        updated_at_ms: row.get(13)?,
+                        workspace_output_partition_identity: row.get(8)?,
+                        base_output_capture_hash: row.get(9)?,
+                        frozen_snapshot_hash: row.get(10)?,
+                        frozen_output_capture_hash: row.get(11)?,
+                        root_path: row.get(12)?,
+                        state: row.get(13)?,
+                        process_identity: row.get(14)?,
+                        created_at_ms: row.get(15)?,
+                        updated_at_ms: row.get(16)?,
                     })
                 },
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        if let Some(workspace) = &workspace {
+            validate_workspace_output_coordinates(workspace)?;
+        }
+        Ok(workspace)
     }
 
     pub fn open_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {
         let mut statement = self.conn.prepare(
             "SELECT workspace_id, thread_id, launch_owner, backend_id, backend_version,
                     pinned_root_identities, mount_identity, base_snapshot,
-                    frozen_snapshot_hash, root_path, state, process_identity, created_at_ms, updated_at_ms
+                    workspace_output_partition_identity, base_output_capture_hash,
+                    frozen_snapshot_hash, frozen_output_capture_hash,
+                    root_path, state, process_identity, created_at_ms, updated_at_ms
                FROM execution_workspace WHERE state != ?1 ORDER BY created_at_ms",
         )?;
         let rows = statement.query_map(params![WorkspaceState::Closed.as_str()], |row| {
@@ -14580,16 +15086,22 @@ impl RuntimeDb {
                 pinned_root_identities: row.get(5)?,
                 mount_identity: row.get(6)?,
                 base_snapshot: row.get(7)?,
-                frozen_snapshot_hash: row.get(8)?,
-                root_path: row.get(9)?,
-                state: row.get(10)?,
-                process_identity: row.get(11)?,
-                created_at_ms: row.get(12)?,
-                updated_at_ms: row.get(13)?,
+                workspace_output_partition_identity: row.get(8)?,
+                base_output_capture_hash: row.get(9)?,
+                frozen_snapshot_hash: row.get(10)?,
+                frozen_output_capture_hash: row.get(11)?,
+                root_path: row.get(12)?,
+                state: row.get(13)?,
+                process_identity: row.get(14)?,
+                created_at_ms: row.get(15)?,
+                updated_at_ms: row.get(16)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for workspace in &rows {
+            validate_workspace_output_coordinates(workspace)?;
+        }
+        Ok(rows)
     }
 
     pub fn workspace_for_thread(&self, thread_id: &str) -> Result<Option<WorkspaceRecord>> {
@@ -16299,6 +16811,116 @@ mod tests {
             )
     }
 
+    fn sealed_root_launch_metadata(
+        project_authority: ryeos_state::objects::ExecutionProjectAuthority,
+    ) -> RuntimeLaunchMetadata {
+        use ryeos_engine::contracts::{
+            EffectivePrincipal, ExecutionHints, Principal, ProjectContext,
+        };
+
+        let snapshot_hash = project_authority
+            .operational_snapshot_projection()
+            .expect("test project authority is pinned")
+            .to_owned();
+        let project_context = ProjectContext::SnapshotHash {
+            hash: snapshot_hash.clone(),
+        };
+        let sealed = crate::thread_lifecycle::SealedRootExecutionRequest::storage_test_fixture_with_project_identity(
+            project_context.clone(),
+            project_authority.clone(),
+        );
+        let resume = crate::launch_metadata::ResumeContext {
+            kind: "graph_run".to_owned(),
+            item_ref: "graph:test/storage-fixture".to_owned(),
+            ref_bindings: BTreeMap::new(),
+            product_selections: Vec::new(),
+            launch_mode: "detached".to_owned(),
+            parameters: serde_json::json!({}),
+            project_context,
+            project_authority: project_authority.clone(),
+            lifecycle_authority:
+                ryeos_state::objects::ExecutionLifecycleAuthority::DAEMON_RESTARTABLE,
+            stable_project_identity: None,
+            local_overlay_root: None,
+            original_snapshot_hash: Some(snapshot_hash),
+            original_pushed_head_ref: None,
+            state_root: None,
+            current_site_id: "site:test".to_owned(),
+            origin_site_id: "site:test".to_owned(),
+            requested_by: EffectivePrincipal::Local(Principal {
+                fingerprint: "session:test".to_owned(),
+                scopes: Vec::new(),
+            }),
+            execution_hints: ExecutionHints::default(),
+            scheduled_fire: None,
+            effective_caps: Vec::new(),
+            parent_delegation_caps: None,
+            executor_ref: Some("native:storage-fixture".to_owned()),
+            runtime_ref: Some("runtime:storage-fixture".to_owned()),
+        };
+        let runtime_key = lillux::crypto::SigningKey::from_bytes(&[21; 32]);
+        let runtime_document =
+            lillux::signature::sign_content("runtime fixture\n", &runtime_key, "#", None);
+        let runtime_header = lillux::signature::parse_signature_line(
+            runtime_document.lines().next().expect("runtime signature"),
+            "#",
+            None,
+        )
+        .expect("runtime signature header");
+        let protocol_key = lillux::crypto::SigningKey::from_bytes(&[22; 32]);
+        let protocol_document =
+            lillux::signature::sign_content("protocol fixture\n", &protocol_key, "#", None);
+        let protocol_header = lillux::signature::parse_signature_line(
+            protocol_document
+                .lines()
+                .next()
+                .expect("protocol signature"),
+            "#",
+            None,
+        )
+        .expect("protocol signature header");
+        let executor_hash = "7".repeat(64);
+        let metadata = RuntimeLaunchMetadata {
+            launch_driver: Some(ryeos_state::objects::ExecutionLaunchDriver::ManagedRuntime),
+            resume_context: Some(resume),
+            sealed_root_request: Some(sealed),
+            admitted_project_authority: Some(project_authority),
+            admitted_artifact_identity: Some(
+                ryeos_state::objects::AdmittedLaunchArtifactIdentity::ManagedRuntime {
+                    runtime_ref: "runtime:storage-fixture".to_owned(),
+                    runtime_content_hash: runtime_header.content_hash,
+                    runtime_signer_fingerprint: runtime_header.signer_fingerprint,
+                    protocol_ref: "protocol:test/fixture".to_owned(),
+                    protocol_content_hash: protocol_header.content_hash,
+                    protocol_signer_fingerprint: protocol_header.signer_fingerprint,
+                    executor_ref: "native:storage-fixture".to_owned(),
+                    executor_content_hash: executor_hash.clone(),
+                    executor_bundle_manifest_hash: "8".repeat(64),
+                    executor_bundle_signer_fingerprint: "9".repeat(64),
+                },
+            ),
+            admitted_launch_capsule_schema: Some(
+                ryeos_state::objects::ADMITTED_LAUNCH_CAPSULE_SCHEMA_VERSION,
+            ),
+            execution_realization_hash: Some("a".repeat(64)),
+            admitted_execution_closure: Some(
+                ryeos_state::objects::AdmittedExecutionClosure::ManagedRuntime {
+                    prepared_runtime_launch: serde_json::json!({
+                        "binding_records": {},
+                        "required_secrets": [],
+                        "admitted_sessions": {},
+                    }),
+                    runtime_descriptor_document: runtime_document,
+                    protocol_descriptor_document: protocol_document,
+                    executor_blob_hash: executor_hash,
+                },
+            ),
+            ..RuntimeLaunchMetadata::default()
+        };
+        metadata.validate().expect("valid sealed launch metadata");
+        metadata
+    }
+
     fn create_locked_profile(db: &RuntimeDb, profile_id: &str, lock_owner: &str) {
         db.create_credential_profile(NewCredentialProfile {
             profile_id,
@@ -17012,6 +17634,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session_state, "idle");
+        assert_eq!(
+            db.begin_credential_enrollment(
+                "P-one",
+                "worker-one",
+                "login-one",
+                lillux::time::timestamp_millis() as i64 + 60_000,
+            )
+            .unwrap(),
+            1
+        );
+        let enrolling = db.credential_profile("P-one").unwrap().unwrap();
+        assert_eq!(enrolling.authority_revision, 2);
+        let stable_enrolling = ryeos_state::OperationalCredentialProfileRecord {
+            profile_id: enrolling.profile_id.clone(),
+            owner_principal: enrolling.owner_principal.clone(),
+            home_id: enrolling.home_id.clone(),
+            authority_revision: enrolling.authority_revision,
+            credential_generation: enrolling.credential_generation,
+            state: enrolling.state.clone(),
+            active_login_id: enrolling.active_login_id.clone(),
+            login_epoch: enrolling.login_epoch,
+            login_expires_at_ms: enrolling.login_expires_at_ms,
+            sanitized_account: enrolling.sanitized_account.clone(),
+            created_at_ms: enrolling.created_at_ms,
+            updated_at_ms: enrolling.updated_at_ms,
+        };
         db.settle_worker_process("worker-one", "T-one", 1, "reaped", "fixture restart")
             .unwrap();
         let settled = db.worker_process("worker-one").unwrap().unwrap();
@@ -17022,11 +17670,149 @@ mod tests {
                 .is_err(),
             "worker exit without a durable completion fence cannot become completed"
         );
-        db.terminalize_dedicated_session("T-one", "worker-one", 1, "fixture_restart")
-            .unwrap();
+        assert_eq!(
+            db.terminalize_dedicated_session("T-one", "worker-one", 1, "fixture_restart")
+                .unwrap()
+                .as_deref(),
+            Some("P-one")
+        );
         let login_terminal = db.dedicated_session("T-one").unwrap().unwrap();
         assert_eq!(login_terminal.state, "terminal");
         assert!(login_terminal.candidate_snapshot_hash.is_none());
+        let profile = db.credential_profile("P-one").unwrap().unwrap();
+        assert_eq!(profile.state, "unauthenticated");
+        assert_eq!(profile.authority_revision, 3);
+        assert!(profile.active_login_id.is_none());
+        assert!(profile.login_expires_at_ms.is_none());
+        assert_eq!(
+            db.terminalize_dedicated_session("T-one", "worker-one", 1, "fixture_restart")
+                .unwrap(),
+            None,
+            "idempotent terminal settlement must not mint another authority revision"
+        );
+
+        // Recreate the exact current-contract commit gap: terminal/session
+        // evidence and cancelled profile facts committed, but the historical
+        // terminal writer retained the enrolling revision. Every authority
+        // predicate must be present before reconciliation may advance it.
+        db.conn
+            .execute(
+                "UPDATE credential_profile SET authority_revision=2 WHERE profile_id='P-one'",
+                [],
+            )
+            .unwrap();
+        for (table, mutation, restoration) in [
+            (
+                "dedicated_session",
+                "UPDATE dedicated_session SET current_turn_id='turn-unsettled' WHERE placement_thread_id='T-one'",
+                "UPDATE dedicated_session SET current_turn_id=NULL WHERE placement_thread_id='T-one'",
+            ),
+            (
+                "dedicated_session",
+                "UPDATE dedicated_session SET owner_principal='fp:other' WHERE placement_thread_id='T-one'",
+                "UPDATE dedicated_session SET owner_principal='fp:operator' WHERE placement_thread_id='T-one'",
+            ),
+            (
+                "dedicated_session",
+                "UPDATE dedicated_session SET chain_root_id='T-other' WHERE placement_thread_id='T-one'",
+                "UPDATE dedicated_session SET chain_root_id='T-one' WHERE placement_thread_id='T-one'",
+            ),
+            (
+                "worker_process",
+                "UPDATE worker_process SET cleanup_state='unproved' WHERE worker_instance_id='worker-one'",
+                "UPDATE worker_process SET cleanup_state='reaped' WHERE worker_instance_id='worker-one'",
+            ),
+            (
+                "worker_process",
+                "UPDATE worker_process SET placement_thread_id='T-other' WHERE worker_instance_id='worker-one'",
+                "UPDATE worker_process SET placement_thread_id='T-one' WHERE worker_instance_id='worker-one'",
+            ),
+        ] {
+            db.conn.execute(mutation, []).unwrap();
+            assert!(
+                !db.reconcile_terminal_credential_profile_authority(&stable_enrolling)
+                    .unwrap(),
+                "{table} mismatch must not authorize terminal credential reconciliation"
+            );
+            db.conn.execute(restoration, []).unwrap();
+        }
+        let transition_timestamp = db
+            .credential_profile("P-one")
+            .unwrap()
+            .unwrap()
+            .updated_at_ms;
+        db.conn
+            .execute(
+                "UPDATE dedicated_session SET updated_at_ms=?2 WHERE placement_thread_id=?1",
+                params!["T-one", transition_timestamp + 1],
+            )
+            .unwrap();
+        assert!(
+            !db.reconcile_terminal_credential_profile_authority(&stable_enrolling)
+                .unwrap(),
+            "a later session timestamp must not be folded into the earlier profile transition"
+        );
+        db.conn
+            .execute(
+                "UPDATE dedicated_session SET updated_at_ms=?2 WHERE placement_thread_id=?1",
+                params!["T-one", transition_timestamp],
+            )
+            .unwrap();
+        let mut wrong_stable = stable_enrolling.clone();
+        wrong_stable.credential_generation += 1;
+        assert!(
+            !db.reconcile_terminal_credential_profile_authority(&wrong_stable)
+                .unwrap(),
+            "a different stable credential generation cannot authorize reconciliation"
+        );
+        let mut wrong_stable = stable_enrolling.clone();
+        wrong_stable.login_epoch += 1;
+        assert!(
+            !db.reconcile_terminal_credential_profile_authority(&wrong_stable)
+                .unwrap(),
+            "a different stable login epoch cannot authorize reconciliation"
+        );
+        db.conn
+            .execute(
+                "INSERT INTO credential_profile_reservation (
+                    reservation_id, operation_id, successor_thread_id, profile_id,
+                    owner_principal, credential_generation, subject_contract_digest,
+                    subject_digest, checkpoint_manifest_hash, upstream_session_id,
+                    project_principal_key, project_hash, target_project_head_hash,
+                    project_fence_state, state, created_at_ms, updated_at_ms
+                 ) VALUES ('reservation-live', 'operation-live', 'T-successor', 'P-one',
+                           'fp:operator', 1, ?1, ?1, ?1, 'T-upstream',
+                           'fp:project', ?1, ?1, 'active', 'reserved', ?2, ?2)",
+                params!["f".repeat(64), transition_timestamp],
+            )
+            .unwrap();
+        assert!(
+            !db.reconcile_terminal_credential_profile_authority(&stable_enrolling)
+                .unwrap(),
+            "a live credential reservation must fence terminal reconciliation"
+        );
+        db.conn
+            .execute(
+                "DELETE FROM credential_profile_reservation WHERE reservation_id='reservation-live'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.reconcile_terminal_credential_profile_authority(&stable_enrolling)
+                .unwrap()
+        );
+        assert_eq!(
+            db.credential_profile("P-one")
+                .unwrap()
+                .unwrap()
+                .authority_revision,
+            3
+        );
+        assert!(
+            !db.reconcile_terminal_credential_profile_authority(&stable_enrolling)
+                .unwrap(),
+            "reconciled terminal authority cannot advance twice"
+        );
     }
 
     #[test]
@@ -17468,6 +18254,8 @@ mod tests {
             backend_version: Some("v1"),
             pinned_root_identities: Some("{}"),
             mount_identity: Some("new-frozen-view"),
+            workspace_output_partition_identity: None,
+            base_output_capture_hash: None,
         })
         .unwrap();
         db.transition_workspace_owned(
@@ -19021,17 +19809,40 @@ mod tests {
             .unwrap();
         db.conn
             .execute(
-                "UPDATE execution_workspace SET state='closed'
+                "UPDATE execution_workspace SET state='closed', frozen_snapshot_hash=?1
                   WHERE workspace_id='W-candidate'",
-                [],
+                params!["c".repeat(64)],
             )
             .unwrap();
         let candidate = "c".repeat(64);
+        assert!(
+            db.retained_candidate_snapshot_roots()
+                .unwrap()
+                .contains(&candidate),
+            "closed workspace retains its frozen candidate before session binding"
+        );
+        db.conn.execute("UPDATE execution_workspace SET thread_id='T-other' WHERE workspace_id='W-candidate'", []).unwrap();
+        assert!(
+            db.retained_candidate_snapshot_roots().is_err(),
+            "wrong-owner journal must not become a GC authority"
+        );
+        db.conn.execute("UPDATE execution_workspace SET thread_id='T-candidate' WHERE workspace_id='W-candidate'", []).unwrap();
+        assert!(
+            !db.bind_dedicated_session_candidate("T-candidate", &"d".repeat(64))
+                .unwrap(),
+            "candidate bind must name the exact frozen journal generation"
+        );
         assert!(
             db.bind_dedicated_session_candidate("T-candidate", &candidate)
                 .unwrap()
         );
         let frozen = db.dedicated_session("T-candidate").unwrap().unwrap();
+        assert!(
+            db.retained_candidate_snapshot_roots()
+                .unwrap()
+                .contains(&candidate),
+            "bound candidate owns the same bytes after the pending journal handoff"
+        );
         assert_eq!(frozen.state, "frozen");
         assert_eq!(frozen.completion_fence.as_ref(), Some(&completion_fence));
         let plan = frozen.candidate_validation_hash.unwrap();
@@ -19310,8 +20121,8 @@ mod tests {
             .unwrap();
         db.conn
             .execute(
-                "UPDATE execution_workspace SET state='closed' WHERE workspace_id='W-retained'",
-                [],
+                "UPDATE execution_workspace SET state='closed', frozen_snapshot_hash=?1 WHERE workspace_id='W-retained'",
+                params!["c".repeat(64)],
             )
             .unwrap();
         let candidate = "c".repeat(64);
@@ -20232,6 +21043,8 @@ mod tests {
                     ryeos_runtime::callback_contract::RuntimeDispatchPublication::NotApplicable,
                 record_hash: None,
                 replayed_from: None,
+                result_projection:
+                    ryeos_effect_contract::DispatchResultProjection::DispatchedSubject,
             },
         })
         .expect("serialize test hook response")
@@ -20357,6 +21170,164 @@ mod tests {
         assert_eq!(retained.chain_root_id, "T-chain");
         assert_eq!(retained.first_caller_thread_id, "T-parent");
         assert!(matches!(retained.mode, RuntimeActionMode::Inline));
+
+        let awaited_operation_id = "a".repeat(64);
+        assert_eq!(
+            db.reserve_runtime_action_intent(
+                &awaited_operation_id,
+                "T-chain",
+                "T-parent",
+                RuntimeActionMode::AwaitedRoot,
+                &request_hash,
+                "T-awaited-child",
+                None,
+            )
+            .unwrap(),
+            "T-awaited-child"
+        );
+        let awaited = db
+            .get_runtime_action_intent_by_child("T-awaited-child")
+            .unwrap()
+            .unwrap();
+        assert_eq!(awaited.mode.as_str(), "awaited_root");
+        assert_eq!(
+            RuntimeActionMode::parse(awaited.mode.as_str()).unwrap(),
+            RuntimeActionMode::AwaitedRoot
+        );
+    }
+
+    #[test]
+    fn awaited_root_retry_reuses_exact_partitioned_project_authority() {
+        let (_tmp, db) = fresh_db();
+        let operation_id = "7".repeat(64);
+        let request_hash = "8".repeat(64);
+        db.reserve_runtime_action_intent(
+            &operation_id,
+            "T-parent-chain",
+            "T-parent",
+            RuntimeActionMode::AwaitedRoot,
+            &request_hash,
+            "T-producer",
+            None,
+        )
+        .unwrap();
+
+        let authority = output_bearing_project_authority("9".repeat(64), "a".repeat(64));
+        db.bind_root_action_project_authority(&operation_id, &authority)
+            .unwrap();
+        db.bind_root_action_project_authority(&operation_id, &authority)
+            .unwrap();
+        let retained = db
+            .get_runtime_action_intent_by_child("T-producer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.mode, RuntimeActionMode::AwaitedRoot);
+        assert_eq!(retained.child_project_authority.as_ref(), Some(&authority));
+        assert!(retained.launch_metadata.is_none());
+
+        let changed = output_bearing_project_authority("9".repeat(64), "b".repeat(64));
+        assert!(
+            db.bind_root_action_project_authority(&operation_id, &changed)
+                .is_err()
+        );
+        assert!(
+            db.reserve_runtime_action_intent(
+                &operation_id,
+                "T-parent-chain",
+                "T-parent",
+                RuntimeActionMode::AwaitedRoot,
+                &request_hash,
+                "T-other-producer",
+                Some(&authority),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            db.get_runtime_action_intent(&operation_id)
+                .unwrap()
+                .unwrap()
+                .child_thread_id,
+            "T-producer"
+        );
+    }
+
+    #[test]
+    fn awaited_root_seal_is_exact_and_retry_safe_after_partition_binding() {
+        let (_tmp, db) = fresh_db();
+        let operation_id = "c".repeat(64);
+        let authority = output_bearing_project_authority("d".repeat(64), "e".repeat(64));
+        db.reserve_runtime_action_intent(
+            &operation_id,
+            "T-parent-chain",
+            "T-parent",
+            RuntimeActionMode::AwaitedRoot,
+            &"f".repeat(64),
+            "T-producer",
+            None,
+        )
+        .unwrap();
+        db.bind_root_action_project_authority(&operation_id, &authority)
+            .unwrap();
+
+        let metadata = sealed_root_launch_metadata(authority.clone());
+        let capsule_hash = metadata
+            .admitted_launch_capsule()
+            .unwrap()
+            .unwrap()
+            .content_hash()
+            .unwrap();
+        let events = vec![crate::state_store::NewEventRecord {
+            event_type: "execution_admitted".to_owned(),
+            storage_class: "system".to_owned(),
+            payload: serde_json::json!({"source": "awaited_root_test"}),
+        }];
+
+        db.seal_root_action_intent(&operation_id, &authority, &capsule_hash, &metadata, &events)
+            .unwrap();
+        db.seal_root_action_intent(&operation_id, &authority, &capsule_hash, &metadata, &events)
+            .unwrap();
+
+        let retained = db
+            .get_runtime_action_intent(&operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.child_project_authority.as_ref(), Some(&authority));
+        assert_eq!(
+            retained.admitted_launch_capsule_hash.as_deref(),
+            Some(capsule_hash.as_str())
+        );
+        assert_eq!(
+            serde_json::to_value(retained.launch_metadata.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&metadata).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(retained.initial_events.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&events).unwrap()
+        );
+
+        let mut changed_metadata = metadata.clone();
+        changed_metadata.cancellation_mode = Some(CancellationMode::Hard);
+        assert!(
+            db.seal_root_action_intent(
+                &operation_id,
+                &authority,
+                &capsule_hash,
+                &changed_metadata,
+                &events,
+            )
+            .is_err()
+        );
+        let changed_authority = output_bearing_project_authority("d".repeat(64), "1".repeat(64));
+        assert!(
+            db.seal_root_action_intent(
+                &operation_id,
+                &changed_authority,
+                &capsule_hash,
+                &metadata,
+                &events,
+            )
+            .is_err()
+        );
     }
 
     fn runtime_workspace_seed(
@@ -20436,21 +21407,27 @@ mod tests {
         use RuntimeWorkspaceOperationPhase::*;
         use ryeos_engine::kind_registry::WorkspaceAccess;
 
-        for access in [
-            WorkspaceAccess::ImmutableCurrentGeneration,
-            WorkspaceAccess::SharedExclusive,
+        for (access, capture_enabled) in [
+            (WorkspaceAccess::ImmutableCurrentGeneration, true),
+            (WorkspaceAccess::ImmutableCurrentGeneration, false),
+            (WorkspaceAccess::SharedExclusive, false),
         ] {
             let tmp = TempDir::new().unwrap();
             let path = tmp.path().join("runtime.db");
             let operation_id = "d".repeat(64);
             let snapshot = "f".repeat(64);
+            let capture = "e".repeat(64);
+            let generation = ryeos_state::objects::WorkspaceGenerationPair {
+                snapshot_hash: snapshot.clone(),
+                output_capture_hash: capture_enabled.then(|| capture.clone()),
+            };
             let seed = runtime_workspace_seed(access);
             {
                 let db = RuntimeDb::open(&path).unwrap();
                 reserve_test_workspace_operation(&db, &seed, "T-child").unwrap();
                 // A reservation is not authority to launch or select input.
                 assert!(
-                    db.bind_runtime_workspace_input_snapshot(&operation_id, &snapshot)
+                    db.bind_runtime_workspace_input_generation(&operation_id, &generation)
                         .is_err()
                 );
                 assert!(
@@ -20483,14 +21460,17 @@ mod tests {
                             )
                             .is_err()
                         );
-                        db.bind_runtime_workspace_input_snapshot(&operation_id, &snapshot)
+                        db.bind_runtime_workspace_input_generation(&operation_id, &generation)
                             .unwrap();
-                        db.bind_runtime_workspace_input_snapshot(&operation_id, &snapshot)
+                        db.bind_runtime_workspace_input_generation(&operation_id, &generation)
                             .unwrap();
                         assert!(
-                            db.bind_runtime_workspace_input_snapshot(
+                            db.bind_runtime_workspace_input_generation(
                                 &operation_id,
-                                &"a".repeat(64),
+                                &ryeos_state::objects::WorkspaceGenerationPair {
+                                    snapshot_hash: "a".repeat(64),
+                                    output_capture_hash: generation.output_capture_hash.clone(),
+                                },
                             )
                             .is_err()
                         );
@@ -20522,10 +21502,20 @@ mod tests {
                     has_input.then_some(snapshot.as_str())
                 );
                 assert_eq!(
+                    operation.input_output_capture_hash.as_deref(),
+                    (has_input && capture_enabled).then_some(capture.as_str())
+                );
+                assert_eq!(
                     db.runtime_child_cas_object_roots()
                         .unwrap()
                         .contains(&snapshot),
                     has_input && phase != Released
+                );
+                assert_eq!(
+                    db.runtime_child_cas_object_roots()
+                        .unwrap()
+                        .contains(&capture),
+                    has_input && capture_enabled && phase != Released
                 );
                 if phase == ChildRunning {
                     assert!(
@@ -21648,6 +22638,60 @@ mod tests {
     }
 
     #[test]
+    fn open_preserves_historical_adapter_protocol_provenance_without_rewriting_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("runtime.db");
+        let db = RuntimeDb::open(&path).unwrap();
+        let mut metadata = serde_json::to_value(RuntimeLaunchMetadata::default()).unwrap();
+        metadata["isolation"] = serde_json::json!({
+            "policy_digest": null,
+            "mode": "enforce",
+            "backend": null,
+            "backend_status": "available",
+            "bundle_manifest_digest": null,
+            "signer_fingerprint": null,
+            "adapter_digest": null,
+            "adapter_protocol": "ryeos.isolation-adapter/v8",
+            "payloads": {},
+            "effective_capabilities": [],
+            "plan_digest": null
+        });
+        let raw = lillux::canonical_json(&metadata).unwrap();
+        let decoded = decode_current_launch_metadata(&raw)
+            .expect("historical protocol testimony is not a current wire request");
+        assert_eq!(encode_current_launch_metadata(&decoded).unwrap(), raw);
+        db.conn
+            .execute(
+                "INSERT INTO thread_runtime (thread_id, chain_root_id, launch_metadata)
+                 VALUES (?1, ?1, ?2)",
+                params!["T-historical-adapter", raw],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = RuntimeDb::open(&path)
+            .expect("historical adapter provenance must not prevent store startup");
+        let runtime = reopened
+            .get_runtime_info("T-historical-adapter")
+            .unwrap()
+            .unwrap();
+        assert!(runtime.incompatible_launch_metadata.is_none());
+        assert_eq!(
+            encode_current_launch_metadata(&runtime.launch_metadata.unwrap()).unwrap(),
+            raw
+        );
+        let retained: String = reopened
+            .conn
+            .query_row(
+                "SELECT launch_metadata FROM thread_runtime WHERE thread_id=?1",
+                ["T-historical-adapter"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, raw);
+    }
+
+    #[test]
     fn open_preserves_former_launch_authority_as_opaque_thread_scoped_history() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("runtime.db");
@@ -22501,6 +23545,8 @@ mod tests {
             backend_version: Some("test-build"),
             pinned_root_identities: Some("test-pins"),
             mount_identity: Some("created-view"),
+            workspace_output_partition_identity: None,
+            base_output_capture_hash: None,
         })
         .unwrap();
         assert!(
@@ -22512,6 +23558,71 @@ mod tests {
         );
         assert!(
             db.attach_workspace_creator("workspace", "T-creator", &claim.claimed_by, &identity)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_binding_persists_exact_output_generation_coordinates() {
+        let (_tmp, db) = fresh_db();
+        db.insert_thread_runtime("T-output", "T-output").unwrap();
+        db.claim_thread_launch("T-output", "claim-output", "daemon-old")
+            .unwrap();
+        let claim = db.get_launch_claim("T-output").unwrap().unwrap();
+        db.reserve_workspace("workspace-output", &"a".repeat(64), "/fixture-output")
+            .unwrap();
+        db.transition_workspace(
+            "workspace-output",
+            &[WorkspaceState::Reserved],
+            WorkspaceState::Constructing,
+            None,
+        )
+        .unwrap();
+        db.claim_workspace_construction("workspace-output", "T-output", &claim.claimed_by)
+            .unwrap();
+        let partition = "b".repeat(64);
+        let capture = "c".repeat(64);
+        db.bind_workspace(WorkspaceBinding {
+            workspace_id: "workspace-output",
+            thread_id: "T-output",
+            launch_owner: Some(&claim.claimed_by),
+            backend_id: Some("native"),
+            backend_version: Some("test-build"),
+            pinned_root_identities: Some("test-pins"),
+            mount_identity: Some("created-output-view"),
+            workspace_output_partition_identity: Some(&partition),
+            base_output_capture_hash: Some(&capture),
+        })
+        .unwrap();
+        let workspace = db.workspace("workspace-output").unwrap().unwrap();
+        assert_eq!(
+            workspace.workspace_output_partition_identity.as_deref(),
+            Some(partition.as_str())
+        );
+        assert_eq!(
+            workspace.base_output_capture_hash.as_deref(),
+            Some(capture.as_str())
+        );
+        assert!(workspace.frozen_output_capture_hash.is_none());
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE execution_workspace SET frozen_snapshot_hash=?2
+                       WHERE workspace_id=?1",
+                    params!["workspace-output", "d".repeat(64)],
+                )
+                .is_err()
+        );
+
+        db.reserve_workspace("workspace-ordinary", &"e".repeat(64), "/fixture-ordinary")
+            .unwrap();
+        assert!(
+            db.conn
+                .execute(
+                    "UPDATE execution_workspace SET base_output_capture_hash=?2
+                       WHERE workspace_id=?1",
+                    params!["workspace-ordinary", "f".repeat(64)],
+                )
                 .is_err()
         );
     }
@@ -22746,6 +23857,88 @@ mod tests {
             expected_children: 1,
             child_project_authority: None,
         }
+    }
+
+    fn output_bearing_project_authority(
+        snapshot_hash: String,
+        capture_hash: String,
+    ) -> ryeos_state::objects::ExecutionProjectAuthority {
+        let bounds = ryeos_state::external_content::products::ProductBounds {
+            maximum_entries: 8,
+            maximum_depth: 4,
+            maximum_file_bytes: 1_024,
+            maximum_total_bytes: 4_096,
+        };
+        let mut partition = ryeos_state::objects::WorkspaceOutputPartition {
+            schema: ryeos_state::objects::WORKSPACE_OUTPUT_PARTITION_SCHEMA.to_owned(),
+            recipe_binding: "product_recipe".to_owned(),
+            recipe_ref: "config:test/products".to_owned(),
+            recipe_raw_content_digest: "1".repeat(64),
+            declarations_hash: "2".repeat(64),
+            project_snapshot_policy_hash: "3".repeat(64),
+            roots: vec![ryeos_state::objects::WorkspaceOutputRoot {
+                name: "runtime".to_owned(),
+                path: "products/runtime".to_owned(),
+                storage: ryeos_state::external_content::products::ProductStorage::LargeContent,
+                declared_bounds: bounds.clone(),
+                effective_bounds: bounds,
+            }],
+            products: Vec::new(),
+            partition_identity: String::new(),
+            capture_policy_digest: "4".repeat(64),
+        };
+        partition.partition_identity = partition.derived_partition_identity().unwrap();
+        ryeos_state::objects::ExecutionProjectAuthority::pinned(
+            "test-project".to_owned(),
+            None,
+            "a".repeat(64),
+            ryeos_state::objects::PinnedProjectRealization::Cow {
+                terminal_publication:
+                    ryeos_state::objects::PinnedTerminalPublication::RetainResult,
+            },
+            ryeos_state::objects::EnvironmentAuthority::None,
+            Vec::new(),
+        )
+        .unwrap()
+        .condition_initial_workspace_outputs(partition)
+        .unwrap()
+        .transition_operational_generation_with_workspace_capture(
+            ryeos_state::objects::OperationalProjectAuthorityTransition::AdvancePinnedCowContinuation {
+                result_snapshot_hash: &snapshot_hash,
+            },
+            &capture_hash,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_child_roots_retain_output_captures_from_intent_and_follow_authority() {
+        let (_tmp, db) = fresh_db();
+        let action_capture = "d".repeat(64);
+        let follow_capture = "e".repeat(64);
+        let action_authority =
+            output_bearing_project_authority("b".repeat(64), action_capture.clone());
+        db.reserve_runtime_action_intent(
+            &"f".repeat(64),
+            "T-chain",
+            "T-parent",
+            RuntimeActionMode::Detached,
+            &"6".repeat(64),
+            "T-child",
+            Some(&action_authority),
+        )
+        .unwrap();
+
+        let mut follow = seed_follow("output-capture-follow");
+        follow.child_project_authority = Some(output_bearing_project_authority(
+            "c".repeat(64),
+            follow_capture.clone(),
+        ));
+        db.reserve_follow(&follow).unwrap();
+
+        let roots = db.runtime_child_cas_object_roots().unwrap();
+        assert!(roots.contains(&action_capture));
+        assert!(roots.contains(&follow_capture));
     }
 
     fn set_single_follow_child(

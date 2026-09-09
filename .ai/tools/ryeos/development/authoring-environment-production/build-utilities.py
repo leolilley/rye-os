@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-07T08:05:59Z:33132b769edc39bd0f840ec6807a8e0f3e3b19f622a01b0fc441984e5be38a79:P2qcdAoP1z/nAtkBuDT3hjNOE5npBza5Tv49AYjUOfNAPp+fze5SeTDZptvPrc7UZomtDQBItJ3dOfNNVFo1Dg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T10:36:31Z:4601a10ca4a52ccf7df567f7596c86a0c4332cd4a5078a1e7c363d8e7e09795c:M0N/GIP92y2QY25BcL8bnHiUfirCnPm8S5ZS0ps6anV7LdMaZvJpGu7H3K9VZSXR7peOBoMHVLNuHhbFuD5tAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 # ryeos-tool:
 #   category: ryeos/development/authoring-environment-production
 #   version: "1.0.0"
@@ -29,12 +29,8 @@
 #       digest: 800d4969489634cc3bbc5774bd9e99a330cdc23bbc1fd0fd231ec6a88ca9acdf
 #       mount_root: execution_runtime
 #       mount: producer-python
-#     - id: authoring-build-support
-#       kind: tree
-#       mode: pinned
-#       digest: f6bcd9d28b9bb3da0da3911cc8f021d75c326d38ac05329d38e2246ed7bea477
-#       mount_root: execution_runtime
-#       mount: authoring-build-support
+#   # authoring-build-support is selected by the enclosing producer Graph and
+#   # reaches this inline Tool through the admitted normalized realization set.
 #     - id: platform
 #       kind: tree
 #       mode: pinned
@@ -44,7 +40,7 @@
 #     - id: source-inputs
 #       kind: tree
 #       mode: pinned
-#       digest: 449c03919f51d36ca976967b63654c44bdf719c43ae418f716668748fe64863b
+#       digest: a6b454a400b503830c71767a91abf649d61979ad1031ffe9840277b3d06fb616
 #       mount_root: execution_runtime
 #       mount: authoring-source-inputs
 

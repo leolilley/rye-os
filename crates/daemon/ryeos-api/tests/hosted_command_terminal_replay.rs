@@ -297,6 +297,8 @@ fn seed_completed_turn_fixture(
         .state_store
         .bind_execution_workspace(WorkspaceBinding {
             workspace_id: &workspace_id,
+            workspace_output_partition_identity: None,
+            base_output_capture_hash: None,
             thread_id: root,
             launch_owner: Some(&launch_claim.claimed_by),
             backend_id: Some("test-backend"),
@@ -786,6 +788,8 @@ async fn terminal_root_replays_only_exact_authoritatively_settled_command() {
         .state_store
         .bind_execution_workspace(WorkspaceBinding {
             workspace_id: "W-terminal-hosted-replay",
+            workspace_output_partition_identity: None,
+            base_output_capture_hash: None,
             thread_id: root,
             launch_owner: Some(&launch_claim.claimed_by),
             backend_id: Some("test-backend"),
@@ -1363,6 +1367,7 @@ async fn terminal_root_replays_only_exact_authoritatively_settled_command() {
                 final_cost: None,
                 managed_envelope: None,
                 result_project_snapshot_hash: None,
+                result_workspace_output_capture_hash: None,
             },
         )
         .unwrap();

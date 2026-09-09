@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -392,6 +392,7 @@ fn validate_structured_session_profile(profile: &StructuredSessionProfile) -> Re
     if profile.configuration_authority != ConfigurationAuthority::ImmutableArgv {
         bail!("structured-session configuration authority is not immutable argv");
     }
+    validate_workload_executable_member(&profile.workload_executable)?;
     if let Some(contract) = &profile.portable_state {
         contract.validate()?;
     }
@@ -698,14 +699,6 @@ fn run() -> Result<()> {
         bail!("structured-session route set is not admitted by the profile");
     }
     let executable_name = std::path::Path::new(&profile.workload_executable);
-    if executable_name.components().count() != 1
-        || !matches!(
-            executable_name.components().next(),
-            Some(std::path::Component::Normal(_))
-        )
-    {
-        bail!("structured-session workload executable must be one relative file name");
-    }
     let baseline_name = std::path::Path::new(&profile.baseline_config);
     if baseline_name.components().count() != 1
         || !matches!(
@@ -822,7 +815,21 @@ fn run() -> Result<()> {
     // threads retain the listener and protected channel; this guard documents
     // that their endpoint is scoped to this bridge boot.
     let _workload_client_broker = workload_client_broker;
-    app.initialize()?;
+    if let Err(error) = app.initialize() {
+        // Upstream stderr can contain credentials and must stay private.
+        // Report only the exact child's OS status, never its output. This is
+        // diagnostic context, not daemon-owned cleanup/settlement testimony.
+        return Err(match app.child.try_wait() {
+            Ok(Some(status)) => error.context(format!(
+                "structured workload initialization failed; child status: {status}"
+            )),
+            Ok(None) => error
+                .context("structured workload initialization failed; child exit not yet observed"),
+            Err(_) => {
+                error.context("structured workload initialization failed; child status unavailable")
+            }
+        });
+    }
     protect_profile_home(std::path::Path::new(&workload_home))?;
     let mut workload_termination = Some(
         lillux::CooperativeChildTermination::for_child(&app.child)
@@ -1159,6 +1166,10 @@ fn resolve_pinned_executable(
     std::path::PathBuf,
     Vec<lillux::InheritedDescriptorAuthority>,
 )> {
+    let executable_member = executable_name
+        .to_str()
+        .ok_or_else(|| anyhow!("structured-session workload executable is not UTF-8"))?;
+    validate_workload_executable_member(executable_member)?;
     if realization_id.is_empty()
         || realization_id.len() > 128
         || !realization_id
@@ -1203,22 +1214,35 @@ fn resolve_pinned_executable(
         .ok_or_else(|| anyhow!("external realization root is unavailable"))?;
     let pinned = match realization.kind {
         ryeos_state::objects::ExternalContentKind::File => {
-            if mount.file_name() != executable_name.file_name() {
+            if executable_name.components().count() != 1
+                || mount.file_name() != Some(executable_name.as_os_str())
+            {
                 bail!("file realization mount does not match the workload executable");
             }
             open_pinned_regular_file_under(&root, mount)?
         }
         ryeos_state::objects::ExternalContentKind::Tree => {
             let directory = open_pinned_directory_under(&root, mount)?;
-            match directory.open_pinned_regular(executable_name.as_os_str(), false)? {
-                Some(file) => file,
-                None => bail!("pinned structured-session workload executable is absent"),
-            }
+            open_pinned_regular_file_under(&directory, executable_name).context(
+                "open pinned structured-session workload executable from its tree realization",
+            )?
         }
     };
     pinned.require_executable()?;
+    // Execution-runtime names are usable by ordinary descendants only after
+    // Lillux proves the entire namespace spelling immutable. A readonly leaf
+    // mount alone is insufficient: a writable ancestor could be rebound.
+    let runtime_argv0 = match realization.mount_root {
+        ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime => {
+            Some(pinned.verified_read_only_namespace_path()?)
+        }
+        ryeos_state::objects::ExternalContentMountRoot::Project => None,
+    };
     let executable_handle = pinned.into_inherited_descriptor_path()?;
     let executable = executable_handle.path().to_path_buf();
+    if let Some(argv0) = runtime_argv0 {
+        return Ok((executable, argv0, vec![executable_handle]));
+    }
     let root_handle = root.into_inherited_descriptor_path()?;
     let descriptor_root = root_handle.path();
     let argv0 = match realization.kind {
@@ -1274,16 +1298,24 @@ fn resolve_pinned_executable_search(
         }
         let directory =
             open_pinned_directory(realization.mount_root.root(Some(external_root))?, &relative)?;
-        let handle = directory.into_inherited_descriptor_path()?;
-        let path = handle
-            .path()
+        let path = match realization.mount_root {
+            ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime => {
+                directory.verified_read_only_namespace_path()?
+            }
+            ryeos_state::objects::ExternalContentMountRoot::Project => {
+                let handle = directory.into_inherited_descriptor_path()?;
+                let path = handle.path().to_path_buf();
+                handles.push(handle);
+                path
+            }
+        };
+        let path = path
             .to_str()
-            .ok_or_else(|| anyhow!("descriptor-rooted executable search path is not UTF-8"))?;
+            .ok_or_else(|| anyhow!("admitted executable search path is not UTF-8"))?;
         if path.contains(':') {
-            bail!("descriptor-rooted executable search path contains a separator");
+            bail!("admitted executable search path contains a separator");
         }
         paths.push(path.to_owned());
-        handles.push(handle);
     }
     Ok((Some(paths.join(":")), handles))
 }
@@ -1300,22 +1332,49 @@ fn resolve_session_process_environment(
     let Some(encoded) = encoded else {
         return Ok((BTreeMap::new(), Vec::new()));
     };
-    let bindings: BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue> =
+    if encoded.len() > ryeos_state::objects::MAX_PREPARED_SESSION_PROCESS_ENVIRONMENT_BYTES {
+        bail!("prepared session process environment exceeds its encoded byte bound");
+    }
+    let prepared: ryeos_state::objects::PreparedSessionProcessEnvironment =
         serde_json::from_str(encoded).context("decode admitted session process environment")?;
-    ryeos_state::objects::validate_session_process_environment(&bindings)?;
+    prepared.validate()?;
+    let bindings = prepared.bindings;
+    let delivery = prepared.runtime_view_delivery;
     let realizations = ryeos_state::objects::ExternalContentRealizationSet::from_value(
         &serde_json::from_str(sealed_realizations)
             .context("decode sealed external realizations for session process environment")?,
     )?;
-    let workspace = lillux::PinnedDirectory::open(workspace)?
-        .ok_or_else(|| anyhow!("worker runtime workspace is unavailable"))?;
-    let mut runtime_view = workspace;
-    for component in [".ai", "cache", "ryeos-runtime"] {
-        runtime_view = runtime_view
-            .open_or_create_child(std::ffi::OsStr::new(component), 0o700)
-            .with_context(|| format!("open worker runtime-view component `{component}`"))?;
-    }
-    runtime_view.tighten_owner_private_directory()?;
+    let runtime_view = if bindings.values().any(|value| {
+        matches!(
+            value,
+            ryeos_state::objects::SessionProcessEnvironmentValue::RuntimeViewDirectory { .. }
+        )
+    }) {
+        let mut view = lillux::PinnedDirectory::open(workspace)?
+            .ok_or_else(|| anyhow!("worker runtime workspace is unavailable"))?;
+        for component in [".ai", "cache", "ryeos-runtime"] {
+            let name = std::ffi::OsStr::new(component);
+            view = match &delivery {
+                ryeos_state::objects::SessionRuntimeViewDelivery::DescriptorWorkspace => {
+                    view.open_or_create_child(name, 0o700)?
+                }
+                ryeos_state::objects::SessionRuntimeViewDelivery::MountedNamespace { .. } => {
+                    view.open_child_directory(name)?.ok_or_else(|| {
+                        anyhow!("prepared runtime-view component `{component}` is missing")
+                    })?
+                }
+            };
+        }
+        if matches!(
+            &delivery,
+            ryeos_state::objects::SessionRuntimeViewDelivery::DescriptorWorkspace
+        ) {
+            view.tighten_owner_private_directory()?;
+        }
+        Some(view)
+    } else {
+        None
+    };
 
     let mut resolved = BTreeMap::new();
     let mut handles = Vec::new();
@@ -1325,23 +1384,42 @@ fn resolve_session_process_environment(
             ryeos_state::objects::SessionProcessEnvironmentValue::RuntimeViewDirectory {
                 relative_path,
             } => {
-                let mut directory = runtime_view.try_clone()?;
+                let mut directory = runtime_view
+                    .as_ref()
+                    .expect("runtime view was required")
+                    .try_clone()?;
                 if relative_path != "." {
                     for component in std::path::Path::new(&relative_path).components() {
                         let std::path::Component::Normal(component) = component else {
                             unreachable!("runtime-view path was validated");
                         };
-                        directory = directory.open_or_create_child(component, 0o700)?;
+                        directory = match &delivery {
+                            ryeos_state::objects::SessionRuntimeViewDelivery::DescriptorWorkspace => {
+                                directory.open_or_create_child(component, 0o700)?
+                            }
+                            ryeos_state::objects::SessionRuntimeViewDelivery::MountedNamespace { .. } => {
+                                directory.open_child_directory(component)?
+                                    .ok_or_else(|| anyhow!("prepared runtime-view directory is missing"))?
+                            }
+                        };
                     }
                 }
-                directory.tighten_owner_private_directory()?;
-                let handle = directory.into_inherited_descriptor_path()?;
-                let value = handle
-                    .path()
+                let path = match &delivery {
+                    ryeos_state::objects::SessionRuntimeViewDelivery::DescriptorWorkspace => {
+                        directory.tighten_owner_private_directory()?;
+                        let handle = directory.into_inherited_descriptor_path()?;
+                        let path = handle.path().to_path_buf();
+                        handles.push(handle);
+                        path
+                    }
+                    ryeos_state::objects::SessionRuntimeViewDelivery::MountedNamespace {
+                        destinations,
+                    } => directory.verified_writable_mount_namespace_path(&destinations[&name])?,
+                };
+                let value = path
                     .to_str()
-                    .ok_or_else(|| anyhow!("runtime-view descriptor path is not UTF-8"))?
+                    .ok_or_else(|| anyhow!("runtime-view path is not UTF-8"))?
                     .to_owned();
-                handles.push(handle);
                 value
             }
             ryeos_state::objects::SessionProcessEnvironmentValue::RealizationPath {
@@ -1365,22 +1443,39 @@ fn resolve_session_process_environment(
                     relative.push(&relative_path);
                 }
                 let external_root = realization.mount_root.root(Some(external_root))?;
-                let handle = match path_kind {
+                let (path, handle) = match path_kind {
                     ryeos_state::objects::SessionProcessEnvironmentPathKind::Directory => {
-                        open_pinned_directory(external_root, &relative)?
-                            .into_inherited_descriptor_path()?
+                        let directory = open_pinned_directory(external_root, &relative)?;
+                        match realization.mount_root {
+                            ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime => {
+                                (directory.verified_read_only_namespace_path()?, None)
+                            }
+                            ryeos_state::objects::ExternalContentMountRoot::Project => {
+                                let handle = directory.into_inherited_descriptor_path()?;
+                                (handle.path().to_path_buf(), Some(handle))
+                            }
+                        }
                     }
                     ryeos_state::objects::SessionProcessEnvironmentPathKind::File => {
-                        open_pinned_regular_file(external_root, &relative)?
-                            .into_inherited_descriptor_path()?
+                        let file = open_pinned_regular_file(external_root, &relative)?;
+                        match realization.mount_root {
+                            ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime => {
+                                (file.verified_read_only_namespace_path()?, None)
+                            }
+                            ryeos_state::objects::ExternalContentMountRoot::Project => {
+                                let handle = file.into_inherited_descriptor_path()?;
+                                (handle.path().to_path_buf(), Some(handle))
+                            }
+                        }
                     }
                 };
-                let value = handle
-                    .path()
+                let value = path
                     .to_str()
-                    .ok_or_else(|| anyhow!("realization descriptor path is not UTF-8"))?
+                    .ok_or_else(|| anyhow!("admitted realization path is not UTF-8"))?
                     .to_owned();
-                handles.push(handle);
+                if let Some(handle) = handle {
+                    handles.push(handle);
+                }
                 value
             }
         };
@@ -1450,6 +1545,14 @@ fn open_pinned_regular_file_under(
         .ok_or_else(|| anyhow!("pinned realization file is absent"))
 }
 
+fn validate_workload_executable_member(value: &str) -> Result<()> {
+    if value.len() > 4096 {
+        bail!("structured-session workload executable exceeds its path bound");
+    }
+    ryeos_state::objects::validate_canonical_project_relative_path(value)
+        .context("structured-session workload executable is not a canonical relative member")
+}
+
 fn protect_profile_home(root: &std::path::Path) -> Result<()> {
     let home = lillux::PinnedDirectory::open(root)?
         .ok_or_else(|| anyhow!("profile workload home is missing"))?;
@@ -1477,12 +1580,13 @@ impl StructuredWorkload {
         let mut command = Command::new(executable);
         lillux::configure_command_argv0(&mut command, workload_argv0)
             .map_err(anyhow::Error::msg)?;
+        // Adopting the session control channel can consume fd 0. Lillux must
+        // preserve the newly configured pipes through the child exec; plain
+        // Stdio::piped plus a pre-exec hook can otherwise close stdin again.
+        lillux::configure_command_piped_stdio(&mut command);
         command
             .args(&profile.workload_args)
             .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .env_clear()
             .env("LANG", "C")
             .env("LC_ALL", "C")
@@ -1554,10 +1658,13 @@ impl StructuredWorkload {
                 );
             }
             if let Some(notification) = step.notification {
-                self.send(&json!({"method":notification,"params":step.params}))?;
+                self.send(&json!({"method":notification,"params":step.params}))
+                    .context("send admitted initialization notification")?;
                 continue;
             }
-            let result = self.call_raw(&step.method, step.params, Duration::from_secs(30))?;
+            let result = self
+                .call_raw(&step.method, step.params, Duration::from_secs(30))
+                .context("exchange admitted initialization request")?;
             if result.get("error").is_some() {
                 bail!("structured-session workload rejected initialization");
             }
@@ -3093,6 +3200,82 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            resolve_pinned_executable(
+                root.path(),
+                &sealed,
+                "fixture",
+                std::path::Path::new("nested/fixture-worker")
+            )
+            .is_err(),
+            "a file realization must not discard an executable-member prefix"
+        );
+    }
+
+    #[test]
+    fn tree_workload_executable_uses_a_canonical_descriptor_walk() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let runtime = project.join("runtime");
+        std::fs::create_dir_all(runtime.join("bin")).unwrap();
+        let executable = runtime.join("bin/program");
+        std::fs::write(&executable, b"nested executable").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).unwrap();
+        symlink("program", runtime.join("bin/program-link")).unwrap();
+        let sealed = pinned_content_fixture("runtime", "project").to_string();
+
+        let (descriptor, argv0, authorities) = resolve_pinned_executable(
+            &project,
+            &sealed,
+            "fixture",
+            std::path::Path::new("bin/program"),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(descriptor).unwrap(), b"nested executable");
+        assert!(argv0.ends_with("runtime/bin/program"));
+        assert_eq!(authorities.len(), 2);
+        assert!(
+            resolve_pinned_executable(
+                &project,
+                &sealed,
+                "fixture",
+                std::path::Path::new("program")
+            )
+            .is_err(),
+            "tree lookup must not flatten a nested executable member"
+        );
+        assert!(
+            resolve_pinned_executable(
+                &project,
+                &sealed,
+                "fixture",
+                std::path::Path::new("bin/program-link")
+            )
+            .is_err(),
+            "tree lookup must not follow an executable symlink"
+        );
+
+        for invalid in [
+            "/bin/program",
+            "../program",
+            "bin/../program",
+            "bin//program",
+            "bin/./program",
+            "bin\\program",
+        ] {
+            assert!(
+                resolve_pinned_executable(
+                    &project,
+                    &sealed,
+                    "fixture",
+                    std::path::Path::new(invalid)
+                )
+                .is_err(),
+                "non-canonical executable member reached the descriptor walk: {invalid:?}"
+            );
+        }
     }
 
     fn pinned_content_fixture(mount: &str, mount_root: &str) -> Value {
@@ -3125,13 +3308,12 @@ mod tests {
         .to_string();
         let (path, search_handles) =
             resolve_pinned_executable_search(&project, &sealed, Some(&search)).unwrap();
-        let bindings = json!({
+        let bindings = descriptor_environment_fixture(json!({
             "FIXTURE_RESOURCE":{
                 "kind":"realization_path", "realization_id":"fixture",
                 "relative_path":"resource", "path_kind":"file"
             }
-        })
-        .to_string();
+        }));
         let (environment, environment_handles) =
             resolve_session_process_environment(&project, &project, &sealed, Some(&bindings))
                 .unwrap();
@@ -3181,11 +3363,10 @@ mod tests {
         .unwrap();
         let sealed = pinned_content_fixture(mount, "execution_runtime").to_string();
         let search = json!([{"realization_id":"fixture", "relative_directory":"."}]).to_string();
-        let bindings = json!({"FIXTURE_RESOURCE":{
+        let bindings = descriptor_environment_fixture(json!({"FIXTURE_RESOURCE":{
             "kind":"realization_path", "realization_id":"fixture",
             "relative_path":"worker", "path_kind":"file"
-        }})
-        .to_string();
+        }}));
         assert!(
             resolve_pinned_executable(
                 project.path(),
@@ -3255,11 +3436,10 @@ mod tests {
             (".", "file"),
             ("../file", "file"),
         ] {
-            let bindings = json!({"FIXTURE_RESOURCE":{
+            let bindings = descriptor_environment_fixture(json!({"FIXTURE_RESOURCE":{
                 "kind":"realization_path", "realization_id":"fixture",
                 "relative_path":relative, "path_kind":kind
-            }})
-            .to_string();
+            }}));
             assert!(
                 resolve_session_process_environment(
                     project.path(),
@@ -3568,7 +3748,7 @@ mod tests {
                 },
             ),
         ]);
-        let encoded = lillux::canonical_json(&serde_json::to_value(bindings).unwrap()).unwrap();
+        let encoded = descriptor_environment_fixture(serde_json::to_value(bindings).unwrap());
         let (resolved, handles) =
             resolve_session_process_environment(root.path(), root.path(), "[]", Some(&encoded))
                 .unwrap();
@@ -3586,6 +3766,33 @@ mod tests {
             root.path()
                 .join(".ai/cache/ryeos-runtime/cargo/home")
                 .is_dir()
+        );
+    }
+
+    fn descriptor_environment_fixture(bindings: Value) -> String {
+        json!({"bindings": bindings, "runtime_view_delivery": {"kind":"descriptor_workspace"}})
+            .to_string()
+    }
+
+    #[test]
+    fn mounted_runtime_view_delivery_never_creates_a_missing_prepared_source() {
+        let root = tempfile::tempdir().unwrap();
+        let encoded = json!({
+            "bindings":{"CARGO_HOME":{"kind":"runtime_view_directory","relative_path":"cargo/home"}},
+            "runtime_view_delivery":{"kind":"mounted_namespace","destinations":{"CARGO_HOME":"/ryeos/runtime-views/CARGO_HOME"}}
+        }).to_string();
+        let error =
+            resolve_session_process_environment(root.path(), root.path(), "[]", Some(&encoded))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("prepared runtime-view"),
+            "{error:#}"
+        );
+        assert!(!root.path().join(".ai").exists());
+        assert!(
+            resolve_session_process_environment(root.path(), root.path(), "[]", Some("{}"))
+                .is_err(),
+            "raw authored bindings are not prepared launch delivery"
         );
     }
 }

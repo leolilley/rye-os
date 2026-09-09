@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T01:05:53Z:fb72bdf691a9d56c73dd187f6777fa32627c10b32701967c7361c11ae58f5344:9NaV0wSmrlk+sChMRovbVcFhv8sSX8E+ZxH8V6oLKz48WPYJWi7PDne8nsWTmB9lHc4/NVb1oFM52QCmijmIDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T01:19:33Z:af43ea685bbb2c2dbce22184f38a3581cb689ba1352353dfe7a77b0669f5e45f:XATqV/XhIpy/rmDW9bik3Vf0w6xJsX5VaG3OrfaUn9uyQK/I+wvrr6bgHP/QiRTcAbTJXbZK9FLx5CKtw0IyAA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 kind: runtime
 serves: worker_execution
 default: true
@@ -16,6 +16,9 @@ launch_contract:
   ref_bindings:
     environment:
       required: false
+      project_result_requirement: none
+      source:
+        kind: caller
       allowed_kinds: [config]
       allowed_spaces: [bundle, project]
       allowed_trust: [trusted_bundle, trusted_project]

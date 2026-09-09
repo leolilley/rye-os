@@ -559,6 +559,7 @@ fn dispatch_request(
             "request_id": request_id,
         }))?;
         let action = ryeos_runtime::callback::ActionPayload {
+            product_selections: Vec::new(),
             operation_id: Some(operation_id),
             item_id: execute.item_ref,
             ref_bindings: execute.ref_bindings,

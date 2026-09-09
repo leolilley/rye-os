@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-06T01:54:48Z:c419dfbb9183d4c1ebe54080fcd9da0a58d16895b8a13e619612b972627b9fe4:MlFU0ICS0WWqK3UObdoMcAEIKgJbtcsKr+4b8FC3nMUUsxOlLudHAyLl30eYA1wRB5V845wK+FMwaSZTBYepBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T03:28:03Z:9d7f086723ad2299bf0f6ce4554a6606fe1a53251559df59d2c46c05544fc717:ocbuy5w2RaQj7BipjBULC8P5JFEwQ+0Hn08fgClMIYztkp6BF8lvfOo3vH+9Sz4NXRYV8GcyMimVS6iBf0PUBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "engine/kinds/tool"
 version: "1.2.0"
 location:
@@ -140,6 +140,9 @@ composed_value_contract:
     external_content:
       type: single
       prim: array
+    external_product_slots:
+      type: single
+      prim: array
 runtime:
   # Tool invocation selectors remain ordinary schema-validated input. The
   # shared runtime template may project one scalar `params` value into one
@@ -195,6 +198,7 @@ runtime:
     # Consumed by the kind-owned external-content admission contract above;
     # it is not a runtime-handler block.
     - external_content
+    - external_product_slots
     # `config_schema` is validated as a pre-pass against the user's
     # ROOT tool item (see plan_builder.rs::build_plan and
     # runtime/config_schema.rs). Wrapper / runtime YAMLs may declare

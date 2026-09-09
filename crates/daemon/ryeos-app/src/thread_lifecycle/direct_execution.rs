@@ -27,6 +27,68 @@ fn persistent_session_spawn_error(error: ryeos_engine::error::EngineError) -> an
 /// capsule, or replay identity.
 pub const ADMITTED_DIRECT_PROJECT_ROOT: &str = ryeos_state::objects::ADMITTED_DIRECT_PROJECT_ROOT;
 
+/// Reconstruct this child's normalized declaration authority independently of
+/// the finalized operational realization union, which may also contain parent
+/// entries admitted only for sealed byte reuse.
+pub fn effective_child_external_content_declarations(
+    engine: &ryeos_engine::engine::Engine,
+    resolution: &ryeos_engine::resolution::ResolutionOutput,
+) -> Result<Option<Vec<ryeos_engine::external_content::ExternalContentDeclaration>>> {
+    let canonical =
+        ryeos_engine::canonical_ref::CanonicalRef::parse(&resolution.root.resolved_ref)?;
+    let schema = engine.kinds.get(&canonical.kind).ok_or_else(|| {
+        anyhow!(
+            "effective child kind `{}` is not registered",
+            canonical.kind
+        )
+    })?;
+    let contract = schema.external_content_contract();
+    let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
+    let mut declared_resolution = resolution.clone();
+    declared_resolution
+        .composed
+        .derived
+        .remove(ryeos_state::objects::EXTERNAL_REALIZATIONS_DERIVED_KEY);
+    ryeos_engine::external_content::effective_external_content_declarations(
+        &declared_resolution,
+        contract,
+        declarer,
+    )
+}
+
+fn ensure_realization_command_declaration_matches(
+    declaration: &ryeos_engine::external_content::ExternalContentDeclaration,
+    realization: &ryeos_engine::external_realization::RealizedExternalContent,
+) -> Result<()> {
+    if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree
+        || declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned
+    {
+        bail!(
+            "realization command requires a child-owned pinned tree declaration, got `{}`",
+            declaration.id
+        );
+    }
+    if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
+        || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
+    {
+        bail!(
+            "realization command requires a pinned tree realization, got `{}`",
+            realization.id
+        );
+    }
+    if declaration.id != realization.id
+        || declaration.digest.as_deref() != Some(realization.manifest_hash.as_str())
+        || declaration.mount_root != realization.mount_root
+        || declaration.mount != realization.mount
+    {
+        bail!(
+            "realization command declaration and admitted realization identity disagree for `{}`",
+            declaration.id
+        );
+    }
+    Ok(())
+}
+
 /// Result of spawning the engine pipeline.
 pub struct SpawnedItemAwaitingAttachment {
     pub pid: u32,
@@ -269,10 +331,27 @@ impl PreparedItemPlan {
         &mut self,
         state: &crate::state::AppState,
         engine: &ryeos_engine::engine::Engine,
-        item_kind: &str,
         resolution: &ryeos_engine::resolution::ResolutionOutput,
         isolation: &ryeos_engine::isolation::IsolationRuntime,
     ) -> Result<bool> {
+        let authority = state.state_store.pinned_state_authority()?;
+        let guard = authority.acquire_shared_guard()?;
+        self.bind_realization_command_guarded(&authority, &guard, engine, resolution, isolation)
+    }
+
+    /// Guard-aware form for callers that already hold one CAS mutation guard
+    /// across a larger admission proof. This preserves the same realization
+    /// and executable-member checks without recursively acquiring authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_realization_command_guarded(
+        &mut self,
+        authority: &ryeos_state::PinnedStateAuthority,
+        guard: &ryeos_state::CasMutationGuard,
+        engine: &ryeos_engine::engine::Engine,
+        resolution: &ryeos_engine::resolution::ResolutionOutput,
+        isolation: &ryeos_engine::isolation::IsolationRuntime,
+    ) -> Result<bool> {
+        authority.ensure_guard(guard)?;
         let selector = match self.plan.nodes.first() {
             Some(ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. }) => {
                 if spec.verified_command.is_some() {
@@ -289,23 +368,11 @@ impl PreparedItemPlan {
             bail!("realization-member commands require enforced descriptor-mounted isolation");
         }
 
-        // The finalized set may also contain entries inherited from the
-        // parent capsule for dependency-byte reuse. Inheritance is not a
-        // command grant: require this child effective program to declare the
-        // selected realization itself before consulting the merged set. Do
-        // not weaken this to an ID-only lookup in `derived`; that would let a
-        // parent prepared/runtime environment become ambient child authority.
-        let contract = engine
-            .kinds
-            .get(item_kind)
-            .and_then(|schema| schema.external_content_contract());
-        let declarer = ryeos_engine::external_content::declaring_authority(resolution)?;
-        let declarations = ryeos_engine::external_content::declarations_from_composed(
-            &resolution.composed.composed,
-            contract,
-            declarer,
-        )?
-        .ok_or_else(|| anyhow!("realization command requires a child-owned declaration"))?;
+        // Inherited parent realizations permit sealed-byte reuse, not commands.
+        // Require the child's own signed declaration or authenticated product
+        // selection before consulting the merged operational realization set.
+        let declarations = effective_child_external_content_declarations(engine, resolution)?
+            .ok_or_else(|| anyhow!("realization command requires a child-owned declaration"))?;
         let declaration = declarations
             .iter()
             .find(|entry| entry.id == selector.realization_id)
@@ -315,15 +382,6 @@ impl PreparedItemPlan {
                     selector.realization_id
                 )
             })?;
-        if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree
-            || declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned
-        {
-            bail!(
-                "realization command requires a child-owned pinned tree declaration, got `{}`",
-                selector.realization_id
-            );
-        }
-
         let realized_value = resolution
             .composed
             .derived
@@ -341,24 +399,8 @@ impl PreparedItemPlan {
                     selector.realization_id
                 )
             })?;
-        if realization.kind != ryeos_state::objects::ExternalContentKind::Tree
-            || realization.mode != ryeos_state::objects::ExternalContentMode::Pinned
-        {
-            bail!(
-                "realization command requires a pinned tree realization, got `{}`",
-                selector.realization_id
-            );
-        }
-        if declaration.digest.as_deref() != Some(realization.manifest_hash.as_str()) {
-            bail!(
-                "realization command declaration and admitted manifest identity disagree for `{}`",
-                selector.realization_id
-            );
-        }
+        ensure_realization_command_declaration_matches(declaration, realization)?;
 
-        let authority = state.state_store.pinned_state_authority()?;
-        let guard = authority.acquire_shared_guard()?;
-        authority.ensure_guard(&guard)?;
         let cas = authority.cas_store()?;
         let manifest_value = cas.get_object(&realization.manifest_hash)?.ok_or_else(|| {
             anyhow!(
@@ -464,7 +506,7 @@ impl PreparedItemPlan {
             Some(other) => bail!("realization command names unsupported manifest kind `{other}`"),
             None => bail!("realization command manifest has no kind"),
         };
-        authority.ensure_guard(&guard)?;
+        authority.ensure_guard(guard)?;
         self.realization_command = Some(PreparedRealizationCommand {
             realization_id: selector.realization_id,
             manifest_hash: realization.manifest_hash.clone(),
@@ -641,8 +683,19 @@ impl PreparedItemPlan {
             if !allowlist.contains(name) {
                 bail!("persistent-session runtime environment `{name}` is not protocol-authorized");
             }
-            if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+            let limit = if name == ryeos_state::objects::SESSION_PROCESS_ENVIRONMENT_ENV {
+                ryeos_state::objects::MAX_PREPARED_SESSION_PROCESS_ENVIRONMENT_BYTES
+            } else {
+                4096
+            };
+            if value.is_empty() || value.len() > limit || value.chars().any(char::is_control) {
                 bail!("persistent-session runtime environment `{name}` is not bounded");
+            }
+            if name == ryeos_state::objects::SESSION_PROCESS_ENVIRONMENT_ENV {
+                serde_json::from_str::<ryeos_state::objects::PreparedSessionProcessEnvironment>(
+                    value,
+                )?
+                .validate()?;
             }
             if spec.env.contains_key(name) || spec.env_sources.contains_key(name) {
                 bail!("persistent-session runtime environment attempts to override `{name}`");
@@ -1224,11 +1277,14 @@ impl PreparedItemPlan {
     /// original template. Cold restart must admit a new root incarnation,
     /// never reopen lower/backend-state paths as a substitute for its view.
     pub fn spawn_persistent_session_held(
-        self,
+        mut self,
         state: &crate::state::AppState,
         workspace: &Path,
         workspace_view: Option<&lillux::InheritedDescriptorAuthority>,
         external_mounts: Vec<ryeos_engine::isolation::IsolationReadOnlyMountAuthority>,
+        writable_runtime_view_mounts: Vec<
+            ryeos_engine::isolation::IsolationWritableRuntimeViewMountAuthority,
+        >,
         target_channels: Vec<ryeos_engine::isolation::IsolationTargetChannelAuthority>,
         lifecycle: &ryeos_state::objects::PersistentSessionLifecycleContract,
         workspace_authority: ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority,
@@ -1239,6 +1295,14 @@ impl PreparedItemPlan {
         if session_identity.is_empty() || session_identity.len() > 128 {
             bail!("persistent-session process identity is not canonical");
         }
+        ensure_runtime_view_delivery_matches(
+            first_subprocess_spec_mut(&mut self.plan)?
+                .env
+                .get(ryeos_state::objects::SESSION_PROCESS_ENVIRONMENT_ENV)
+                .map(String::as_str),
+            &writable_runtime_view_mounts,
+            state.isolation.is_enforced(),
+        )?;
         use ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority;
         let project_authority = match workspace_authority {
             PersistentSessionWorkspaceAuthority::EphemeralScratch => {
@@ -1285,6 +1349,7 @@ impl PreparedItemPlan {
             isolation_verified_code: Vec::new(),
             isolation_verified_command: self.admitted_command,
             isolation_external_read_only_mounts: external_mounts,
+            isolation_writable_runtime_view_mounts: writable_runtime_view_mounts,
             isolation_target_channels: target_channels,
             isolation_workspace: Some(workspace.to_path_buf()),
             subprocess_limits: Some(lillux::SubprocessLimits {
@@ -1466,6 +1531,45 @@ fn admitted_execution_plan_value_for_command(
     serde_json::to_value(admitted).context("encode admitted direct execution plan")
 }
 
+fn ensure_runtime_view_delivery_matches(
+    encoded: Option<&str>,
+    mounts: &[ryeos_engine::isolation::IsolationWritableRuntimeViewMountAuthority],
+    enforced: bool,
+) -> Result<()> {
+    let Some(encoded) = encoded else {
+        if !mounts.is_empty() {
+            bail!("runtime-view mounts lack prepared environment delivery");
+        }
+        return Ok(());
+    };
+    let prepared: ryeos_state::objects::PreparedSessionProcessEnvironment =
+        serde_json::from_str(encoded)?;
+    prepared.validate()?;
+    match prepared.runtime_view_delivery {
+        ryeos_state::objects::SessionRuntimeViewDelivery::DescriptorWorkspace => {
+            if enforced || !mounts.is_empty() {
+                bail!("descriptor runtime-view delivery contradicts launch isolation");
+            }
+        }
+        ryeos_state::objects::SessionRuntimeViewDelivery::MountedNamespace { destinations } => {
+            let mut seen = std::collections::BTreeSet::new();
+            if !enforced
+                || mounts.len() != destinations.len()
+                || mounts.iter().any(|mount| {
+                    !seen.insert(mount.environment_name())
+                        || destinations
+                            .get(mount.environment_name())
+                            .map(|path| path.as_os_str())
+                            != Some(mount.destination().as_os_str())
+                })
+            {
+                bail!("runtime-view mount authorities disagree with prepared environment delivery");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn first_subprocess_spec_mut(plan: &mut ExecutionPlan) -> Result<&mut PlanSubprocessSpec> {
     match plan.nodes.first_mut() {
         Some(ryeos_engine::contracts::PlanNode::DispatchSubprocess { spec, .. }) => Ok(spec),
@@ -1631,14 +1735,59 @@ pub fn prepare_item_plan(
     sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
     parent_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
 ) -> Result<PreparedItemPlan> {
+    prepare_item_plan_with_logical_context(
+        engine,
+        resolved,
+        isolation,
+        lifecycle_authority,
+        live_access,
+        sealed_content,
+        parent_filesystem_ceiling,
+        None,
+    )
+}
+
+/// Recompile current Bundle code with the already-admitted logical execution
+/// root. This supplies template context only, never project source authority.
+pub fn prepare_bundle_item_plan_for_qualification(
+    engine: &Engine,
+    resolved: &ResolvedExecutionRequest,
+    isolation: &ryeos_engine::isolation::IsolationRuntime,
+    program: &ryeos_engine::effective_program::FinalizedEffectiveProgram,
+    logical_project_root: Option<&Path>,
+) -> Result<PreparedItemPlan> {
+    prepare_item_plan_with_logical_context(
+        engine,
+        resolved,
+        isolation,
+        ryeos_state::objects::ExecutionLifecycleAuthority::DAEMON_RESTARTABLE,
+        None,
+        None,
+        ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
+        Some((&program.resolution().root.raw_content, logical_project_root)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_item_plan_with_logical_context(
+    engine: &Engine,
+    resolved: &ResolvedExecutionRequest,
+    isolation: &ryeos_engine::isolation::IsolationRuntime,
+    lifecycle_authority: ryeos_state::objects::ExecutionLifecycleAuthority,
+    live_access: Option<&ryeos_engine::isolation::IsolationLiveAccessAuthority>,
+    sealed_content: Option<&dyn ryeos_engine::project_content::SealedDependencyBytes>,
+    parent_filesystem_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
+    logical_context: Option<(&str, Option<&Path>)>,
+) -> Result<PreparedItemPlan> {
     engine.with_checked_bundle_generation(|_generation| {
         let verified = super::verified_execution_subject(engine, resolved)?;
-        let mut plan = super::build_execution_plan_for_request(
+        let mut plan = super::build_execution_plan_for_request_with_logical_context(
             engine,
             resolved,
             &verified,
             sealed_content,
             parent_filesystem_ceiling,
+            logical_context,
         )?;
         let root_subject_source_identity =
             if resolved.resolved_item.source_space == ryeos_engine::contracts::ItemSpace::Bundle {
@@ -2132,6 +2281,7 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
         isolation_verified_code,
         isolation_verified_command: prepared_plan.admitted_command,
         isolation_external_read_only_mounts,
+        isolation_writable_runtime_view_mounts: Vec::new(),
         isolation_target_channels: Vec::new(),
         isolation_workspace,
         subprocess_limits: None,
@@ -2213,6 +2363,92 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_view_delivery_requires_exact_mount_authority_set() {
+        use ryeos_engine::isolation::IsolationWritableRuntimeViewMountAuthority;
+        let root = tempfile::tempdir().unwrap();
+        let source = {
+            let _lease = lillux::retain_fork_sensitive_descriptors();
+            lillux::PinnedDirectory::open(root.path())
+                .unwrap()
+                .unwrap()
+                .into_inherited_descriptor_path()
+                .unwrap()
+        };
+        let mount =
+            IsolationWritableRuntimeViewMountAuthority::new("CARGO_HOME".to_owned(), source)
+                .unwrap();
+        let prepared = serde_json::json!({
+            "bindings":{"CARGO_HOME":{"kind":"runtime_view_directory","relative_path":"cargo"}},
+            "runtime_view_delivery":{"kind":"mounted_namespace","destinations":{"CARGO_HOME":"/ryeos/runtime-views/CARGO_HOME"}}
+        }).to_string();
+        ensure_runtime_view_delivery_matches(Some(&prepared), std::slice::from_ref(&mount), true)
+            .unwrap();
+        assert!(ensure_runtime_view_delivery_matches(Some(&prepared), &[], true).is_err());
+        assert!(
+            ensure_runtime_view_delivery_matches(
+                Some(&prepared),
+                std::slice::from_ref(&mount),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_runtime_view_delivery_matches(None, std::slice::from_ref(&mount), true).is_err()
+        );
+        assert!(
+            ensure_runtime_view_delivery_matches(Some(&prepared), &[mount.clone(), mount], true)
+                .is_err()
+        );
+        let descriptor = serde_json::json!({
+            "bindings":{},"runtime_view_delivery":{"kind":"descriptor_workspace"}
+        })
+        .to_string();
+        ensure_runtime_view_delivery_matches(Some(&descriptor), &[], false).unwrap();
+        assert!(ensure_runtime_view_delivery_matches(Some(&descriptor), &[], true).is_err());
+    }
+
+    #[test]
+    fn realization_command_requires_exact_normalized_declaration_coordinate() {
+        let declaration: ryeos_engine::external_content::ExternalContentDeclaration =
+            serde_json::from_value(json!({
+                "id":"runtime", "kind":"tree", "mode":"pinned",
+                "digest":"a".repeat(64), "mount_root":"execution_runtime",
+                "mount":"runtime"
+            }))
+            .unwrap();
+        let realization = ryeos_engine::external_realization::RealizedExternalContent {
+            id: "runtime".to_owned(),
+            kind: ryeos_state::objects::ExternalContentKind::Tree,
+            mode: ryeos_state::objects::ExternalContentMode::Pinned,
+            manifest_hash: "a".repeat(64),
+            entry_count: 1,
+            total_bytes: 1,
+            mount_root: ryeos_state::objects::ExternalContentMountRoot::ExecutionRuntime,
+            mount: "runtime".to_owned(),
+        };
+        ensure_realization_command_declaration_matches(&declaration, &realization).unwrap();
+
+        for mutate in [
+            |value: &mut ryeos_engine::external_realization::RealizedExternalContent| {
+                value.manifest_hash = "b".repeat(64)
+            },
+            |value: &mut ryeos_engine::external_realization::RealizedExternalContent| {
+                value.mount = "other".to_owned()
+            },
+            |value: &mut ryeos_engine::external_realization::RealizedExternalContent| {
+                value.mount_root = ryeos_state::objects::ExternalContentMountRoot::Project
+            },
+        ] {
+            let mut changed = realization.clone();
+            mutate(&mut changed);
+            assert!(
+                ensure_realization_command_declaration_matches(&declaration, &changed).is_err()
+            );
+        }
+    }
+
     #[test]
     fn persistent_session_spawn_cleanup_requires_lillux_testimony() {
         use crate::persistent_session::PersistentSessionCleanupUnproved;
@@ -2284,6 +2520,7 @@ mod tests {
         .unwrap();
         let proof = ryeos_engine::effective_program::prove_finalization_authority(
             &candidate,
+            None,
             &[],
             &engine.resolution_roots(None),
             None,

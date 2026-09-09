@@ -710,6 +710,7 @@ fn exec_tool(
                 // Offline dispatch admits no launch capsule, so there is no
                 // realization to bind; declaring kinds refuse at finalization.
                 external_read_only_mounts: &[],
+                writable_runtime_view_mounts: &[],
                 target_channels: &[],
                 item_ref: tool_ref_str,
                 thread_id: "offline-cli",

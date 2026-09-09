@@ -17,19 +17,75 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.environment = load(".ai/config/development/ryeos/worker-environment.yaml")
 
+    def test_development_profile_admits_the_verified_native_build_file_limit(self):
+        profile = load("bundles/.ai/node/init/profiles/development.yaml")
+        # Native utility production exercised this finite descriptor ceiling;
+        # Zig's libc build exceeds the former 1024 limit before linking.
+        self.assertEqual(profile["policies"]["isolation"]["policy"]["limits"]["open_files"],
+                         4096)
+
+    def test_graph_owned_product_inputs_fit_the_signed_kind_contract(self):
+        kind = load("bundles/standard/.ai/node/engine/kinds/graph/graph.kind-schema.yaml")
+        contract = kind["execution"]["external_content"]
+        self.assertEqual(contract["max_declarations"], 4)
+        for name in ("authoring-environment-production", "authoring-built-utilities-production",
+                     "gnu-python-production"):
+            graph = load(f".ai/graphs/ryeos/development/{name}.yaml")
+            slots = graph["external_product_slots"]
+            self.assertLessEqual(len(slots) + len(graph.get("external_content", [])),
+                                 contract["max_declarations"])
+            for slot in slots:
+                self.assertIn(slot["mount_root"], contract["allowed_mount_roots"])
+                recipe = load(".ai/config/" + slot["relationship_ref"].removeprefix("config:") + ".yaml")
+                relationship = next(item for item in recipe["product_relationships"]["relationships"]
+                                    if item["name"] == slot["relationship"])
+                product = relationship["required_product"]
+                if product["storage"] == "large_content":
+                    self.assertLessEqual(product["bounds"]["maximum_total_bytes"],
+                                         contract["large_content"]["max_total_bytes"])
+
     def test_root_composes_authoring_and_restricted_client_not_child_compiler(self):
         baseline = load("bundles/codex/.ai/config/codex/environments/authoring.yaml")
         self.assertEqual(self.environment["schema"], baseline["schema"])
         self.assertEqual(self.environment["worker_ref"], baseline["worker_ref"])
         declarations = {entry["id"]: entry for entry in self.environment["external_content"]}
-        self.assertEqual(set(declarations), {"authoring-tools", "workload-client"})
-        self.assertEqual(declarations["authoring-tools"]["digest"],
-                         baseline["external_content"][0]["digest"])
+        self.assertEqual(set(declarations), {"workload-client"})
+        slots = {entry["id"]: entry for entry in self.environment["external_product_slots"]}
+        self.assertEqual(slots, {"authoring-tools": {
+            "id": "authoring-tools",
+            "relationship_ref": "config:development/ryeos/authoring-environment-products",
+            "relationship": "runtime_to_authoring_worker",
+            "kind": "tree", "mount_root": "execution_runtime", "mount": "authoring-tools",
+        }})
+        self.assertEqual(baseline["external_content"][0]["digest"],
+                         "1ca7a7fe9ecc1d19c38c986ba9df435ff7bbe6d4ba020f2643564b8bba0c84e6")
         client = self.environment["workload_client"]["client"]
         self.assertEqual(client, {"realization_id": "workload-client", "relative_path": "bin/ryeos"})
         self.assertIn({"realization_id": client["realization_id"], "relative_directory": "bin"},
                       self.environment["configuration"]["executable_search"])
         self.assertIsNone(baseline["workload_client"])
+
+    def test_native_runtime_adoption_requires_the_independent_bundle_policy(self):
+        products = load(".ai/config/development/ryeos/authoring-environment-products.yaml")
+        relationships = {item["name"]: item for item in
+                         products["product_relationships"]["relationships"]}
+        verifier = relationships["runtime_to_native_authoring_qualification"]
+        self.assertEqual(verifier["consumer"], {
+            "canonical_ref": "tool:ryeos/environments/qualification/native-authoring/verify",
+            "declaration_id": "authoring-runtime",
+        })
+        self.assertEqual(verifier["qualification"], {
+            "policy_ref": None, "required_claims": []})
+        worker = relationships["runtime_to_authoring_worker"]
+        self.assertEqual(worker["consumer"], {
+            "canonical_ref": "config:development/ryeos/worker-environment",
+            "declaration_id": "authoring-tools",
+        })
+        self.assertEqual(worker["qualification"], {
+            "policy_ref": "config:ryeos/environments/qualification/native-authoring",
+            "required_claims": ["authoring_runtime_closed"],
+        })
+        self.assertNotIn("expected_manifest_hash", str(verifier) + str(worker))
 
     def test_child_grants_match_exact_existing_signed_operations(self):
         routes = self.environment["workload_client"]["executions"]
@@ -162,8 +218,10 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
             "type": "object", "properties": {}, "additionalProperties": False})
         self.assertEqual(set(config["nodes"]), {"assemble", "verify", "done"})
         self.assertEqual(graph["requires"]["capabilities"]["declared"], [
-            "ryeos.execute.tool." + prefix + "/" + operation
-            for operation in ("assemble", "verify")])
+            "ryeos.execute.config.development/ryeos/authoring-environment-products",
+            *["ryeos.execute.tool." + prefix + "/" + operation
+              for operation in ("assemble", "verify")],
+        ])
         for operation, successor in (("assemble", "verify"), ("verify", "done")):
             node = config["nodes"][operation]
             self.assertEqual(node["node_type"], "action")
@@ -184,6 +242,131 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
             for operation in ("assemble", "verify")))
         for manifest in ("manifest.source.yaml", "manifest.yaml"):
             self.assertIn("graph", load(".ai/" + manifest)["requires_kinds"])
+
+    def test_production_inputs_use_exact_product_relationships_and_graph_slots(self):
+        cases = [
+            {
+                "recipe": "authoring-prepared-input-products",
+                "relationship": "prepared_inputs_to_environment_production",
+                "producer": "graph:ryeos/development/authoring-prepared-inputs-production",
+                "product": "prepared_inputs",
+                "consumer": "graph:ryeos/development/authoring-environment-production",
+                "declaration": "assembly-inputs",
+                "consumer_graph": "authoring-environment-production",
+                "mount": "authoring-inputs",
+            },
+            {
+                "recipe": "authoring-build-support-products",
+                "relationship": "build_support_to_utility_production",
+                "producer": "graph:ryeos/development/authoring-build-support-production",
+                "product": "build_support",
+                "consumer": "graph:ryeos/development/authoring-built-utilities-production",
+                "declaration": "authoring-build-support",
+                "consumer_graph": "authoring-built-utilities-production",
+                "mount": "authoring-build-support",
+            },
+            {
+                "recipe": "authoring-built-utilities-products",
+                "relationship": "built_utilities_to_environment_production",
+                "producer": "graph:ryeos/development/authoring-built-utilities-production",
+                "product": "built_utilities",
+                "consumer": "graph:ryeos/development/authoring-environment-production",
+                "declaration": "built-utilities",
+                "consumer_graph": "authoring-environment-production",
+                "mount": "authoring-built-utilities",
+            },
+        ]
+        for case in cases:
+            with self.subTest(case=case["relationship"]):
+                recipe = load(f".ai/config/development/ryeos/{case['recipe']}.yaml")
+                relationships = recipe["product_relationships"]
+                self.assertEqual(relationships["schema"], "ryeos.product_relationships.v1")
+                relationship = next(entry for entry in relationships["relationships"]
+                                    if entry["name"] == case["relationship"])
+                self.assertEqual(relationship["producer"], {
+                    "canonical_ref": case["producer"], "recipe_binding": "product_recipe",
+                    "product_name": case["product"], "parameters": {}})
+                self.assertEqual(relationship["consumer"], {
+                    "canonical_ref": case["consumer"],
+                    "declaration_id": case["declaration"]})
+                self.assertEqual(relationship["required_product"]["shape"], "tree")
+                self.assertEqual(relationship["required_product"]["storage"], "large_content")
+                self.assertEqual(relationship["qualification"], {
+                    "policy_ref": None, "required_claims": []})
+                graph = load(f".ai/graphs/ryeos/development/{case['consumer_graph']}.yaml")
+                slot = next(entry for entry in graph["external_product_slots"]
+                            if entry["id"] == case["declaration"])
+                self.assertEqual(slot, {
+                    "id": case["declaration"],
+                    "relationship_ref": f"config:development/ryeos/{case['recipe']}",
+                    "relationship": case["relationship"], "kind": "tree",
+                    "mount_root": "execution_runtime", "mount": case["mount"]})
+
+    def test_selected_inputs_replace_only_the_corresponding_literal_leaf_pins(self):
+        owner = ROOT / ".ai/tools/ryeos/development/authoring-environment-production"
+        for operation in ("assemble.py", "verify.py"):
+            source = (owner / operation).read_text()
+            self.assertNotIn("digest: cc090b3d53dd41c0", source)
+            self.assertIn("id: producer-python", source)
+            self.assertIn("assembly-inputs is selected by the enclosing producer Graph", source)
+            self.assertIn("built-utilities is selected by that same Graph", source)
+        utility = (owner / "build-utilities.py").read_text()
+        self.assertNotIn("digest: f6bcd9d28b9bb3da", utility)
+        for retained_pin in ("id: producer-python", "id: platform", "id: source-inputs"):
+            self.assertIn(retained_pin, utility)
+        self.assertIn("authoring-build-support is selected by the enclosing producer Graph", utility)
+
+    def test_recorded_wrappers_forward_only_explicit_authenticated_root_selections(self):
+        cases = {
+            "authoring-built-utilities-production": [
+                ("build_support_selection", "authoring-build-support")],
+            "authoring-environment-production": [
+                ("assembly_inputs_selection", "assembly-inputs"),
+                ("built_utilities_selection", "built-utilities")],
+            "gnu-python-production": [
+                ("production_support_selection", "production-support")],
+        }
+        for producer, expected in cases.items():
+            with self.subTest(producer=producer):
+                wrapper = load(
+                    f".ai/graphs/ryeos/development/{producer}-recorded.yaml")
+                schema = wrapper["config"]["config_schema"]
+                self.assertEqual(schema["required"], [name for name, _ in expected])
+                for parameter, declaration in expected:
+                    value = schema["properties"][parameter]
+                    self.assertEqual(value["required"], [
+                        "declaration_id", "witness_hash", "qualification_hash",
+                        "witness_source"])
+                    self.assertEqual(value["properties"]["declaration_id"]["enum"],
+                                     [declaration])
+                    self.assertEqual(value["properties"]["qualification_hash"]["type"],
+                                     "null")
+                    source_schema = value["properties"]["witness_source"]
+                    self.assertEqual(source_schema, {"oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {"kind": {"const": "local_capture"}},
+                            "additionalProperties": False,
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "acceptance_hash"],
+                            "properties": {
+                                "kind": {"const": "received"},
+                                "acceptance_hash": {
+                                    "type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    ]})
+                    self.assertFalse(value["additionalProperties"])
+                action = wrapper["config"]["nodes"]["produce"]["action"]
+                self.assertEqual(action["product_selections"], [
+                    {"target": {"kind": "root"}, "selection": "${inputs." + parameter + "}"}
+                    for parameter, _ in expected])
+                self.assertNotIn("manifest_hash", str(action))
+                self.assertNotIn("latest", str(action))
 
     def test_production_graph_leaves_use_same_exact_inputs_and_opaque_protocol(self):
         leaves = []

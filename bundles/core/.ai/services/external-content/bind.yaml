@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-05T00:45:15Z:ae5e833efe2c0d08304afde9cf702bc8d3fbe1a999658b9c842fdc15e4b985c4:0pOgtaOMsTUNdxYiX6V6EmHP0Oioi1aVOMWmE5PgqUN3LMf6fUatuNitK6ZWSj3oqVqZfUgTNUfPJHCReJynDQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-08T19:05:49Z:02afd32f002dac684a09aa9b519cf6a4cb1557e8ac406f3c3fc4c130d7dba2a3:KJJcoEOJf79Wz43Z6ByyhmfysaMY1UV83RihUHQY22TYFaJah3O/Eubed6Qko3sb2pGMuN1yM+QAwa2/z11ODA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 kind: service
 endpoint: external-content.bind
 required_caps: ["ryeos.execute.service.external-content/bind"]
@@ -10,4 +10,5 @@ schema:
   consumer_kind: string
   project_snapshot_hash: string?
   project_path: string?
+  product_selections: array?
 description: "Bind a staged external-content manifest to one exact installed-bundle or pinned-project consumer"

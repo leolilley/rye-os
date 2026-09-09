@@ -474,6 +474,13 @@ pub(crate) fn reset_for_cross_site_admission(
     roots: &ryeos_engine::item_resolution::ResolutionRoots,
     subject_resolution_authority: &SubjectResolutionAuthority,
 ) -> Result<()> {
+    if prepared
+        .content_dependencies
+        .values()
+        .any(|dependency| !dependency.product_selections.is_empty())
+    {
+        bail!("product selections require target-local composition before cross-site admission");
+    }
     // This is a new receiving-node admission, not same-node recovery. Preserve
     // the portable contract exactly, but refuse a node that cannot admit its
     // captured ceilings rather than silently replacing or widening them.
@@ -697,7 +704,18 @@ pub(crate) fn admit_or_verify_prepared_sessions(
     prepared: &mut PreparedRuntimeLaunch,
     subject_resolution_authority: &SubjectResolutionAuthority,
     recovered: bool,
+    handler_context: Option<&ryeos_app::handler_context::HandlerContext>,
+    roots: &ryeos_engine::item_resolution::ResolutionRoots,
 ) -> Result<AdmittedSessionPublications> {
+    prepare_product_selections(
+        state,
+        engine,
+        prepared,
+        subject_resolution_authority,
+        recovered,
+        handler_context,
+        roots,
+    )?;
     validate_prepared_content_targets(state, prepared)?;
     let mut expected_names = BTreeSet::new();
     let (content_by_target, search_by_target, realizations_by_dependency, mut publications) =
@@ -838,7 +856,20 @@ pub(crate) fn preview_prepared_dependencies(
     engine: &ryeos_engine::engine::Engine,
     prepared: &PreparedRuntimeLaunch,
     subject_resolution_authority: &SubjectResolutionAuthority,
+    handler_context: Option<&ryeos_app::handler_context::HandlerContext>,
+    resolution_roots: &ryeos_engine::item_resolution::ResolutionRoots,
 ) -> Result<PreparedDependencyValidationPreview> {
+    let mut selected_prepared = prepared.clone();
+    prepare_product_selections(
+        state,
+        engine,
+        &mut selected_prepared,
+        subject_resolution_authority,
+        false,
+        handler_context,
+        resolution_roots,
+    )?;
+    let prepared = &selected_prepared;
     validate_prepared_content_targets(state, prepared)?;
     // Execution dependencies are admitted bundle programs. This projectless
     // lookup must not be copied into the content-dependency pass below: a
@@ -1017,7 +1048,9 @@ fn validate_prepared_content_targets(
     state: &AppState,
     prepared: &PreparedRuntimeLaunch,
 ) -> Result<()> {
-    use ryeos_engine::external_content::{declarations_from_composed, declaring_authority};
+    use ryeos_engine::external_content::{
+        declaring_authority, effective_external_content_declarations,
+    };
     let mut by_target: BTreeMap<
         String,
         (
@@ -1029,8 +1062,8 @@ fn validate_prepared_content_targets(
         dependency.validate()?;
         let resolution = dependency.resolution.restore();
         let source_contract = dependency.external_content_policy.declaration_contract();
-        let declarations = declarations_from_composed(
-            &resolution.composed.composed,
+        let declarations = effective_external_content_declarations(
+            &resolution,
             Some(&source_contract),
             declaring_authority(&resolution)?,
         )?
@@ -1154,6 +1187,73 @@ type TargetSessionProcessEnvironment =
     BTreeMap<String, BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue>>;
 type RealizationsByDependency =
     BTreeMap<String, ryeos_engine::external_realization::RealizedExternalContentSet>;
+
+/// Resolve invocation-time witnesses before any manifest preview, target
+/// aggregation, or admission. A preparer only selects signed dependency slots;
+/// it cannot manufacture the configured operator's product authority.
+#[allow(clippy::too_many_arguments)]
+fn prepare_product_selections(
+    state: &AppState,
+    engine: &ryeos_engine::engine::Engine,
+    prepared: &mut PreparedRuntimeLaunch,
+    subject: &SubjectResolutionAuthority,
+    recovered: bool,
+    handler_context: Option<&ryeos_app::handler_context::HandlerContext>,
+    roots: &ryeos_engine::item_resolution::ResolutionRoots,
+) -> Result<()> {
+    for (name, dependency) in &mut prepared.content_dependencies {
+        let mut resolution = dependency.resolution.restore();
+        let retained =
+            ryeos_engine::external_content::resolved_external_product_selections(&resolution)?;
+        if dependency.product_selections.is_empty() {
+            if retained.is_some() {
+                bail!(
+                    "content dependency `{name}` has product authority without a sealed selector"
+                );
+            }
+            continue;
+        }
+        let context = handler_context.ok_or_else(|| {
+            anyhow!("product selection requires retained local operator authority")
+        })?;
+        if recovered {
+            ryeos_app::operator_external_content::product_composition::verify_recovered_selections(
+                state,
+                &resolution,
+                subject,
+                &context.fingerprint,
+                &dependency.product_selections,
+            )?;
+        } else {
+            // Content-only dependencies use their already resolved data as D0.
+            // Executable roots have a separate source/hook/validator admission
+            // phase and must not be smuggled through this data dependency lane.
+            let kind =
+                ryeos_engine::canonical_ref::CanonicalRef::parse(&resolution.root.resolved_ref)?
+                    .kind;
+            let schema = engine.kinds.get(&kind).ok_or_else(|| {
+                anyhow!("product content dependency `{name}` has no signed kind contract")
+            })?;
+            if schema.execution.is_some() {
+                bail!(
+                    "product content dependency `{name}` is executable; select its products through root execution admission"
+                );
+            }
+            ryeos_app::operator_external_content::product_composition::select_products(
+                state,
+                context,
+                engine,
+                roots,
+                subject,
+                &mut resolution,
+                &dependency.product_selections,
+            )?;
+            dependency.resolution =
+                ryeos_engine::resolution::RetainedResolutionOutput::capture(&resolution);
+        }
+    }
+    Ok(())
+}
 
 fn admit_or_verify_content_dependencies(
     state: &AppState,
@@ -1758,6 +1858,11 @@ fn admit_session_capsule(
         ryeos_engine::effective_program::lock_validated_effective_program(resolution, validation)?;
     let proof = ryeos_engine::effective_program::prove_finalization_authority(
         &candidate,
+        engine
+            .kinds
+            .get(&dependency.captured_verified_subject()?.resolved.kind)
+            .and_then(|schema| schema.execution.as_ref())
+            .and_then(|execution| execution.external_content.as_ref()),
         &[],
         &roots,
         None,
@@ -1774,11 +1879,19 @@ fn admit_session_capsule(
     // projection. Keeping only the pre-admission resolution would make outer
     // recovery compare two different programs.
     dependency.resolution = finalized.resolution().clone();
+    let retained_product_selections =
+        ryeos_engine::external_content::resolved_external_product_selections(
+            finalized.resolution(),
+        )?;
+    let semantic_resolution =
+        ryeos_state::external_content::products::composition::project_resolution_product_selections_for_identity(
+            &serde_json::to_value(ryeos_engine::resolution::RetainedResolutionOutput::capture(
+                finalized.resolution(),
+            ))?,
+        )?;
     let exact_program = PersistentSessionExactProgram {
         effective_definition_digest: finalized.effective_definition_digest().as_str().to_owned(),
-        resolution_output: ryeos_engine::resolution::RetainedResolutionOutput::capture(
-            finalized.resolution(),
-        ),
+        resolution_output: serde_json::from_value(semantic_resolution)?,
         evidence_attachments: evidence_attachments.to_vec(),
     };
     let exact_program_value = serde_json::to_value(&exact_program)?;
@@ -1902,6 +2015,7 @@ fn admit_session_capsule(
         kind: PERSISTENT_SESSION_CAPSULE_KIND.to_owned(),
         exact_program: exact_program_value,
         exact_program_hash,
+        retained_product_selections,
         lifecycle,
         wire,
         artifact_identity,
@@ -1948,8 +2062,7 @@ fn verify_session_capsule(
     content_target_contract: Option<&ryeos_engine::kind_registry::KindExternalContentDecl>,
 ) -> Result<AdmittedPersistentSessionCapsule> {
     let capsule = load_capsule(state, capsule_hash)?;
-    let exact: PersistentSessionExactProgram =
-        serde_json::from_value(capsule.exact_program.clone())?;
+    let exact = retained_exact_program(&capsule)?;
     let retained_dependency =
         ryeos_engine::resolution::RetainedResolutionOutput::capture(&dependency.resolution);
     if exact.resolution_output.root_ref() != dependency.canonical_ref
@@ -1997,8 +2110,7 @@ pub fn inspect_capsule(
 ) -> Result<AdmittedPersistentSessionIdentity> {
     let capsule = load_capsule(state, capsule_hash)?;
     validate_capsule_current_trust(&state.engine, &capsule)?;
-    let exact: PersistentSessionExactProgram =
-        serde_json::from_value(capsule.exact_program.clone())?;
+    let exact = retained_exact_program(&capsule)?;
     validate_exact_evidence_attachments(&exact)?;
     let current_digest = exact.resolution_output.effective_definition_digest()?;
     if current_digest.as_str() != exact.effective_definition_digest {
@@ -2043,8 +2155,7 @@ where
             "exclusive persistent-session protocol `{protocol_ref}` cannot enter the request pool"
         );
     }
-    let exact: PersistentSessionExactProgram =
-        serde_json::from_value(capsule.exact_program.clone())?;
+    let exact = retained_exact_program(&capsule)?;
     validate_exact_evidence_attachments(&exact)?;
     let current_digest = exact.resolution_output.effective_definition_digest()?;
     if current_digest.as_str() != exact.effective_definition_digest {
@@ -2186,6 +2297,93 @@ fn create_node_owned_runtime_view(workspace: &Path) -> Result<lillux::PinnedDire
     }
     current.tighten_owner_private_directory()?;
     Ok(current)
+}
+
+fn prepare_session_process_environment(
+    capsule: &AdmittedPersistentSessionCapsule,
+    workspace: &Path,
+    workspace_view: Option<&lillux::InheritedDescriptorAuthority>,
+    workspace_authority: ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority,
+    enforced: bool,
+) -> Result<(
+    ryeos_state::objects::PreparedSessionProcessEnvironment,
+    Vec<ryeos_engine::isolation::IsolationWritableRuntimeViewMountAuthority>,
+)> {
+    use ryeos_state::objects::{
+        PreparedSessionProcessEnvironment, SessionProcessEnvironmentValue,
+        SessionRuntimeViewDelivery, runtime_view_mount_destination,
+    };
+    ryeos_state::objects::validate_session_process_environment(&capsule.process_environment)?;
+    let mut prepared = PreparedSessionProcessEnvironment {
+        bindings: capsule.process_environment.clone(),
+        runtime_view_delivery: SessionRuntimeViewDelivery::DescriptorWorkspace,
+    };
+    if !enforced {
+        prepared.validate()?;
+        return Ok((prepared, Vec::new()));
+    }
+    let runtime_views = capsule
+        .process_environment
+        .iter()
+        .filter_map(|(name, value)| match value {
+            SessionProcessEnvironmentValue::RuntimeViewDirectory { relative_path } => {
+                Some((name, relative_path))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let destinations = runtime_views
+        .iter()
+        .map(|(name, _)| Ok(((*name).clone(), runtime_view_mount_destination(name)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    prepared.runtime_view_delivery = SessionRuntimeViewDelivery::MountedNamespace { destinations };
+    prepared.validate()?;
+    let mut mounts = Vec::with_capacity(runtime_views.len());
+    if !runtime_views.is_empty() {
+        // Borrow the exact workspace incarnation, never its diagnostic host
+        // pathname. Only the existing projectless scratch owner has no view.
+        let _lease = lillux::retain_fork_sensitive_descriptors();
+        let (workspace_is_retained_view, workspace) = match (workspace_view, workspace_authority) {
+            (
+                Some(view),
+                ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority::RuntimeWorkspace,
+            ) => (true, view.clone()),
+            (
+                None,
+                ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority::EphemeralScratch,
+            ) => {
+                let scratch = lillux::PinnedDirectory::open(workspace)?
+                    .ok_or_else(|| anyhow!("persistent-session scratch workspace is missing"))?
+                    .into_inherited_descriptor_path()?;
+                (false, scratch)
+            }
+            _ => bail!("runtime-view preparation contradicts its admitted workspace authority"),
+        };
+        for (name, relative_path) in runtime_views {
+            let mut relative = PathBuf::from(".ai/cache/ryeos-runtime");
+            if relative_path != "." {
+                relative.push(relative_path);
+            }
+            let source = workspace.open_or_create_private_directory_descendant(&relative)?;
+            mounts.push(if workspace_is_retained_view {
+                let workspace_relative_path = relative
+                    .to_str()
+                    .ok_or_else(|| anyhow!("runtime-view workspace path is not UTF-8"))?
+                    .to_owned();
+                ryeos_engine::isolation::IsolationWritableRuntimeViewMountAuthority::new_workspace_descendant(
+                    name.clone(),
+                    workspace_relative_path,
+                    source,
+                )?
+            } else {
+                ryeos_engine::isolation::IsolationWritableRuntimeViewMountAuthority::new(
+                    name.clone(),
+                    source,
+                )?
+            });
+        }
+    }
+    Ok((prepared, mounts))
 }
 
 fn prepare_structured_session_baseline(
@@ -2398,9 +2596,16 @@ fn spawn_capsule_process_held(
                 .map_err(anyhow::Error::from)
         })
         .transpose()?;
+    let (prepared_environment, writable_runtime_view_mounts) = prepare_session_process_environment(
+        capsule,
+        workspace,
+        workspace_view,
+        session_protocol.workspace_authority,
+        state.isolation.is_enforced(),
+    )?;
     let session_process_environment = (!capsule.process_environment.is_empty())
         .then(|| {
-            lillux::canonical_json(&serde_json::to_value(&capsule.process_environment)?)
+            lillux::canonical_json(&serde_json::to_value(&prepared_environment)?)
                 .map_err(anyhow::Error::from)
         })
         .transpose()?;
@@ -2436,6 +2641,7 @@ fn spawn_capsule_process_held(
         workspace,
         workspace_view,
         mounts,
+        writable_runtime_view_mounts,
         extra_target_channels,
         &capsule.lifecycle,
         session_protocol.workspace_authority,
@@ -2483,8 +2689,7 @@ pub fn start_exclusive_capsule(
 ) -> Result<()> {
     let capsule = load_capsule(state, capsule_hash)?;
     validate_capsule_current_trust(&state.engine, &capsule)?;
-    let exact: PersistentSessionExactProgram =
-        serde_json::from_value(capsule.exact_program.clone())?;
+    let exact = retained_exact_program(&capsule)?;
     validate_exact_evidence_attachments(&exact)?;
     let session_protocol = retained_session_protocol(&state.engine, &capsule)?;
     use ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority;
@@ -2710,6 +2915,13 @@ fn load_capsule(state: &AppState, hash: &str) -> Result<AdmittedPersistentSessio
     Ok(capsule)
 }
 
+fn retained_exact_program(
+    capsule: &AdmittedPersistentSessionCapsule,
+) -> Result<PersistentSessionExactProgram> {
+    serde_json::from_value(capsule.retained_exact_program()?)
+        .context("decode full retained persistent-session exact program")
+}
+
 fn validate_capsule_current_trust(
     engine: &ryeos_engine::engine::Engine,
     capsule: &AdmittedPersistentSessionCapsule,
@@ -2805,6 +3017,7 @@ fn direct_request(
         usage_subject_asserted_by: None,
         parameters: Value::Object(Default::default()),
         ref_bindings: BTreeMap::new(),
+        product_selections: Vec::new(),
         resolved_item: verified.resolved.clone(),
         root_raw_content_digest: dependency.subject.raw_content_digest.clone(),
         plan_context: PlanContext {
@@ -3166,6 +3379,7 @@ mod tests {
         };
         let mut dependency = PreparedContentDependency {
             binding: "environment".into(),
+            product_selections: Vec::new(),
             canonical_ref: exact.resolution_output.root_ref().into(),
             resolution: exact.resolution_output,
             targets: vec!["worker".into()],
@@ -3335,6 +3549,7 @@ mod tests {
             kind: PERSISTENT_SESSION_CAPSULE_KIND.to_owned(),
             exact_program,
             exact_program_hash,
+            retained_product_selections: None,
             lifecycle: PersistentSessionLifecycleContract {
                 max_processes: 1,
                 max_inflight_per_process: 1,
@@ -3494,6 +3709,91 @@ mod tests {
         assert!(
             format!("{error:#}").contains("runtime-view component `.ai`"),
             "got {error:#}"
+        );
+    }
+
+    #[test]
+    fn prepared_runtime_views_borrow_exact_workspace_not_replacement_path() {
+        use ryeos_engine::protocols::descriptor::PersistentSessionWorkspaceAuthority;
+        use ryeos_state::objects::{SessionProcessEnvironmentValue, SessionRuntimeViewDelivery};
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let view = {
+            let _lease = lillux::retain_fork_sensitive_descriptors();
+            lillux::PinnedDirectory::open(&workspace)
+                .unwrap()
+                .unwrap()
+                .into_inherited_descriptor_path()
+                .unwrap()
+        };
+        let original = root.path().join("original");
+        std::fs::rename(&workspace, &original).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let mut capsule = capsule_fixture(&retained_program_fixture("/fixture/worker.yaml", 'a'));
+        capsule.process_environment.insert(
+            "CARGO_HOME".to_owned(),
+            SessionProcessEnvironmentValue::RuntimeViewDirectory {
+                relative_path: "cargo/home".to_owned(),
+            },
+        );
+        let (prepared, mounts) = prepare_session_process_environment(
+            &capsule,
+            &workspace,
+            Some(&view),
+            PersistentSessionWorkspaceAuthority::RuntimeWorkspace,
+            true,
+        )
+        .unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(matches!(
+            prepared.runtime_view_delivery,
+            SessionRuntimeViewDelivery::MountedNamespace { .. }
+        ));
+        assert!(original.join(".ai/cache/ryeos-runtime/cargo/home").is_dir());
+        assert!(!workspace.join(".ai").exists());
+        assert!(
+            prepare_session_process_environment(
+                &capsule,
+                &workspace,
+                None,
+                PersistentSessionWorkspaceAuthority::RuntimeWorkspace,
+                true,
+            )
+            .is_err()
+        );
+        let (disabled, mounts) = prepare_session_process_environment(
+            &capsule,
+            &workspace,
+            None,
+            PersistentSessionWorkspaceAuthority::RuntimeWorkspace,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            disabled.runtime_view_delivery,
+            SessionRuntimeViewDelivery::DescriptorWorkspace
+        ));
+        assert!(mounts.is_empty());
+        assert!(!workspace.join(".ai").exists());
+
+        let (scratch, mounts) = prepare_session_process_environment(
+            &capsule,
+            &workspace,
+            None,
+            PersistentSessionWorkspaceAuthority::EphemeralScratch,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            scratch.runtime_view_delivery,
+            SessionRuntimeViewDelivery::MountedNamespace { .. }
+        ));
+        assert_eq!(mounts.len(), 1);
+        assert!(
+            workspace
+                .join(".ai/cache/ryeos-runtime/cargo/home")
+                .is_dir()
         );
     }
 

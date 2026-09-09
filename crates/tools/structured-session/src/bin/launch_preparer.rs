@@ -8,8 +8,8 @@ use ryeos_handler_protocol::{
     LaunchEnvironmentContributionRequestWire, LaunchEnvironmentPathKindWire,
     LaunchEnvironmentValueWire, LaunchExecutionDependencyRequestWire, LaunchPrepareError,
     LaunchPrepareErrorClass, LaunchPrepareResponse, LaunchPrepareSuccess, LaunchPreparedItemWire,
-    TrustClassWire, ValidateLaunchPreparerConfigRequest, ValidateLaunchPreparerConfigResponse,
-    ValidateLaunchPreparerConfigSuccess,
+    RefBindingSourceWire, TrustClassWire, ValidateLaunchPreparerConfigRequest,
+    ValidateLaunchPreparerConfigResponse, ValidateLaunchPreparerConfigSuccess,
 };
 use serde::Deserialize;
 
@@ -257,6 +257,8 @@ fn validate(request: ValidateLaunchPreparerConfigRequest) -> ValidateLaunchPrepa
             .get(ENVIRONMENT_BINDING)
             .is_some_and(|decl| {
                 !decl.required
+                    && decl.source == RefBindingSourceWire::Caller
+                    && decl.project_result_requirement == ryeos_handler_protocol::ProjectResultRequirement::None
                     && decl.allowed_kinds == ["config"]
                     && decl.allowed_spaces == [ItemSpaceWire::Bundle, ItemSpaceWire::Project]
                     && decl.allowed_trust
@@ -675,6 +677,7 @@ fn validate_worker_environment(
         "schema",
         "worker_ref",
         "external_content",
+        "external_product_slots",
         "configuration",
         "credential_requirement",
         "portable_state_contract",
@@ -687,7 +690,7 @@ fn validate_worker_environment(
         ));
     }
     if value.get("schema").and_then(serde_json::Value::as_str)
-        != Some("ryeos.worker_environment.v4")
+        != Some("ryeos.worker_environment.v5")
         || value
             .get("category")
             .and_then(serde_json::Value::as_str)
@@ -699,39 +702,54 @@ fn validate_worker_environment(
     {
         return Err(wire_error(
             "worker_environment_invalid",
-            "worker environment is outside the admitted v4 contract",
+            "worker environment is outside the admitted v5 contract",
         ));
     }
-    let declarations: Vec<ryeos_engine::external_content::ExternalContentDeclaration> =
-        serde_json::from_value(value.get("external_content").cloned().ok_or_else(|| {
-            wire_error(
-                "worker_environment_content_invalid",
-                "worker environment has no external-content declaration list",
-            )
-        })?)
-        .map_err(|_| {
-            wire_error(
-                "worker_environment_content_invalid",
-                "worker environment external-content declarations are malformed",
-            )
-        })?;
-    if declarations.len() > 8 {
+    // These are the closed authored shape ceilings, not node/target grants.
+    // Generic dependency admission applies the actual signed source/target
+    // contracts after the application has resolved every pending product slot.
+    let shape_contract = ryeos_engine::kind_registry::KindExternalContentDecl {
+        realization_derived: ryeos_engine::external_content::EXTERNAL_REALIZATIONS_DERIVED_KEY
+            .to_owned(),
+        allowed_roots: Vec::new(),
+        allowed_mount_roots: vec![
+            ryeos_engine::external_content::ExternalContentMountRoot::Project,
+            ryeos_engine::external_content::ExternalContentMountRoot::ExecutionRuntime,
+        ],
+        max_declarations: 8,
+        large_content: None,
+    };
+    let shape = ryeos_engine::external_content::authored_external_content_shape(
+        &environment.composed.composed,
+        Some(&shape_contract),
+        // Locator roots are forbidden by this syntax contract. This label
+        // allows project-only slot syntax; provenance is checked just below.
+        ryeos_engine::external_content::DeclaringAuthority::Project,
+    )
+    .map_err(|_| {
+        wire_error(
+            "worker_environment_content_invalid",
+            "worker environment literal/slot declarations are malformed",
+        )
+    })?
+    .ok_or_else(|| {
+        wire_error(
+            "worker_environment_content_invalid",
+            "worker environment has no content shape",
+        )
+    })?;
+    if !shape.product_slots.is_empty() && environment.source_space != ItemSpaceWire::Project {
         return Err(wire_error(
             "worker_environment_content_invalid",
-            "worker environment exceeds its external-content declaration ceiling",
+            "worker product slots require a pinned-project environment",
         ));
     }
-    let declaration_ids = declarations
-        .iter()
-        .map(|declaration| declaration.id.as_str())
-        .collect::<BTreeSet<_>>();
-    if declaration_ids.len() != declarations.len()
-        || declarations.iter().any(|declaration| {
-            declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned
-                || declaration.locator.is_some()
-                || declaration.digest.is_none()
-        })
-    {
+    let declaration_ids = shape.ids().collect::<BTreeSet<_>>();
+    if shape.literal_declarations.iter().any(|declaration| {
+        declaration.mode != ryeos_engine::external_content::ExternalContentMode::Pinned
+            || declaration.locator.is_some()
+            || declaration.digest.is_none()
+    }) {
         return Err(wire_error(
             "worker_environment_content_invalid",
             "worker environment content must be unique locator-free pinned declarations",
@@ -786,11 +804,9 @@ fn validate_worker_environment(
                 "worker environment executable search does not name a unique canonical declared realization directory",
             ));
         }
-        let declaration = declarations
-            .iter()
-            .find(|declaration| declaration.id == entry.realization_id)
-            .expect("search declaration id was retained");
-        if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree {
+        if shape.kind_for_id(&entry.realization_id)
+            != Some(ryeos_engine::external_content::ExternalContentKind::Tree)
+        {
             return Err(wire_error(
                 "worker_environment_executable_search_invalid",
                 "worker environment executable search requires tree realizations",
@@ -862,16 +878,15 @@ fn validate_worker_environment(
                     "worker environment workload-client request is outside the closed contract",
                 )
             })?;
-            let declaration = declarations
-                .iter()
-                .find(|declaration| declaration.id == request.client.realization_id)
+            let declaration_kind = shape
+                .kind_for_id(&request.client.realization_id)
                 .ok_or_else(|| {
                     wire_error(
                         "worker_environment_workload_client_invalid",
                         "workload-client realization is not declared by the environment",
                     )
                 })?;
-            if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree {
+            if declaration_kind != ryeos_engine::external_content::ExternalContentKind::Tree {
                 return Err(wire_error(
                     "worker_environment_workload_client_invalid",
                     "workload-client realization must be a complete pinned tree",
@@ -944,7 +959,7 @@ fn validate_worker_environment(
     )?;
     Ok(ValidatedWorkerEnvironment {
         worker_ref,
-        has_external_content: !declarations.is_empty(),
+        has_external_content: !shape.is_empty(),
         executable_search,
         process_environment,
         workload_client,
@@ -954,6 +969,113 @@ fn validate_worker_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_product_environment() -> LaunchPreparedItemWire {
+        LaunchPreparedItemWire {
+            canonical_ref: "config:fixture/environments/product".to_owned(),
+            source_space: ItemSpaceWire::Project,
+            effective_trust_class: TrustClassWire::TrustedProject,
+            composed: ryeos_handler_protocol::LaunchComposedViewWire {
+                composed: serde_json::json!({
+                    "category":"fixture/environments", "schema":"ryeos.worker_environment.v5",
+                    "worker_ref":"worker:fixture/hosted", "external_content":[],
+                    "external_product_slots":[{
+                        "id":"runtime", "relationship_ref":"config:fixture/recipe",
+                        "relationship":"runtime_to_worker", "kind":"tree",
+                        "mount_root":"execution_runtime", "mount":"runtime"
+                    }],
+                    "configuration":{
+                        "executable_search":[{"realization_id":"runtime","relative_directory":"bin"}],
+                        "process_environment":{
+                            "FIXTURE_RUNTIME_ROOT":{"kind":"realization_path","realization_id":"runtime", "relative_path":"lib", "path_kind":"directory"}
+                        }
+                    },
+                    "credential_requirement":{"workload_family":"fixture","required_state":"active","subject_projection_contract":"fixture.account.v1"},
+                    "portable_state_contract":"ryeos.worker_session.restore.v1", "workload_client":null
+                }),
+                derived: BTreeMap::new(),
+                policy_facts: BTreeMap::new(),
+            },
+            resolution_digest: serde_json::json!({"fixture":"syntax-only"}),
+        }
+    }
+
+    #[test]
+    fn v5_product_shape_selects_existing_dependency_without_a_witness() {
+        let environment = pending_product_environment();
+        let validated = validate_worker_environment(&environment).unwrap();
+        assert!(validated.has_external_content);
+        assert_eq!(validated.executable_search[0].realization_id, "runtime");
+        let mut config = valid_config();
+        config["worker_ref"] = serde_json::Value::Null;
+        config["environment_binding"] = serde_json::json!(ENVIRONMENT_BINDING);
+        let primary = LaunchPreparedItemWire {
+            canonical_ref: "worker_execution:fixture/session".to_owned(),
+            source_space: ItemSpaceWire::Project,
+            effective_trust_class: TrustClassWire::TrustedProject,
+            composed: ryeos_handler_protocol::LaunchComposedViewWire {
+                composed: serde_json::json!({"config":config}),
+                derived: BTreeMap::new(),
+                policy_facts: BTreeMap::new(),
+            },
+            resolution_digest: serde_json::json!({"fixture":"primary"}),
+        };
+        let LaunchPrepareResponse::Success { result } =
+            prepare(ryeos_handler_protocol::LaunchPrepareRequest {
+                handler_config: serde_json::json!({}),
+                primary,
+                ref_bindings: BTreeMap::from([(ENVIRONMENT_BINDING.to_owned(), environment)]),
+                config_inputs: BTreeMap::new(),
+            })
+        else {
+            panic!("pending product shape must remain pure preparer input")
+        };
+        let dependency = &result.content_dependencies[ENVIRONMENT_BINDING];
+        assert_eq!(dependency.binding, ENVIRONMENT_BINDING);
+        assert_eq!(dependency.executable_search[0].realization_id, "runtime");
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("witness_hash")
+        );
+    }
+
+    #[test]
+    fn v5_product_shape_is_closed_and_does_not_accept_bundle_slots() {
+        let mut old = pending_product_environment();
+        old.composed.composed["schema"] = serde_json::json!("ryeos.worker_environment.v4");
+        assert!(validate_worker_environment(&old).is_err());
+        let mut missing = pending_product_environment();
+        missing
+            .composed
+            .composed
+            .as_object_mut()
+            .unwrap()
+            .remove("external_product_slots");
+        assert!(validate_worker_environment(&missing).is_err());
+        let mut bundled = pending_product_environment();
+        bundled.source_space = ItemSpaceWire::Bundle;
+        bundled.effective_trust_class = TrustClassWire::TrustedBundle;
+        assert!(validate_worker_environment(&bundled).is_err());
+        for field in ["digest", "witness_hash", "relationship_binding", "locator"] {
+            let mut forged = pending_product_environment();
+            forged.composed.composed["external_product_slots"][0][field] =
+                serde_json::json!("caller");
+            assert!(validate_worker_environment(&forged).is_err(), "{field}");
+        }
+        let mut file_search = pending_product_environment();
+        file_search.composed.composed["external_product_slots"][0]["kind"] =
+            serde_json::json!("file");
+        assert!(validate_worker_environment(&file_search).is_err());
+        let mut undeclared = pending_product_environment();
+        undeclared.composed.composed["configuration"]["process_environment"]["FIXTURE_RUNTIME_ROOT"]
+            ["realization_id"] = serde_json::json!("other");
+        assert!(validate_worker_environment(&undeclared).is_err());
+        let mut protected = pending_product_environment();
+        protected.composed.composed["configuration"]["process_environment"]["PYTHONHOME"] =
+            serde_json::json!({"kind":"literal","value":"/host/python"});
+        assert!(validate_worker_environment(&protected).is_err());
+    }
 
     fn valid_config() -> serde_json::Value {
         serde_json::json!({
@@ -1031,7 +1153,8 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
+                    "external_product_slots":[],
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{
@@ -1094,7 +1217,8 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
+                    "external_product_slots":[],
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{
@@ -1151,7 +1275,8 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
+                    "external_product_slots":[],
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{"executable_search":[],"process_environment":{}},
@@ -1214,7 +1339,8 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
+                    "external_product_slots":[],
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[{
                         "id":"workload-client",

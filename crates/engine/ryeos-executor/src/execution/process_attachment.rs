@@ -22,6 +22,7 @@ pub(crate) struct LifecycleOwnerGuard {
     state: AppState,
     thread_id: String,
     disarmed: bool,
+    settled_owned_wait: bool,
     callback_token: Option<String>,
     thread_auth_token: Option<String>,
     workspace_lifeline: Option<Arc<TempDirGuard>>,
@@ -33,6 +34,7 @@ impl LifecycleOwnerGuard {
             state: state.clone(),
             thread_id: thread_id.to_string(),
             disarmed: false,
+            settled_owned_wait: false,
             callback_token: None,
             thread_auth_token: None,
             workspace_lifeline: None,
@@ -63,11 +65,25 @@ impl LifecycleOwnerGuard {
         Ok(())
     }
 
-    /// Process completion revokes callbacks, but fallible finalization/capture
-    /// still needs the original workspace cleanup owner. Disarm only after
-    /// completed closure or an explicit recovery/shutdown ownership transfer.
-    pub(crate) fn revoke_tokens_after_wait(&mut self) {
+    /// Record a `SpawnedRuntime::wait` result carrying its explicit settled
+    /// attached-wait proof. That proof is emitted only after the exact process
+    /// group was reaped and the attached workspace membership settled. Fallible
+    /// terminal capture still needs this guard's workspace cleanup owner, but
+    /// no later error may be reclassified as an owner-drop kill.
+    pub(crate) fn record_settled_owned_wait(&mut self) {
         self.revoke_tokens();
+        self.settled_owned_wait = true;
+    }
+
+    /// A wait error does not prove that process or workspace descendants are
+    /// quiescent. Revoke callback authority, but retain the ordinary owner-drop
+    /// stop order.
+    pub(crate) fn revoke_tokens_after_unsettled_wait(&mut self) {
+        self.revoke_tokens();
+    }
+
+    pub(crate) fn has_settled_owned_wait(&self) -> bool {
+        self.settled_owned_wait
     }
 
     pub(crate) fn disarm(&mut self) {
