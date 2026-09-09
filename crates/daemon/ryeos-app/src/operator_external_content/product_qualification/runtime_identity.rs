@@ -35,7 +35,10 @@ pub(super) fn reconstruct_current_direct_artifact_identity(
     logical_project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<AdmittedLaunchArtifactIdentity> {
     authority.ensure_guard(guard)?;
-    crate::operator_authority::require_local_configured_operator(state, context)?;
+    // The verifier runs on this node, but its owner can be an authenticated
+    // remote operator. Use the same admitted-owner boundary as qualification
+    // publication; transport locality must not replace principal/site proof.
+    crate::operator_authority::require_admitted_operator(state, context)?;
 
     state.engine.with_checked_bundle_generation(|_| {
         let admission = resolved
@@ -49,7 +52,7 @@ pub(super) fn reconstruct_current_direct_artifact_identity(
         admission.ensure_matches_plan_context(&state.engine, &resolved.plan_context)?;
 
         let EffectivePrincipal::Local(principal) = &resolved.plan_context.requested_by else {
-            bail!("independent product qualification requires a local verifier principal");
+            bail!("independent product qualification rejects delegated verifier principals");
         };
         context.validate_execution_authority(
             &principal.fingerprint,

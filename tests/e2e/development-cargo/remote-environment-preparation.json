@@ -57,6 +57,63 @@
     "Whole candidate diff, independent assertions and source-HEAD-fenced return/integration",
     "Final merge into next"
   ],
+  "followup_20260910_after_merge": {
+    "scope": "Independent disposable local nodes only; historical attempt above retained unchanged",
+    "merged_into_next": "0421be54c",
+    "installed_daemon_sha256": "3249c5c894353444bd35afa62da69a744cba1afb0f2629e601faff324fec7c41",
+    "producer_target_snapshot": "d3bd37ed1c161c8382638276cc2a3fadd687a461f446f460163b49158bb07dfe",
+    "utility_production": {
+      "root": "T-6e0ea1c4-f784-97be-c7b2-7c7ec625aecf",
+      "launch_id": "L-20260910000000000000000000000204",
+      "capsule": "b0833ea381e39190040a093d8d9b90946a6acbf03042f71a6d10bd7561aa4415",
+      "status": "completed",
+      "outcome_code": "success",
+      "built_utilities_witness": "09d933c8e026968b7c70be39afb565edebed2f05c476c5106c6fa56403bdae7d",
+      "build_logs_witness": "346be7f940e9a1439a35fc5e0799a83857f834d8359341c3a07569b002777857"
+    },
+    "environment_production": {
+      "root": "T-16caa6a0-cc96-fea9-5e3c-8caec7806571",
+      "launch_id": "L-20260910000000000000000000000205",
+      "capsule": "dd9347308ca72b2d8b62c8fc9a041b6e18d9ef39f55252684ff625e87ef0599d",
+      "status": "completed",
+      "outcome_code": "success",
+      "runtime_witness": "b6b2c66c236d3483aa01b5b4019317c1ea51785e94d559eee3f13f68a65d8349",
+      "runtime_manifest": "462135d8fd8f9df1101b9100ba3661baaba4a07c7070288262d7dd8b22a50050"
+    },
+    "independent_verifier": {
+      "root": "T-3791358e-a9fa-509c-64a1-67dce9abe0b0",
+      "launch_id": "L-20260910000000000000000000000206",
+      "capsule": "6fa7a920e1c398e857e177fca321c3ea0d26def63dc97333b24cc78309281448",
+      "status": "completed",
+      "outcome_code": "exit:0",
+      "claims": ["authoring_runtime_closed"],
+      "command_count": 43,
+      "elf_count": 51,
+      "network_contacted": false
+    },
+    "qualification_publication": {
+      "status": "failed",
+      "error": "action requires a local_client configured operator",
+      "cause": "Current direct-verifier artifact reconstruction retained a local-client-only guard although the qualification owner admits authenticated remote operators",
+      "source_correction": "Reuse require_admitted_operator, retaining exact owner, scopes, authenticated origin, trusted Bundle and executable provenance checks",
+      "review": "Independent safety review found the correction appropriate and no further locality guard in this path",
+      "focused_api_tests": "9/9 passed; includes unadmitted-operator, owner, serving-site and grant-change negatives",
+      "corrected_installed_qualification": false
+    },
+    "snapshot_inventory": {
+      "rejected_source_snapshot": "18d5cdf86ca2da9e4c4e518c1365733d7b8ad4ffbf781a6cbcbc8fad0bc25ff6",
+      "transferred_or_exposed": false,
+      "finding": "Root-only checks missed retired local bundle artifacts and nested fixture-node history in the main checkout",
+      "policy_correction_commit": "9144c4b91",
+      "focused_capture_policy_test": "1/1 passed with authored-fixture retention checks"
+    },
+    "remaining": [
+      "Install the narrow direct-verifier authority correction and retry qualification against the existing completed verifier",
+      "Recapture and inspect corrected main snapshot, then transfer/reconcile and bind exact worker child consumers",
+      "Real repository worker edit, restricted child operations, restart/reattach, exact completion fence",
+      "Whole candidate diff, independent evaluation, source-HEAD-fenced return and explicit integration"
+    ]
+  },
   "unchanged": [
     "Primary node",
     "Railway",
