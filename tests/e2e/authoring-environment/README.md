@@ -21,6 +21,32 @@ nested-namespace qualification; it must not be replaced by acceptance of PID 0.
 Shell here-document scratch usability remains unresolved. Existing operator-
 driven Cargo and artifact evidence below does not establish these worker gates.
 
+### Offline pinned transport diagnostic
+
+Before another model turn, run the exact retained vendor executable against
+disposable sockets, without a RyeOS node or subscription credentials:
+
+```sh
+python3 -B tests/e2e/authoring-environment/probe_pinned_codex_broker.py \
+  --codex /absolute/path/to/retained/pinned/codex
+```
+
+The probe verifies the executable against the authored Codex activation pin.
+It deliberately uses the test host's Python/readable runtime, not a production
+worker environment; it cannot qualify the complete nested launch. On the pinned
+0.147.0 Linux artifact, direct Unix connect is refused, and the exact-allowlisted
+HTTP Unix-socket proxy request returns **501, `unix sockets unsupported`**.
+An unallowed address request returns 403; the private listener receives nothing.
+This was executed on 2026-09-09 without a model call or node mutation.
+
+Therefore an exact socket allowlist alone is **not** the missing implementation.
+Do not enable unrestricted networking, allow all loopback services, accept PID 0,
+or silently select a different transport. A supported vendor transport and the
+restricted client's authenticated peer contract must be resolved together before
+changing the signed production profile. A newer vendor pin is not presumed to
+fix either requirement until actually qualified. No proxy or authentication
+change is included in this diagnostic checkpoint.
+
 ## Production and independent probes
 
 Production is owned by the ordinary Tools and adjacent libraries under

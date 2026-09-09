@@ -28,6 +28,7 @@ __pycache__/
 !authoring-environment/utility_build_probe.py
 !authoring-environment/build-support-qualification.json
 !authoring-environment/hosted-worker-qualification.json
+!authoring-environment/probe_pinned_codex_broker.py
 !authoring-environment/test_probe.py
 !authoring-environment/qualify.py
 !authoring-environment/probe.sh

@@ -81,7 +81,22 @@
       "disposition": "discarded_without_publication"
     }
   ],
+  "offline_transport_diagnostic": {
+    "date": "2026-09-09",
+    "probe": "probe_pinned_codex_broker.py",
+    "codex_sha256": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40",
+    "model_calls": 0,
+    "node_mutations": 0,
+    "direct_unix_connect_errno": 1,
+    "exact_allowlisted_unix_proxy_status": 501,
+    "exact_allowlisted_unix_proxy_body": "unix sockets unsupported",
+    "unallowed_address_proxy_status": 403,
+    "broker_contacted": false,
+    "production_transport_changed": false,
+    "nested_broker_authentication_qualified": false
+  },
   "remaining": [
+    "Resolve the pinned Linux artifact's unsupported Unix-socket proxy before choosing any new transport or vendor pin.",
     "Admit only the exact restricted broker transport through the nested command sandbox without external destinations.",
     "Qualify authenticated broker identity across nested PID namespaces; no PID-zero or UID-only fallback.",
     "Provide explicitly scoped shell scratch through existing environment and filesystem owners.",
