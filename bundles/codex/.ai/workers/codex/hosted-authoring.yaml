@@ -1,6 +1,6 @@
-# ryeos:signed:2026-09-09T00:37:00Z:c20c399d3386207d6cb7d9ca4a93e2bad2c2eb2768ff3503426329a456011943:qql2banYxRelK6je3rd+JQWwZoWQknUJNAr7lKFBfbK9e+M4y4mPfzMqfeZAJxoeZLisdYSbGEm6EieTphHnCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-09T00:41:03Z:74fdd7e5d3cf932cd37d15aabc61352ab99488ddfac18c72c4f634d2d25a0294:01ycnAhsy2UHXAO94Gc6/sj02+G7d1gNPsSSihstS6JOhWeB8pEVmBgLV+FloqOX5lZgvKebL2uurAb1p1fNCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "codex"
-version: "1.0.1"
+version: "1.0.2"
 executor_id: "@subprocess"
 description: "Codex authoring profile; select through config:codex/environments/authoring."
 execution_protocol: protocol:ryeos/core/structured_session
@@ -18,7 +18,7 @@ session_resources:
 source:
   root: "lib/hosted"
   entry: "authoring.profile.json"
-  digest: "22455334617b0b2605ef33f7019882ead3af809332c249a850c60bda5f0f7faa"
+  digest: "df3e94c9b03a76b2266d75376422df497199ba0b3b78c862b2024c41508eeab2"
 
 external_content:
   - id: codex

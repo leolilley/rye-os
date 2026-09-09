@@ -87,6 +87,7 @@ class CodexContractTests(unittest.TestCase):
             self.assertEqual({key for key, value in policy["filters"].items()
                               if value == "include"}, {
                 "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+                "TZ", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_PAGER",
                 "RYEOS_WORKLOAD_CLIENT_ENDPOINT",
             })
             for name in ("HOME", "CODEX_HOME", "DBUS_*", "SSH_*", "*PROXY"):

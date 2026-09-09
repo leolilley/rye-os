@@ -116,6 +116,16 @@ class AuthoringEnvironmentTests(unittest.TestCase):
         self.assertEqual(filesystem.pop("/ryeos/realizations/authoring-tools"), "read")
         self.assertEqual(actual, original)
 
+    def test_authored_shell_environment_is_not_silently_dropped(self):
+        policy = tomllib.loads((SOURCE / "authoring.config.toml").read_text())[
+            "shell_environment_policy"]
+        self.assertEqual(policy["inherit"], "all")
+        development = yaml.safe_load((REPOSITORY /
+            ".ai/config/development/ryeos/worker-environment.yaml").read_text())
+        for environment in (self.environment, development):
+            for name in environment["configuration"]["process_environment"]:
+                self.assertEqual(policy["filters"].get(name), "include", name)
+
     def test_input_selection_is_the_authored_finite_contract(self):
         production = module("authoring_production", REPOSITORY /
             ".ai/tools/ryeos/development/authoring-environment-production/lib/production.py")

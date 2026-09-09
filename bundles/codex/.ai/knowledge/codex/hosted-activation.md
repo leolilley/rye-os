@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-09T00:37:00Z:089b733e4bdb8c5751a73108a9efc02dd6a68a383643137eed659abda321792d:eBcd4kTG5ymSR5n1Ym9mlBM8kXTILmS+mO6K3JN6iV2OGKc41JPnj9nrbAs7kCIwSNdOO5khpJyg0kngE1OKAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T00:41:03Z:75940fc01824758ac88044cd3ae7e80a2814558aa963d5ba28b63b499edfa733:m9dfp5mtbyg3fVZBH+f52Od3U0jM5/cDWYuFjMUMBQNdv7Qb3Ai4x7fAwc9L+Pwxnl1ZVrVpyvNXO2BJpfR6CQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [codex, hosted-execution, structured-session, credentials, acceptance]
-version: "1.9.0"
+version: "1.10.0"
 description: >
   Activation, credential ceremony, command routes, and release acceptance for
   the pinned Codex structured-session workload.
@@ -170,7 +170,8 @@ configured-operator forwarding route to inspect profiles on a remote node.
    check pass.
 
    Both signed Codex profiles pass only PATH, selected locale/terminal
-   variables and the exact `RYEOS_WORKLOAD_CLIENT_ENDPOINT` into shell
+   variables, authored GIT_CONFIG_NOSYSTEM/GIT_CONFIG_GLOBAL/GIT_PAGER settings,
+   and the exact `RYEOS_WORKLOAD_CLIENT_ENDPOINT` into shell
    children. They filter the bridge's admitted environment with a finite
    include list; `inherit="core"` would discard the broker coordinate before
    that filtering. HOME, CODEX_HOME, credentials, proxy configuration and
