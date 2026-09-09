@@ -2792,6 +2792,25 @@ pub async fn execute_command(
         acquire_credential_profile_contact(&initial.credential_profile_id, placement_thread_id)
             .await?;
     let session = current_session(state, placement_thread_id)?;
+    // An unavailable caller route must not reserve a command or cross possible
+    // contact: the bridge treats a protocol refusal as a worker failure. Consult the
+    // same frozen profile/route selection used at launch, not live bundle
+    // definitions. Runtime recovery has its separate daemon-owned surface.
+    let public_protocol = if command_kind == "route" {
+        let launch = state
+            .state_store
+            .admitted_launch_capsule(placement_thread_id)?
+            .ok_or_else(|| anyhow!("hosted root lost its admitted launch capsule"))?;
+        let profile = admitted_structured_protocol(state, &session.admitted_capsule_hash)?;
+        validate_public_command_surface(
+            &profile.contract,
+            admitted_worker_execution_config(&launch)?,
+            &payload,
+        )?;
+        Some(profile)
+    } else {
+        None
+    };
     if command_kind == "route"
         && session.candidate_disposition
             == crate::runtime_db::DedicatedCandidateDisposition::RetainedForReview
@@ -2815,8 +2834,10 @@ pub async fn execute_command(
     let worker_boot_epoch = session
         .worker_boot_epoch
         .ok_or_else(|| anyhow!("dedicated session has no attached worker"))?;
-    let (protocol_profile_hash, protocol_schema_hashes) =
-        structured_protocol_identity(state, &session.admitted_capsule_hash)?;
+    let (protocol_profile_hash, protocol_schema_hashes) = match public_protocol {
+        Some(profile) => (profile.profile_hash, profile.schema_hashes),
+        None => structured_protocol_identity(state, &session.admitted_capsule_hash)?,
+    };
     let observation_limit = command_observation_limit(command_kind)?;
     let record =
         state
@@ -3140,6 +3161,14 @@ fn structured_protocol_identity(
     state: &AppState,
     capsule_hash: &str,
 ) -> Result<(String, std::collections::BTreeMap<String, String>)> {
+    let profile = admitted_structured_protocol(state, capsule_hash)?;
+    Ok((profile.profile_hash, profile.schema_hashes))
+}
+
+fn admitted_structured_protocol(
+    state: &AppState,
+    capsule_hash: &str,
+) -> Result<ryeos_state::objects::AdmittedStructuredSessionProfile> {
     let authority = state.state_store.pinned_state_authority()?;
     let guard = authority.acquire_shared_guard()?;
     authority.ensure_guard(&guard)?;
@@ -3152,10 +3181,63 @@ fn structured_protocol_identity(
     if capsule.content_hash()? != capsule_hash {
         bail!("admitted session capsule content hash changed");
     }
-    let profile = capsule
+    capsule
         .structured_session_profile
-        .ok_or_else(|| anyhow!("structured session capsule has no admitted protocol profile"))?;
-    Ok((profile.profile_hash, profile.schema_hashes))
+        .ok_or_else(|| anyhow!("structured session capsule has no admitted protocol profile"))
+}
+
+/// Select from already-compiled launch authority; this is not another profile
+/// compiler or provider request-schema validator. The bridge still validates
+/// payload semantics and runtime session binding. Visibility is checked here
+/// because even sending a refused command crosses the durable contact boundary.
+fn validate_public_command_surface(
+    contract: &Value,
+    worker_execution: &Value,
+    payload: &Value,
+) -> Result<()> {
+    let command = payload
+        .as_object()
+        .filter(|command| {
+            command.len() == 2
+                && command.contains_key("route_id")
+                && command.contains_key("payload")
+        })
+        .ok_or_else(|| {
+            anyhow!("public structured-session command requires only route_id and payload")
+        })?;
+    let route_id = command["route_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("public structured-session command has no route id"))?;
+    let route_set = worker_execution
+        .get("route_set")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("hosted root lost its admitted route selection"))?;
+    let selected = contract
+        .get("route_sets")
+        .and_then(|sets| sets.get(route_set))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("admitted structured-session route set disappeared"))?;
+    if !selected.iter().any(|id| id.as_str() == Some(route_id)) {
+        bail!("structured-session route is not admitted for this execution");
+    }
+    let route = contract
+        .get("routes")
+        .and_then(Value::as_array)
+        .and_then(|routes| {
+            routes
+                .iter()
+                .find(|route| route.get("id").and_then(Value::as_str) == Some(route_id))
+        })
+        .ok_or_else(|| anyhow!("admitted structured-session route is undefined"))?;
+    // Omitted audience means public in the existing signed profile contract.
+    // Null/unknown values are not omitted and cannot acquire public authority.
+    if route
+        .get("audience")
+        .is_some_and(|audience| audience.as_str() != Some("public"))
+    {
+        bail!("structured-session route is not available on this command surface");
+    }
+    Ok(())
 }
 
 fn command_observation_limit(command_kind: &str) -> Result<usize> {
@@ -5539,6 +5621,55 @@ pub fn abort_session_for_root_stop(state: &AppState, placement_thread_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_command_surface_uses_only_frozen_selected_public_routes() {
+        let contract = json!({
+            "route_sets": {"selected": ["public.explicit", "public.default", "recovery.inspect"]},
+            "routes": [
+                {"id": "public.explicit", "audience": "public"},
+                {"id": "public.default"},
+                {"id": "recovery.inspect", "audience": "runtime"},
+                {"id": "other.public", "audience": "public"}
+            ]
+        });
+        let config = json!({"route_set": "selected"});
+        for route_id in ["public.explicit", "public.default"] {
+            validate_public_command_surface(
+                &contract,
+                &config,
+                &json!({"route_id": route_id, "payload": {}}),
+            )
+            .unwrap();
+        }
+        for route_id in ["recovery.inspect", "other.public", "unknown"] {
+            assert!(
+                validate_public_command_surface(
+                    &contract,
+                    &config,
+                    &json!({"route_id": route_id, "payload": {}}),
+                )
+                .is_err(),
+                "{route_id} must be rejected before reservation or worker contact"
+            );
+        }
+        for payload in [
+            json!({"route_id": "public.explicit"}),
+            json!({"route_id": 1, "payload": {}}),
+            json!({"route_id": "public.explicit", "payload": {}, "ryeos_control": {}}),
+        ] {
+            assert!(validate_public_command_surface(&contract, &config, &payload).is_err());
+        }
+        let command = json!({"route_id": "public.explicit", "payload": {}});
+        for config in [json!({}), json!({"route_set": "other"})] {
+            assert!(validate_public_command_surface(&contract, &config, &command).is_err());
+        }
+        for audience in [Value::Null, json!("unknown")] {
+            let mut changed = contract.clone();
+            changed["routes"][0]["audience"] = audience;
+            assert!(validate_public_command_surface(&changed, &config, &command).is_err());
+        }
+    }
 
     #[test]
     fn retirement_recovery_cannot_overrule_a_retained_process_owner() {

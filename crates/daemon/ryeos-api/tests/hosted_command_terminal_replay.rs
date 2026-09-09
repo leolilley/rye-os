@@ -88,6 +88,7 @@ fn store_structured_session_capsule(state: &ryeos_app::state::AppState) -> (Stri
         },
         execution_realization_hash: "8".repeat(64),
         source_binding_hash: None,
+        retained_product_selections: None,
         structured_session_profile: Some(AdmittedStructuredSessionProfile {
             profile_hash: profile_hash.clone(),
             contract,

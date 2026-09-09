@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T09:15:12Z:3c6d25e9c35342c59f7d9ec0109552f0bfa57ec65d8669ebafc821f2fa72bba4:bvzXxA/leo4yc2pe0bh62bTgXSehbfnFiV9Hn/uEC88I6+5pV+0BOuDo1jcnuT+3Jgn8W/gS/QPvUpLoojDTAg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T10:43:33Z:178348aa4c86140ceea4d0cb9e6dccb8af857a5fa4f3e58c66942aaa54f267e9:Wd7H6tWAzBkIw9UjGvX5ErLZUz+5AVk1hA02MtrgIaI8f8g29GMck6ml6wVNQeRA0Sxcyt65l/Hb+8wrEmXpCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -741,6 +741,12 @@ cleanup retain quarantine; unconditional resource destruction is not settlement
 evidence. Shutdown retains the coordinator's recovery obligations. These rules
 apply equally to fresh, detached and resumed child execution and do not give a
 child authority to close or publish its parent's workspace.
+
+Unknown command delivery is distinct from unknown process cleanup. When the
+exact placement/capsule has retained reaped-worker testimony, no current epoch,
+and no unsettled worker or conflicting pool ownership, workspace capture may
+proceed without settling or replaying the unknown command. A newer pending
+boot defeats older cleanup evidence. An absent PID alone proves neither case.
 
 The immutable runtime covers engine plan subprocesses, managed and streaming
 runtime launches, compose-context children, external parser/composer handlers

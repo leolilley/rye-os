@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T09:15:12Z:e0ed505a17be2f2ccf3825b56c555685a3ef05df1ace2713f1ff10a3eab04c81:8lAA/VrIocEEtVzxR9HE3VBcojSB/vGbYIMERy4F/RcqXR+Uegm7lJ51GgPQJoQ5cTMBH29Man4NGzIxqrNSCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T10:43:33Z:86e2714ada7b1f294f997d73220b2629890237555501b87bbdda3a5478c68aeb:j1MRSfsltuKzQ6hPTztNv6i6rvJLKMdTdrnV46jqKPw9XNsXcA37hCSINeP7rqnTZuOwtrxxts3UfRGd5WaqDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
@@ -114,6 +114,13 @@ replacement receives `MAX(boot_epoch)+1`. Dead/reaped or
 dead/unproved rows remain as exact cleanup evidence. The dedicated-session,
 credential-lock, and workspace ownership compare-and-swap transaction admits
 at most one current worker; recovery cannot erase or reuse a prior epoch.
+
+Public route commands select only public-audience routes in the root's frozen
+route set. Unknown, unselected, or recovery-only routes are rejected before
+command reservation and worker contact. Daemon-owned reattachment uses its
+separate runtime surface. Exact settled command replay remains a read of its
+original testimony, even after terminalization; it does not re-admit or resend
+the request. Payload semantics remain governed by the admitted protocol.
 
 Every profile and worker-execution entry point admits only an exact
 node-admitted operator principal: either the node's configured local operator

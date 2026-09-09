@@ -19,6 +19,7 @@ __pycache__/
 !*/outputs/.gitkeep
 !execution-comparison/README.md
 !environment-products/README.md
+!authoring-environment/invocation-qualification-v18-20260909.json
 !environment-products/assert-live-response.py
 !environment-products/test_response_assertions.py
 !environment-products/check-fixture.sh

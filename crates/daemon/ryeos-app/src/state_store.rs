@@ -6185,10 +6185,12 @@ impl StateStore {
             bail!("dedicated session does not name the capture workspace");
         }
         let Some(worker_id) = session.worker_instance_id.as_deref() else {
-            let retired_for_recovery = session.state == "recovering"
-                && session.send_boundary == "none"
-                && g.runtime_db
-                    .placement_has_reaped_worker_history(root, &session.admitted_capsule_hash)?;
+            let retired_for_recovery = matches!(
+                (session.state.as_str(), session.send_boundary.as_str()),
+                ("recovering", "none") | ("outcome_unknown", "outcome_unknown")
+            ) && g
+                .runtime_db
+                .placement_has_reaped_worker_history(root, &session.admitted_capsule_hash)?;
             let failed_start_settled =
                 session.state == "terminal" && session.send_boundary != "outcome_unknown";
             if session.worker_boot_epoch.is_some()
@@ -6200,6 +6202,9 @@ impl StateStore {
             // cleanup testimony. Recovery instead requires indexed old-boot
             // retirement. Admission reserves each newer ID/epoch before contact,
             // so an old reaped boot cannot conceal a newer pending attempt.
+            // A contacted command can remain outcome-unknown after this exact
+            // process is proved reaped. Capture consumes only cleanup testimony;
+            // it must not settle or replay that command to obtain quiescence.
             return Ok(None);
         };
         let worker = g
@@ -18322,9 +18327,13 @@ mod tests {
 
     #[test]
     fn workspace_capture_refuses_pending_and_identity_unknown_worker_start() {
-        for (cleanup_proved, recovered_boot) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (cleanup_proved, recovered_boot, contacted_command) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
             let (store, binding) = workspace_binding_fixture();
             let root = "T-workspace-root";
             let workspace = store
@@ -18393,6 +18402,27 @@ mod tests {
                         updated_at_ms: 1,
                     })
                     .unwrap();
+                let contacted = if contacted_command {
+                    store
+                        .complete_worker_binding("worker-capture", root, 1)
+                        .unwrap();
+                    let command = store
+                        .reserve_dedicated_session_command(NewDedicatedSessionCommand {
+                            placement_thread_id: root,
+                            idempotency_key: "capture-contacted-command",
+                            worker_boot_epoch: 1,
+                            command_kind: "route",
+                            request_digest: &"c".repeat(64),
+                            payload: &serde_json::json!({"route": "fixture.read"}),
+                        })
+                        .unwrap();
+                    store
+                        .mark_dedicated_command_contacted(root, command.command_sequence, 1)
+                        .unwrap();
+                    Some(command.command_sequence)
+                } else {
+                    None
+                };
                 store
                     .fence_abandoned_worker_process("worker-capture", root, 1, "reaped")
                     .unwrap();
@@ -18406,9 +18436,56 @@ mod tests {
                         .unwrap()
                         .is_none()
                 );
+                if let Some(sequence) = contacted {
+                    let session = store.dedicated_session(root).unwrap().unwrap();
+                    assert_eq!(session.state, "outcome_unknown");
+                    assert_eq!(session.send_boundary, "outcome_unknown");
+                    assert!(session.worker_instance_id.is_none());
+                    assert!(session.worker_boot_epoch.is_none());
+                    let command = store
+                        .dedicated_session_command(root, sequence)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(command.state, "outcome_unknown");
+                    assert_eq!(command.worker_boot_epoch, 1);
+                    assert!(command.result.is_none());
+                    assert!(
+                        store
+                            .mark_dedicated_command_contacted(root, sequence, 1)
+                            .is_err()
+                    );
+                }
                 store
                     .acquire_credential_profile("P-capture", "fp:operator", "worker-next")
                     .unwrap();
+                if contacted.is_some() {
+                    // Proven process retirement permits capture, not automatic
+                    // recovery of an unknown command. The uncontacted cases
+                    // below separately prove that a valid newer pending boot
+                    // cannot hide behind this historical cleanup testimony.
+                    assert!(
+                        store
+                            .prepare_dedicated_session_recovery(
+                                root,
+                                1,
+                                "worker-next",
+                                &binding.workspace_id
+                            )
+                            .is_err()
+                    );
+                    let session = store.dedicated_session(root).unwrap().unwrap();
+                    assert_eq!(session.state, "outcome_unknown");
+                    assert_eq!(session.send_boundary, "outcome_unknown");
+                    assert!(session.worker_instance_id.is_none());
+                    assert!(session.worker_boot_epoch.is_none());
+                    assert!(
+                        store
+                            .workspace_worker_capture_record(&retired)
+                            .unwrap()
+                            .is_none()
+                    );
+                    continue;
+                }
                 assert_eq!(
                     store
                         .prepare_dedicated_session_recovery(
