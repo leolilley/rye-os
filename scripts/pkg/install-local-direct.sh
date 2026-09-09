@@ -146,20 +146,32 @@ fi
 ryeos_user() {
     local secs="$1"
     shift
+    # Initialization already passes the selected app root explicitly. Carry
+    # the same selection across sudo/login for lifecycle operations too;
+    # otherwise an install targeting a second node can stop the primary node.
+    local selected_app_root="${init_app_root:-${RYEOS_APP_ROOT:-}}"
     if [[ "$invoking_user" != "$(id -un)" ]]; then
         local user_shell cmd a
         user_shell="$(getent passwd "$invoking_user" | cut -d: -f7)"
         [[ -x "$user_shell" ]] || user_shell="/bin/sh"
-        printf -v cmd 'exec ryeos'
+        if [[ -n "$selected_app_root" ]]; then
+            printf -v cmd 'exec env %q ryeos' "RYEOS_APP_ROOT=$selected_app_root"
+        else
+            printf -v cmd 'exec ryeos'
+        fi
         for a in "$@"; do printf -v cmd '%s %q' "$cmd" "$a"; done
         run_timeout "$secs" sudo -H -u "$invoking_user" "$user_shell" -lc "$cmd"
     else
-        run_timeout "$secs" ryeos "$@"
+        if [[ -n "$selected_app_root" ]]; then
+            RYEOS_APP_ROOT="$selected_app_root" run_timeout "$secs" ryeos "$@"
+        else
+            run_timeout "$secs" ryeos "$@"
+        fi
     fi
 }
 
 ryeos_status_quick() {
-    RYEOS_TTY=never ryeos_user 10 node status 2>/dev/null || true
+    RYEOS_TTY=never ryeos_user 10 node status
 }
 
 # Build only the init-profile portion of init. The distribution mapping is
@@ -317,6 +329,30 @@ require_closed_source_bundle_payloads() {
     fi
 }
 
+# This is an external host-install boundary, not node or workload policy.
+# Complete it before entering lifecycle shutdown: discovering a missing binary
+# or prompting for sudo after stop strands a previously working node. The
+# lifecycle owner, not this shell helper, must later establish supervisor
+# inhibition and descendant recovery obligations for replacement.
+preflight_host_install() {
+    local release_dir="$1" binary
+    shift
+    for binary in "$@"; do
+        [[ -f "$release_dir/$binary" && -x "$release_dir/$binary" ]] || {
+            ryeos_term_fail "missing required release binary: $release_dir/$binary"
+            return 1
+        }
+    done
+    if [[ $(id -u) -ne 0 ]]; then
+        # Never hide the only authorization prompt behind a progress renderer.
+        ryeos_term_suspend
+        sudo -v || {
+            ryeos_term_fail "sudo authorization is required before stopping the node"
+            return 1
+        }
+    fi
+}
+
 # Build init trust arguments from the exact source boundary the installer
 # selected and validated. The result intentionally excludes every other
 # document that might already exist below the packaged share directory.
@@ -343,84 +379,38 @@ collect_selected_source_trust_args() {
     return 0
 }
 
-pid_from_status() {
-    awk '
-        /^pid:/ { print $2; exit }
-        /daemon \(pid [0-9]+\)/ {
-            line=$0
-            sub(/^.*daemon \(pid /, "", line)
-            sub(/\).*$/, "", line)
-            print line
-            exit
-        }
-    '
-}
-
 status_has_live_daemon() {
     grep -Eq '^(running|starting — daemon|live daemon control is unusable|failed — daemon)'
 }
 
-verified_local_ryeosd_pid() {
-    local pid="$1" expected_uid actual_uid comm
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
-    [[ -r "/proc/$pid/comm" ]] || return 1
-    read -r comm < "/proc/$pid/comm" || return 1
-    [[ "$comm" == "ryeosd" ]] || return 1
-    expected_uid="$(id -u "$invoking_user")"
-    actual_uid="$(stat -c %u "/proc/$pid" 2>/dev/null)" || return 1
-    [[ "$actual_uid" == "$expected_uid" ]]
-}
-
 stop_daemon_for_install() {
-    local status_out pid final_status stop_succeeded=1
+    local status_out final_status
 
-    status_out="$(ryeos_status_quick)"
+    status_out="$(ryeos_status_quick)" || \
+        die "cannot establish node lifecycle state; refusing binary replacement"
     if ! status_has_live_daemon <<<"$status_out"; then
-        return 1
+        # Only an affirmative offline result permits an initially stopped
+        # install. Failed probes, stale ownership and unfamiliar output must
+        # never be interpreted as absence of a node.
+        if grep -Eq '^(initialized, stopped|not initialized)' <<<"$status_out"; then
+            return 1
+        fi
+        die "node lifecycle ownership is uncertain; refusing binary replacement"
     fi
-
-    pid="$(pid_from_status <<<"$status_out")"
-    verified_local_ryeosd_pid "$pid" || \
-        die "refusing stop because lifecycle PID '${pid:-missing}' is not a verified ryeosd owned by $invoking_user"
 
     ryeos_term_info "stopping live daemon before replacing binaries"
     ryeos_term_suspend
-    if ! ryeos_user 30 stop --force; then
-        stop_succeeded=0
-        ryeos_term_warn "ryeos stop timed out or failed; falling back to direct process kill"
-    fi
+    # Exact process control and escalation belong to the installed lifecycle
+    # owner/Lillux. A shell PID/name check cannot pin a process incarnation and
+    # cannot inhibit supervisor restart or settle a retained worker scope.
+    # There is deliberately no numeric-PID kill or predecessor-client fallback.
+    ryeos_user 30 stop --force || \
+        die "node shutdown failed; refusing binary replacement (no direct-kill fallback)"
 
-    # Older installed clients can report success as soon as daemon metadata and
-    # sockets disappear even though the process is still draining uncancellable
-    # blocking work. The installer must gate replacement on the original PID,
-    # not lifecycle presentation state.
-    if kill -0 "$pid" 2>/dev/null; then
-        if [[ $stop_succeeded -eq 1 ]]; then
-            ryeos_term_warn "stop returned before daemon pid $pid exited; forcing stale process"
-        fi
-        verified_local_ryeosd_pid "$pid" || \
-            die "refusing direct stop because pid $pid changed identity before exit"
-        kill "$pid" 2>/dev/null || true
-        for _ in {1..30}; do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.2
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-        for _ in {1..10}; do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.2
-        done
-        kill -0 "$pid" 2>/dev/null && \
-            die "daemon pid $pid remained live after forced stop"
-    fi
-
-    final_status="$(ryeos_status_quick)"
-    if status_has_live_daemon <<<"$final_status"; then
-        die "failed to stop live daemon before install"
-    fi
+    final_status="$(ryeos_status_quick)" || \
+        die "cannot verify stopped node; refusing binary replacement"
+    grep -Eq '^initialized, stopped' <<<"$final_status" || \
+        die "node did not remain stopped; refusing binary replacement"
 
     return 0
 }
@@ -696,16 +686,33 @@ while IFS= read -r node_init_profile_name; do
         die "source-root node init-profile contract is invalid: $node_init_profile_name"
 done < <(ryeos_node_init_profile_names)
 
+# Reject an invalid profile-selection request before shutdown or package writes.
+# This selects arguments only; init's existing locked prospective-generation
+# compiler remains the authority for signed policy validation/publication.
+if [[ $run_init -eq 1 ]]; then
+    state_root="${init_app_root:-$invoking_user_home/.local/share/ryeos}"
+    policy_generation_path="$state_root/.ai/node/policies"
+    if [[ $reset_node_policy_generation -eq 1 ]]; then
+        [[ -e "$policy_generation_path" && ! -L "$policy_generation_path" ]] || \
+            die "--reset-node-policy-generation requires an existing safe policy generation"
+    elif [[ -n "$node_profile_override" \
+        && ( -e "$policy_generation_path" || -L "$policy_generation_path" ) ]]; then
+        die "--node-profile selects first publication only; use --reset-node-policy-generation to replace an existing generation explicitly"
+    fi
+    build_install_init_profile_args \
+        "$policy_generation_path" "$node_init_profile" "$reset_node_policy_generation" || \
+        die "could not resolve init-profile arguments"
+fi
+
+preflight_host_install "$target_dir" "${required_bins[@]}" || \
+    die "host install preflight failed; node lifecycle was not changed"
+
 daemon_was_running=0
 if [[ $restart_daemon -eq 1 ]] && command -v ryeos >/dev/null 2>&1; then
     if stop_daemon_for_install; then
         daemon_was_running=1
     fi
 fi
-
-for b in "${required_bins[@]}"; do
-    [[ -x "$target_dir/$b" ]] || die "missing required release binary: $target_dir/$b"
-done
 
 # Clean up stale bundle binaries from /usr/bin/.
 # Previous installs placed handler/runtime/tool binaries there;
@@ -735,12 +742,6 @@ for b in "${stale_bins[@]}"; do
         sudo rm -f "$bin_dir/$b"
     fi
 done
-
-# Pre-authorize sudo before any spinner owns the terminal; a password prompt
-# raised under the progress UI is invisible and times out.
-if [[ $(id -u) -ne 0 ]]; then
-    sudo -v || die "sudo authorization is required for /usr installs"
-fi
 
 ryeos_term_begin INSTALL "installing binaries"
 for b in "${required_bins[@]}"; do
@@ -846,18 +847,6 @@ if [[ $run_init -eq 1 ]]; then
     init_as=()
     [[ "$invoking_user" != "$(id -un)" ]] && init_as=(sudo -H -u "$invoking_user")
     ryeos_term_update "initializing node state" "user $invoking_user"
-    state_root="${init_app_root:-$invoking_user_home/.local/share/ryeos}"
-    policy_generation_path="$state_root/.ai/node/policies"
-    if [[ $reset_node_policy_generation -eq 1 ]]; then
-        [[ -e "$policy_generation_path" && ! -L "$policy_generation_path" ]] || \
-            die "--reset-node-policy-generation requires an existing safe policy generation"
-    elif [[ -n "$node_profile_override" \
-        && ( -e "$policy_generation_path" || -L "$policy_generation_path" ) ]]; then
-        die "--node-profile selects first publication only; use --reset-node-policy-generation to replace an existing generation explicitly"
-    fi
-    build_install_init_profile_args \
-        "$policy_generation_path" "$node_init_profile" "$reset_node_policy_generation" || \
-        die "could not resolve init-profile arguments"
     if [[ $reset_node_policy_generation -eq 1 ]]; then
         ryeos_term_note "replacing obsolete signed node policy generation during initialization"
     elif [[ $INSTALL_PUBLISH_INITIAL_POLICY -eq 1 ]]; then
