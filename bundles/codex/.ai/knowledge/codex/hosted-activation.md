@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T09:15:12Z:6db58a0759caec6c323a7555be65f991eb421900237297e132d4a130c23deb17:Jp7hoKBOPMeJdRyla6TGOMm7imV1/nqKhbTisLH/YpLJHDZkeTQvFcucpbFx2X8yZRlES4rl3EQzTD31osjqAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T18:08:16Z:f03f254b392fb57f1366ada26124585bb8d4f7bfbd21aa6cb980a66b764b311e:3aTSK8CKlNgRvL7DbDpXm1CdIPPq2VjyHw3Bvm9wvc7ArZr2Sc5RDIw3jS4kBvIJKsiJJhjfg96XdqfYW6xtDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [codex, hosted-execution, structured-session, credentials, acceptance]
@@ -182,6 +182,18 @@ configured-operator forwarding route to inspect profiles on a remote node.
    bounded execution request; the daemon retains and revalidates authority.
 
    Ordinary shell/editing commands remain Codex commands. The Codex profiles
+   mount their executable resources and command tools in the existing immutable
+   execution-runtime namespace, not under the editable project. Their finite
+   nested-sandbox read permissions cover these exact pinned inputs. Runtime
+   mountpoint setup must not become source edits in a frozen candidate; inspect
+   the complete candidate diff independently of the task-specific evaluator.
+   Moving these mounts changes the admitted worker program and capsule, not
+   installed-bundle literal binding identity (consumer ref and publisher).
+   Revalidate exact retained manifests, bindings and current grants under the
+   new signed source; do not infer that unchanged bytes need acquisition or
+   that an old running capsule silently adopts the new program.
+
+   The Codex profiles
    no longer expose `/tmp/.ryeos-wc` or its endpoint variable. Native CLI ingress
    remains a separate RyeOS interface; connectivity from Codex's nested sandbox
    is not qualified and must not be claimed from a protocol callback test.

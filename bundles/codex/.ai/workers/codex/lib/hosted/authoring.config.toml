@@ -42,6 +42,12 @@ extends = ":workspace"
 ":minimal" = "read"
 ":tmpdir" = "write"
 ":slash_tmp" = "deny"
+# Process resources are pinned read-only runtime inputs, never project files.
+"/ryeos/realizations/codex" = "read"
+"/ryeos/realizations/codex-code-mode-host" = "read"
+"/ryeos/realizations/codex-resources/bwrap" = "read"
+"/ryeos/realizations/codex-resources/zsh/bin/zsh" = "read"
+"/ryeos/realizations/codex-path/rg" = "read"
 "/ryeos/realizations/authoring-tools" = "read"
 
 [permissions.ryeos-workspace-only.filesystem.":workspace_roots"]

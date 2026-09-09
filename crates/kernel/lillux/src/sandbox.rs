@@ -661,18 +661,12 @@ mod imp {
                 .then_with(|| left.destination.cmp(&right.destination))
         });
         for (index, mount) in mounts.iter().enumerate() {
-            // Source-backed ancestors must already contain their targets.
-            // Creating a missing child after binding a live source would
-            // mutate that source; precreating it before binding hides it.
-            if !mounts[..index]
-                .iter()
-                .any(|parent| mount.destination.starts_with(&parent.destination))
-            {
-                create_target(
-                    &rooted(&mount.destination)?,
-                    descriptor_kind(mount.source_fd)?,
-                )?;
-            }
+            prepare_descriptor_mount_target(
+                &mount.destination,
+                descriptor_kind(mount.source_fd)?,
+                request.overlay.as_ref().map(|overlay| &overlay.destination),
+                &mounts[..index],
+            )?;
             bind_descriptor_mount(mount)
                 .map_err(|error| format!("mount {}: {error}", mount.destination.display()))?;
             if let Some(view) = request
@@ -1274,6 +1268,38 @@ mod imp {
         match kind {
             DescriptorKind::Directory => create_directory_target(path),
             DescriptorKind::Regular | DescriptorKind::UnixSocket => create_regular_target(path),
+        }
+    }
+
+    fn prepare_descriptor_mount_target(
+        destination: &PathBuf,
+        kind: DescriptorKind,
+        overlay_destination: Option<&PathBuf>,
+        preceding_mounts: &[LinuxSandboxMount],
+    ) -> Result<(), String> {
+        let target = rooted(destination)?;
+        // Source-backed ancestors must already contain their targets. The
+        // overlay is mounted before the ordinary mounts: creating even an empty
+        // target beneath it writes into the retained CoW upper and contaminates
+        // later project capture. The same rule protects earlier bind sources.
+        // Only private namespace-owned paths may acquire mount placeholders;
+        // precreating a child before mounting its source would merely hide it.
+        let source_backed = overlay_destination
+            .is_some_and(|parent| destination.starts_with(parent))
+            || preceding_mounts
+                .iter()
+                .any(|parent| destination.starts_with(&parent.destination));
+        if source_backed {
+            match kind {
+                DescriptorKind::Directory => {
+                    ensure_directory_path(&target, "source-backed sandbox mount target")
+                }
+                DescriptorKind::Regular | DescriptorKind::UnixSocket => {
+                    ensure_regular_path(&target, "source-backed sandbox mount target")
+                }
+            }
+        } else {
+            create_target(&target, kind)
         }
     }
 
@@ -3597,6 +3623,134 @@ mod imp {
     #[cfg(test)]
     mod namespace_source_tests {
         use super::*;
+
+        #[test]
+        fn source_backed_mount_targets_never_create_absent_overlay_children() {
+            // Exercise the preparation seam used after mounting the CoW view,
+            // without requiring namespace privileges. Any write here would be
+            // a write to that view's upper in the real launch sequence.
+            let backing = tempfile::tempdir_in(ROOT).unwrap();
+            let destination = PathBuf::from("/").join(backing.path().strip_prefix(ROOT).unwrap());
+            let retained = backing.path().join("retained");
+            std::fs::write(&retained, b"candidate edits").unwrap();
+            for (relative, kind) in [
+                ("absent-file", DescriptorKind::Regular),
+                ("absent-directory", DescriptorKind::Directory),
+                ("missing-parent/file", DescriptorKind::Regular),
+                ("missing-parent/directory", DescriptorKind::Directory),
+            ] {
+                assert!(
+                    prepare_descriptor_mount_target(
+                        &destination.join(relative),
+                        kind,
+                        Some(&destination),
+                        &[],
+                    )
+                    .is_err()
+                );
+                assert!(!backing.path().join(relative).exists());
+                assert_eq!(std::fs::read_dir(backing.path()).unwrap().count(), 1);
+                assert_eq!(std::fs::read(&retained).unwrap(), b"candidate edits");
+            }
+        }
+
+        #[test]
+        fn source_backed_mount_targets_preserve_existing_overlay_targets() {
+            let backing = tempfile::tempdir_in(ROOT).unwrap();
+            let destination = PathBuf::from("/").join(backing.path().strip_prefix(ROOT).unwrap());
+            std::fs::write(backing.path().join("file"), b"retained contents").unwrap();
+            std::fs::create_dir(backing.path().join("directory")).unwrap();
+            for (relative, kind) in [
+                ("file", DescriptorKind::Regular),
+                ("directory", DescriptorKind::Directory),
+                ("", DescriptorKind::Directory),
+            ] {
+                prepare_descriptor_mount_target(
+                    &destination.join(relative),
+                    kind,
+                    Some(&destination),
+                    &[],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                std::fs::read(backing.path().join("file")).unwrap(),
+                b"retained contents"
+            );
+            assert_eq!(std::fs::read_dir(backing.path()).unwrap().count(), 2);
+            for (relative, kind) in [
+                ("file", DescriptorKind::Directory),
+                ("directory", DescriptorKind::Regular),
+            ] {
+                assert!(
+                    prepare_descriptor_mount_target(
+                        &destination.join(relative),
+                        kind,
+                        Some(&destination),
+                        &[],
+                    )
+                    .is_err()
+                );
+            }
+            std::os::unix::fs::symlink("file", backing.path().join("link")).unwrap();
+            assert!(
+                prepare_descriptor_mount_target(
+                    &destination.join("link"),
+                    DescriptorKind::Regular,
+                    Some(&destination),
+                    &[],
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn source_backed_mount_targets_retain_bind_source_rule_and_private_creation() {
+            let backing = tempfile::tempdir_in(ROOT).unwrap();
+            let destination = PathBuf::from("/").join(backing.path().strip_prefix(ROOT).unwrap());
+            let preceding = [LinuxSandboxMount {
+                // Target preparation does not inspect or consume source FDs.
+                source_fd: 0,
+                destination: destination.clone(),
+                access: LinuxSandboxMountAccess::Writable,
+                layer: 0,
+            }];
+            for kind in [DescriptorKind::Regular, DescriptorKind::Directory] {
+                assert!(
+                    prepare_descriptor_mount_target(
+                        &destination.join("absent"),
+                        kind,
+                        None,
+                        &preceding,
+                    )
+                    .is_err()
+                );
+                assert_eq!(std::fs::read_dir(backing.path()).unwrap().count(), 0);
+            }
+            // A lexical prefix is not a path ancestor. Independent namespace
+            // paths still need placeholders for ordinary realization mounts.
+            let unrelated = destination.join("private");
+            let unrelated_bind = [LinuxSandboxMount {
+                destination: unrelated.clone(),
+                ..preceding[0].clone()
+            }];
+            prepare_descriptor_mount_target(
+                &destination.join("private-other/file"),
+                DescriptorKind::Regular,
+                Some(&unrelated),
+                &unrelated_bind,
+            )
+            .unwrap();
+            prepare_descriptor_mount_target(
+                &destination.join("private-other/directory"),
+                DescriptorKind::Directory,
+                Some(&unrelated),
+                &unrelated_bind,
+            )
+            .unwrap();
+            assert!(backing.path().join("private-other/file").is_file());
+            assert!(backing.path().join("private-other/directory").is_dir());
+        }
 
         #[test]
         fn target_channel_accepts_nonzero_coordinate_and_survives_exec() {
