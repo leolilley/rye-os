@@ -270,6 +270,7 @@ impl LaunchPreparerRunner {
                 supervised_status: None,
             },
             IsolationLaunchContext {
+                immutable_project: None,
                 workspace_view: None,
                 project_path,
                 project_authority: IsolationProjectAuthority::ReadOnly,

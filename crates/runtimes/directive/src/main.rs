@@ -106,8 +106,7 @@ fn render_stimulus_with_limits(
 ) -> Result<String> {
     let (compiled, referenced_inputs) = compile_stimulus(prompt_template)?;
 
-    let execution =
-        ryeos_engine::scheduled_fire_context::execution_context_value(scheduled_fire);
+    let execution = ryeos_engine::scheduled_fire_context::execution_context_value(scheduled_fire);
     let context = ryeos_runtime::EvaluationContext::new()
         .with_root("inputs", inputs)
         .with_root("execution", &execution);
@@ -683,12 +682,8 @@ mod tests {
 
     #[test]
     fn rendered_stimulus_rejects_non_input_roots() {
-        let error = render_stimulus(
-            "${state.question}",
-            &json!({"question": "why?"}),
-            None,
-        )
-        .expect_err("non-input root must fail");
+        let error = render_stimulus("${state.question}", &json!({"question": "why?"}), None)
+            .expect_err("non-input root must fail");
 
         assert!(
             error
@@ -725,9 +720,8 @@ mod tests {
             ..ryeos_runtime::EvaluationLimits::default()
         };
 
-        let error =
-            render_stimulus_with_limits("ok", &json!({"x": "too long"}), None, &limits)
-                .expect_err("oversized unused input must fail within the expression budget");
+        let error = render_stimulus_with_limits("ok", &json!({"x": "too long"}), None, &limits)
+            .expect_err("oversized unused input must fail within the expression budget");
 
         assert!(error.to_string().contains("scalar is"));
         assert!(error.to_string().contains("unreferenced_inputs"));

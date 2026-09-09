@@ -687,7 +687,7 @@ fn validate_worker_environment(
         ));
     }
     if value.get("schema").and_then(serde_json::Value::as_str)
-        != Some("ryeos.worker_environment.v4")
+        != Some("ryeos.worker_environment.v5")
         || value
             .get("category")
             .and_then(serde_json::Value::as_str)
@@ -862,34 +862,36 @@ fn validate_worker_environment(
                     "worker environment workload-client request is outside the closed contract",
                 )
             })?;
-            let declaration = declarations
-                .iter()
-                .find(|declaration| declaration.id == request.client.realization_id)
-                .ok_or_else(|| {
-                    wire_error(
+            if let Some(client) = request.cli_program() {
+                let declaration = declarations
+                    .iter()
+                    .find(|declaration| declaration.id == client.realization_id)
+                    .ok_or_else(|| {
+                        wire_error(
+                            "worker_environment_workload_client_invalid",
+                            "workload-client realization is not declared by the environment",
+                        )
+                    })?;
+                if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree {
+                    return Err(wire_error(
                         "worker_environment_workload_client_invalid",
-                        "workload-client realization is not declared by the environment",
-                    )
-                })?;
-            if declaration.kind != ryeos_engine::external_content::ExternalContentKind::Tree {
-                return Err(wire_error(
-                    "worker_environment_workload_client_invalid",
-                    "workload-client realization must be a complete pinned tree",
-                ));
-            }
-            let parent = std::path::Path::new(&request.client.relative_path)
-                .parent()
-                .and_then(std::path::Path::to_str)
-                .filter(|path| !path.is_empty())
-                .unwrap_or(".");
-            if !executable_search.iter().any(|entry| {
-                entry.realization_id == request.client.realization_id
-                    && entry.relative_directory == parent
-            }) {
-                return Err(wire_error(
-                    "worker_environment_workload_client_invalid",
-                    "workload-client executable is outside the environment executable search",
-                ));
+                        "workload-client realization must be a complete pinned tree",
+                    ));
+                }
+                let parent = std::path::Path::new(&client.relative_path)
+                    .parent()
+                    .and_then(std::path::Path::to_str)
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(".");
+                if !executable_search.iter().any(|entry| {
+                    entry.realization_id == client.realization_id
+                        && entry.relative_directory == parent
+                }) {
+                    return Err(wire_error(
+                        "worker_environment_workload_client_invalid",
+                        "workload-client executable is outside the environment executable search",
+                    ));
+                }
             }
             Some(request)
         }
@@ -1031,7 +1033,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{
@@ -1094,7 +1096,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{
@@ -1151,7 +1153,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[],
                     "configuration":{"executable_search":[],"process_environment":{}},
@@ -1214,7 +1216,7 @@ mod tests {
             composed: ryeos_handler_protocol::LaunchComposedViewWire {
                 composed: serde_json::json!({
                     "category":"fixture/environments",
-                    "schema":"ryeos.worker_environment.v4",
+                    "schema":"ryeos.worker_environment.v5",
                     "worker_ref":"worker:fixture/hosted",
                     "external_content":[{
                         "id":"workload-client",
@@ -1239,11 +1241,11 @@ mod tests {
                     },
                     "portable_state_contract":"ryeos.worker_session.restore.v1",
                     "workload_client":{
-                        "protocol":"ryeos.workload-client/v1",
-                        "client":{
+                        "protocol":ryeos_runtime::workload_client::WORKLOAD_CLIENT_PROTOCOL,
+                        "bindings":[{"kind":"cli","program":{
                             "realization_id":"workload-client",
                             "relative_path":"bin/ryeos"
-                        },
+                        }}],
                         "executions":[{
                             "item_ref":"directive:project/check",
                             "ref_bindings":{},
@@ -1265,7 +1267,7 @@ mod tests {
         assert!(validated.workload_client.is_some());
 
         let mut missing = environment;
-        missing.composed.composed["workload_client"]["client"]["realization_id"] =
+        missing.composed.composed["workload_client"]["bindings"][0]["program"]["realization_id"] =
             serde_json::json!("absent");
         assert_eq!(
             validate_worker_environment(&missing).unwrap_err().code,

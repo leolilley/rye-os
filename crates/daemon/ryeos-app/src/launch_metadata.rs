@@ -97,7 +97,9 @@ fn validate_canonical_capabilities(label: &str, capabilities: &[String]) -> anyh
 // v32 combines qualified process-scope guarantees and strict adapter v8
 // nested-sandbox provenance in the same unlanded containment cut.
 // Earlier launch classes are opaque history, never assumed scope-capable.
-pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 32;
+// v33 retains explicit workload invocation bindings and v2 grant/wire authority.
+// An old mandatory-client declaration is not an implicit CLI binding.
+pub const LAUNCH_METADATA_SCHEMA_VERSION: u32 = 33;
 
 /// Per-thread daemon-owned state directory.
 ///

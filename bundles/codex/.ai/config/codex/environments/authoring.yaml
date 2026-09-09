@@ -1,6 +1,6 @@
-# ryeos:signed:2026-09-06T03:45:22Z:bddcc07607501185ebd279f76ebd57be35b9c940ae3f70c89b3c9fcfe9242fdf:1tNVtkIim9u5P/axUgiFIdED8ZJgny7bmDCjmu2unRs7Y6yH5rVrxgdwjf3hLTC/DAg+MW04Ds5kuFoswdONBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-09T03:59:20Z:e88a060ef674661380366cde83f6a3d8e4c7ebff601b61806c791a2016e84aff:C/vcPtpjGAXRV+wd4YDyknjdteKDQ3lGHPQX+V912YsO1H6xHXSXxCustLhlc76ybWX1E4HlIqk6XZcB7REyAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: codex/environments
-schema: ryeos.worker_environment.v4
+schema: ryeos.worker_environment.v5
 worker_ref: worker:codex/hosted-authoring
 external_content:
   - id: authoring-tools
@@ -19,6 +19,7 @@ configuration:
     GIT_CONFIG_GLOBAL: {kind: literal, value: /dev/null}
     GIT_PAGER: {kind: literal, value: cat}
     TZ: {kind: literal, value: UTC}
+    TMPDIR: {kind: runtime_view_directory, relative_path: scratch}
 credential_requirement:
   workload_family: codex
   required_state: active

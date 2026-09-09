@@ -1270,6 +1270,7 @@ impl PreparedItemPlan {
             app_root: state.config.app_root.clone(),
             isolation: state.isolation.clone(),
             isolation_project_authority: project_authority,
+            isolation_immutable_project: None,
             isolation_workspace_view: workspace_view.cloned(),
             isolation_filesystem_authority_ceiling: filesystem_authority_ceiling,
             isolation_network_authority_ceiling: network_authority_ceiling,
@@ -1863,6 +1864,7 @@ pub struct SpawnItemParams<'a> {
     pub roots: DaemonRootEnv,
     pub isolation: Arc<ryeos_engine::isolation::IsolationRuntime>,
     pub isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
+    pub isolation_immutable_project: Option<ryeos_state::PinnedProjectMaterialization>,
     pub isolation_workspace_view: Option<lillux::InheritedDescriptorAuthority>,
     pub isolation_live_access_authority:
         Option<ryeos_engine::isolation::IsolationLiveAccessAuthority>,
@@ -1920,6 +1922,7 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
         roots,
         isolation,
         isolation_project_authority,
+        isolation_immutable_project,
         isolation_workspace_view,
         isolation_live_access_authority,
         isolation_external_read_only_mounts,
@@ -2123,6 +2126,7 @@ pub fn spawn_item(params: SpawnItemParams<'_>) -> Result<SpawnedItemAwaitingAtta
         app_root,
         isolation,
         isolation_project_authority,
+        isolation_immutable_project,
         isolation_workspace_view,
         isolation_filesystem_authority_ceiling:
             ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,

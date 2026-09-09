@@ -1855,10 +1855,10 @@ fn admit_session_capsule(
         let profile_bytes = source_files.get(entry).ok_or_else(|| {
             anyhow!("structured-session entry is absent from its captured source closure")
         })?;
-        Some(ryeos_engine::structured_session_profile::compile(
-            profile_bytes,
-            &source_files,
-        )?)
+        let profile =
+            ryeos_engine::structured_session_profile::compile(profile_bytes, &source_files)?;
+        validate_required_session_environment(&profile, environment)?;
+        Some(profile)
     } else {
         None
     };
@@ -2366,6 +2366,7 @@ fn spawn_capsule_process_held(
         None => (None, None),
     };
     if let Some(profile) = capsule.structured_session_profile.as_ref() {
+        validate_required_session_environment(profile, &capsule.process_environment)?;
         let bound_source = source
             .as_ref()
             .ok_or_else(|| anyhow!("structured-session capsule has no bound source authority"))?;
@@ -2767,6 +2768,64 @@ pub fn start_exclusive_capsule(
     // is live. The projection remains the authority; this process-local signal
     // only removes a polling loop and is safe to lose across restart.
     ryeos_app::dedicated_session_service::notify_projection_change(&identity.placement_thread_id);
+    Ok(())
+}
+
+/// Validate selected workload ingress against the already compiled dependency
+/// before releasing a worker boot. No mutable profile lookup or inference from
+/// an installed binary may enable an interface.
+pub fn validate_workload_client_profile(
+    state: &AppState,
+    capsule_hash: &str,
+    request: &ryeos_runtime::workload_client::WorkloadClientRequestContract,
+) -> Result<String> {
+    use ryeos_runtime::workload_client::WorkloadClientIngress;
+    request.validate()?;
+    let capsule = load_capsule(state, capsule_hash)?;
+    let profile = capsule
+        .structured_session_profile
+        .ok_or_else(|| anyhow!("workload client requires a compiled structured-session profile"))?;
+    profile.validate()?;
+    for binding in &request.bindings {
+        let supported = match binding.ingress() {
+            WorkloadClientIngress::Cli => {
+                profile
+                    .contract
+                    .pointer("/workload_client/cli_endpoint_env")
+                    .and_then(Value::as_str)
+                    == Some(ryeos_runtime::workload_client::WORKLOAD_CLIENT_ENDPOINT_ENV)
+            }
+            WorkloadClientIngress::StructuredSession => profile
+                .contract
+                .pointer("/workload_client/structured_session")
+                .is_some_and(Value::is_object),
+        };
+        if !supported {
+            bail!("selected workload ingress is absent from the admitted protocol profile");
+        }
+    }
+    Ok(profile.profile_hash)
+}
+
+fn validate_required_session_environment(
+    profile: &ryeos_state::objects::AdmittedStructuredSessionProfile,
+    environment: &BTreeMap<String, ryeos_state::objects::SessionProcessEnvironmentValue>,
+) -> Result<()> {
+    let names = profile
+        .contract
+        .get("required_process_environment")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!("compiled profile lacks its required process environment contract")
+        })?;
+    for name in names {
+        let name = name
+            .as_str()
+            .ok_or_else(|| anyhow!("invalid required environment name"))?;
+        if !environment.contains_key(name) {
+            bail!("required process environment `{name}` is absent from admitted session inputs");
+        }
+    }
     Ok(())
 }
 

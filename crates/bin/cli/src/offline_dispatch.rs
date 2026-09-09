@@ -62,10 +62,11 @@ pub async fn try_offline_dispatch(
         ..Default::default()
     })
     .map_err(local_err)?;
-    let isolation = ryeos_app::engine_init::load_locked_registered_isolation(&node_config.app_root)
-        .map_err(|error| CliError::Local {
-            detail: format!("load node isolation policy: {error:#}"),
-        })?;
+    let isolation =
+        ryeos_app::engine_init::load_locked_registered_definition_isolation(&node_config.app_root)
+            .map_err(|error| CliError::Local {
+                detail: format!("load node isolation policy: {error:#}"),
+            })?;
     // One generation operation spans descriptor resolution, binary capture,
     // and any direct client/tool exec handoff. A TUI/help launch must never
     // resolve its surface under one installed generation and execute a client
@@ -148,6 +149,53 @@ pub async fn try_offline_dispatch(
     // 5. Resolve once through the engine, then dispatch by composed fields.
     let item = effective_item(&engine, canonical, project_path, execute_ref)?;
     let tail = &argv[matched.consumed..];
+
+    // Auto commands inherit their resolved service's dual-mode placement.
+    // Do not start a standalone state owner while the live daemon owns it.
+    if *availability == CommandAvailability::Auto
+        && item
+            .composed_value
+            .get("availability")
+            .and_then(Value::as_str)
+            == Some("both")
+        && prefer_live_daemon_for_dual_mode(app_root).await?
+    {
+        return Ok(None);
+    }
+
+    // Discovery never acquires controller authority. Only direct executable
+    // dispatch re-admits execution, while the original generation guard still
+    // prevents replacement. Rebuild/re-resolve under that execution snapshot;
+    // never retry failed execution admission using the definition-only one.
+    let (engine, isolation, item) = if has_launch_binary_ref(&item.composed_value)
+        || has_tool_command(&item.composed_value)
+        || item
+            .composed_value
+            .get("local_execute")
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        let execution_isolation =
+            ryeos_app::engine_init::load_locked_registered_isolation(&node_config.app_root)
+                .map_err(local_err)?;
+        let execution_engine = boot_engine(
+            &node_config,
+            project_path,
+            &bundle_roots,
+            std::sync::Arc::clone(&execution_isolation),
+            node_policy.require::<ryeos_app::node_policy::sections::execution::NodeExecutionAdmissionPolicy>()
+                .map_err(local_err)?,
+        )?;
+        let execution_item = effective_item(
+            &execution_engine,
+            CanonicalRef::parse(execute_ref).map_err(|error| local_err(error.into()))?,
+            project_path,
+            execute_ref,
+        )?;
+        (execution_engine, execution_isolation, execution_item)
+    } else {
+        (engine, isolation, item)
+    };
 
     if has_launch_binary_ref(&item.composed_value) {
         return exec_client(
@@ -687,6 +735,7 @@ fn exec_tool(
         .apply(
             base_request,
             ryeos_engine::isolation::IsolationLaunchContext {
+                immutable_project: None,
                 workspace_view: None,
                 project_path: Path::new(project_path),
                 project_authority: project_authority.project,
@@ -1669,6 +1718,58 @@ else:
         .unwrap();
 
         assert!(outcome.is_none(), "daemon-only command ran offline");
+    }
+
+    #[test]
+    fn registered_definition_discovery_retains_generation_fencing() {
+        let fixture = Fixture::new();
+        let definitions =
+            ryeos_app::engine_init::load_locked_registered_definition_isolation(&fixture.system)
+                .unwrap();
+        let guard = definitions.begin_registered_generation_operation().unwrap();
+        assert!(definitions.registered_generation_node_trust().is_some());
+        assert!(
+            definitions
+                .inspection()
+                .process_scope_capabilities
+                .is_empty()
+        );
+        assert!(
+            definitions
+                .plan_process_scope("cli-must-not-control")
+                .is_err()
+        );
+        let execution =
+            ryeos_app::engine_init::load_locked_registered_isolation(&fixture.system).unwrap();
+        assert_eq!(definitions.digest(), execution.digest());
+        definitions.ensure_registered_generation_current().unwrap();
+        drop(guard);
+
+        fixture.write_signed(
+            &fixture.bundle.join(ryeos_engine::AI_DIR).join("node/commands/custom.yaml"),
+            "tokens: [custom]\ndescription: Daemon-owned fixture\ndispatch:\n  kind: execute_ref\n  execute: service:custom\n  availability: daemon\n",
+        );
+        let outcome = try_offline_dispatch_for_test(
+            &["custom".to_string()],
+            &fixture.system,
+            &fixture.project_str(),
+        )
+        .unwrap();
+        assert!(
+            outcome.is_none(),
+            "discovery must route to the actual controller"
+        );
+
+        // A metadata runtime must not lose the installed generation lifeline.
+        // Deliberately tamper outside the registry owner to exercise its check.
+        fixture.write_signed(
+            &fixture
+                .bundle
+                .join(ryeos_engine::AI_DIR)
+                .join("manifest.yaml"),
+            "name: test\nversion: '2.0'\nprovides_kinds: []\nrequires_kinds: []\nuses_kinds: []\n",
+        );
+        assert!(definitions.ensure_registered_generation_current().is_err());
     }
 
     #[test]

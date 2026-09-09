@@ -608,6 +608,7 @@ fn isolation_plan_request(
         crate::isolation::IsolationLaunchContext {
             project_path,
             project_authority: ctx.isolation_project_authority,
+            immutable_project: ctx.isolation_immutable_project.as_ref(),
             workspace_view: ctx.isolation_workspace_view.as_ref(),
             filesystem_authority_ceiling,
             network_authority_ceiling: ctx
@@ -668,6 +669,7 @@ fn isolation_plan_request_awaiting_attachment(
             crate::isolation::IsolationLaunchContext {
                 project_path,
                 project_authority: ctx.isolation_project_authority,
+                immutable_project: ctx.isolation_immutable_project.as_ref(),
                 workspace_view: ctx.isolation_workspace_view.as_ref(),
                 filesystem_authority_ceiling,
                 network_authority_ceiling: ctx
@@ -840,6 +842,7 @@ mod tests {
             app_root,
             isolation,
             isolation_project_authority: crate::isolation::IsolationProjectAuthority::External,
+            isolation_immutable_project: None,
             isolation_workspace_view: None,
             isolation_filesystem_authority_ceiling:
                 crate::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,

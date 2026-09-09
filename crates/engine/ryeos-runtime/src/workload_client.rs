@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::callback::MethodCall;
 
-pub const WORKLOAD_CLIENT_PROTOCOL: &str = "ryeos.workload-client/v1";
+pub const WORKLOAD_CLIENT_PROTOCOL: &str = "ryeos.workload-client/v2";
 pub const WORKLOAD_CLIENT_CHANNEL_ENV: &str = "RYEOS_WORKLOAD_CLIENT_FD";
 /// Fixed sandbox descriptor for the protected daemon-to-bridge boot channel.
 ///
@@ -26,8 +26,9 @@ pub const WORKLOAD_CLIENT_BROKER_DIRECTORY_NAME: &str = ".ryeos-wc";
 pub const WORKLOAD_CLIENT_ENDPOINT_ENV: &str =
     ryeos_engine::protocol_vocabulary::WORKLOAD_CLIENT_ENDPOINT_ENV;
 pub const MAX_WORKLOAD_CLIENT_FRAME_BYTES: usize = 4 * 1024 * 1024;
-/// Boot/ready frames carry only protocol and grant bounds, not execution data.
+/// Boot/ready frames carry bounded public presentation, never execution results.
 pub const MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_WORKLOAD_CLIENT_PRESENTATION_BYTES: usize = 48 * 1024;
 // Closed protocol ceilings, not node defaults. Signed policy may select less.
 pub const MAX_WORKLOAD_CLIENT_EXECUTIONS: u16 = 256;
 pub const MAX_WORKLOAD_CLIENT_REF_BINDINGS: u16 = 32;
@@ -58,7 +59,7 @@ pub const WORKLOAD_CLIENT_REQUEST_FACT: &str = "workload_client_request";
 #[serde(deny_unknown_fields)]
 pub struct WorkloadClientRequestContract {
     pub protocol: String,
-    pub client: WorkloadClientProgram,
+    pub bindings: Vec<WorkloadClientBinding>,
     pub executions: Vec<WorkloadClientExecutionCeiling>,
     pub max_in_flight: u16,
     pub max_invocations_per_boot: u32,
@@ -70,6 +71,60 @@ pub struct WorkloadClientRequestContract {
 pub struct WorkloadClientProgram {
     pub realization_id: String,
     pub relative_path: String,
+}
+
+/// Selected request ingress, not an execution kind or an authority grant.
+/// Both ingress implementations feed the same daemon dispatch owner. In
+/// particular, protocol ingress must not fabricate an executable dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkloadClientBinding {
+    Cli { program: WorkloadClientProgram },
+    StructuredSession {},
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadClientIngress {
+    Cli,
+    StructuredSession,
+}
+
+impl WorkloadClientBinding {
+    pub fn ingress(&self) -> WorkloadClientIngress {
+        match self {
+            Self::Cli { .. } => WorkloadClientIngress::Cli,
+            Self::StructuredSession {} => WorkloadClientIngress::StructuredSession,
+        }
+    }
+}
+
+pub fn validate_workload_client_ingresses(
+    ingresses: &[WorkloadClientIngress],
+) -> anyhow::Result<()> {
+    if ingresses.is_empty()
+        || ingresses.len() > 2
+        || ingresses.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        anyhow::bail!("workload-client ingresses must be nonempty, sorted and unique");
+    }
+    Ok(())
+}
+
+/// Only a trusted ingress may assign this namespace. An untrusted request ID
+/// (including a string shaped like another ingress's ID) is always input to
+/// this projection, never an already-normalized identity. Behavior is excluded:
+/// existing dispatch admission detects changed behavior under one occurrence.
+pub fn ingress_request_id(
+    ingress: WorkloadClientIngress,
+    external_request_id: &str,
+) -> anyhow::Result<String> {
+    validate_request_id(external_request_id)?;
+    let coordinate = lillux::canonical_json(&serde_json::json!({
+        "ingress": ingress,
+        "request_id": external_request_id,
+    }))?;
+    Ok(format!("wc-{}", lillux::sha256_hex(coordinate.as_bytes())))
 }
 
 /// One exact child route requested by the project environment.
@@ -122,16 +177,28 @@ impl WorkloadClientRequestContract {
         if self.protocol != WORKLOAD_CLIENT_PROTOCOL {
             anyhow::bail!("workload-client request protocol is not current");
         }
-        validate_identifier(
-            "workload-client realization id",
-            &self.client.realization_id,
-        )?;
-        ryeos_state::objects::validate_session_process_environment_relative_path(
-            &self.client.relative_path,
-        )?;
-        let executable = std::path::Path::new(&self.client.relative_path);
-        if executable.file_name().is_none() {
-            anyhow::bail!("workload-client program path has no executable member");
+        if self.bindings.is_empty() || self.bindings.len() > 2 {
+            anyhow::bail!("workload-client request must select a finite ingress set");
+        }
+        let mut previous = None;
+        for binding in &self.bindings {
+            let ingress = binding.ingress();
+            if previous.is_some_and(|prior| prior >= ingress) {
+                anyhow::bail!("workload-client bindings must be sorted and unique");
+            }
+            previous = Some(ingress);
+            if let WorkloadClientBinding::Cli { program } = binding {
+                validate_identifier("workload-client realization id", &program.realization_id)?;
+                ryeos_state::objects::validate_session_process_environment_relative_path(
+                    &program.relative_path,
+                )?;
+                if std::path::Path::new(&program.relative_path)
+                    .file_name()
+                    .is_none()
+                {
+                    anyhow::bail!("workload-client program path has no executable member");
+                }
+            }
         }
         validate_execution_ceilings(&self.executions)?;
         validate_workload_client_limits(
@@ -143,6 +210,19 @@ impl WorkloadClientRequestContract {
             anyhow::bail!("workload-client project request exceeds its retained fact bound");
         }
         Ok(())
+    }
+
+    pub fn cli_program(&self) -> Option<&WorkloadClientProgram> {
+        self.bindings.iter().find_map(|binding| match binding {
+            WorkloadClientBinding::Cli { program } => Some(program),
+            WorkloadClientBinding::StructuredSession {} => None,
+        })
+    }
+
+    pub fn has_ingress(&self, ingress: WorkloadClientIngress) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.ingress() == ingress)
     }
 }
 
@@ -365,23 +445,46 @@ fn validate_effect_classes(values: &[String], allow_empty: bool) -> anyhow::Resu
 pub struct WorkloadClientBootFrame {
     pub protocol: String,
     pub grant_digest: String,
+    pub ingresses: Vec<WorkloadClientIngress>,
+    pub execution_presentation: Value,
     pub max_in_flight: u16,
     pub max_request_bytes: u32,
+    pub max_lifetime_seconds: u64,
 }
 
 impl WorkloadClientBootFrame {
     pub fn validate(&self) -> anyhow::Result<()> {
+        validate_workload_client_ingresses(&self.ingresses)?;
+        validate_execution_presentation(&self.execution_presentation)?;
         if self.protocol != WORKLOAD_CLIENT_PROTOCOL
             || !lillux::valid_hash(&self.grant_digest)
             || self.max_in_flight == 0
             || self.max_in_flight > MAX_WORKLOAD_CLIENT_IN_FLIGHT
             || self.max_request_bytes == 0
             || self.max_request_bytes as usize > MAX_WORKLOAD_CLIENT_FRAME_BYTES
+            || self.max_lifetime_seconds == 0
+            || self.max_lifetime_seconds > MAX_WORKLOAD_CLIENT_LIFETIME_SECONDS
         {
             anyhow::bail!("workload-client boot frame is not canonical");
         }
         Ok(())
     }
+}
+
+/// Mechanical transport ceiling for a projection derived by the existing
+/// inventory/resolution owner. It cannot authorize an operation.
+pub fn validate_execution_presentation(value: &Value) -> anyhow::Result<()> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("workload presentation must be an array"))?;
+    if items.is_empty()
+        || items.len() > usize::from(MAX_WORKLOAD_CLIENT_EXECUTIONS)
+        || items.iter().any(|item| !item.is_object())
+        || serde_json::to_vec(value)?.len() > MAX_WORKLOAD_CLIENT_PRESENTATION_BYTES
+    {
+        anyhow::bail!("workload presentation exceeds its closed count/byte bounds");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +534,93 @@ pub struct WorkloadClientRequestFrame {
     pub operation: WorkloadClientOperation,
 }
 
+/// Trusted-ingress provenance on the protected channel, never accepted by
+/// the workload-local CLI wire grammar. This is retained with the existing
+/// action intent, not in a transport-owned replay database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkloadInvocationSource {
+    Cli {
+        external_request_id: String,
+    },
+    StructuredSession {
+        upstream_session_id: String,
+        operation_id: String,
+        call_id: String,
+    },
+}
+
+impl WorkloadInvocationSource {
+    /// The single operation-coordinate derivation shared by live admission
+    /// and durable intent decoding. Behavior is checked separately by the
+    /// action request digest; it must not create another occurrence.
+    pub fn runtime_operation_id(&self, grant_digest: &str) -> anyhow::Result<String> {
+        if !lillux::valid_hash(grant_digest) {
+            anyhow::bail!("workload occurrence grant digest is not canonical");
+        }
+        let value =
+            serde_json::json!({"grant_digest":grant_digest,"request_id":self.request_id()?});
+        Ok(lillux::sha256_hex(
+            lillux::canonical_json(&value)?.as_bytes(),
+        ))
+    }
+
+    pub fn ingress(&self) -> WorkloadClientIngress {
+        match self {
+            Self::Cli { .. } => WorkloadClientIngress::Cli,
+            Self::StructuredSession { .. } => WorkloadClientIngress::StructuredSession,
+        }
+    }
+
+    pub fn request_id(&self) -> anyhow::Result<String> {
+        let external = match self {
+            Self::Cli {
+                external_request_id,
+            } => {
+                validate_request_id(external_request_id)?;
+                external_request_id.clone()
+            }
+            Self::StructuredSession {
+                upstream_session_id,
+                operation_id,
+                call_id,
+            } => {
+                for value in [upstream_session_id, operation_id, call_id] {
+                    if value.is_empty()
+                        || value.len() > MAX_WORKLOAD_CLIENT_IDENTIFIER_BYTES
+                        || value.chars().any(char::is_control)
+                    {
+                        anyhow::bail!("workload invocation correlation is not bounded text");
+                    }
+                }
+                let canonical = lillux::canonical_json(&serde_json::to_value(self)?)?;
+                lillux::sha256_hex(canonical.as_bytes())
+            }
+        };
+        ingress_request_id(self.ingress(), &external)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadClientDispatchFrame {
+    pub source: WorkloadInvocationSource,
+    pub request: WorkloadClientRequestFrame,
+}
+
+impl WorkloadClientDispatchFrame {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.request.validate()?;
+        if self.request.request_id != self.source.request_id()? {
+            anyhow::bail!("workload invocation contradicts its trusted ingress identity");
+        }
+        if serde_json::to_vec(self)?.len() > MAX_WORKLOAD_CLIENT_FRAME_BYTES {
+            anyhow::bail!("workload invocation exceeds protected frame limit");
+        }
+        Ok(())
+    }
+}
+
 impl WorkloadClientRequestFrame {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.protocol != WORKLOAD_CLIENT_PROTOCOL {
@@ -460,14 +650,26 @@ impl WorkloadClientRequestFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkloadClientOutcome {
-    Completed {
-        value: Value,
+    Dispatched {
+        response: crate::callback_contract::CallbackDispatchResponse,
     },
     Failed {
         code: String,
         message: String,
         retryable: bool,
     },
+}
+
+impl WorkloadClientOutcome {
+    /// Dispatch returning JSON is not proof that a child test succeeded.
+    /// Reuse the canonical envelope classifier and daemon-owned thread status;
+    /// never maintain a second list of kind-specific result conventions here.
+    pub fn succeeded(&self) -> bool {
+        match self {
+            Self::Dispatched { response } => response.execution_succeeded(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -484,6 +686,9 @@ impl WorkloadClientResponseFrame {
             anyhow::bail!("workload-client response protocol is not current");
         }
         validate_request_id(&self.request_id)?;
+        if let WorkloadClientOutcome::Dispatched { response } = &self.outcome {
+            response.dispatch.validate()?;
+        }
         if let WorkloadClientOutcome::Failed { code, message, .. } = &self.outcome {
             if code.is_empty()
                 || code.len() > MAX_WORKLOAD_CLIENT_ERROR_CODE_BYTES
@@ -600,10 +805,12 @@ mod tests {
     fn request(executions: Vec<WorkloadClientExecutionCeiling>) -> WorkloadClientRequestContract {
         WorkloadClientRequestContract {
             protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
-            client: WorkloadClientProgram {
-                realization_id: "ryeos-workload-client".to_owned(),
-                relative_path: "bin/ryeos".to_owned(),
-            },
+            bindings: vec![WorkloadClientBinding::Cli {
+                program: WorkloadClientProgram {
+                    realization_id: "ryeos-workload-client".to_owned(),
+                    relative_path: "bin/ryeos".to_owned(),
+                },
+            }],
             executions,
             max_in_flight: 2,
             max_invocations_per_boot: 8,
@@ -619,6 +826,108 @@ mod tests {
         ])
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn ingress_selection_is_explicit_and_protocol_needs_no_program() {
+        let mut selected = request(vec![execution("tool:project/check")]);
+        selected.bindings = vec![WorkloadClientBinding::StructuredSession {}];
+        selected.validate().unwrap();
+        assert!(selected.cli_program().is_none());
+        assert!(selected.has_ingress(WorkloadClientIngress::StructuredSession));
+        selected
+            .bindings
+            .insert(0, request(selected.executions.clone()).bindings.remove(0));
+        selected.validate().unwrap();
+        assert!(selected.cli_program().is_some());
+        selected.bindings.reverse();
+        assert!(selected.validate().is_err());
+        selected.bindings = vec![WorkloadClientBinding::StructuredSession {}; 2];
+        assert!(selected.validate().is_err());
+        selected.bindings.clear();
+        assert!(selected.validate().is_err());
+    }
+
+    #[test]
+    fn binding_decode_refuses_implicit_or_competing_program_authority() {
+        let selected = request(vec![execution("tool:project/check")]);
+        let mut value = serde_json::to_value(&selected).unwrap();
+        value.as_object_mut().unwrap().remove("bindings");
+        assert!(serde_json::from_value::<WorkloadClientRequestContract>(value.clone()).is_err());
+        value["client"] =
+            serde_json::json!({"realization_id":"unused", "relative_path":"bin/ryeos"});
+        assert!(serde_json::from_value::<WorkloadClientRequestContract>(value).is_err());
+        assert!(
+            serde_json::from_value::<WorkloadClientBinding>(serde_json::json!({
+                "kind":"structured_session", "program":{"realization_id":"unused"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn trusted_ingress_projection_separates_adversarial_external_ids() {
+        let cli = ingress_request_id(WorkloadClientIngress::Cli, "same-id").unwrap();
+        let protocol =
+            ingress_request_id(WorkloadClientIngress::StructuredSession, "same-id").unwrap();
+        assert_ne!(cli, protocol);
+        assert_eq!(
+            cli,
+            ingress_request_id(WorkloadClientIngress::Cli, "same-id").unwrap()
+        );
+        assert_ne!(
+            protocol,
+            ingress_request_id(WorkloadClientIngress::Cli, &protocol).unwrap()
+        );
+        assert!(ingress_request_id(WorkloadClientIngress::Cli, "").is_err());
+    }
+
+    #[test]
+    fn workload_wire_cannot_assert_protected_ingress_provenance() {
+        let source = WorkloadInvocationSource::StructuredSession {
+            upstream_session_id: "session".to_owned(),
+            operation_id: "turn".to_owned(),
+            call_id: "call".to_owned(),
+        };
+        let request = WorkloadClientRequestFrame {
+            protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+            request_id: source.request_id().unwrap(),
+            operation: WorkloadClientOperation::Execute(WorkloadClientExecuteRequest {
+                item_ref: "tool:fixture/check".to_owned(),
+                ref_bindings: BTreeMap::new(),
+                params: serde_json::json!({}),
+                call: None,
+            }),
+        };
+        let protected = WorkloadClientDispatchFrame {
+            source: source.clone(),
+            request: request.clone(),
+        };
+        protected.validate().unwrap();
+        assert!(
+            serde_json::from_value::<WorkloadClientRequestFrame>(
+                serde_json::to_value(&protected).unwrap()
+            )
+            .is_err()
+        );
+        let mut forged = serde_json::to_value(&request).unwrap();
+        forged["source"] = serde_json::to_value(&source).unwrap();
+        assert!(serde_json::from_value::<WorkloadClientRequestFrame>(forged).is_err());
+        let cli = WorkloadInvocationSource::Cli {
+            external_request_id: request.request_id.clone(),
+        };
+        assert_ne!(cli.request_id().unwrap(), request.request_id);
+        assert!(
+            WorkloadClientDispatchFrame {
+                source: cli,
+                request
+            }
+            .validate()
+            .is_err()
+        );
+        let mut malformed = serde_json::to_value(source).unwrap();
+        malformed["worker_boot_epoch"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<WorkloadInvocationSource>(malformed).is_err());
     }
 
     #[test]
@@ -649,6 +958,9 @@ mod tests {
         let mut boot = WorkloadClientBootFrame {
             protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
             grant_digest: "a".repeat(64),
+            ingresses: vec![WorkloadClientIngress::Cli],
+            execution_presentation: serde_json::json!([{}]),
+            max_lifetime_seconds: 300,
             max_in_flight: MAX_WORKLOAD_CLIENT_IN_FLIGHT,
             max_request_bytes: MAX_WORKLOAD_CLIENT_FRAME_BYTES as u32,
         };

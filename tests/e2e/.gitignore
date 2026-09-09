@@ -20,6 +20,7 @@ __pycache__/
 !execution-comparison/README.md
 !authoring-environment/test_production.py
 !authoring-environment/test_development_contract.py
+!authoring-environment/test_candidate_evaluator.py
 !authoring-environment/test_preparation.py
 !authoring-environment/test_utilities.py
 !authoring-environment/test_utility_production.py
@@ -28,7 +29,10 @@ __pycache__/
 !authoring-environment/utility_build_probe.py
 !authoring-environment/build-support-qualification.json
 !authoring-environment/hosted-worker-qualification.json
+!authoring-environment/invocation-qualification-20260909.json
 !authoring-environment/probe_pinned_codex_broker.py
+!authoring-environment/probe_pinned_codex_tools.py
+!authoring-environment/pinned-codex-tools-capability.json
 !authoring-environment/test_probe.py
 !authoring-environment/qualify.py
 !authoring-environment/probe.sh

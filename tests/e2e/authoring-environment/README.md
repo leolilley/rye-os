@@ -15,16 +15,18 @@ broker connection with EPERM. Do not interpret completed turn/candidate facts
 as successful project verification, promote these candidates, or claim Railway
 or full-repository development acceptance.
 
-The remaining connection must be admitted without general network access or
-weakening broker authentication. The current PID-1 peer proof also needs native
-nested-namespace qualification; it must not be replaced by acceptance of PID 0.
-Shell here-document scratch usability remains unresolved. Existing operator-
-driven Cargo and artifact evidence below does not establish these worker gates.
+The original next step was to resolve the nested CLI connection without general
+network access or weakening broker authentication. That prescription is now
+superseded by the reviewed structured-session invocation correction: Codex uses
+an explicitly admitted protocol callback; the native CLI is qualified separately,
+not claimed inside nested Codex. The later checkpoints below describe the new
+evidence. Scoped scratch and installed worker/child execution remain open.
+Existing operator-driven Cargo evidence does not establish those worker gates.
 
 ### Offline pinned transport diagnostic
 
-Before another model turn, run the exact retained vendor executable against
-disposable sockets, without a RyeOS node or subscription credentials:
+The original credential-free diagnostic used the exact retained executable
+against disposable sockets. To reproduce that historical diagnostic:
 
 ```sh
 python3 -B tests/e2e/authoring-environment/probe_pinned_codex_broker.py \
@@ -41,11 +43,11 @@ This was executed on 2026-09-09 without a model call or node mutation.
 
 Therefore an exact socket allowlist alone is **not** the missing implementation.
 Do not enable unrestricted networking, allow all loopback services, accept PID 0,
-or silently select a different transport. A supported vendor transport and the
-restricted client's authenticated peer contract must be resolved together before
-changing the signed production profile. A newer vendor pin is not presumed to
-fix either requirement until actually qualified. No proxy or authentication
-change is included in this diagnostic checkpoint.
+or silently select a different transport. The original requirement to resolve
+the CLI transport before changing the profile is superseded by the explicitly
+approved callback plan, not silently bypassed. A newer vendor pin is not presumed
+to fix CLI connectivity until actually qualified. No proxy or authentication
+change is claimed by this historical diagnostic.
 
 ## Production and independent probes
 
@@ -110,6 +112,65 @@ worker authoring environment remain separate evidence. This is operator-driven,
 not worker/remote-loop qualification.
 
 ## Independent artifact probe
+
+### Pinned App Server registration diagnostic
+
+`probe_pinned_codex_tools.py --codex <retained-pinned-executable>` checks the
+executable against the signed Codex activation digest, generates both schema
+surfaces, and probes registration in fresh credential-free homes. The vendor
+experimental capability is toggled only in these disposable diagnostic processes;
+no installed profile, node or model turn is involved.
+
+`pinned-codex-tools-capability.json` records the 2026-09-09 result: the stable
+surface rejects dynamic-tool registration and the opted-in surface accepts it.
+This is not actual tool emission, child execution or hosted-loop qualification.
+The user approved adoption after this probe; the signed authoring profile now
+opts in. Installed callback/child execution and vendor restart restoration
+remain separate qualification gates. The old
+Unix-proxy-first prescription in `hosted-worker-qualification.json` is historical;
+the corrected invocation plan retains both interfaces with separate topology
+qualification. None of its prior failed attempts or produced artifacts changed.
+
+### Native invocation transport checkpoint — 2026-09-09
+
+The bridge's ignored `workload_client_broker::tests::native_dual_ingress` test
+passed in a fresh unprivileged Linux PID/mount namespace with private `/tmp`.
+It exercised real Lillux peer checks, an idle CLI listener sharing the sole slot
+with protocol ingress, and distinct normalized IDs for identical caller IDs.
+Repeating it with `RYEOS_TEST_DUAL_CLIENT_BINARY` set to the newly built
+`ryeos-workload-client` also passed, including nonzero exit for a deliberately
+failed daemon result. No sudo, installed node, credentials or model was used.
+The daemon response is a test fixture: this proves transport/client behavior,
+not a signed installed child execution or connectivity inside nested Codex.
+
+`invocation-qualification-20260909.json` retains the subsequent real v15/v16
+callback attempts separately from historical evidence. V16 admitted a real
+immutable-input child but both it and the independent evaluator failed before
+process start on missing read-only project mount visibility. Neither turn
+completion nor frozen candidate capture is a successful development-loop claim.
+
+```sh
+cargo test -p ryeos-structured-session --bin ryeos-structured-session-bridge \
+  workload_client_broker::tests::native_dual_ingress -- --ignored --exact --nocapture
+```
+
+### Independent candidate assertion
+
+The independent frozen-candidate assertion is the ordinary signed
+`tool:qualification/format-candidate` fixture under this directory's `.ai/tools`.
+Install it in the fixture **before** capturing the worker's immutable base;
+bind its declared exact authoring-tools realization independently and do not
+add it to the worker's execution grant. It reads only the fixed sample and
+reports the existing candidate-evaluation result with exact base/candidate
+hashes. An unchanged, unformatted, extended or symlink sample is refused.
+It is a narrow E2E assertion, not a general repository/security evaluator.
+The separate owner must still inspect the full candidate delta before adoption.
+
+`test_candidate_evaluator.py` checks assertion semantics using the external test
+host's explicitly selected programs. Passing it does not qualify the installed
+artifact, base-resolution authority, candidate view or publication path.
+
+### Assembled artifact probes
 
 After producing an assembled output, run:
 

@@ -1020,17 +1020,25 @@ impl PersistentSessionPool {
         session_id: &str,
         request_body: Value,
         cancelled: C,
-        on_delta: D,
+        mut on_delta: D,
     ) -> Result<Value>
     where
         C: Fn() -> bool,
         D: FnMut(Value) -> Result<()>,
     {
-        self.execute_exclusive_with_deadline(session_id, request_body, cancelled, on_delta, None)
+        self.execute_exclusive_with_deadline(
+            session_id,
+            request_body,
+            cancelled,
+            |value| on_delta(value).map(|()| None),
+            None,
+        )
     }
 
     /// Apply an already-admitted absolute deadline to the ordinary request
     /// I/O deadline, including time waiting for the shared writer.
+    /// A delta consumer may return an acknowledgement only after accepting
+    /// that exact request-correlated progress through its authority owner.
     pub fn execute_exclusive_with_deadline<C, D>(
         &self,
         session_id: &str,
@@ -1041,7 +1049,7 @@ impl PersistentSessionPool {
     ) -> Result<Value>
     where
         C: Fn() -> bool,
-        D: FnMut(Value) -> Result<()>,
+        D: FnMut(Value) -> Result<Option<Value>>,
     {
         self.ensure_admission_open()?;
         validate_exclusive_session_id(session_id)?;
@@ -1140,7 +1148,7 @@ impl PersistentSessionPool {
             control_body,
             &|| false,
             deadline,
-            &mut |_| Ok(()),
+            &mut |_| Ok(None),
         )
         .map_err(|error| attach_process_diagnostic(&process, error));
         if result.is_err() {
@@ -1315,7 +1323,7 @@ impl PersistentSessionPool {
             request_body,
             &cancelled,
             deadline,
-            &mut on_delta,
+            &mut |value| on_delta(value).map(|()| None),
         );
         let result = result.map_err(|error| attach_process_diagnostic(&process, error));
         match result {
@@ -2714,7 +2722,7 @@ fn execute_on_process<C, D>(
 ) -> Result<Value>
 where
     C: Fn() -> bool,
-    D: FnMut(Value) -> Result<()>,
+    D: FnMut(Value) -> Result<Option<Value>>,
 {
     let request_id = format!(
         "{}-{}",
@@ -2777,7 +2785,21 @@ where
             } = budgeted;
             match frame.kind {
                 PersistentSessionFrameKind::Delta => {
-                    on_delta(frame.body.expect("delta body validated"))?;
+                    if let Some(acknowledgement) =
+                        on_delta(frame.body.expect("delta body validated"))?
+                    {
+                        process.write(
+                            wire,
+                            &PersistentSessionFrame {
+                                protocol: wire.wire_protocol.clone(),
+                                version: wire.wire_version,
+                                kind: PersistentSessionFrameKind::ObservationAck,
+                                request_id: Some(request_id.clone()),
+                                body: Some(acknowledgement),
+                            },
+                            deadline,
+                        )?;
+                    }
                 }
                 PersistentSessionFrameKind::Final => {
                     if cancel_sent {
@@ -3016,9 +3038,11 @@ fn validate_frame_shape(
         PersistentSessionFrameKind::Cancel => {
             frame.request_id.as_ref().is_some_and(|id| !id.is_empty()) && frame.body.is_none()
         }
-        PersistentSessionFrameKind::ObservationBatch
-        | PersistentSessionFrameKind::ObservationAck => {
+        PersistentSessionFrameKind::ObservationBatch => {
             frame.request_id.is_none() && frame.body.is_some()
+        }
+        PersistentSessionFrameKind::ObservationAck => {
+            frame.request_id.as_ref().is_none_or(|id| !id.is_empty()) && frame.body.is_some()
         }
     };
     if !valid
@@ -3305,7 +3329,9 @@ mod tests {
         std::fs::create_dir_all(&policy_dir)?;
         std::fs::write(
             policy_dir.join("isolation-policy.yaml"),
-            "version: 1\nmode: disabled\nbackend: null\nfilesystem:\n  readable: []\n  writable: [\"{project}\"]\nnetwork:\n  mode: isolated\nenvironment:\n  allow: [\"*\"]\nlimits:\n  open_files: 128\n  stdout_bytes: 1048576\n  stderr_bytes: 1048576\n  verified_artifact_file_bytes: 67108864\n  verified_artifact_total_bytes: 268435456\n  verified_artifact_files: 4096\n",
+            serde_yaml::to_string(
+                &ryeos_engine::isolation::IsolationPolicy::disabled_for_authoring(),
+            )?,
         )?;
         let isolation = Arc::new(ryeos_engine::isolation::IsolationRuntime::load(
             app_root.path(),
@@ -3346,6 +3372,12 @@ while True:
     frame = receive()
     if frame['kind'] == 'request':
         send('delta', frame['request_id'], {'text':'fixture'})
+        if frame['body'].get('await_delta_ack'):
+            acknowledgement = receive()
+            if (acknowledgement['kind'] != 'observation_ack'
+                    or acknowledgement['request_id'] != frame['request_id']
+                    or acknowledgement['body'] != {'accepted':'fixture'}):
+                raise SystemExit(3)
         if frame['body'].get('emit_observation'):
             send('observation_batch', None, {
                 'first_sequence':1,
@@ -3412,6 +3444,7 @@ while True:
             isolation,
             isolation_project_authority:
                 ryeos_engine::isolation::IsolationProjectAuthority::External,
+            isolation_immutable_project: None,
             isolation_workspace_view: None,
             isolation_filesystem_authority_ceiling:
                 ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling::NodePolicy,
@@ -3946,6 +3979,54 @@ while True:
             ..admitted
         };
         assert!(validate_frame_shape(&excessive, None).is_err());
+    }
+
+    #[test]
+    fn command_progress_ack_retains_its_request_coordinate() {
+        let frame = PersistentSessionFrame {
+            protocol: "test.session".to_owned(),
+            version: 1,
+            kind: PersistentSessionFrameKind::ObservationAck,
+            request_id: Some("request-one".to_owned()),
+            body: Some(serde_json::json!({"command_progress_digest":"a".repeat(64)})),
+        };
+        assert!(validate_frame_shape(&frame, None).is_ok());
+        let mut empty = frame.clone();
+        empty.request_id = Some(String::new());
+        assert!(validate_frame_shape(&empty, None).is_err());
+        let mut absent = frame;
+        absent.body = None;
+        assert!(validate_frame_shape(&absent, None).is_err());
+    }
+
+    #[test]
+    fn command_progress_ack_is_sent_only_after_delta_acceptance() {
+        let pool = PersistentSessionPool::new();
+        let mut lifecycle = test_lifecycle();
+        lifecycle.ready_timeout_ms = 5_000;
+        lifecycle.request_timeout_ms = 5_000;
+        let wire = test_wire();
+        let session_id = "progress-ack-fixture";
+        pool.reserve_exclusive(session_id, &lifecycle, &wire)
+            .unwrap()
+            .bind(fake_framed_session().unwrap())
+            .unwrap();
+        let mut accepted = false;
+        let result = pool
+            .execute_exclusive_with_deadline(
+                session_id,
+                serde_json::json!({"await_delta_ack":true}),
+                || false,
+                |delta| {
+                    assert_eq!(delta, serde_json::json!({"text":"fixture"}));
+                    accepted = true;
+                    Ok(Some(serde_json::json!({"accepted":"fixture"})))
+                },
+                None,
+            )
+            .unwrap();
+        assert!(accepted);
+        assert_eq!(result, serde_json::json!({"echo":{"await_delta_ack":true}}));
     }
 
     #[test]

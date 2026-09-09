@@ -425,6 +425,9 @@ impl IsolationTargetChannelAuthority {
 pub struct IsolationLaunchContext<'a> {
     pub project_path: &'a Path,
     pub project_authority: IsolationProjectAuthority,
+    /// State-issued proof for the actual immutable execution input, not the
+    /// definition/subject generation. Never reconstruct it from a cache path.
+    pub immutable_project: Option<&'a ryeos_state::PinnedProjectMaterialization>,
     /// Exact retained view from the admitted workspace owner's bound slot.
     /// Enforced RuntimeWorkspace launches require it. It is never rebuilt
     /// from lower/backend-state paths; nonworkspace and disabled launches

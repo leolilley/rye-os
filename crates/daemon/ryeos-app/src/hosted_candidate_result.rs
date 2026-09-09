@@ -171,10 +171,7 @@ impl HostedCandidateResultEvidence {
                 "candidate capture operation",
                 self.candidate_capture_operation_id.as_str(),
             ),
-            (
-                "closure validation",
-                self.closure_validation_hash.as_str(),
-            ),
+            ("closure validation", self.closure_validation_hash.as_str()),
             ("command response", self.command_response_digest.as_str()),
         ] {
             if !canonical_hash(hash) {
@@ -238,7 +235,10 @@ impl HostedCandidateResultEvidence {
     pub fn from_attestation(attestation: &Attestation) -> Result<Self> {
         if attestation.claim != HOSTED_CANDIDATE_RESULT_CLAIM
             || attestation.policy != HOSTED_CANDIDATE_RESULT_POLICY
-            || attestation.evidence.get("schema").and_then(serde_json::Value::as_str)
+            || attestation
+                .evidence
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
                 != Some(HOSTED_CANDIDATE_RESULT_SCHEMA)
         {
             bail!("attestation is not hosted candidate-result testimony");
@@ -362,7 +362,8 @@ mod tests {
         let response = HostedCandidateResultResponse::from_value(
             serde_json::to_value(HostedCandidateResultResponse::new(evidence(), &signer).unwrap())
                 .unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         response
             .validate_against(
                 &request,
@@ -407,7 +408,9 @@ mod tests {
         let error = HostedCandidateResultResponse::from_value(serde_json::json!({
             "evidence":{"schema":"ryeos.hosted_terminal_candidate_result_evidence.v1"},
             "attestation":"not current testimony",
-        })).unwrap_err().to_string();
+        }))
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("evidence schema is not current"));
         let mut value = serde_json::to_value(evidence()).unwrap();
         value["candidate_state"] = "publish_ready".into();
@@ -427,7 +430,10 @@ mod tests {
     #[test]
     fn candidate_result_keeps_launch_and_session_capsule_coordinates_distinct() {
         let evidence = evidence();
-        assert_ne!(evidence.admitted_launch_capsule_hash, evidence.admitted_session_capsule_hash);
+        assert_ne!(
+            evidence.admitted_launch_capsule_hash,
+            evidence.admitted_session_capsule_hash
+        );
         evidence.validate().unwrap();
         let mut changed = evidence.clone();
         changed.completion_fence.admitted_capsule_hash = evidence.admitted_launch_capsule_hash;
@@ -448,7 +454,9 @@ impl HostedCandidateResultResponse {
     pub fn from_value(value: serde_json::Value) -> Result<Self> {
         // Classify the current contract before decoding its nested evidence.
         // No predecessor can be interpreted as the frozen-candidate shape.
-        if value.pointer("/evidence/schema").and_then(serde_json::Value::as_str)
+        if value
+            .pointer("/evidence/schema")
+            .and_then(serde_json::Value::as_str)
             != Some(HOSTED_CANDIDATE_RESULT_SCHEMA)
         {
             bail!("hosted candidate result evidence schema is not current");

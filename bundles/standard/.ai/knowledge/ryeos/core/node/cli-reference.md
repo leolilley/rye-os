@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-03T11:56:15Z:2eff75cf9344fc6f04aa3d127acca4b00a44ab126a331a67e6b77e995795ec27:TJbmSjxGcMh5Gb0SNCMbs+VOS7qA0oeoFnjj2emwi3Fm8yDRiQhuQ7J1gx4c3LwnKiQWsyc1mBrnv2VtAVVpCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T06:30:46Z:f8666cf6f790cb78f52e262ec757b8b866533afd0b488e8e902a60db1cc01acd:snr4wjyMI5Ed+yv18YR+ItnLgJnRLMF28iNe0wGVn9qNxuNtJPhWvUrwwhrg03rwHoMZ3tCSoTwHsI2U+T7bBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [reference, cli, verbs, aliases, lifecycle]
-version: "3.5.1"
+version: "3.5.3"
 description: >
   Complete reference for the ryeos CLI: local lifecycle verbs, local
   operator verbs, daemon-backed verbs, aliases, and arguments.
@@ -21,7 +21,34 @@ The `ryeos` CLI has two execution paths:
 Daemon-backed dispatch is preflighted with local lifecycle status unless
 `RYEOSD_URL` is set. Lifecycle verbs ignore `RYEOSD_URL`.
 
+Command metadata and bundle verification use registered definition admission:
+the same signed policy, adapter checks, trust and bundle-generation fencing,
+but no supervised process-scope acquisition. Direct executable dispatch
+re-admits execution under the retained generation guard; it does not fall back
+to definition admission if execution is refused. An `auto` command whose
+resolved service declares `availability: both` uses the live daemon when that
+node is running. Otherwise, its standalone service must prove stopped-node
+ownership and independently admit the service. Standalone services do not
+acquire the supervised worker controller's scope authority.
+
 ## Minimal lifecycle surface
+
+Signed command project bindings distinguish selection from service parameters:
+`no_project_flag` permits the CLI selector, `bind_parameter` projects a selected
+path, and `bind_no_project_parameter` explicitly projects a projectless selection
+as `true` into the named service argument. It does not emit an implicit `false`.
+`request_project_path` separately supplies execution-envelope context. Both live
+and offline binding use the same rules. Remote execute/status/list declare the
+boolean projection; doctor, fetch, verification, binding and UI commands do not
+acquire an undeclared service argument merely because they accept `--no-project`.
+
+For direct `execute <item-ref>`, argv `--project` / `--no-project` select the
+execution context separately from the item's structured parameters. JSON
+`project`, `no_project`, and `project_path` fields supplied through `--input`
+or the single-JSON-argument form remain item data; they neither select local
+project authority nor disappear during CLI binding. A remote operation may
+therefore carry its own project parameter while the outer call is projectless.
+Signed command aliases still use their declared selector-to-service mappings.
 
 ### `ryeos init`
 

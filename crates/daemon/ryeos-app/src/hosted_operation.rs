@@ -264,6 +264,7 @@ where
     begin_hosted_root_operation_if_appendable_with_check(
         root_thread_id,
         &mut durable_root_is_appendable,
+        true,
     )?
     .ok_or_else(|| anyhow::anyhow!("hosted execution root is not durably appendable"))
 }
@@ -271,6 +272,7 @@ where
 fn begin_hosted_root_operation_if_appendable_with_check<F>(
     root_thread_id: &str,
     mut durable_root_is_appendable: F,
+    wait_for_terminalizer: bool,
 ) -> Result<Option<HostedRootOperationLease>>
 where
     F: FnMut() -> Result<bool>,
@@ -291,6 +293,12 @@ where
                 .ok_or_else(|| anyhow::anyhow!("hosted root operation count overflow"))?;
             drop(state);
             return Ok(Some(HostedRootOperationLease { gate }));
+        }
+        if !wait_for_terminalizer {
+            // New child requests must not wait behind a terminalizer that
+            // is itself draining their parent command. Refusal grants no
+            // execution authority and lets the parent settle normally.
+            return Ok(None);
         }
         // A terminalizer owns the only transition that can make this root
         // permanently unappendable. Wait for its commit/abort notification,
@@ -342,6 +350,34 @@ pub async fn begin_hosted_root_operation_async(
     .await
 }
 
+/// Admit a new child through the existing root gate without waiting for a
+/// concurrent terminalizer. This is not a causal-settlement exemption: only
+/// operations already holding a lease may finish after the gate closes.
+pub async fn try_begin_hosted_child_operation_async(
+    state_store: &Arc<crate::state_store::StateStore>,
+    root_thread_id: &str,
+) -> Result<HostedRootOperationLease> {
+    let state_store = Arc::clone(state_store);
+    let root_thread_id = root_thread_id.to_owned();
+    acquire_hosted_root_gate("child admission", move || {
+        begin_hosted_root_operation_if_appendable_with_check(
+            &root_thread_id,
+            || {
+                let thread = state_store
+                    .get_thread(&root_thread_id)?
+                    .ok_or_else(|| anyhow::anyhow!("hosted execution root thread disappeared"))?;
+                Ok(!crate::state_store::is_terminal_status(&thread.status)
+                    && state_store
+                        .active_source_worker_handoff_for_placement(&root_thread_id)?
+                        .is_none())
+            },
+            false,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("hosted root is closing; new child was not admitted"))
+    })
+    .await
+}
+
 /// Acquire appendability ownership when the durable root is still live, or
 /// return `None` for an already-terminal root. This is for recovery and
 /// cleanup paths whose terminal branch is deliberately read-only with respect
@@ -351,15 +387,19 @@ pub fn begin_hosted_root_operation_if_appendable(
     state_store: &crate::state_store::StateStore,
     root_thread_id: &str,
 ) -> Result<Option<HostedRootOperationLease>> {
-    begin_hosted_root_operation_if_appendable_with_check(root_thread_id, || {
-        let thread = state_store
-            .get_thread(root_thread_id)?
-            .ok_or_else(|| anyhow::anyhow!("hosted execution root thread disappeared"))?;
-        Ok(!crate::state_store::is_terminal_status(&thread.status)
-            && state_store
-                .active_source_worker_handoff_for_placement(root_thread_id)?
-                .is_none())
-    })
+    begin_hosted_root_operation_if_appendable_with_check(
+        root_thread_id,
+        || {
+            let thread = state_store
+                .get_thread(root_thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("hosted execution root thread disappeared"))?;
+            Ok(!crate::state_store::is_terminal_status(&thread.status)
+                && state_store
+                    .active_source_worker_handoff_for_placement(root_thread_id)?
+                    .is_none())
+        },
+        true,
+    )
 }
 
 /// Wait for appendability on the blocking pool, retaining the same optional
@@ -538,9 +578,11 @@ mod tests {
         let root_id = "root-async-drain-fixture";
         let dir = tempfile::tempdir().unwrap();
         let runtime_state_dir = dir.path().join(".ai/state");
-        let identity = crate::identity::NodeIdentity::create(&dir.path().join("node-key.pem"))
-            .unwrap();
-        let signer = Arc::new(crate::state_store::NodeIdentitySigner::from_identity(&identity));
+        let identity =
+            crate::identity::NodeIdentity::create(&dir.path().join("node-key.pem")).unwrap();
+        let signer = Arc::new(crate::state_store::NodeIdentitySigner::from_identity(
+            &identity,
+        ));
         let mut head_trust = ryeos_state::refs::TrustStore::new();
         head_trust.insert(identity.fingerprint().to_owned(), *identity.verifying_key());
         let state_store = Arc::new(
@@ -598,12 +640,16 @@ mod tests {
         let late = tokio::spawn(async move {
             acquire_hosted_root_gate("optional operation test", move || {
                 let mut checked_tx = Some(checked_tx);
-                begin_hosted_root_operation_if_appendable_with_check(root_id, || {
-                    if let Some(sender) = checked_tx.take() {
-                        let _ = sender.send(());
-                    }
-                    Ok(late_appendable.load(Ordering::Acquire))
-                })
+                begin_hosted_root_operation_if_appendable_with_check(
+                    root_id,
+                    || {
+                        if let Some(sender) = checked_tx.take() {
+                            let _ = sender.send(());
+                        }
+                        Ok(late_appendable.load(Ordering::Acquire))
+                    },
+                    true,
+                )
             })
             .await
             .unwrap()
@@ -651,15 +697,26 @@ mod tests {
         let (checked_tx, checked_rx) = std::sync::mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
             let mut checked_tx = Some(checked_tx);
-            begin_hosted_root_operation_if_appendable_with_check(root_id, || {
-                if let Some(sender) = checked_tx.take() {
-                    sender.send(()).unwrap();
-                }
-                Ok(waiter_appendable.load(std::sync::atomic::Ordering::Acquire))
-            })
+            begin_hosted_root_operation_if_appendable_with_check(
+                root_id,
+                || {
+                    if let Some(sender) = checked_tx.take() {
+                        sender.send(()).unwrap();
+                    }
+                    Ok(waiter_appendable.load(std::sync::atomic::Ordering::Acquire))
+                },
+                true,
+            )
         });
         checked_rx.recv().unwrap();
         assert!(!waiter.is_finished());
+        // A response-gating new child must be refused immediately while its
+        // parent is one of the operations this terminalizer is draining.
+        assert!(
+            begin_hosted_root_operation_if_appendable_with_check(root_id, || Ok(true), false)
+                .unwrap()
+                .is_none()
+        );
         drop(operation);
         joined.join().unwrap();
         assert!(waiter.join().unwrap().unwrap().is_none());

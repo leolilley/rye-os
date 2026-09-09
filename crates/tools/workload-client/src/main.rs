@@ -57,23 +57,44 @@ fn run() -> Result<()> {
         operation: WorkloadClientOperation::Execute(invocation),
     };
     frame.validate()?;
-    ryeos_runtime::workload_client::write_frame(&mut stream, &frame)?;
+    ryeos_runtime::workload_client::write_frame(&mut stream, &frame)
+        .context("execution contact may have occurred; do not rerun as a new CLI invocation")?;
     let response: WorkloadClientResponseFrame =
-        ryeos_runtime::workload_client::read_frame(&mut stream)?;
-    response.validate()?;
+        ryeos_runtime::workload_client::read_frame(&mut stream)
+            .context("execution outcome is unknown; do not rerun as a new CLI invocation")?;
+    response
+        .validate()
+        .context("execution outcome is unknown: invalid response; do not rerun")?;
     if response.request_id != frame.request_id {
-        bail!("workload-client response request id does not match");
+        bail!(
+            "workload-client response request id does not match; execution outcome is unknown, do not rerun"
+        );
     }
+    let succeeded = response.outcome.succeeded();
     match response.outcome {
-        WorkloadClientOutcome::Completed { value } => {
-            println!("{}", serde_json::to_string(&value)?);
+        WorkloadClientOutcome::Dispatched { response } => {
+            println!("{}", serde_json::to_string(&response.result)?);
+            if !succeeded {
+                bail!("child execution did not succeed");
+            }
             Ok(())
         }
         WorkloadClientOutcome::Failed {
             code,
             message,
             retryable,
-        } => bail!("{code}: {message} (retryable={retryable})"),
+        } => {
+            if matches!(
+                code.as_str(),
+                ryeos_runtime::callback::RUNTIME_ACTION_OUTCOME_UNKNOWN_CODE
+                    | ryeos_runtime::callback::RUNTIME_ACTION_RESULT_UNAVAILABLE_CODE
+            ) {
+                bail!(
+                    "{code}: {message}; do not rerun automatically: a new CLI invocation creates a new operation"
+                );
+            }
+            bail!("{code}: {message} (retryable={retryable})");
+        }
     }
 }
 

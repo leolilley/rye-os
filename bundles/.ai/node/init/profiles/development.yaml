@@ -1,4 +1,4 @@
-# ryeos:signed:2026-09-08T22:52:45Z:e3e298309d0a73b0a45f5784acd104e8b86b3e71ea8adffcd926795a57b1e2ed:fG/DUZHjr3VkjoMd3LA5fVYxLC5CkDVoRxiqu7rAI/CeeJoW3UWfhKHxmPXn5VTLyNLKt8X1QCL9MQzuaKXiDw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-09T03:59:20Z:0bcb134bc5784d97226cfb3824aaf87e2042e119541647bd422e673aae7862b5:7QcsTmQlkbu7t9+yC7chSEUeqbZ4P875fhlweoBPxrP5J0CFnjsRTJNM5HmGVpsV3dIgaEp2NTZmFMW5pGd2Bw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 schema: 1
 exact_bundles:
   - browser
@@ -111,7 +111,7 @@ policies:
     max_private_materialization_copy_bytes: 17179869184
     host_env_passthrough: []
     workload_client:
-      protocol: ryeos.workload-client/v1
+      protocol: ryeos.workload-client/v2
       delegation_cap_ceiling:
         - ryeos.execute.tool.*
       allowed_effect_classes:

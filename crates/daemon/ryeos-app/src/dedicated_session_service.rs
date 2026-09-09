@@ -808,7 +808,7 @@ fn validate_hosted_transition_source(
         .as_object()
         .ok_or_else(|| anyhow!("hosted turn fact source is not an object"))?;
     match object.get("kind").and_then(Value::as_str) {
-        Some("command_response") if object.len() == 4 => {
+        Some("command_response" | "command_progress") if object.len() == 4 => {
             let command_sequence = object
                 .get("command_sequence")
                 .and_then(Value::as_u64)
@@ -821,7 +821,11 @@ fn validate_hosted_transition_source(
                 .ok_or_else(|| anyhow!("hosted turn command source has no request digest"))?;
             let expected = command_fact_operation_id(
                 session,
-                "hosted_worker_command_observation_batch",
+                if object["kind"] == "command_progress" {
+                    "hosted_worker_command_progress"
+                } else {
+                    "hosted_worker_command_observation_batch"
+                },
                 command_sequence,
                 request_digest,
             )?;
@@ -1130,11 +1134,70 @@ fn validate_authoritative_state_transition_facts(
             &expected.event_type,
             operation_id,
         )?;
-        if fact.count != 1 || fact.payload.as_ref() != Some(&expected.payload) {
+        if fact.count != 1
+            || !fact.payload.as_ref().is_some_and(|actual| {
+                actual == &expected.payload
+                    || corroborates_command_progress(session, &expected, actual)
+            })
+        {
             bail!("hosted worker batch has no exact daemon-accepted transition testimony");
+        }
+        if fact
+            .payload
+            .as_ref()
+            .is_some_and(|actual| actual != &expected.payload)
+        {
+            // A corroborating final needs the actual earlier batch as well
+            // as the start fact; a source-shaped claim alone is insufficient.
+            let (sequence, digest) = command_coordinate
+                .ok_or_else(|| anyhow!("corroborating start has no command coordinate"))?;
+            let progress =
+                retained_command_progress(state, session, worker_boot_epoch, sequence, digest)?
+                    .ok_or_else(|| {
+                        anyhow!("corroborating start lacks its original progress batch")
+                    })?;
+            if progress["session_observations"][0]["turn_id"] != expected.payload["turn_id"] {
+                bail!("corroborating start contradicts its progress batch");
+            }
         }
     }
     Ok(())
+}
+
+/// Only the final response of the very same command may corroborate its
+/// previously accepted start. This never blesses an unrelated duplicate
+/// transition, nor lets a later command relabel the original source fact.
+fn corroborates_command_progress(
+    session: &DedicatedSessionRecord,
+    expected: &NewEventRecord,
+    actual: &Value,
+) -> bool {
+    if expected.event_type != "hosted_session.turn_started"
+        || expected
+            .payload
+            .pointer("/source/kind")
+            .and_then(Value::as_str)
+            != Some("command_response")
+        || actual.pointer("/source/kind").and_then(Value::as_str) != Some("command_progress")
+    {
+        return false;
+    }
+    let Some(epoch) = expected.payload["worker_boot_epoch"].as_u64() else {
+        return false;
+    };
+    let Ok(Some((sequence, digest))) =
+        validate_hosted_transition_source(session, epoch, &actual["source"])
+    else {
+        return false;
+    };
+    if expected.payload["command_sequence"].as_u64() != Some(sequence)
+        || expected.payload["request_digest"].as_str() != Some(digest.as_str())
+    {
+        return false;
+    }
+    let mut corroborated = actual.clone();
+    corroborated["source"] = expected.payload["source"].clone();
+    corroborated == expected.payload
 }
 
 fn require_new_state_transition_facts(
@@ -1985,6 +2048,40 @@ pub fn reconcile_command_outboxes(state: &AppState) -> Result<()> {
                 }),
             )?;
         }
+        if let Some(progress) = retained_command_progress(
+            state,
+            &session,
+            record.worker_boot_epoch,
+            record.command_sequence,
+            &record.request_digest,
+        )? {
+            let current = current_session(state, &session.placement_thread_id)?;
+            let turn_id = progress["session_observations"][0]["turn_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("retained command progress lost its turn identity"))?;
+            // Replay only a lagging start projection in its original boot.
+            // Completion or recovery is a later frontier, never permission
+            // to resurrect an old turn as newly running.
+            if current.worker_boot_epoch == Some(record.worker_boot_epoch)
+                && current.state == "idle"
+                && current.current_turn_id.is_none()
+                && hosted_turn_completion_payload(
+                    state,
+                    &session,
+                    record.worker_boot_epoch,
+                    turn_id,
+                )?
+                .is_none()
+            {
+                apply_worker_observations(
+                    state,
+                    &session.placement_thread_id,
+                    record.worker_boot_epoch,
+                    &progress,
+                    1,
+                )?;
+            }
+        }
         match record.state.as_str() {
             "committed" => {}
             "dispatched" | "outcome_unknown" => {
@@ -1999,6 +2096,14 @@ pub fn reconcile_command_outboxes(state: &AppState) -> Result<()> {
                 {
                     let observation_limit = command_observation_limit(&record.command_kind)?;
                     validate_session_observation_cardinality(&canonical_batch, observation_limit)?;
+                    let remaining = command_batch_after_progress(
+                        state,
+                        &session,
+                        record.worker_boot_epoch,
+                        record.command_sequence,
+                        &record.request_digest,
+                        &canonical_batch,
+                    )?;
                     project_worker_events(
                         state,
                         &session,
@@ -2009,7 +2114,7 @@ pub fn reconcile_command_outboxes(state: &AppState) -> Result<()> {
                         state,
                         &record.placement_thread_id,
                         record.worker_boot_epoch,
-                        &canonical_batch,
+                        &remaining,
                         observation_limit,
                     )?;
                     append_recovered_command_fact_once(
@@ -2846,6 +2951,10 @@ pub async fn execute_command(
     let pool = Arc::clone(&state.persistent_sessions);
     let execution_session_id = placement_thread_id.to_string();
     let is_runtime_recovery = command_kind == "reattach";
+    let progress_state = state.clone();
+    let progress_session = session.clone();
+    let progress_sequence = record.command_sequence;
+    let progress_digest = request_digest.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let contact_deadline = contact_deadline_at_ms.map(|deadline_at_ms| {
             let now = std::time::Instant::now();
@@ -2886,7 +2995,21 @@ pub async fn execute_command(
                     contact_deadline_at_ms
                         .is_some_and(|deadline| lillux::time::timestamp_millis() >= deadline)
                 },
-                |_| Ok(()),
+                |delta| {
+                    let gate = transition_gate(&execution_session_id);
+                    let _guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let batch = canonical_command_observation_batch(&delta, 1)?;
+                    validate_command_progress_batch(&batch)?;
+                    validate_new_state_transition_sequence(&progress_state, &execution_session_id, worker_boot_epoch, &batch)?;
+                    // The enclosing command already owns root and credential
+                    // contact leases. This is its causal settlement, not new
+                    // ingress: reacquiring a root gate here can deadlock stop.
+                    append_command_observation_batch_phase(&progress_state, &progress_session, worker_boot_epoch,
+                        progress_sequence, &progress_digest, &delta, &batch, true)?;
+                    apply_worker_observations(&progress_state, &execution_session_id, worker_boot_epoch, &batch, 1)?;
+                    notify_projection_change(&execution_session_id);
+                    Ok(Some(json!({"command_progress_digest":ryeos_state::objects::canonical_value_digest(&delta)?})))
+                },
                 contact_deadline,
             )
         }
@@ -2900,11 +3023,19 @@ pub async fn execute_command(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Err(error) = canonical_command_observation_batch(&result, observation_limit)
                 .and_then(|canonical_batch| {
+                    let remaining = command_batch_after_progress(
+                        state,
+                        &session,
+                        worker_boot_epoch,
+                        record.command_sequence,
+                        &request_digest,
+                        &canonical_batch,
+                    )?;
                     validate_new_state_transition_sequence(
                         state,
                         placement_thread_id,
                         worker_boot_epoch,
-                        &canonical_batch,
+                        &remaining,
                     )?;
                     append_command_observation_batch(
                         state,
@@ -2920,7 +3051,7 @@ pub async fn execute_command(
                         state,
                         placement_thread_id,
                         worker_boot_epoch,
-                        &canonical_batch,
+                        &remaining,
                         observation_limit,
                     )
                 })
@@ -3532,25 +3663,158 @@ fn append_command_observation_batch(
     result: &Value,
     canonical_batch: &Value,
 ) -> Result<()> {
-    let response_digest = ryeos_state::objects::canonical_value_digest(result)?;
-    let batch_operation_id = command_fact_operation_id(
+    append_command_observation_batch_phase(
+        state,
         session,
-        "hosted_worker_command_observation_batch",
+        worker_boot_epoch,
         command_sequence,
         request_digest,
+        result,
+        canonical_batch,
+        false,
+    )
+}
+
+fn validate_command_progress_batch(batch: &Value) -> Result<()> {
+    if batch
+        .get("events")
+        .and_then(Value::as_array)
+        .is_none_or(|events| !events.is_empty())
+    {
+        bail!("command progress must not carry unrelated events");
+    }
+    let values = batch
+        .get("session_observations")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .ok_or_else(|| anyhow!("command progress must contain one lifecycle start"))?;
+    match serde_json::from_value::<WorkerObservation>(values[0].clone())? {
+        WorkerObservation::State {
+            expected,
+            next,
+            turn_id: Some(turn_id),
+            completed_turn_id: None,
+        } if expected == "idle" && next == "turn_running" => {
+            validate_hosted_turn_id("command progress turn", &turn_id)
+        }
+        _ => bail!("command progress is not a turn-start observation"),
+    }
+}
+
+fn retained_command_progress(
+    state: &AppState,
+    session: &DedicatedSessionRecord,
+    epoch: u64,
+    sequence: u64,
+    request_digest: &str,
+) -> Result<Option<Value>> {
+    let Some(fact) = command_fact_payload(
+        state,
+        session,
+        "hosted_worker_command_progress",
+        sequence,
+        request_digest,
+        epoch,
+    )?
+    else {
+        return Ok(None);
+    };
+    let batch = fact
+        .get("canonical_batch")
+        .ok_or_else(|| anyhow!("command progress lacks its canonical batch"))?;
+    validate_command_progress_batch(batch)?;
+    validate_authoritative_state_transition_facts(
+        state,
+        session,
+        epoch,
+        batch,
+        json!({
+            "kind":"command_progress","batch_operation_id":fact["operation_id"],
+            "command_sequence":sequence,"request_digest":request_digest,
+        }),
+        Some((sequence, request_digest)),
     )?;
+    Ok(Some(batch.clone()))
+}
+
+fn command_batch_after_progress(
+    state: &AppState,
+    session: &DedicatedSessionRecord,
+    epoch: u64,
+    sequence: u64,
+    request_digest: &str,
+    batch: &Value,
+) -> Result<Value> {
+    let Some(progress) =
+        retained_command_progress(state, session, epoch, sequence, request_digest)?
+    else {
+        return Ok(batch.clone());
+    };
+    let early = &progress["session_observations"][0];
+    let mut remaining = batch.clone();
+    let observations = remaining["session_observations"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("command observations are absent"))?;
+    if observations.iter().filter(|value| *value == early).count() != 1 {
+        bail!("final command batch does not corroborate its exact early start");
+    }
+    observations.retain(|value| value != early);
+    Ok(remaining)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_command_observation_batch_phase(
+    state: &AppState,
+    session: &DedicatedSessionRecord,
+    worker_boot_epoch: u64,
+    command_sequence: u64,
+    request_digest: &str,
+    result: &Value,
+    canonical_batch: &Value,
+    progress: bool,
+) -> Result<()> {
+    let event_type = if progress {
+        "hosted_worker_command_progress"
+    } else {
+        "hosted_worker_command_observation_batch"
+    };
+    let response_digest = ryeos_state::objects::canonical_value_digest(result)?;
+    let batch_operation_id =
+        command_fact_operation_id(session, event_type, command_sequence, request_digest)?;
     let mut followups = state_transition_fact_events(
         session,
         worker_boot_epoch,
         canonical_batch,
         json!({
-            "kind":"command_response",
+            "kind":if progress { "command_progress" } else { "command_response" },
             "batch_operation_id":batch_operation_id,
             "command_sequence":command_sequence,
             "request_digest":request_digest,
         }),
         Some((command_sequence, request_digest)),
     )?;
+    if !progress {
+        let mut new = Vec::new();
+        for transition in followups {
+            let existing = crate::authoritative_root_fact::lookup(
+                state,
+                &session.placement_thread_id,
+                &transition.event_type,
+                transition.payload["operation_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("transition has no operation identity"))?,
+            )?;
+            if existing.count == 1
+                && existing.payload.as_ref().is_some_and(|actual| {
+                    corroborates_command_progress(session, &transition, actual)
+                })
+            {
+                continue;
+            }
+            new.push(transition);
+        }
+        followups = new;
+    }
     require_new_state_transition_facts(state, session, &followups)?;
     followups.extend(approval_request_fact_events(
         session,
@@ -3560,7 +3824,7 @@ fn append_command_observation_batch(
     append_command_fact_once_with_followups(
         state,
         session,
-        "hosted_worker_command_observation_batch",
+        event_type,
         command_sequence,
         request_digest,
         json!({
@@ -5841,6 +6105,50 @@ mod tests {
         assert_eq!(facts[1].event_type, "hosted_session.turn_completed");
         assert_eq!(facts[1].payload["turn_id"], "turn-one");
         assert!(facts[1].payload.get("command_sequence").is_none());
+    }
+
+    #[test]
+    fn command_progress_corroboration_retains_exact_original_source() {
+        let session = session_fixture();
+        let digest = "b".repeat(64);
+        let batch = json!({"events":[],"session_observations":[{
+            "kind":"state","expected":"idle","next":"turn_running","turn_id":"turn-one"
+        }]});
+        validate_command_progress_batch(&batch).unwrap();
+        let make = |phase: &str, event_type: &str| {
+            state_transition_fact_events(&session, 3, &batch, json!({
+                "kind":phase,"command_sequence":2,"request_digest":digest,
+                "batch_operation_id":command_fact_operation_id(&session, event_type, 2, &digest).unwrap()
+            }), Some((2, &digest))).unwrap().remove(0)
+        };
+        let early = make("command_progress", "hosted_worker_command_progress");
+        let final_fact = make(
+            "command_response",
+            "hosted_worker_command_observation_batch",
+        );
+        assert!(corroborates_command_progress(
+            &session,
+            &final_fact,
+            &early.payload
+        ));
+        for (pointer, replacement) in [
+            ("/source/command_sequence", json!(3)),
+            ("/source/request_digest", json!("c".repeat(64))),
+            ("/source/batch_operation_id", json!("d".repeat(64))),
+            ("/worker_boot_epoch", json!(4)),
+            ("/turn_id", json!("turn-other")),
+        ] {
+            let mut changed = early.payload.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                !corroborates_command_progress(&session, &final_fact, &changed),
+                "{pointer}"
+            );
+        }
+        let completion = json!({"events":[],"session_observations":[{
+            "kind":"state","expected":"turn_running","next":"idle","completed_turn_id":"turn-one"
+        }]});
+        assert!(validate_command_progress_batch(&completion).is_err());
     }
 
     #[test]

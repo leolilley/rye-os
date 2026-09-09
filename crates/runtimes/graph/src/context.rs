@@ -10,9 +10,8 @@ pub struct ExecutionContext {
 
 impl ExecutionContext {
     pub fn as_context_value(&self) -> Value {
-        let mut context = ryeos_engine::scheduled_fire_context::execution_context_value(
-            self.schedule.as_ref(),
-        );
+        let mut context =
+            ryeos_engine::scheduled_fire_context::execution_context_value(self.schedule.as_ref());
         if let Some(context) = context.as_object_mut() {
             context.insert(
                 "parent_thread_id".to_owned(),

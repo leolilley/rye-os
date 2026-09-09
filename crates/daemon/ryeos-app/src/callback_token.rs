@@ -110,7 +110,9 @@ pub struct AdmittedWorkloadClientGrant {
     pub operator_grant_digest: String,
     pub root_delegation_digest: String,
     pub node_policy_generation_digest: String,
+    pub ingresses: Vec<ryeos_runtime::workload_client::WorkloadClientIngress>,
     pub executions: Vec<ryeos_runtime::workload_client::WorkloadClientExecutionCeiling>,
+    pub execution_presentation: serde_json::Value,
     pub effective_caps: Vec<String>,
     pub max_in_flight: u16,
     pub max_invocations_per_boot: u32,
@@ -119,9 +121,26 @@ pub struct AdmittedWorkloadClientGrant {
 }
 
 impl AdmittedWorkloadClientGrant {
-    pub const SCHEMA: u32 = 1;
+    pub const SCHEMA: u32 = 2;
 
     pub fn validate(&self) -> Result<()> {
+        ryeos_runtime::workload_client::validate_execution_presentation(
+            &self.execution_presentation,
+        )?;
+        let presented = self
+            .execution_presentation
+            .as_array()
+            .expect("validated presentation array");
+        if presented.len() != self.executions.len()
+            || presented
+                .iter()
+                .zip(&self.executions)
+                .any(|(item, ceiling)| {
+                    item.get("ceiling") != serde_json::to_value(ceiling).ok().as_ref()
+                })
+        {
+            bail!("workload presentation contradicts its admitted execution ceiling");
+        }
         if self.schema != Self::SCHEMA
             || self.protocol != ryeos_runtime::workload_client::WORKLOAD_CLIENT_PROTOCOL
             || self.chain_root_id.is_empty()
@@ -166,6 +185,7 @@ impl AdmittedWorkloadClientGrant {
                 bail!("admitted workload-client {label} digest is not canonical");
             }
         }
+        ryeos_runtime::workload_client::validate_workload_client_ingresses(&self.ingresses)?;
         ryeos_runtime::workload_client::validate_execution_ceilings(&self.executions)?;
         ryeos_runtime::workload_client::validate_workload_client_limits(
             self.max_in_flight,
@@ -1477,7 +1497,7 @@ mod tests {
     }
 
     fn workload_client_grant() -> AdmittedWorkloadClientGrant {
-        AdmittedWorkloadClientGrant {
+        let mut grant = AdmittedWorkloadClientGrant {
             schema: AdmittedWorkloadClientGrant::SCHEMA,
             protocol: ryeos_runtime::workload_client::WORKLOAD_CLIENT_PROTOCOL.to_owned(),
             chain_root_id: "T-root".to_owned(),
@@ -1495,6 +1515,8 @@ mod tests {
             operator_grant_digest: "2".repeat(64),
             root_delegation_digest: "3".repeat(64),
             node_policy_generation_digest: "4".repeat(64),
+            ingresses: vec![ryeos_runtime::workload_client::WorkloadClientIngress::Cli],
+            execution_presentation: serde_json::Value::Null,
             executions: vec![
                 ryeos_runtime::workload_client::WorkloadClientExecutionCeiling {
                     item_ref: "tool:project/check".to_owned(),
@@ -1518,7 +1540,15 @@ mod tests {
             max_invocations_per_boot: 8,
             max_lifetime_seconds: 300,
             max_request_bytes: 4096,
-        }
+        };
+        grant.execution_presentation = serde_json::Value::Array(
+            grant
+                .executions
+                .iter()
+                .map(|ceiling| serde_json::json!({"ceiling":ceiling}))
+                .collect(),
+        );
+        grant
     }
 
     fn workload_client_action() -> ryeos_runtime::callback::ActionPayload {

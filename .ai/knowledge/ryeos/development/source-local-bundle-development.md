@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-08T23:22:09Z:0a84df213ea1ae176db59bf27509c0a5a9c2c4ee1e7fda4a536d8e1fed1b6c9b:KDbi6BC2x1xGvGuVUAdBgZ6k0bMfJMVuYOb3Pq82U7T7ZS/KHBS8whKzoZgVmq+M7yo+mSZn5iYIo5KNDBC1AQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T03:59:20Z:91ad2db1ca1719e15f20b63b474e7deb9bf9fef1d846e07ceecf8536f07847c9:NSFkuxjnLkkLL1LVPUNT614lG1SitjSLyVzlSRec0n0nsQqj/egSH2nlhTNVmpjN0w+YK06RcU7XjX7D8gwYBA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: ryeos/development
 name: source-local-bundle-development
@@ -454,6 +454,12 @@ in the Codex bundle. Neither may supply node policy, target identity or
 credential authority.
 
 ## Exact workload-client realization
+
+This artifact serves explicitly selected native CLI ingress. The current
+source-local Codex development environment selects structured-session protocol
+invocation instead and does not carry this executable as an unused dependency.
+The two interfaces share existing dispatch authority; qualifying one does not
+qualify the other inside a nested sandbox.
 
 The restricted workload client is an external realization, not a Core bundle
 binary and not a file extracted from a runtime image. The official release's

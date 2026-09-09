@@ -618,6 +618,9 @@ pub fn load_node_config_two_phase(
 /// Standalone service execution has no daemon callback listener to capture.
 /// Its isolation snapshot must therefore omit callback-socket authority rather
 /// than attempting to pin the configured-but-unbound daemon socket path.
+/// It also does not own the supervised process-scope provider. Definition
+/// admission retains enforced isolation without claiming those capabilities;
+/// persistent worker execution belongs to the normal daemon bootstrap.
 pub fn load_node_config_two_phase_standalone(
     config: &Config,
 ) -> Result<(
@@ -745,7 +748,11 @@ fn load_node_config_two_phase_with_socket(
                 isolation_backend,
             )
         }
-        None => ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy(
+        // A stopped-node service owns its state operation, not the supervised
+        // worker controller. Preserve signed isolation/adapter checks without
+        // opening that controller's process scopes. Scope-requiring execution
+        // cannot be admitted from this snapshot; daemon startup above owns it.
+        None => ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy_for_definition_validation(
             app_root,
             node_policy
                 .require::<ryeos_engine::isolation::IsolationPolicy>()?

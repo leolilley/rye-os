@@ -24,10 +24,10 @@ ignore_default_excludes = false
 "LC_CTYPE" = "include"
 "TERM" = "include"
 "TZ" = "include"
+"TMPDIR" = "include"
 "GIT_CONFIG_NOSYSTEM" = "include"
 "GIT_CONFIG_GLOBAL" = "include"
 "GIT_PAGER" = "include"
-"RYEOS_WORKLOAD_CLIENT_ENDPOINT" = "include"
 "HOME" = "exclude"
 "CODEX_HOME" = "exclude"
 "DBUS_*" = "exclude"
@@ -40,9 +40,8 @@ extends = ":workspace"
 [permissions.ryeos-workspace-only.filesystem]
 ":root" = "deny"
 ":minimal" = "read"
-":tmpdir" = "deny"
+":tmpdir" = "write"
 ":slash_tmp" = "deny"
-"/tmp/.ryeos-wc" = "read"
 "/ryeos/realizations/authoring-tools" = "read"
 
 [permissions.ryeos-workspace-only.filesystem.":workspace_roots"]

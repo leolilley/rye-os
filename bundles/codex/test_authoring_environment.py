@@ -44,7 +44,7 @@ class AuthoringEnvironmentTests(unittest.TestCase):
         self.assertEqual(self.default["worker_ref"], "worker:codex/hosted")
 
     def test_explicit_worker_uses_existing_environment_contract(self):
-        self.assertEqual(self.environment["schema"], "ryeos.worker_environment.v4")
+        self.assertEqual(self.environment["schema"], "ryeos.worker_environment.v5")
         self.assertEqual(self.environment["worker_ref"], "worker:codex/hosted-authoring")
         for key in ("credential_requirement", "portable_state_contract", "workload_client"):
             self.assertEqual(self.environment[key], self.default[key])
@@ -99,14 +99,43 @@ class AuthoringEnvironmentTests(unittest.TestCase):
         self.assertEqual(self.worker["source"]["entry"], "authoring.profile.json")
         self.assertEqual(self.default_worker["source"]["entry"], "structured-session.profile.json")
 
-    def test_profile_only_selects_baseline_and_exact_read_permission(self):
+    def test_profile_selects_baseline_permission_and_signed_invocation(self):
         actual = json.loads((SOURCE / "authoring.profile.json").read_text())
         original = json.loads((SOURCE / "structured-session.profile.json").read_text())
+        self.assertEqual(actual["required_process_environment"], ["TMPDIR"])
+        actual["required_process_environment"] = []
+        self.assertEqual(actual["initialization"][0]["params"].pop("capabilities"),
+                         {"experimentalApi": True})
+        invocation = actual["workload_client"]["structured_session"]
+        self.assertEqual(invocation["method"], "item/tool/call")
+        self.assertEqual(invocation["registration_route"], "session.start")
+        self.assertEqual(invocation["required_values"], {
+            "/message/params/tool": "ryeos_execute",
+            "/message/params/namespace": None,
+        })
+        self.assertIsNone(actual["workload_client"]["cli_endpoint_env"])
+        actual["workload_client"] = None
+        route = next(route for route in actual["routes"] if route["id"] == "session.start")
+        self.assertEqual(route["request_schema"], "schema/ThreadStartParams.experimental.json")
+        self.assertIn("dynamicTools", route["forbidden_fields"])
+        route["forbidden_fields"].remove("dynamicTools")
+        route["request_schema"] = "schema/ThreadStartParams.json"
+        turn_route = next(route for route in actual["routes"] if route["id"] == "turn.start")
+        self.assertEqual(turn_route.pop("progress_notifications"), ["turn/started"])
+        started = next(rule for rule in actual["notifications"] if rule["method"] == "turn/started")
+        self.assertEqual(started.pop("upstream_session_pointer"), "/message/params/threadId")
+        self.assertEqual(len(started["observations"]), 1)
+        self.assertEqual(started["observations"][0]["value"]["fields"]["turn_id"]["pointer"],
+                         "/message/params/turn/id")
+        started["observations"] = []
         self.assertEqual(actual["baseline_config"], "authoring.config.toml")
         actual["baseline_config"] = original["baseline_config"]
         added = ', "/ryeos/realizations/authoring-tools"="read"'
         self.assertEqual(sum(added in arg for arg in actual["workload_args"]), 1)
         actual["workload_args"] = [arg.replace(added, "") for arg in actual["workload_args"]]
+        self.assertTrue(any('\":tmpdir\"=\"write\"' in arg for arg in actual["workload_args"]))
+        actual["workload_args"] = [arg.replace('\":tmpdir\"=\"write\"', '\":tmpdir\"=\"deny\"')
+                                  .replace(', \"TMPDIR\"=\"include\"', '') for arg in actual["workload_args"]]
         self.assertEqual(actual, original)
 
     def test_baseline_only_adds_the_exact_read_permission(self):
@@ -114,6 +143,9 @@ class AuthoringEnvironmentTests(unittest.TestCase):
         original = tomllib.loads((SOURCE / "baseline.config.toml").read_text())
         filesystem = actual["permissions"]["ryeos-workspace-only"]["filesystem"]
         self.assertEqual(filesystem.pop("/ryeos/realizations/authoring-tools"), "read")
+        self.assertEqual(filesystem[":tmpdir"], "write")
+        filesystem[":tmpdir"] = "deny"
+        self.assertEqual(actual["shell_environment_policy"]["filters"].pop("TMPDIR"), "include")
         self.assertEqual(actual, original)
 
     def test_authored_shell_environment_is_not_silently_dropped(self):
@@ -179,6 +211,7 @@ class AuthoringEnvironmentTests(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": {"kind": "literal", "value": "/dev/null"},
             "GIT_PAGER": {"kind": "literal", "value": "cat"},
             "TZ": {"kind": "literal", "value": "UTC"},
+            "TMPDIR": {"kind": "runtime_view_directory", "relative_path": "scratch"},
         })
 
 

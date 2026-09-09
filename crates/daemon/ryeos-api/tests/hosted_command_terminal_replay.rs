@@ -46,7 +46,7 @@ fn store_structured_session_capsule(state: &ryeos_app::state::AppState) -> (Stri
         wire: PersistentSessionWireContract {
             channel_env: "RYEOS_SESSION_FD".to_owned(),
             wire_protocol: "ryeos.structured-session".to_owned(),
-            wire_version: 1,
+            wire_version: 2,
             max_frame_bytes: 1024,
         },
         artifact_identity: AdmittedLaunchArtifactIdentity::DirectItemExecutor {
@@ -243,10 +243,63 @@ struct CompletedTurnFixture {
     request_digest: String,
 }
 
+struct PendingTurnFixture {
+    worker_instance_id: String,
+    command_payload: Value,
+    request_digest: String,
+    sequence: u64,
+    turn_id: String,
+    result: Value,
+}
+
 fn seed_completed_turn_fixture(
     state: &ryeos_app::state::AppState,
     root: &str,
 ) -> CompletedTurnFixture {
+    seed_completed_turn_fixture_with_progress(state, root, false)
+}
+
+fn seed_completed_turn_fixture_with_progress(
+    state: &ryeos_app::state::AppState,
+    root: &str,
+    early_progress: bool,
+) -> CompletedTurnFixture {
+    let pending = seed_pending_turn_fixture(state, root, early_progress);
+    let PendingTurnFixture {
+        worker_instance_id,
+        command_payload,
+        request_digest,
+        sequence,
+        turn_id,
+        result,
+    } = pending;
+    append_final_turn_batch(state, root, sequence, &request_digest, &result);
+    let response_digest = ryeos_state::objects::canonical_value_digest(&result).unwrap();
+    state.state_store.append_events(root, root, &[command_fact(
+        root, "hosted_command.settled", sequence, &request_digest, 1,
+        json!({"schema":1,"origin":"daemon_observed_io", "response_digest":response_digest,"succeeded":true}),
+    )]).unwrap();
+    state
+        .state_store
+        .settle_dedicated_command(root, sequence, 1, true, &result)
+        .unwrap();
+    project_turn_start(state, root, &turn_id);
+    complete_turn(state, root, &turn_id);
+    let observation =
+        ryeos_app::dedicated_session_service::command_observation(state, root, sequence).unwrap();
+    CompletedTurnFixture {
+        fence: serde_json::from_value(observation["completion_fence"].clone()).unwrap(),
+        worker_instance_id,
+        command_payload,
+        request_digest,
+    }
+}
+
+fn seed_pending_turn_fixture(
+    state: &ryeos_app::state::AppState,
+    root: &str,
+    early_progress: bool,
+) -> PendingTurnFixture {
     let owner = "fp:test-operator";
     let (capsule_hash, protocol_profile_hash, protocol_schema_hashes) =
         store_structured_session_capsule(state);
@@ -401,14 +454,30 @@ fn seed_completed_turn_fixture(
         }],
         "value":"retained",
     });
-    let response_digest = ryeos_state::objects::canonical_value_digest(&result).unwrap();
+    let mut start = turn_start_fact(root, command.command_sequence, &request_digest, 1, &turn_id);
+    let progress = early_progress.then(|| {
+        let batch = json!({"events":[],"session_observations":result["session_observations"]});
+        let progress = command_fact(
+            root,
+            "hosted_worker_command_progress",
+            command.command_sequence,
+            &request_digest,
+            1,
+            json!({"schema":1,"origin":"daemon_observed_io",
+                "response_digest":ryeos_state::objects::canonical_value_digest(&batch).unwrap(),
+                "canonical_batch":batch}),
+        );
+        start.payload["source"]["kind"] = json!("command_progress");
+        start.payload["source"]["batch_operation_id"] = progress.payload["operation_id"].clone();
+        progress
+    });
     state
         .state_store
         .append_events(
             root,
             root,
             &[
-                command_fact(
+                Some(command_fact(
                     root,
                     "hosted_command.committed",
                     command.command_sequence,
@@ -425,52 +494,52 @@ fn seed_completed_turn_fixture(
                         "protocol_profile_hash":protocol_profile_hash,
                         "protocol_schema_hashes":protocol_schema_hashes,
                     }),
-                ),
-                command_fact(
-                    root,
-                    "hosted_worker_command_observation_batch",
-                    command.command_sequence,
-                    &request_digest,
-                    1,
-                    json!({
-                        "schema":1,
-                        "origin":"daemon_observed_io",
-                        "response_digest":response_digest,
-                        "canonical_batch":{
-                            "events":result["events"],
-                            "session_observations":result["session_observations"],
-                        },
-                    }),
-                ),
-                turn_start_fact(root, command.command_sequence, &request_digest, 1, &turn_id),
-                command_fact(
-                    root,
-                    "hosted_command.settled",
-                    command.command_sequence,
-                    &request_digest,
-                    1,
-                    json!({
-                        "schema":1,
-                        "origin":"daemon_observed_io",
-                        "response_digest":response_digest,
-                        "succeeded":true,
-                    }),
-                ),
-            ],
+                )),
+                progress,
+                Some(start),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
         )
         .unwrap();
     state
         .state_store
         .mark_dedicated_command_contacted(root, command.command_sequence, 1)
         .unwrap();
+    PendingTurnFixture {
+        worker_instance_id,
+        command_payload,
+        request_digest,
+        sequence: command.command_sequence,
+        turn_id,
+        result,
+    }
+}
+
+fn append_final_turn_batch(
+    state: &ryeos_app::state::AppState,
+    root: &str,
+    sequence: u64,
+    request_digest: &str,
+    result: &Value,
+) {
+    state.state_store.append_events(root, root, &[command_fact(
+        root, "hosted_worker_command_observation_batch", sequence, request_digest, 1,
+        json!({"schema":1,"origin":"daemon_observed_io",
+            "response_digest":ryeos_state::objects::canonical_value_digest(result).unwrap(),
+            "canonical_batch":{"events":result["events"],"session_observations":result["session_observations"]}}),
+    )]).unwrap();
+}
+
+fn project_turn_start(state: &ryeos_app::state::AppState, root: &str, turn_id: &str) {
     state
         .state_store
-        .settle_dedicated_command(root, command.command_sequence, 1, true, &result)
+        .observe_dedicated_session_state(root, 1, "idle", "turn_running", None, Some(turn_id))
         .unwrap();
-    state
-        .state_store
-        .observe_dedicated_session_state(root, 1, "idle", "turn_running", None, Some(&turn_id))
-        .unwrap();
+}
+
+fn complete_turn(state: &ryeos_app::state::AppState, root: &str, turn_id: &str) {
     let mut terminal_batch = json!({
         "first_sequence":1,
         "count":1,
@@ -487,18 +556,154 @@ fn seed_completed_turn_fixture(
         Value::String(ryeos_state::objects::canonical_value_digest(&terminal_batch).unwrap());
     ryeos_app::dedicated_session_service::ingest_observation_batch(state, root, 1, terminal_batch)
         .unwrap();
-    let observation = ryeos_app::dedicated_session_service::command_observation(
-        state,
+}
+
+#[tokio::test]
+async fn command_progress_recovery_preserves_the_exact_crash_frontier() {
+    for (label, projected, completed, final_batch) in [
+        ("before-projection", false, false, false),
+        ("before-ack", true, false, false),
+        ("before-settlement", true, false, true),
+        ("completion-before-settlement", true, true, true),
+    ] {
+        let (_tmp, state) = test_state::build_test_state();
+        let root = format!("T-progress-{label}");
+        let pending = seed_pending_turn_fixture(&state, &root, true);
+        if projected {
+            project_turn_start(&state, &root, &pending.turn_id);
+        }
+        if completed {
+            complete_turn(&state, &root, &pending.turn_id);
+        }
+        if final_batch {
+            append_final_turn_batch(
+                &state,
+                &root,
+                pending.sequence,
+                &pending.request_digest,
+                &pending.result,
+            );
+        }
+        for _ in 0..2 {
+            ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).unwrap();
+            let command = state
+                .state_store
+                .dedicated_session_command(&root, pending.sequence)
+                .unwrap()
+                .unwrap();
+            let session = state.state_store.dedicated_session(&root).unwrap().unwrap();
+            assert_eq!(
+                command.state,
+                if final_batch {
+                    "completed"
+                } else {
+                    "outcome_unknown"
+                },
+                "{label}"
+            );
+            if completed {
+                assert_eq!(session.state, "idle", "{label}");
+                assert!(session.current_turn_id.is_none());
+                let observed = ryeos_app::dedicated_session_service::command_observation(
+                    &state,
+                    &root,
+                    pending.sequence,
+                )
+                .unwrap();
+                assert_eq!(observed["completion_fence"]["turn_id"], pending.turn_id);
+            } else {
+                assert_eq!(
+                    session.current_turn_id.as_deref(),
+                    Some(pending.turn_id.as_str()),
+                    "{label}"
+                );
+                assert_eq!(
+                    session.state,
+                    if final_batch {
+                        "turn_running"
+                    } else {
+                        "outcome_unknown"
+                    },
+                    "{label}"
+                );
+            }
+            if final_batch {
+                assert_eq!(
+                    command.result.as_ref().unwrap()["response_digest"],
+                    ryeos_state::objects::canonical_value_digest(&pending.result).unwrap()
+                );
+            }
+        }
+        let replay = state
+            .state_store
+            .replay_events(&root, Some(&root), None, 128, 1024 * 1024)
+            .unwrap();
+        let starts = replay
+            .events
+            .iter()
+            .filter(|event| event.event_type == "hosted_session.turn_started")
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1, "{label}");
+        assert_eq!(starts[0].payload["source"]["kind"], "command_progress");
+    }
+}
+
+#[tokio::test]
+async fn command_progress_recovery_refuses_a_conflicting_final_start() {
+    let (_tmp, state) = test_state::build_test_state();
+    let root = "T-progress-conflicting-final";
+    let pending = seed_pending_turn_fixture(&state, root, true);
+    project_turn_start(&state, root, &pending.turn_id);
+    let mut bad_result = pending.result.clone();
+    bad_result["session_observations"][0]["turn_id"] = json!("different-turn");
+    append_final_turn_batch(
+        &state,
         root,
-        command.command_sequence,
+        pending.sequence,
+        &pending.request_digest,
+        &bad_result,
+    );
+    assert!(ryeos_app::dedicated_session_service::reconcile_command_outboxes(&state).is_err());
+    let command = state
+        .state_store
+        .dedicated_session_command(root, pending.sequence)
+        .unwrap()
+        .unwrap();
+    assert_eq!(command.state, "dispatched");
+    let session = state.state_store.dedicated_session(root).unwrap().unwrap();
+    assert_eq!(
+        session.current_turn_id.as_deref(),
+        Some(pending.turn_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn completed_command_retains_its_early_progress_start_authority() {
+    let (_tmp, state) = test_state::build_test_state();
+    let root = "T-progress-completed-fence";
+    let fixture = seed_completed_turn_fixture_with_progress(&state, root, true);
+    let observed = ryeos_app::dedicated_session_service::command_observation(
+        &state,
+        root,
+        fixture.fence.command_sequence,
     )
     .unwrap();
-    CompletedTurnFixture {
-        fence: serde_json::from_value(observation["completion_fence"].clone()).unwrap(),
-        worker_instance_id,
-        command_payload,
-        request_digest,
-    }
+    assert_eq!(observed["operation"]["state"], "completed");
+    assert_eq!(
+        observed["completion_fence"],
+        serde_json::to_value(&fixture.fence).unwrap()
+    );
+    let replay = state
+        .state_store
+        .replay_events(root, Some(root), None, 128, 1024 * 1024)
+        .unwrap();
+    let starts = replay
+        .events
+        .iter()
+        .filter(|event| event.event_type == "hosted_session.turn_started")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].payload["source"]["kind"], "command_progress");
 }
 
 #[tokio::test]

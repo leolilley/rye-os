@@ -2262,10 +2262,17 @@ impl IsolationRuntime {
                 .filesystem
                 .writable
                 .iter()
-                .any(|entry| entry == "{project}");
+                .any(|entry| entry == "{project}")
+                || (context.project_authority == IsolationProjectAuthority::ReadOnly
+                    && self
+                        .inspection
+                        .filesystem
+                        .readable
+                        .iter()
+                        .any(|entry| entry == "{project}"));
             if !admits_verified_code || !admits_project {
                 return Err(refused(format!(
-                    "captured execution requires node ceilings for {{verified_code}} readable and {{project}} writable; node policy requested readable {:?}, writable {:?}",
+                    "captured execution requires node ceilings for {{verified_code}} readable and {{project}} access compatible with launch authority; node policy requested readable {:?}, writable {:?}",
                     self.inspection.filesystem.readable, self.inspection.filesystem.writable
                 )));
             }
@@ -2705,6 +2712,38 @@ impl IsolationRuntime {
             }
             None => Vec::new(),
         };
+        // A read-only ceiling is not directory authority. Only the state-issued
+        // proof for this exact execution input can expose an immutable project
+        // from protected node storage. Do not recognize snapshots by pathname,
+        // borrow the definition generation, or widen realization mount scope.
+        let immutable_project_handle = if let Some(proof) = context.immutable_project {
+            if context.project_authority != IsolationProjectAuthority::ReadOnly
+                || context.live_access.is_some()
+                || context.workspace_view.is_some()
+            {
+                return Err(refused(
+                    "immutable project proof contradicts launch authority".to_string(),
+                ));
+            }
+            if !proof.owns_path(&canonical_project).map_err(|error| {
+                refused(format!(
+                    "immutable project binding cannot be checked: {error}"
+                ))
+            })? {
+                return Err(refused(
+                    "immutable project proof does not own the execution input".to_string(),
+                ));
+            }
+            Some(proof.verified_mount_descriptor().map_err(|error| {
+                refused(format!(
+                    "immutable project content changed before launch: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+        let retained_read_only_project =
+            immutable_project_handle.is_some() || retained_live_project_handle.is_some();
         let canonical_cwd = canonicalize_context_mount("working directory", &cwd_destination)?;
         let mount_namespace = MountNamespace {
             project_destination: &project_destination,
@@ -2833,6 +2872,8 @@ impl IsolationRuntime {
                 ))
             })?;
             (true, Some(handle), None)
+        } else if let Some(handle) = immutable_project_handle {
+            (false, Some(handle), None)
         } else if let Some(handle) = retained_live_project_handle {
             (false, Some(handle), None)
         } else {
@@ -3260,6 +3301,38 @@ impl IsolationRuntime {
             node_trusted_keys_dir: context.node_trusted_keys_dir,
             verified_code_mounts: &verified_code_mounts,
         };
+        if context.project_authority == IsolationProjectAuthority::ReadOnly
+            && (self
+                .inspection
+                .filesystem
+                .readable
+                .iter()
+                .any(|entry| entry == "{project}")
+                || (retained_read_only_project
+                    && self
+                        .inspection
+                        .filesystem
+                        .writable
+                        .iter()
+                        .any(|entry| entry == "{project}")))
+        {
+            // Reuse the protected-root floor when narrowing project access.
+            // Only a verified immutable materialization permits the exact
+            // project inside node storage; it grants no sibling or parent.
+            let project_validation = WritableMountValidation {
+                app_root: if context.immutable_project.is_some() {
+                    None
+                } else {
+                    writable_validation.app_root
+                },
+                ..writable_validation
+            };
+            validate_writable_mount(
+                &canonical_project,
+                WritableMountAuthority::Policy,
+                &project_validation,
+            )?;
+        }
         let configured_readable = self
             .inspection
             .filesystem
@@ -3269,6 +3342,8 @@ impl IsolationRuntime {
                 context.filesystem_authority_ceiling
                     == IsolationFilesystemAuthorityCeiling::NodePolicy
                     || configured.as_str() == "{verified_code}"
+                    || (context.project_authority == IsolationProjectAuthority::ReadOnly
+                        && configured.as_str() == "{project}")
             });
         let mut readable_mounts = configured_readable
             .map(|configured| resolve_readable_mounts(configured, &readable_resolution))
@@ -3276,6 +3351,23 @@ impl IsolationRuntime {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        // Retained project authority narrows a configured project write grant;
+        // a bare ReadOnly ceiling must not manufacture a project mount. Code-only
+        // launches remain valid through their verified-code mounts and final cwd
+        // visibility check. Never convert arbitrary writable paths or node state.
+        // This is the same policy intersection for immutable child inputs and
+        // independent candidate evaluation, not a workload-specific exception.
+        if context.project_authority == IsolationProjectAuthority::ReadOnly
+            && retained_read_only_project
+            && self
+                .inspection
+                .filesystem
+                .writable
+                .iter()
+                .any(|entry| entry == "{project}")
+        {
+            readable_mounts.extend(resolve_readable_mounts("{project}", &readable_resolution)?);
+        }
         if project_workspace.is_some() {
             readable_mounts.retain(|mount| {
                 !(mount.source.starts_with(&canonical_project)
@@ -6170,6 +6262,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: app_root.path(),
                     project_authority: IsolationProjectAuthority::ReadOnly,
@@ -6253,6 +6346,7 @@ mod tests {
             .apply_with_provenance(
                 request,
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: app_root.path(),
                     project_authority: IsolationProjectAuthority::ReadOnly,
@@ -6318,6 +6412,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::ReadOnly,
@@ -6428,6 +6523,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::External,
@@ -6568,6 +6664,156 @@ mod tests {
             inherited_fd_mappings: Vec::new(),
             supervised_status: None,
         };
+        let immutable_project =
+            ryeos_state::PinnedProjectMaterialization::from_observed_tree_for_test(
+                "a".repeat(64),
+                project.path(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        // Immutable child/evaluator inputs intersect the node's exact project
+        // grant with read-only launch authority. They must not lose visibility
+        // merely because the node ceiling permits writing, nor gain any grant
+        // when the node omitted the project altogether.
+        for ceiling in [
+            IsolationFilesystemAuthorityCeiling::CapturedExecution,
+            IsolationFilesystemAuthorityCeiling::NodePolicy,
+        ] {
+            for (readable_project, writable_project) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let mut narrowed = runtime.clone();
+                narrowed.inspection.filesystem.readable = vec!["{verified_code}".into()];
+                narrowed.inspection.filesystem.writable.clear();
+                if readable_project {
+                    narrowed
+                        .inspection
+                        .filesystem
+                        .readable
+                        .push("{project}".into());
+                }
+                if writable_project {
+                    narrowed
+                        .inspection
+                        .filesystem
+                        .writable
+                        .push("{project}".into());
+                }
+                // An unrelated writable grant must never turn into a read
+                // mount when the project authority is read-only.
+                narrowed
+                    .inspection
+                    .filesystem
+                    .writable
+                    .push(content.path().to_string_lossy().into_owned());
+                let context = IsolationLaunchContext {
+                    immutable_project: Some(&immutable_project),
+                    workspace_view: None,
+                    project_path: project.path(),
+                    project_authority: IsolationProjectAuthority::ReadOnly,
+                    filesystem_authority_ceiling: ceiling,
+                    network_authority_ceiling: IsolationNetworkAuthorityCeiling::Isolated,
+                    live_access: None,
+                    state_root: None,
+                    checkpoint_dir: None,
+                    checkpoint_authority: None,
+                    daemon_socket_path: None,
+                    bundle_roots: &[],
+                    node_trusted_keys_dir: None,
+                    verified_code: &[],
+                    verified_command: Some(&command),
+                    external_read_only_mounts: &[],
+                    target_channels: &[],
+                    item_ref: "tool:tests/immutable-project",
+                    thread_id: "T-immutable-project",
+                };
+                let applied = narrowed.apply_with_provenance(request(), context);
+                if !readable_project && !writable_project {
+                    let error = applied.err().expect("missing project grant must refuse");
+                    assert!(
+                        error.to_string().contains("node ceilings")
+                            || error.to_string().contains("not visible"),
+                        "{error}"
+                    );
+                    continue;
+                }
+                let applied = applied.unwrap();
+                let (bytes, _) = applied
+                    .request
+                    .inherited_fds
+                    .last()
+                    .unwrap()
+                    .read_regular_file_stable_bounded(
+                        ryeos_isolation_protocol::MAX_REQUEST_BYTES as u64,
+                    )
+                    .unwrap();
+                let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let mounts = wire["plan"]["mounts"].as_array().unwrap();
+                let project_mounts: Vec<_> = mounts
+                    .iter()
+                    .filter(|mount| mount["destination"].as_str() == project.path().to_str())
+                    .collect();
+                assert_eq!(project_mounts.len(), 1);
+                assert_eq!(project_mounts[0]["access"], "read_only");
+                assert!(
+                    !mounts
+                        .iter()
+                        .any(|mount| mount["destination"].as_str() == content.path().to_str())
+                );
+                // Removing the proof must not expose protected node storage,
+                // whether the policy requested project read or project write.
+                let error = narrowed
+                    .apply_with_provenance(
+                        request(),
+                        IsolationLaunchContext {
+                            immutable_project: None,
+                            ..context
+                        },
+                    )
+                    .err()
+                    .expect("unproved node-storage project must refuse");
+                assert!(
+                    error.to_string().contains("protected app root")
+                        || error.to_string().contains("not visible"),
+                    "{error}"
+                );
+                let wrong_input =
+                    ryeos_state::PinnedProjectMaterialization::from_observed_tree_for_test(
+                        "b".repeat(64),
+                        &sibling_state,
+                        BTreeMap::new(),
+                    )
+                    .unwrap();
+                let error = narrowed
+                    .apply_with_provenance(
+                        request(),
+                        IsolationLaunchContext {
+                            immutable_project: Some(&wrong_input),
+                            ..context
+                        },
+                    )
+                    .err()
+                    .expect("subject or sibling proof must not own input");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not own the execution input"),
+                    "{error}"
+                );
+                std::fs::write(project.path().join("changed"), b"not captured").unwrap();
+                let error = narrowed
+                    .apply_with_provenance(request(), context)
+                    .err()
+                    .expect("same inode with changed content must refuse");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("immutable project content changed"),
+                    "{error}"
+                );
+                std::fs::remove_file(project.path().join("changed")).unwrap();
+            }
+        }
         for (exact_state, network_ceiling) in [
             (None, IsolationNetworkAuthorityCeiling::Isolated),
             (
@@ -6589,6 +6835,7 @@ mod tests {
                 ));
             }
             let context = IsolationLaunchContext {
+                immutable_project: None,
                 workspace_view: None,
                 project_path: project.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
@@ -6778,6 +7025,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: project.path(),
                     project_authority: IsolationProjectAuthority::External,
@@ -6896,6 +7144,7 @@ mod tests {
         let error = match runtime.apply(
             request,
             IsolationLaunchContext {
+                immutable_project: None,
                 workspace_view: None,
                 project_path: app_root.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
@@ -6950,6 +7199,7 @@ mod tests {
         let error = match runtime.apply(
             request,
             IsolationLaunchContext {
+                immutable_project: None,
                 workspace_view: None,
                 project_path: app_root.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
@@ -7004,6 +7254,7 @@ mod tests {
         let error = match runtime.apply(
             request,
             IsolationLaunchContext {
+                immutable_project: None,
                 workspace_view: None,
                 project_path: app_root.path(),
                 project_authority: IsolationProjectAuthority::EphemeralScratch,
@@ -7108,6 +7359,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: &project,
                     project_authority: IsolationProjectAuthority::RuntimeWorkspace,
@@ -7154,6 +7406,7 @@ mod tests {
             authorized_write_namespaces: vec!["project".to_string()],
         };
         let context = IsolationLaunchContext {
+            immutable_project: None,
             workspace_view: None,
             project_path: app_root.path(),
             project_authority: IsolationProjectAuthority::External,
@@ -7211,6 +7464,7 @@ mod tests {
             supervised_status: Some(status.reader),
         };
         let context = IsolationLaunchContext {
+            immutable_project: None,
             workspace_view: None,
             project_path: app_root.path(),
             project_authority: IsolationProjectAuthority::External,
@@ -7259,6 +7513,7 @@ mod tests {
             authorized_write_namespaces: vec!["project".to_string()],
         };
         let context = |live_access| IsolationLaunchContext {
+            immutable_project: None,
             workspace_view: None,
             project_path: app_root.path(),
             project_authority: IsolationProjectAuthority::External,
@@ -7335,6 +7590,7 @@ mod tests {
                     supervised_status: None,
                 },
                 IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: app_root.path(),
                     project_authority: IsolationProjectAuthority::RuntimeWorkspace,

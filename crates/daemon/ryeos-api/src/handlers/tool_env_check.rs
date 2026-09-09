@@ -206,6 +206,7 @@ pub async fn handle(
                 &probe_names,
                 &isolation,
                 ryeos_engine::isolation::IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: None,
                     project_path: &project_path,
                     project_authority: ryeos_engine::isolation::IsolationProjectAuthority::ReadOnly,

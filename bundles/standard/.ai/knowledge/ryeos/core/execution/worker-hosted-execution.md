@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-07T23:13:21Z:7c3a0b4cd4fb9504c84f8339db0289996435eab8ae73f855eda188c52e6f89ff:CmSbAsu6KjjCoiOgAbpFI9TJQtFFvs675R9Vxm03Jqyyr4RL+o0zhRgnv9Lg0qDbjRkR/1JT/Wa+xJvvsXDfCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T04:38:33Z:1746fb0c9bb78da131a1b104274410160c69f848085684163fcf247beb199402:yz5n84ahAnHg8J98xmUFPV815wwcWSySMDZSJlfXS+JMzSw6DwQC0HUo5E1/K0gVw2T6A6MfD2QOf+UrCEoBCw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/core/execution"
 name: "worker-hosted-execution"
@@ -228,7 +228,7 @@ A project worker execution selects its signed portable environment through the
 runtime-declared `environment` ref binding. The selector is not an ordinary
 parameter and cannot be smuggled through the worker input envelope. The generic
 launch preparer accepts only a trusted bundle/project `config` with the closed
-`ryeos.worker_environment.v4` schema, derives the exact worker dependency from
+`ryeos.worker_environment.v5` schema, derives the exact worker dependency from
 it, and retains the engine-resolved path-free binding record in the outer
 admitted program. The environment may additionally declare locator-free pinned
 external content and an ordered executable-search list over those exact tree
@@ -249,7 +249,7 @@ execution and content dependencies remain projectless: selecting them from a
 project must not give their code a project overlay. Same-site recovery keeps
 the captured realizations rather than re-resolving mutable names.
 
-The v4 configuration may also declare `process_environment`. This is not an
+The v5 configuration may also declare `process_environment`. This is not an
 extension of content authority and is not a project/vault environment overlay.
 The kind-owned preparer emits a generic path-free environment contribution as
 a sibling of execution and content dependencies. Every contribution names its
@@ -277,9 +277,9 @@ policy remain the final enforcement path. No host environment, absolute
 authored path, credential home, project ignore entry, or kind-specific engine
 branch becomes environment authority.
 
-The required-nullable v4 `workload_client` member is independent of process
+The required-nullable v5 `workload_client` member is independent of process
 environment and external-content authority. `null` disables it. A non-null
-request names one exact client member in an already declared pinned tree plus
+request selects explicit CLI, structured-session, or both ingress bindings plus
 a finite, sorted set of child item refs, ref-binding values, call forms,
 effect classes, signed workspace-access assertions, in-flight count,
 invocation count and lifetime. The signed
@@ -293,8 +293,16 @@ workload name is engine vocabulary.
 RyeOS does not expose an operator key, callback bearer, thread-auth bearer,
 daemon address or ordinary CLI transport to the workload. The daemon retains
 those existing authorities in memory and creates one boot-bound protected
-target channel. Its secret-free boot frame contains only the protocol, grant
-digest and byte/concurrency bounds. Inside an enforced private-tmp and fresh
+target channel. Its secret-free boot frame contains the protocol, grant
+digest, selected ingress, byte/concurrency/lifetime bounds and a finite public
+operation presentation. The existing verified resolution and inventory owners
+derive that presentation from the original admitted source, never candidate
+edits. The placement's immutable `hosted_session.workload_client_admitted`
+fact binds its profile, request and presentation digests before contact;
+reattachment must reproduce the same recipe. It does not grant execution.
+
+CLI binding requires an exact client member in a declared pinned tree.
+Inside an enforced private-tmp and fresh
 PID-namespace sandbox, the trusted bridge publishes one random owner-private
 local endpoint. Lillux accepts only a non-init peer visible in that PID
 namespace, while the client proves the connected server is namespace PID 1;
@@ -302,6 +310,50 @@ pathname replacement therefore cannot impersonate the retained broker. A
 restricted client realization staged as `ryeos` supports only
 `ryeos execute`; it has no app-root discovery, HTTP/daemon fallback, signing,
 remote, lifecycle, installation or publication surface.
+
+Structured-session binding instead uses the signed profile's closed
+registration/request/result mapping over its existing application connection.
+It requires no client executable, listener, endpoint environment or unused
+realization. Selected interfaces share one grant, slot pool and daemon channel;
+there is no automatic retry through another interface. A protocol callback
+does not make an ordinary shell command a RyeOS execution.
+
+The trusted bridge assigns ingress provenance. Protocol session/operation/call
+identity is distinct from reply RPC identity and caller-controlled CLI IDs.
+The existing `RuntimeActionIntent` retains that source and exactly one child;
+a new call must match the current hosted turn. Same-call changed behavior is
+refused. An old call under a new boot grant is fenced to the original action
+and reports unknown rather than executing again. Child failure, unknown outcome,
+and unavailable retained result remain distinct from task success. No ingress
+may turn digest-only/unavailable results into permission to rerun.
+
+Structured-session wire version 2 adds request-correlated progress
+acknowledgements. A signed route can select one unconditional turn-start
+notification from its existing profile. That notification's signed upstream
+session pointer must select a required string in its schema and match the
+already-bound session before any progress is admitted. The bridge sends it as
+a Delta on the exact active command; it does not infer authority from a tool
+call's turn ID. Under the original command lease, the daemon atomically records
+`hosted_worker_command_progress` and `hosted_session.turn_started`, applies the
+projection, then sends an ObservationAck with the exact request ID and canonical
+progress digest. The bridge withholds both invocation dispatch and causally
+later pushed batches until that acknowledgement; timeout or mismatch fails
+closed. Ordinary uncorrelated observation acknowledgements retain their own
+sequence/digest identity.
+
+The final command batch must corroborate the same early boot, command sequence,
+request digest and turn. It retains the start for historical lookup but does
+not append or apply it twice. Recovery validates the original progress batch
+and start source; an already completed turn is never resurrected by a delayed
+final response. New child ingress is refused immediately once the existing
+root gate is terminalizing, while earlier accepted work retains its causal
+settlement lane. These are existing command/observation and runtime-action
+owners, not a second invocation ledger.
+
+The application event loop continues servicing controls and server messages
+while a child is outstanding. Child settlement/thaw remains daemon-owned, so a
+frozen bridge is not needed to release its own workspace borrower. Lillux bounds
+channel I/O with absolute deadlines and supplies shutdown wakeup mechanics.
 
 A nested workload permission profile may reopen only the fixed private broker
 directory `/tmp/.ryeos-wc` as read-only beneath broader tmp-directory denies.

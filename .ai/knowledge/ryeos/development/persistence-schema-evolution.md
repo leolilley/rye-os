@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-08T22:30:26Z:4ade0bd342d15f781de960118f7252a5268d9a5b03d5b536f55eaf11cc1a17f8:8S03K9tw+Mav1dqjrL73tQ6ul/9GgPwuq0EbMKBFcVNzV0fKK9T+Jq/lH6NGmVWrBp6LS4jYoVtuhSsuSYb3DQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T03:59:20Z:ded08f9893f6c84db735b078f9a9980ffb7c529dba169b30dcea09130da7624d:T12dFMi3Jb8D/43eXJIlcMr98bkPlzgZzf5LGv6gmdJNujHAeoq7RzQ4UROi9XMMt6Z/YEoE6l2kNbyeXNzaCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ```yaml
 category: "ryeos/development"
 name: "persistence-schema-evolution"
@@ -34,10 +34,20 @@ The current clean-cut execution formats include:
 - project snapshot schema 5;
 - admitted launch capsule schema 25;
 - persistent-session capsule schema 8;
-- runtime launch metadata epoch 32;
+- runtime launch metadata epoch 33;
 - the standalone runtime project-authority envelope epoch 4; and
-- the owned runtime SQLite operator schema epoch 30 (encoded in the RyeOS
+- the owned runtime SQLite operator schema epoch 31 (encoded in the RyeOS
   `PRAGMA application_id` family).
+
+Workload invocation uses launch metadata 33 and runtime epoch 31. The existing
+runtime-action row now retains trusted ingress provenance; a partial unique
+index fences protocol session/turn/call identity across boot-grant rotation.
+Decoding recomputes the operation coordinate from retained source and grant.
+The request protocol is v2, environment contract v5, and compiled structured
+profile version 3. Structured-session wire version 2 binds command-progress
+acknowledgements to the exact request and digest. The signed protocol and bridge
+select the same version; old peers fail their wire identity check. Predecessor
+authority is not defaulted or reinterpreted.
 
 The isolation policy v4 cut required explicit `network.runtime_files` (including an
 explicit empty list). Launch metadata 31 binds the sealed input digests in the

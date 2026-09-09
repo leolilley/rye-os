@@ -120,6 +120,7 @@ pub(crate) fn run_handler_subprocess(
     let req = launch.isolation.apply(
         req,
         IsolationLaunchContext {
+            immutable_project: None,
             workspace_view: None,
             project_path: &bundle_root,
             project_authority: IsolationProjectAuthority::ReadOnly,

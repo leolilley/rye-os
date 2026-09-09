@@ -21,10 +21,13 @@ use ryeos_executor::execution::persistent_session::ExclusivePersistentSessionIde
 use ryeos_runtime::authorizer::AuthorizationPolicy;
 use ryeos_runtime::workload_client::{
     WORKLOAD_CLIENT_CHANNEL_ENV, WORKLOAD_CLIENT_CHANNEL_TARGET_FD, WORKLOAD_CLIENT_PROTOCOL,
-    WorkloadClientBootFrame, WorkloadClientOperation, WorkloadClientOutcome,
-    WorkloadClientReadyFrame, WorkloadClientRequestContract, WorkloadClientRequestFrame,
+    WorkloadClientBootFrame, WorkloadClientDispatchFrame, WorkloadClientOperation,
+    WorkloadClientOutcome, WorkloadClientReadyFrame, WorkloadClientRequestContract,
     WorkloadClientResponseFrame,
 };
+
+const WORKLOAD_PRESENTATION_EVENT: &str = "hosted_session.workload_client_admitted";
+const WORKLOAD_PRESENTATION_OPERATION: &str = "workload-client-presentation";
 
 /// Compile and start one boot-local workload-client authority when the exact
 /// admitted project environment requested it. The returned child endpoint is
@@ -95,6 +98,12 @@ pub(super) fn prepare_for_dedicated_boot(
         return Ok(None);
     };
     request.validate()?;
+    let profile_hash =
+        ryeos_executor::execution::persistent_session::validate_workload_client_profile(
+            state,
+            session_capsule_hash,
+            &request,
+        )?;
 
     require_private_workload_client_isolation(state)?;
     let execution_policy = state
@@ -186,6 +195,15 @@ pub(super) fn prepare_for_dedicated_boot(
     let request_digest = digest_value(&request)?;
     let caller_scope_digest = digest_value(&canonical_strings(ingress.scopes.clone()))?;
     let root_delegation_digest = digest_value(&root_delegation_caps)?;
+    let execution_presentation = present_admitted_executions(
+        state,
+        root_capability,
+        &request,
+        &effective_caps,
+        owner_principal,
+        &root_thread.current_site_id,
+        &root_thread.origin_site_id,
+    )?;
     let grant = AdmittedWorkloadClientGrant {
         schema: AdmittedWorkloadClientGrant::SCHEMA,
         protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
@@ -204,7 +222,13 @@ pub(super) fn prepare_for_dedicated_boot(
         operator_grant_digest: current_operator.grant_digest,
         root_delegation_digest,
         node_policy_generation_digest: state.node_policy.generation_digest().to_owned(),
+        ingresses: request
+            .bindings
+            .iter()
+            .map(|binding| binding.ingress())
+            .collect(),
         executions: request.executions.clone(),
+        execution_presentation,
         effective_caps: effective_caps.clone(),
         max_in_flight: request.max_in_flight,
         max_invocations_per_boot: request.max_invocations_per_boot,
@@ -212,6 +236,37 @@ pub(super) fn prepare_for_dedicated_boot(
         max_request_bytes: node_policy.max_request_bytes,
     };
     let grant_digest = grant.digest()?;
+
+    // One immutable placement fact binds the exact mechanical registration
+    // recipe across boot rotation. A different presentation under the same
+    // placement conflicts before contact; it cannot silently replace tools
+    // restored by the pinned protocol implementation from its captured state.
+    let presentation_fact = json!({
+        "placement_thread_id":identity.placement_thread_id,
+        "session_capsule_hash":session_capsule_hash,
+        "request_digest":grant.request_digest,
+        "profile_hash":profile_hash,
+        "presentation_digest":digest_value(&grant.execution_presentation)?,
+        "ingresses":grant.ingresses,
+    });
+    if identity.boot_epoch > 1 {
+        let retained = ryeos_app::authoritative_root_fact::lookup(
+            state,
+            &identity.placement_thread_id,
+            WORKLOAD_PRESENTATION_EVENT,
+            WORKLOAD_PRESENTATION_OPERATION,
+        )?;
+        if retained.count != 1 {
+            bail!("recovered workload boot lacks its original presentation testimony");
+        }
+    }
+    ryeos_app::authoritative_root_fact::append_once(
+        state,
+        &identity.placement_thread_id,
+        WORKLOAD_PRESENTATION_EVENT,
+        WORKLOAD_PRESENTATION_OPERATION,
+        presentation_fact,
+    )?;
 
     state
         .state_store
@@ -412,6 +467,63 @@ fn canonical_strings(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
+fn present_admitted_executions(
+    state: &AppState,
+    root: &CallbackCapability,
+    request: &WorkloadClientRequestContract,
+    scopes: &[String],
+    owner: &str,
+    current_site: &str,
+    origin_site: &str,
+) -> Result<Value> {
+    use ryeos_engine::contracts::{
+        EffectivePrincipal, PlanContext, Principal, ProjectContext, SubjectResolutionAuthority,
+    };
+    let provenance = &root.provenance;
+    let subject = provenance.subject_resolution_authority();
+    let context = ryeos_executor::executor::ExecutionContext {
+        principal_fingerprint: owner.to_owned(),
+        caller_scopes: scopes.to_vec(),
+        engine: provenance.request_engine().clone(),
+        requested_call: None,
+        plan_ctx: PlanContext {
+            requested_by: EffectivePrincipal::Local(Principal {
+                fingerprint: owner.to_owned(),
+                scopes: scopes.to_vec(),
+            }),
+            project_context: if matches!(subject, SubjectResolutionAuthority::Projectless) {
+                ProjectContext::None
+            } else {
+                ProjectContext::LocalPath {
+                    path: provenance.subject_effective_path().to_path_buf(),
+                }
+            },
+            subject_resolution_authority: subject,
+            current_site_id: current_site.to_owned(),
+            origin_site_id: origin_site.to_owned(),
+            execution_hints: Default::default(),
+            scheduled_fire: None,
+            validate_only: true,
+        },
+    };
+    let binding = ryeos_app::thread_lifecycle::AdmittedProjectBinding::from_provenance(
+        &context.engine,
+        &context.plan_ctx,
+        provenance,
+    )?;
+    let presentation = request
+        .executions
+        .iter()
+        .map(|ceiling| {
+            ryeos_executor::dispatch::present_workload_execution(ceiling, &binding, &context, state)
+                .map_err(anyhow::Error::new)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let presentation = Value::Array(presentation);
+    ryeos_runtime::workload_client::validate_execution_presentation(&presentation)?;
+    Ok(presentation)
+}
+
 fn digest_value(value: &impl serde::Serialize) -> Result<String> {
     let value = serde_json::to_value(value)?;
     let canonical = lillux::canonical_json(&value)?;
@@ -478,9 +590,16 @@ fn serve_daemon_broker(
     thread_auth_token: &str,
     mut channel: lillux::InheritedDuplexChannel,
 ) -> Result<()> {
+    let deadline = lillux::time::MonotonicDeadline::after(lillux::time::Duration::from_secs(
+        grant.max_lifetime_seconds,
+    ));
+    let mut channel = channel.with_deadline(deadline);
     let boot = WorkloadClientBootFrame {
         protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
         grant_digest: grant_digest.to_owned(),
+        ingresses: grant.ingresses.clone(),
+        execution_presentation: grant.execution_presentation.clone(),
+        max_lifetime_seconds: grant.max_lifetime_seconds,
         max_in_flight: grant.max_in_flight,
         max_request_bytes: grant.max_request_bytes,
     };
@@ -499,18 +618,18 @@ fn serve_daemon_broker(
         bail!("workload-client bridge acknowledged a different boot grant");
     }
 
-    let deadline = lillux::time::MonotonicDeadline::after(lillux::time::Duration::from_secs(
-        grant.max_lifetime_seconds,
-    ));
     for invocation in 0..grant.max_invocations_per_boot {
         if deadline.has_elapsed() {
             bail!("workload-client boot authority expired");
         }
-        let request: WorkloadClientRequestFrame =
+        let request: WorkloadClientDispatchFrame =
             ryeos_runtime::workload_client::read_frame_bounded(
                 &mut channel,
                 grant.max_request_bytes as usize,
             )?;
+        if deadline.has_elapsed() {
+            bail!("workload-client authority expired while receiving a request");
+        }
         let response = dispatch_request(
             state,
             runtime,
@@ -535,12 +654,15 @@ fn dispatch_request(
     grant_digest: &str,
     callback_token: &str,
     thread_auth_token: &str,
-    request: WorkloadClientRequestFrame,
+    dispatch: WorkloadClientDispatchFrame,
 ) -> WorkloadClientResponseFrame {
-    let request_id = request.request_id.clone();
+    let request_id = dispatch.request.request_id.clone();
     let outcome = (|| -> Result<Value> {
-        request.validate()?;
+        dispatch.validate()?;
         grant.validate()?;
+        if !grant.ingresses.contains(&dispatch.source.ingress()) {
+            bail!("workload invocation selected an ungranted ingress");
+        }
         validate_live_boot(
             state,
             grant,
@@ -548,16 +670,13 @@ fn dispatch_request(
             callback_token,
             thread_auth_token,
         )?;
-        let WorkloadClientOperation::Execute(execute) = request.operation;
+        let WorkloadClientOperation::Execute(execute) = dispatch.request.operation;
         // The request id is the runtime-asserted occurrence coordinate. Keep
         // behavior out of this identity: runtime.dispatch_action separately
         // retains the canonical action digest, so replaying the same
         // coordinate with different behavior fails instead of minting a
         // second child operation.
-        let operation_id = digest_value(&json!({
-            "grant_digest": grant_digest,
-            "request_id": request_id,
-        }))?;
+        let operation_id = dispatch.source.runtime_operation_id(grant_digest)?;
         let action = ryeos_runtime::callback::ActionPayload {
             operation_id: Some(operation_id),
             item_id: execute.item_ref,
@@ -580,23 +699,49 @@ fn dispatch_request(
                 "thread_id": grant.placement_thread_id,
                 "thread_auth_token": thread_auth_token,
                 "action": action,
+                "workload_invocation": dispatch.source,
             }),
             state,
             None,
         ))
     })();
     let outcome = match outcome {
-        Ok(value) => WorkloadClientOutcome::Completed { value },
-        Err(error) => WorkloadClientOutcome::Failed {
-            code: "execution-failed".to_owned(),
-            message: bounded_error(&error),
-            retryable: false,
+        Ok(value) => match serde_json::from_value::<
+            ryeos_runtime::callback_contract::CallbackDispatchResponse,
+        >(value)
+        {
+            Ok(response) => WorkloadClientOutcome::Dispatched { response },
+            // A malformed response after contact must not become a retryable
+            // failure-before-execution or a fabricated successful child.
+            Err(_) => WorkloadClientOutcome::Failed {
+                code: ryeos_runtime::callback::RUNTIME_ACTION_OUTCOME_UNKNOWN_CODE.to_owned(),
+                message: "dispatch returned an invalid response after possible child contact"
+                    .to_owned(),
+                retryable: false,
+            },
         },
+        Err(error) => classify_workload_dispatch_error(&error),
     };
     WorkloadClientResponseFrame {
         protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
         request_id,
         outcome,
+    }
+}
+
+fn classify_workload_dispatch_error(error: &anyhow::Error) -> WorkloadClientOutcome {
+    use ryeos_executor::dispatch_error::DispatchError;
+    match error.downcast_ref::<DispatchError>() {
+        Some(dispatch) => WorkloadClientOutcome::Failed {
+            code: dispatch.code().to_owned(),
+            message: ryeos_runtime::workload_client::bounded_error_message(&dispatch.to_string()),
+            retryable: dispatch.retryable(),
+        },
+        None => WorkloadClientOutcome::Failed {
+            code: "execution-failed".to_owned(),
+            message: bounded_error(error),
+            retryable: false,
+        },
     }
 }
 

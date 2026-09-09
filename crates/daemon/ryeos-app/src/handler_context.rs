@@ -134,7 +134,11 @@ impl HandlerContext {
         {
             anyhow::bail!("recorded service invocation root is not canonical");
         }
-        if self.recorded_service_root_id.replace(root_thread_id).is_some() {
+        if self
+            .recorded_service_root_id
+            .replace(root_thread_id)
+            .is_some()
+        {
             anyhow::bail!("recorded service handler context already has an invocation root");
         }
         Ok(self)

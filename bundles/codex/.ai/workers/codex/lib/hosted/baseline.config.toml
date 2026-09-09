@@ -27,7 +27,6 @@ ignore_default_excludes = false
 "GIT_CONFIG_NOSYSTEM" = "include"
 "GIT_CONFIG_GLOBAL" = "include"
 "GIT_PAGER" = "include"
-"RYEOS_WORKLOAD_CLIENT_ENDPOINT" = "include"
 "HOME" = "exclude"
 "CODEX_HOME" = "exclude"
 "DBUS_*" = "exclude"
@@ -42,7 +41,6 @@ extends = ":workspace"
 ":minimal" = "read"
 ":tmpdir" = "deny"
 ":slash_tmp" = "deny"
-"/tmp/.ryeos-wc" = "read"
 
 [permissions.ryeos-workspace-only.filesystem.":workspace_roots"]
 ".ai/cache/ryeos-runtime" = "read"

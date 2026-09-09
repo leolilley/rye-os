@@ -470,6 +470,7 @@ pub struct RuntimeWorkspaceOperation {
     pub project_authority_digest: String,
     pub workload_client_grant_digest: String,
     pub input_snapshot_hash: Option<String>,
+    pub invocation: ryeos_runtime::workload_client::WorkloadInvocationSource,
 }
 
 #[derive(Debug, Clone)]
@@ -481,6 +482,7 @@ pub struct NewRuntimeWorkspaceOperation<'a> {
     pub worker_boot_identity_hash: &'a str,
     pub project_authority_digest: &'a str,
     pub workload_client_grant_digest: &'a str,
+    pub invocation: ryeos_runtime::workload_client::WorkloadInvocationSource,
 }
 
 fn workspace_access_as_str(access: ryeos_engine::kind_registry::WorkspaceAccess) -> &'static str {
@@ -549,6 +551,13 @@ fn decode_runtime_action_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run
                 project_authority_digest: row.get(16)?,
                 workload_client_grant_digest: row.get(17)?,
                 input_snapshot_hash: row.get(18)?,
+                invocation: serde_json::from_str(&row.get::<_, String>(19)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        19,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
             })
         })
         .transpose()?;
@@ -1127,6 +1136,7 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
     workspace_project_authority_digest TEXT,
     workspace_grant_digest TEXT,
     workspace_input_snapshot_hash TEXT,
+    workload_invocation TEXT,
     created_at_ms INTEGER NOT NULL,
     CHECK (
         mode = 'detached'
@@ -1148,6 +1158,7 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
             AND workspace_project_authority_digest IS NULL
             AND workspace_grant_digest IS NULL
             AND workspace_input_snapshot_hash IS NULL
+            AND workload_invocation IS NULL
         )
         OR
         (
@@ -1156,6 +1167,7 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
             workspace_id IS NOT NULL
             AND workspace_access IS NOT NULL
             AND workspace_operation_phase IS NOT NULL
+            AND workload_invocation IS NOT NULL
             AND workspace_worker_instance_id IS NOT NULL
             AND workspace_worker_boot_epoch IS NOT NULL
             AND workspace_worker_boot_identity_hash IS NOT NULL
@@ -1171,6 +1183,12 @@ CREATE TABLE IF NOT EXISTS runtime_action_intent (
 
 CREATE INDEX IF NOT EXISTS idx_runtime_action_intent_chain_root
     ON runtime_action_intent(chain_root_id);
+
+-- A protocol occurrence survives boot-local credential rotation. Keep its
+-- association in the action intent itself; a new grant is not a new call.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_action_protocol_invocation
+    ON runtime_action_intent(first_caller_thread_id, workload_invocation)
+    WHERE json_extract(workload_invocation, '$.kind') = 'structured_session';
 
 -- This is the mechanical shared-workspace barrier. Immutable children leave
 -- the index after binding their separate read-only generation; an exclusive
@@ -1612,7 +1630,9 @@ const RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK: u32 = 0x0000_00ff;
 // attachment. No predecessor row can imply borrower absence or mount ownership.
 // Epoch 30 retains pre-contact scope authority in the existing session owner,
 // explicit attached scope presence/absence and the stable offline lifetime fence.
-const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 30;
+// Epoch 31 retains exact workload ingress/callback identity in the existing
+// action intent. Never infer that testimony for a predecessor workspace row.
+const RUNTIME_OPERATOR_SCHEMA_EPOCH: u32 = 31;
 const _: () = assert!(
     RUNTIME_OPERATOR_SCHEMA_EPOCH > 0
         && RUNTIME_OPERATOR_SCHEMA_EPOCH <= RUNTIME_OPERATOR_SCHEMA_EPOCH_MASK
@@ -2021,6 +2041,12 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                     },
                     sqlite_schema::ColumnSpec {
                         name: "workspace_input_snapshot_hash",
+                        col_type: "TEXT",
+                        pk: false,
+                        not_null: false,
+                    },
+                    sqlite_schema::ColumnSpec {
+                        name: "workload_invocation",
                         col_type: "TEXT",
                         pk: false,
                         not_null: false,
@@ -3337,6 +3363,12 @@ fn runtime_schema_spec() -> sqlite_schema::SchemaSpec {
                 table: "runtime_action_intent",
                 columns: &["chain_root_id"],
                 unique: false,
+            },
+            sqlite_schema::IndexSpec {
+                name: "idx_runtime_action_protocol_invocation",
+                table: "runtime_action_intent",
+                columns: &["first_caller_thread_id", "workload_invocation"],
+                unique: true,
             },
             sqlite_schema::IndexSpec {
                 name: "idx_runtime_action_workspace_barrier",
@@ -4835,6 +4867,13 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
             );
         }
         validate_runtime_workspace_operation(operation)?;
+        if operation
+            .invocation
+            .runtime_operation_id(&operation.workload_client_grant_digest)?
+            != intent.operation_id
+        {
+            bail!("runtime action occurrence contradicts retained workload invocation authority");
+        }
     }
     if intent.launch_metadata.is_some() && intent.incompatible_launch_metadata.is_some() {
         bail!(
@@ -4883,6 +4922,7 @@ fn validate_runtime_action_intent_record(intent: &RuntimeActionIntent) -> Result
 }
 
 fn validate_runtime_workspace_operation(operation: &RuntimeWorkspaceOperation) -> Result<()> {
+    operation.invocation.request_id()?;
     for (label, value, limit) in [
         ("workspace id", operation.workspace_id.as_str(), 256usize),
         (
@@ -11339,9 +11379,13 @@ impl RuntimeDb {
                 project_authority_digest: seed.project_authority_digest.to_owned(),
                 workload_client_grant_digest: seed.workload_client_grant_digest.to_owned(),
                 input_snapshot_hash: None,
+                invocation: seed.invocation.clone(),
             })
             .map(|operation| {
                 validate_runtime_workspace_operation(&operation)?;
+                if operation.invocation.runtime_operation_id(&operation.workload_client_grant_digest)? != operation_id {
+                    bail!("runtime action was reused with different workspace authority: invocation coordinate");
+                }
                 Ok::<_, anyhow::Error>(operation)
             })
             .transpose()?;
@@ -11355,9 +11399,9 @@ impl RuntimeDb {
                 workspace_worker_instance_id, workspace_worker_boot_epoch,
                 workspace_worker_boot_identity_hash,
                 workspace_project_authority_digest, workspace_grant_digest,
-                created_at_ms
+                created_at_ms, workload_invocation
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                      ?12, ?13, ?14, ?15, ?16)
+                      ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(operation_id) DO NOTHING",
             params![
                 operation_id,
@@ -11394,6 +11438,14 @@ impl RuntimeDb {
                     .as_ref()
                     .map(|operation| operation.workload_client_grant_digest.as_str()),
                 lillux::time::timestamp_millis(),
+                proposed_workspace_operation
+                    .as_ref()
+                    .map(|operation| -> Result<String> {
+                        Ok(lillux::canonical_json(&serde_json::to_value(
+                            &operation.invocation,
+                        )?)?)
+                    })
+                    .transpose()?,
             ],
         )?;
         let persisted = tx.query_row(
@@ -11405,7 +11457,7 @@ impl RuntimeDb {
                     workspace_worker_instance_id, workspace_worker_boot_epoch,
                     workspace_worker_boot_identity_hash,
                     workspace_project_authority_digest, workspace_grant_digest,
-                    workspace_input_snapshot_hash
+                    workspace_input_snapshot_hash, workload_invocation
                FROM runtime_action_intent WHERE operation_id=?1",
             params![operation_id],
             decode_runtime_action_intent,
@@ -11437,6 +11489,7 @@ impl RuntimeDb {
                     && stored.worker_boot_identity_hash == proposed.worker_boot_identity_hash
                     && stored.project_authority_digest == proposed.project_authority_digest
                     && stored.workload_client_grant_digest == proposed.workload_client_grant_digest
+                    && stored.invocation == proposed.invocation
             }
             _ => false,
         };
@@ -11541,7 +11594,7 @@ impl RuntimeDb {
                         workspace_worker_instance_id, workspace_worker_boot_epoch,
                         workspace_worker_boot_identity_hash,
                         workspace_project_authority_digest, workspace_grant_digest,
-                        workspace_input_snapshot_hash
+                        workspace_input_snapshot_hash, workload_invocation
                  FROM runtime_action_intent WHERE operation_id=?1 AND mode='detached'",
                 params![operation_id],
                 decode_runtime_action_intent,
@@ -11593,7 +11646,7 @@ impl RuntimeDb {
                         workspace_worker_instance_id, workspace_worker_boot_epoch,
                         workspace_worker_boot_identity_hash,
                         workspace_project_authority_digest, workspace_grant_digest,
-                        workspace_input_snapshot_hash
+                        workspace_input_snapshot_hash, workload_invocation
                    FROM runtime_action_intent WHERE operation_id=?1",
                 params![operation_id],
                 decode_runtime_action_intent,
@@ -11603,6 +11656,37 @@ impl RuntimeDb {
             validate_runtime_action_intent_record(intent)?;
         }
         Ok(row)
+    }
+
+    /// Exact indexed association, independent of the current boot/grant. CLI
+    /// request IDs remain boot-local and must not borrow protocol authority.
+    pub fn runtime_action_for_protocol_invocation(
+        &self,
+        placement_thread_id: &str,
+        source: &ryeos_runtime::workload_client::WorkloadInvocationSource,
+    ) -> Result<Option<RuntimeActionIntent>> {
+        if !matches!(
+            source,
+            ryeos_runtime::workload_client::WorkloadInvocationSource::StructuredSession { .. }
+        ) {
+            bail!("protocol invocation lookup requires protocol provenance");
+        }
+        source.request_id()?;
+        let canonical = lillux::canonical_json(&serde_json::to_value(source)?)?;
+        let operation_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT operation_id FROM runtime_action_intent
+             WHERE first_caller_thread_id=?1 AND workload_invocation=?2
+               AND json_extract(workload_invocation, '$.kind')='structured_session'",
+                params![placement_thread_id, canonical],
+                |row| row.get(0),
+            )
+            .optional()?;
+        operation_id
+            .map(|id| self.get_runtime_action_intent(&id))
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn runtime_action_intents(&self) -> Result<Vec<RuntimeActionIntent>> {
@@ -11615,7 +11699,7 @@ impl RuntimeDb {
                     workspace_worker_instance_id, workspace_worker_boot_epoch,
                     workspace_worker_boot_identity_hash,
                     workspace_project_authority_digest, workspace_grant_digest,
-                    workspace_input_snapshot_hash
+                    workspace_input_snapshot_hash, workload_invocation
                FROM runtime_action_intent ORDER BY created_at_ms, operation_id",
         )?;
         let intents = statement
@@ -21489,7 +21573,19 @@ mod tests {
             worker_boot_identity_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             project_authority_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             workload_client_grant_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            invocation: ryeos_runtime::workload_client::WorkloadInvocationSource::Cli {
+                external_request_id: "fixture-request".to_owned(),
+            },
         }
+    }
+
+    fn test_workspace_operation_id() -> String {
+        let seed = runtime_workspace_seed(
+            ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration,
+        );
+        seed.invocation
+            .runtime_operation_id(seed.workload_client_grant_digest)
+            .unwrap()
     }
 
     fn reserve_test_workspace_operation(
@@ -21498,7 +21594,7 @@ mod tests {
         proposed_child: &str,
     ) -> Result<String> {
         db.reserve_runtime_action_intent_with_workspace(
-            &"d".repeat(64),
+            &test_workspace_operation_id(),
             "T-chain",
             "T-parent",
             RuntimeActionMode::Inline,
@@ -21516,7 +21612,7 @@ mod tests {
         let db = RuntimeDb::new_in_memory().unwrap();
         let seed = runtime_workspace_seed(WorkspaceAccess::ImmutableCurrentGeneration);
         reserve_test_workspace_operation(&db, &seed, "T-child").unwrap();
-        for coordinate in 0..7 {
+        for coordinate in 0..8 {
             let mut changed = seed.clone();
             match coordinate {
                 0 => changed.workspace_id = "workspace-other",
@@ -21526,6 +21622,12 @@ mod tests {
                 4 => changed.worker_boot_identity_hash = seed.project_authority_digest,
                 5 => changed.project_authority_digest = seed.workload_client_grant_digest,
                 6 => changed.workload_client_grant_digest = seed.worker_boot_identity_hash,
+                7 => {
+                    changed.invocation =
+                        ryeos_runtime::workload_client::WorkloadInvocationSource::Cli {
+                            external_request_id: "different-request".to_owned(),
+                        }
+                }
                 _ => unreachable!(),
             }
             let error = reserve_test_workspace_operation(&db, &changed, "T-retry").unwrap_err();
@@ -21533,7 +21635,7 @@ mod tests {
         }
         assert!(
             db.reserve_runtime_action_intent(
-                &"d".repeat(64),
+                &test_workspace_operation_id(),
                 "T-chain",
                 "T-parent",
                 RuntimeActionMode::Inline,
@@ -21551,6 +21653,85 @@ mod tests {
     }
 
     #[test]
+    fn runtime_workspace_protocol_occurrence_is_retained_and_cannot_cross_boot() {
+        use ryeos_runtime::workload_client::WorkloadInvocationSource;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("runtime.db");
+        let mut seed = runtime_workspace_seed(
+            ryeos_engine::kind_registry::WorkspaceAccess::ImmutableCurrentGeneration,
+        );
+        seed.invocation = WorkloadInvocationSource::StructuredSession {
+            upstream_session_id: "session-one".to_owned(),
+            operation_id: "turn-one".to_owned(),
+            call_id: "call-one".to_owned(),
+        };
+        let operation_id = seed
+            .invocation
+            .runtime_operation_id(seed.workload_client_grant_digest)
+            .unwrap();
+        let reserve =
+            |db: &RuntimeDb, seed: &NewRuntimeWorkspaceOperation<'_>, id: &str, request: &str| {
+                db.reserve_runtime_action_intent_with_workspace(
+                    id,
+                    "T-chain",
+                    "T-parent",
+                    RuntimeActionMode::Inline,
+                    request,
+                    "T-child",
+                    None,
+                    Some(seed),
+                )
+            };
+        {
+            let db = RuntimeDb::open(&path).unwrap();
+            reserve(&db, &seed, &operation_id, &"e".repeat(64)).unwrap();
+        }
+        let db = RuntimeDb::open(&path).unwrap();
+        let retained = db
+            .runtime_action_for_protocol_invocation("T-parent", &seed.invocation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.operation_id, operation_id);
+        assert_eq!(
+            retained.workspace_operation.unwrap().invocation,
+            seed.invocation
+        );
+        assert_eq!(
+            reserve(&db, &seed, &operation_id, &"e".repeat(64)).unwrap(),
+            "T-child"
+        );
+        assert!(reserve(&db, &seed, &operation_id, &"f".repeat(64)).is_err());
+        assert!(
+            db.runtime_action_for_protocol_invocation("T-other", &seed.invocation)
+                .unwrap()
+                .is_none()
+        );
+        let mut successor = seed.clone();
+        successor.worker_boot_epoch = 2;
+        successor.workload_client_grant_digest = seed.worker_boot_identity_hash;
+        let successor_id = successor
+            .invocation
+            .runtime_operation_id(successor.workload_client_grant_digest)
+            .unwrap();
+        assert_ne!(successor_id, operation_id);
+        assert!(reserve(&db, &successor, &successor_id, &"e".repeat(64)).is_err());
+        assert_eq!(db.runtime_action_intents().unwrap().len(), 1);
+        // A well-shaped but substituted durable provenance is not authority.
+        let altered = WorkloadInvocationSource::StructuredSession {
+            upstream_session_id: "session-one".to_owned(),
+            operation_id: "turn-one".to_owned(),
+            call_id: "call-two".to_owned(),
+        };
+        db.conn
+            .execute(
+                "UPDATE runtime_action_intent SET workload_invocation=?1",
+                params![lillux::canonical_json(&serde_json::to_value(altered).unwrap()).unwrap()],
+            )
+            .unwrap();
+        assert!(db.get_runtime_action_intent(&operation_id).is_err());
+    }
+
+    #[test]
     fn runtime_workspace_phases_and_input_retention_survive_every_restart() {
         use RuntimeWorkspaceOperationPhase::*;
         use ryeos_engine::kind_registry::WorkspaceAccess;
@@ -21561,7 +21742,7 @@ mod tests {
         ] {
             let tmp = TempDir::new().unwrap();
             let path = tmp.path().join("runtime.db");
-            let operation_id = "d".repeat(64);
+            let operation_id = test_workspace_operation_id();
             let snapshot = "f".repeat(64);
             let seed = runtime_workspace_seed(access);
             {

@@ -112,6 +112,21 @@ pub struct LocalDuplexStream {
 }
 
 impl LocalDuplexStream {
+    pub fn with_deadline(
+        &mut self,
+        deadline: crate::time::MonotonicDeadline,
+    ) -> crate::exec::DeadlineDuplexStream<'_> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            crate::exec::DeadlineDuplexStream::new(self.stream.as_fd(), deadline)
+        }
+        #[cfg(not(unix))]
+        {
+            crate::exec::DeadlineDuplexStream::unsupported(deadline)
+        }
+    }
+
     /// Connect to an endpoint minted by [`OwnerPrivateLocalDuplexListener`].
     pub fn connect(endpoint: &Path) -> Result<Self> {
         validate_endpoint_path(endpoint)?;

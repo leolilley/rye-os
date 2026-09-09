@@ -15258,6 +15258,30 @@ impl StateStore {
         {
             bail!("runtime workspace operation contradicts the current hosted placement");
         }
+        if let ryeos_runtime::workload_client::WorkloadInvocationSource::StructuredSession {
+            upstream_session_id,
+            operation_id: upstream_operation_id,
+            ..
+        } = &workspace_operation.invocation
+        {
+            // Only a new callback requires the currently running turn. An
+            // already-reserved exact action may replay its retained outcome;
+            // the DB still compares its complete request/workspace authority.
+            let retained = g.runtime_db.runtime_action_for_protocol_invocation(
+                caller_thread_id,
+                &workspace_operation.invocation,
+            )?;
+            if let Some(retained) = retained {
+                if retained.operation_id != operation_id {
+                    bail!("protocol occurrence already belongs to an earlier runtime action");
+                }
+            } else if session.remote_thread_id.as_ref() != Some(upstream_session_id)
+                || session.current_turn_id.as_ref() != Some(upstream_operation_id)
+                || !matches!(session.state.as_str(), "turn_running" | "awaiting_approval")
+            {
+                bail!("new workload callback does not target the current hosted turn");
+            }
+        }
         let worker = g
             .runtime_db
             .worker_process(workspace_operation.worker_instance_id)?
@@ -15282,6 +15306,16 @@ impl StateStore {
             child_project_authority,
             Some(workspace_operation),
         )
+    }
+
+    pub fn runtime_action_for_protocol_invocation(
+        &self,
+        placement_thread_id: &str,
+        source: &ryeos_runtime::workload_client::WorkloadInvocationSource,
+    ) -> Result<Option<runtime_db::RuntimeActionIntent>> {
+        self.lock()?
+            .runtime_db
+            .runtime_action_for_protocol_invocation(placement_thread_id, source)
     }
 
     pub fn runtime_action_intents(&self) -> Result<Vec<runtime_db::RuntimeActionIntent>> {
@@ -17883,7 +17917,10 @@ mod tests {
         access: ryeos_engine::kind_registry::WorkspaceAccess,
         child: &str,
     ) -> String {
-        let operation_id = "d".repeat(64);
+        let invocation = ryeos_runtime::workload_client::WorkloadInvocationSource::Cli {
+            external_request_id: "fixture-request".to_owned(),
+        };
+        let operation_id = invocation.runtime_operation_id(&"c".repeat(64)).unwrap();
         let g = store.lock().unwrap();
         g.runtime_db
             .reserve_runtime_action_intent_with_workspace(
@@ -17902,6 +17939,7 @@ mod tests {
                     worker_boot_identity_hash: &"a".repeat(64),
                     project_authority_digest: &"b".repeat(64),
                     workload_client_grant_digest: &"c".repeat(64),
+                    invocation,
                 }),
             )
             .unwrap();

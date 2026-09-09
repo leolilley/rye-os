@@ -219,7 +219,11 @@ pub fn load_registered_isolation(
     let _generation_lock =
         crate::bundle_transaction::BundleRegistryMutationLock::acquire_for_startup(app_root)
             .context("acquire bundle-generation lock for isolation composition")?;
-    load_registered_generation_under_lock(app_root).map(|generation| generation.0)
+    load_registered_generation_under_lock(
+        app_root,
+        ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy,
+    )
+    .map(|generation| generation.0)
 }
 
 /// Standalone composition pins and verifies one generation under a bounded
@@ -231,10 +235,46 @@ pub fn load_registered_isolation(
 pub fn load_locked_registered_isolation(
     app_root: &std::path::Path,
 ) -> Result<Arc<ryeos_engine::isolation::IsolationRuntime>> {
+    load_locked_registered_isolation_with(
+        app_root,
+        ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy,
+    )
+}
+
+/// Verify registered definitions under the same trust, lock and generation
+/// lifeline as execution, without acquiring the supervisor's process scopes.
+/// Metadata discovery and bundle verification are not execution controllers.
+/// This is not an execution-admission fallback: an actual scope-requiring
+/// launch must use its execution owner's fully admitted runtime.
+pub fn load_locked_registered_definition_isolation(
+    app_root: &std::path::Path,
+) -> Result<Arc<ryeos_engine::isolation::IsolationRuntime>> {
+    load_locked_registered_isolation_with(
+        app_root,
+        ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy_for_definition_validation,
+    )
+}
+
+type RegisteredIsolationResolver = fn(
+    &std::path::Path,
+    ryeos_engine::isolation::IsolationPolicy,
+    PathBuf,
+    String,
+    Option<Arc<ryeos_engine::isolation::ResolvedIsolationBackend>>,
+) -> std::result::Result<
+    ryeos_engine::isolation::IsolationRuntime,
+    ryeos_engine::error::EngineError,
+>;
+
+fn load_locked_registered_isolation_with(
+    app_root: &std::path::Path,
+    resolve: RegisteredIsolationResolver,
+) -> Result<Arc<ryeos_engine::isolation::IsolationRuntime>> {
     let generation_lock =
         crate::bundle_transaction::BundleRegistryReadLock::acquire_for_composition(app_root)
             .context("acquire bundle-generation read lock for isolation composition")?;
-    let (runtime, node_trust, generation) = load_registered_generation_under_lock(app_root)?;
+    let (runtime, node_trust, generation) =
+        load_registered_generation_under_lock(app_root, resolve)?;
     let bundle_roots = generation.registered_roots();
     let lifeline = Arc::new(RetainedRegisteredGeneration {
         app_root: app_root.to_path_buf(),
@@ -251,6 +291,7 @@ pub fn load_locked_registered_isolation(
 
 fn load_registered_generation_under_lock(
     app_root: &std::path::Path,
+    resolve: RegisteredIsolationResolver,
 ) -> Result<(
     Arc<ryeos_engine::isolation::IsolationRuntime>,
     TrustStore,
@@ -289,7 +330,7 @@ fn load_registered_generation_under_lock(
     let backend = generation.checked(&trust_store, || {
         resolve_isolation_backend(&generation, &trust_store, &policy)
     })?;
-    let runtime = ryeos_engine::isolation::IsolationRuntime::resolve_compiled_policy(
+    let runtime = resolve(
         app_root,
         policy,
         crate::node_policy::generation::policy_directory(app_root).join("isolation.yaml"),

@@ -69,6 +69,25 @@ def source_manifest_digest() -> str:
 
 
 class CodexContractTests(unittest.TestCase):
+    def test_turn_settings_notification_is_typed_bounded_testimony(self) -> None:
+        schema_path = SOURCE / "schema/ThreadSettingsUpdatedNotification.json"
+        schema = json.loads(schema_path.read_text())
+        self.assertEqual(schema["title"], "ThreadSettingsUpdatedNotification")
+        self.assertEqual(set(schema["required"]), {"threadId", "threadSettings"})
+        for name in ("structured-session.profile.json", "authoring.profile.json"):
+            profile = json.loads((SOURCE / name).read_text())
+            notification = next(n for n in profile["notifications"]
+                                if n["method"] == "thread/settings/updated")
+            self.assertEqual(notification["schema"], "schema/ThreadSettingsUpdatedNotification.json")
+            self.assertEqual(notification["upstream_session_pointer"], "/message/params/threadId")
+            self.assertTrue(notification["durable"])
+            self.assertEqual(notification["observations"], [])
+            fields = notification["payload"]["fields"]
+            self.assertEqual(set(fields), {"thread_id", "model", "model_provider", "settings_digest"})
+            self.assertEqual(fields["settings_digest"]["op"], "digest")
+            for field in ("thread_id", "model", "model_provider"):
+                self.assertEqual(fields[field]["max_string_bytes"], 256)
+
     def test_shell_environment_retains_only_exact_child_transport_and_locale(self) -> None:
         for profile_name in ("structured-session.profile.json", "authoring.profile.json"):
             profile = json.loads((SOURCE / profile_name).read_text())
@@ -78,8 +97,7 @@ class CodexContractTests(unittest.TestCase):
             policy = tomllib.loads(args[0])["shell_environment_policy"]
             baseline = tomllib.loads((SOURCE / profile["baseline_config"]).read_text())
             self.assertEqual(policy, baseline["shell_environment_policy"])
-            # Includes filter the inherited set; they cannot restore a broker
-            # variable discarded earlier by inherit=core. The allowlist must
+            # Includes filter the inherited set. The allowlist must
             # remain finite: never expose all RYEOS_* or credential variables.
             self.assertEqual(policy["inherit"], "all")
             self.assertFalse(policy["ignore_default_excludes"])
@@ -88,8 +106,7 @@ class CodexContractTests(unittest.TestCase):
                               if value == "include"}, {
                 "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
                 "TZ", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_PAGER",
-                "RYEOS_WORKLOAD_CLIENT_ENDPOINT",
-            })
+            } | ({"TMPDIR"} if profile_name == "authoring.profile.json" else set()))
             for name in ("HOME", "CODEX_HOME", "DBUS_*", "SSH_*", "*PROXY"):
                 self.assertEqual(policy["filters"][name], "exclude")
 
@@ -211,25 +228,24 @@ class CodexContractTests(unittest.TestCase):
         self.assertEqual(manifest_digest, "f1f39917086d223da68135108afa401fe75d47e2b102ea3f81c699595256bfe5")
         self.assertIn(f"    digest: {manifest_digest}", environment)
         self.assertIn("    - realization_id: command-tools", environment)
-        self.assertIn("schema: ryeos.worker_environment.v4", environment)
+        self.assertIn("schema: ryeos.worker_environment.v5", environment)
         self.assertIn("  process_environment: {}", environment)
         self.assertIn("      relative_directory: bin", environment)
         self.assertIn("workload_client: null", environment)
 
-    def test_hosted_profile_opens_only_the_private_workload_broker_directory(self) -> None:
-        self.assertEqual(self.profile["schema_version"], 2)
-        self.assertEqual(
-            self.profile["workload_client"],
-            {"endpoint_env": "RYEOS_WORKLOAD_CLIENT_ENDPOINT"},
-        )
+    def test_minimal_profile_has_no_workload_ingress_or_socket_allowance(self) -> None:
+        self.assertEqual(self.profile["schema_version"], 3)
+        self.assertIsNone(self.profile["workload_client"])
         immutable_args = "\n".join(self.profile["workload_args"])
-        self.assertIn('"/tmp/.ryeos-wc"="read"', immutable_args)
+        self.assertNotIn("/tmp/.ryeos-wc", immutable_args)
+        self.assertNotIn("RYEOS_WORKLOAD_CLIENT_ENDPOINT", immutable_args)
         self.assertIn('":tmpdir"="deny"', immutable_args)
         self.assertIn('":slash_tmp"="deny"', immutable_args)
         self.assertNotIn('"RYEOS_*"="exclude"', immutable_args)
 
         baseline = (SOURCE / self.profile["baseline_config"]).read_text()
-        self.assertIn('"/tmp/.ryeos-wc" = "read"', baseline)
+        self.assertNotIn("/tmp/.ryeos-wc", baseline)
+        self.assertNotIn("RYEOS_WORKLOAD_CLIENT_ENDPOINT", baseline)
         self.assertIn('":tmpdir" = "deny"', baseline)
         self.assertIn('":slash_tmp" = "deny"', baseline)
         self.assertNotIn('"RYEOS_*" = "exclude"', baseline)

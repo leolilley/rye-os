@@ -24,6 +24,7 @@ pub(super) struct SpawnRuntimeParams<'a> {
     pub binary: &'a str,
     pub project_path: &'a Path,
     pub project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
+    pub immutable_project: Option<ryeos_state::PinnedProjectMaterialization>,
     pub filesystem_authority_ceiling: ryeos_engine::isolation::IsolationFilesystemAuthorityCeiling,
     pub network_authority_ceiling: ryeos_engine::isolation::IsolationNetworkAuthorityCeiling,
     pub project_state_scope: Option<&'a str>,
@@ -130,6 +131,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
         binary,
         project_path,
         project_authority,
+        immutable_project,
         filesystem_authority_ceiling,
         network_authority_ceiling,
         project_state_scope,
@@ -295,6 +297,7 @@ pub(super) fn spawn_runtime(params: SpawnRuntimeParams<'_>) -> Result<SpawnedRun
             ryeos_engine::isolation::IsolationLaunchContext {
                 project_path: &spec.project_path,
                 project_authority,
+                immutable_project: immutable_project.as_ref(),
                 workspace_view: workspace_view.as_ref(),
                 filesystem_authority_ceiling,
                 network_authority_ceiling,

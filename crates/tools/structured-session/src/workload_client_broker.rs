@@ -1,253 +1,322 @@
-//! Mechanical bridge from short-lived workload-local client connections to
-//! one daemon-owned protected target channel.
+//! Bounded ingress adaptation onto one protected daemon channel.
 //!
-//! This module has no grant logic. The daemon retains every bearer and the
-//! admitted workload-client grant; this bridge only bounds, frames, and pairs
-//! requests. The endpoint is not a daemon endpoint and never receives a
-//! daemon pathname or credential.
+//! CLI and structured protocol requests share framing, slots and pending
+//! responses. None is a grant, executor or durable operation ledger.
+//! Caller prefixes are never accepted as already-normalized identities.
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use ryeos_runtime::workload_client::{
-    WORKLOAD_CLIENT_PROTOCOL, WorkloadClientBootFrame, WorkloadClientOutcome,
-    WorkloadClientReadyFrame, WorkloadClientRequestFrame, WorkloadClientResponseFrame,
+    WORKLOAD_CLIENT_PROTOCOL, WorkloadClientBootFrame, WorkloadClientDispatchFrame,
+    WorkloadClientIngress, WorkloadClientOutcome, WorkloadClientReadyFrame,
+    WorkloadClientRequestFrame, WorkloadClientResponseFrame, WorkloadInvocationSource,
 };
 
+type PendingResponses = Arc<Mutex<HashMap<String, SyncSender<WorkloadClientResponseFrame>>>>;
+
 pub struct RunningWorkloadClientBroker {
-    endpoint: String,
-    stopping: Arc<AtomicBool>,
-    slots: Arc<SlotPool>,
+    endpoint: Option<String>,
+    channel: WorkloadClientChannel,
     accept_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl RunningWorkloadClientBroker {
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+    pub fn channel(&self) -> WorkloadClientChannel {
+        self.channel.clone()
     }
 }
 
 impl Drop for RunningWorkloadClientBroker {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        self.slots.ready.notify_all();
-        // Wake a listener blocked in accept. The typed accept boundary rejects
-        // namespace PID 1 as a client, but still returns from the syscall so
-        // the loop can observe shutdown and release the exact socket inode.
-        let _ = lillux::LocalDuplexStream::connect(Path::new(&self.endpoint));
+        self.channel.stopping.store(true, Ordering::Release);
+        let _ = self.channel.interrupt.shutdown();
+        if let Some(endpoint) = &self.endpoint {
+            // Wake accept. Lillux refuses the runtime itself as an invoking peer.
+            let _ = lillux::LocalDuplexStream::connect(Path::new(endpoint));
+        }
         if let Some(thread) = self.accept_thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-struct SlotPool {
-    available: Mutex<usize>,
-    ready: Condvar,
-}
-
+struct SlotPool(Mutex<usize>);
 impl SlotPool {
-    fn acquire(self: &Arc<Self>, stopping: &AtomicBool) -> Option<SlotGuard> {
-        let mut available = self
-            .available
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        while *available == 0 && !stopping.load(Ordering::Acquire) {
-            available = self
-                .ready
-                .wait(available)
-                .unwrap_or_else(|error| error.into_inner());
-        }
-        if stopping.load(Ordering::Acquire) {
+    fn try_acquire(self: &Arc<Self>) -> Option<SlotGuard> {
+        let mut available = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if *available == 0 {
             return None;
         }
         *available -= 1;
-        Some(SlotGuard {
-            pool: Arc::clone(self),
+        Some(SlotGuard(Arc::clone(self)))
+    }
+}
+struct SlotGuard(Arc<SlotPool>);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        let mut available = self.0.0.lock().unwrap_or_else(|error| error.into_inner());
+        *available += 1;
+    }
+}
+
+/// A transport handle for trusted bridge code, never delivered to the workload.
+#[derive(Clone)]
+pub struct WorkloadClientChannel {
+    writer: Arc<Mutex<lillux::InheritedDuplexChannel>>,
+    pending: PendingResponses,
+    slots: Arc<SlotPool>,
+    stopping: Arc<AtomicBool>,
+    max_request_bytes: usize,
+    ingresses: Vec<WorkloadClientIngress>,
+    execution_presentation: serde_json::Value,
+    deadline: lillux::time::MonotonicDeadline,
+    interrupt: Arc<lillux::InheritedDuplexChannel>,
+}
+
+impl WorkloadClientChannel {
+    pub fn execution_presentation(&self) -> &serde_json::Value {
+        &self.execution_presentation
+    }
+    pub fn admits(&self, ingress: WorkloadClientIngress) -> bool {
+        self.ingresses.contains(&ingress)
+    }
+
+    /// Do not block the App Server event loop on a child or full protected
+    /// pipe. The common slot ceiling bounds these invocation tasks.
+    pub fn submit(
+        &self,
+        source: WorkloadInvocationSource,
+        request: WorkloadClientRequestFrame,
+    ) -> Result<Receiver<WorkloadClientResponseFrame>> {
+        request.validate()?;
+        source.request_id()?;
+        if !self.admits(source.ingress()) || self.stopping.load(Ordering::Acquire) {
+            bail!("workload ingress is absent or closed");
+        }
+        let slot = self
+            .slots
+            .try_acquire()
+            .ok_or_else(|| anyhow!("workload ingress is full"))?;
+        let (sender, receiver) = sync_channel(1);
+        let channel = self.clone();
+        thread::Builder::new()
+            .name("ryeos-workload-invocation".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = sender.send(channel.exchange(source, request));
+            })
+            .context("start bounded workload invocation")?;
+        Ok(receiver)
+    }
+
+    fn exchange(
+        &self,
+        source: WorkloadInvocationSource,
+        mut request: WorkloadClientRequestFrame,
+    ) -> WorkloadClientResponseFrame {
+        let external_id = request.request_id.clone();
+        let outcome = (|| -> Result<WorkloadClientResponseFrame> {
+            request.validate()?;
+            if !self.admits(source.ingress()) || self.stopping.load(Ordering::Acquire) {
+                bail!("workload ingress is absent or closed");
+            }
+            request.request_id = source.request_id()?;
+            let id = request.request_id.clone();
+            let dispatch = WorkloadClientDispatchFrame { source, request };
+            dispatch.validate()?;
+            if serde_json::to_vec(&dispatch)?.len() > self.max_request_bytes {
+                bail!("workload request exceeds admitted byte limit");
+            }
+            let (sender, receiver) = sync_channel(1);
+            {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match pending.entry(id.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(sender);
+                    }
+                    Entry::Occupied(_) => bail!("workload occurrence is already in flight"),
+                }
+            }
+            let sent = self
+                .writer
+                .lock()
+                .map_err(|_| anyhow!("workload channel writer is poisoned"))
+                .and_then(|mut writer| {
+                    ryeos_runtime::workload_client::write_frame_bounded(
+                        &mut writer.with_deadline(self.deadline),
+                        &dispatch,
+                        self.max_request_bytes,
+                    )
+                });
+            if sent.is_err() {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&id);
+                // Partial write is not proof of no contact; retire the framing
+                // stream and never retry this call through another ingress.
+                self.stopping.store(true, Ordering::Release);
+                let _ = self.interrupt.shutdown();
+                return Ok(unknown_response(&external_id));
+            }
+            Ok(match receiver.recv_timeout(self.deadline.remaining()) {
+                Ok(mut response) => {
+                    response.request_id = external_id.clone();
+                    response
+                }
+                Err(_) => {
+                    self.stopping.store(true, Ordering::Release);
+                    let _ = self.interrupt.shutdown();
+                    unknown_response(&external_id)
+                }
+            })
+        })();
+        outcome.unwrap_or_else(|error| {
+            failure_response(&external_id, "broker-refused", &error.to_string())
         })
     }
 }
 
-struct SlotGuard {
-    pool: Arc<SlotPool>,
-}
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        let mut available = self
-            .pool
-            .available
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        *available += 1;
-        self.pool.ready.notify_one();
-    }
-}
-
-/// Start the broker after the daemon supplied its secret-free boot contract.
-/// The returned endpoint is the only value forwarded to the workload.
 pub fn start(
     mut daemon_channel: lillux::InheritedDuplexChannel,
+    supported_ingresses: &[WorkloadClientIngress],
 ) -> Result<RunningWorkloadClientBroker> {
     let boot: WorkloadClientBootFrame = ryeos_runtime::workload_client::read_frame_bounded(
         &mut daemon_channel,
         ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
     )
-    .context("read workload-client boot contract")?;
+    .context("read workload boot contract")?;
     boot.validate()?;
-
-    // Lillux binds this below the native sandbox's private tmpfs and proves
-    // that this bridge is namespace PID 1. Project/candidate content and a
-    // host-visible same-UID directory never carry the endpoint.
-    let listener = lillux::OwnerPrivateLocalDuplexListener::bind_isolated_runtime(
-        ryeos_runtime::workload_client::WORKLOAD_CLIENT_BROKER_DIRECTORY_NAME,
-        "w",
-    )?;
+    let deadline = lillux::time::MonotonicDeadline::after(lillux::time::Duration::from_secs(
+        boot.max_lifetime_seconds,
+    ));
+    if boot
+        .ingresses
+        .iter()
+        .any(|ingress| !supported_ingresses.contains(ingress))
+    {
+        bail!("selected workload ingress is not admitted by the compiled profile");
+    }
+    let listener = if boot.ingresses.contains(&WorkloadClientIngress::Cli) {
+        Some(
+            lillux::OwnerPrivateLocalDuplexListener::bind_isolated_runtime(
+                ryeos_runtime::workload_client::WORKLOAD_CLIENT_BROKER_DIRECTORY_NAME,
+                "w",
+            )?,
+        )
+    } else {
+        None
+    };
     let endpoint = listener
-        .endpoint()
-        .to_str()
-        .ok_or_else(|| anyhow!("workload-client endpoint path is not UTF-8"))?
-        .to_owned();
-
+        .as_ref()
+        .map(|listener| {
+            listener
+                .endpoint()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("workload endpoint is not UTF-8"))
+        })
+        .transpose()?;
     let ready = WorkloadClientReadyFrame {
         protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
         grant_digest: boot.grant_digest.clone(),
     };
-    ready.validate()?;
     ryeos_runtime::workload_client::write_frame_bounded(
         &mut daemon_channel,
         &ready,
         ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_CONTROL_FRAME_BYTES,
-    )
-    .context("publish workload-client bridge readiness")?;
-
-    let reader = daemon_channel
-        .try_clone()
-        .context("clone protected workload-client response channel")?;
-    let writer = Arc::new(Mutex::new(daemon_channel));
-    let pending: Arc<Mutex<HashMap<String, SyncSender<WorkloadClientResponseFrame>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let response_pending = Arc::clone(&pending);
+    )?;
+    let reader = daemon_channel.try_clone()?;
+    let interrupt = Arc::new(daemon_channel.try_clone()?);
+    let channel = WorkloadClientChannel {
+        writer: Arc::new(Mutex::new(daemon_channel)),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        slots: Arc::new(SlotPool(Mutex::new(usize::from(boot.max_in_flight)))),
+        stopping: Arc::new(AtomicBool::new(false)),
+        max_request_bytes: boot.max_request_bytes as usize,
+        ingresses: boot.ingresses,
+        execution_presentation: boot.execution_presentation,
+        deadline,
+        interrupt: Arc::clone(&interrupt),
+    };
+    let response_pending = Arc::clone(&channel.pending);
+    let response_stopping = Arc::clone(&channel.stopping);
     thread::Builder::new()
-        .name("ryeos-workload-client-responses".to_owned())
-        .spawn(move || read_daemon_responses(reader, response_pending))
-        .context("start workload-client response reader")?;
-
-    let slots = Arc::new(SlotPool {
-        available: Mutex::new(usize::from(boot.max_in_flight)),
-        ready: Condvar::new(),
-    });
-    let accept_writer = Arc::clone(&writer);
-    let accept_pending = Arc::clone(&pending);
-    let max_request_bytes = usize::try_from(boot.max_request_bytes)
-        .context("workload-client request ceiling exceeds this platform")?;
-    let stopping = Arc::new(AtomicBool::new(false));
-    let accept_stopping = Arc::clone(&stopping);
-    let accept_slots = Arc::clone(&slots);
-    let accept_thread = thread::Builder::new()
-        .name("ryeos-workload-client-accept".to_owned())
+        .name("ryeos-workload-responses".to_owned())
         .spawn(move || {
-            loop {
-                let Some(slot) = accept_slots.acquire(&accept_stopping) else {
-                    return;
-                };
-                let stream = match listener.accept_isolated_descendant() {
-                    Ok(stream) => stream,
-                    Err(_) if accept_stopping.load(Ordering::Acquire) => return,
-                    // Refuse an outside peer without retiring the endpoint for
-                    // valid descendants. Lillux already consumed and closed the
-                    // unauthorized connection before returning this error.
-                    Err(_) => continue,
-                };
-                if accept_stopping.load(Ordering::Acquire) {
-                    return;
-                }
-                let writer = Arc::clone(&accept_writer);
-                let pending = Arc::clone(&accept_pending);
-                if thread::Builder::new()
-                    .name("ryeos-workload-client-invocation".to_owned())
-                    .spawn(move || {
-                        handle_local_invocation(stream, writer, pending, slot, max_request_bytes)
-                    })
-                    .is_err()
-                {
-                    // A failed spawn drops the closure and therefore its stream
-                    // and slot guard without forwarding the request.
-                    return;
-                }
-            }
+            read_daemon_responses(reader, response_pending, response_stopping, deadline);
+            let _ = interrupt.shutdown();
+        })?;
+    let accept_channel = channel.clone();
+    let accept_thread = listener
+        .map(|listener| {
+            thread::Builder::new()
+                .name("ryeos-workload-accept".to_owned())
+                .spawn(move || {
+                    loop {
+                        let stream = match listener.accept_isolated_descendant() {
+                            Ok(stream) => stream,
+                            Err(_) if accept_channel.stopping.load(Ordering::Acquire) => return,
+                            Err(_) => continue,
+                        };
+                        if accept_channel.stopping.load(Ordering::Acquire) {
+                            return;
+                        }
+                        // An idle listener must not reserve the shared slot and starve
+                        // protocol ingress. Acquire after exact peer admission instead.
+                        let Some(slot) = accept_channel.slots.try_acquire() else {
+                            continue;
+                        };
+                        let channel = accept_channel.clone();
+                        if thread::Builder::new()
+                            .name("ryeos-workload-cli".to_owned())
+                            .spawn(move || {
+                                let _slot = slot;
+                                handle_local_invocation(stream, channel);
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                })
         })
-        .context("start workload-client accept loop")?;
-
+        .transpose()?;
     Ok(RunningWorkloadClientBroker {
         endpoint,
-        stopping,
-        slots,
-        accept_thread: Some(accept_thread),
+        channel,
+        accept_thread,
     })
 }
 
-fn handle_local_invocation(
-    mut stream: lillux::LocalDuplexStream,
-    writer: Arc<Mutex<lillux::InheritedDuplexChannel>>,
-    pending: Arc<Mutex<HashMap<String, SyncSender<WorkloadClientResponseFrame>>>>,
-    _slot: SlotGuard,
-    max_request_bytes: usize,
-) {
-    let request: Result<WorkloadClientRequestFrame> =
-        ryeos_runtime::workload_client::read_frame_bounded(&mut stream, max_request_bytes)
-            .context("read workload-client invocation");
-    let request = match request.and_then(|request| {
-        request.validate()?;
-        Ok(request)
-    }) {
-        Ok(request) => request,
-        Err(error) => {
-            let _ = write_local_failure(&mut stream, "invalid-request", error.to_string());
-            return;
+fn handle_local_invocation(mut stream: lillux::LocalDuplexStream, channel: WorkloadClientChannel) {
+    let mut stream = stream.with_deadline(channel.deadline);
+    let request =
+        ryeos_runtime::workload_client::read_frame_bounded(&mut stream, channel.max_request_bytes);
+    let response = match request {
+        Ok(request) => {
+            let request: WorkloadClientRequestFrame = request;
+            let source = WorkloadInvocationSource::Cli {
+                external_request_id: request.request_id.clone(),
+            };
+            channel.exchange(source, request)
         }
-    };
-    let request_id = request.request_id.clone();
-    let (response_sender, response_receiver) = sync_channel(1);
-    {
-        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
-        match pending.entry(request_id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(response_sender);
-            }
-            Entry::Occupied(_) => {
-                let _ = write_local_failure(
-                    &mut stream,
-                    &request_id,
-                    "request id is already in flight".to_owned(),
-                );
-                return;
-            }
-        }
-    }
-    let sent = writer
-        .lock()
-        .map_err(|_| anyhow!("workload-client request writer is poisoned"))
-        .and_then(|mut writer| ryeos_runtime::workload_client::write_frame(&mut *writer, &request));
-    if let Err(error) = sent {
-        pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&request_id);
-        let _ = write_local_failure(&mut stream, &request_id, error.to_string());
-        return;
-    }
-    let response = match response_receiver.recv() {
-        Ok(response) => response,
         Err(_) => failure_response(
-            &request_id,
-            "broker-disconnected",
-            "daemon workload-client channel closed".to_owned(),
+            "invalid-request",
+            "broker-refused",
+            "invalid workload request",
         ),
     };
     let _ = ryeos_runtime::workload_client::write_frame(&mut stream, &response);
@@ -255,8 +324,11 @@ fn handle_local_invocation(
 
 fn read_daemon_responses(
     mut reader: lillux::InheritedDuplexChannel,
-    pending: Arc<Mutex<HashMap<String, SyncSender<WorkloadClientResponseFrame>>>>,
+    pending: PendingResponses,
+    stopping: Arc<AtomicBool>,
+    deadline: lillux::time::MonotonicDeadline,
 ) {
+    let mut reader = reader.with_deadline(deadline);
     loop {
         let response: WorkloadClientResponseFrame =
             match ryeos_runtime::workload_client::read_frame(&mut reader) {
@@ -273,47 +345,208 @@ fn read_daemon_responses(
         let Some(sender) = sender else {
             break;
         };
-        if sender.send(response).is_err() {
-            continue;
-        }
+        let _ = sender.send(response);
     }
-    let abandoned = {
-        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
-        std::mem::take(&mut *pending)
-    };
+    stopping.store(true, Ordering::Release);
+    let abandoned = std::mem::take(&mut *pending.lock().unwrap_or_else(|error| error.into_inner()));
     for (request_id, sender) in abandoned {
-        let _ = sender.send(failure_response(
-            &request_id,
-            "broker-disconnected",
-            "daemon workload-client channel closed".to_owned(),
-        ));
+        let _ = sender.send(unknown_response(&request_id));
     }
 }
 
-fn write_local_failure(
-    stream: &mut lillux::LocalDuplexStream,
-    request_id: &str,
-    message: String,
-) -> Result<()> {
-    ryeos_runtime::workload_client::write_frame(
-        stream,
-        &failure_response(request_id, "broker-refused", message),
+fn unknown_response(request_id: &str) -> WorkloadClientResponseFrame {
+    failure_response(
+        request_id,
+        ryeos_runtime::callback::RUNTIME_ACTION_OUTCOME_UNKNOWN_CODE,
+        "protected channel closed after possible execution contact; do not retry as a new occurrence",
     )
 }
 
-fn failure_response(request_id: &str, code: &str, message: String) -> WorkloadClientResponseFrame {
-    let request_id = if ryeos_runtime::workload_client::validate_request_id(request_id).is_ok() {
-        request_id.to_owned()
-    } else {
-        "invalid-request".to_owned()
-    };
+fn failure_response(request_id: &str, code: &str, message: &str) -> WorkloadClientResponseFrame {
     WorkloadClientResponseFrame {
         protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
-        request_id,
+        request_id: if ryeos_runtime::workload_client::validate_request_id(request_id).is_ok() {
+            request_id.to_owned()
+        } else {
+            "invalid-request".to_owned()
+        },
         outcome: WorkloadClientOutcome::Failed {
             code: code.to_owned(),
-            message: ryeos_runtime::workload_client::bounded_error_message(&message),
+            message: ryeos_runtime::workload_client::bounded_error_message(message),
             retryable: false,
         },
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use lillux::time::{Duration, MonotonicDeadline};
+    use ryeos_runtime::workload_client::*;
+    use serde_json::json;
+
+    const TEST_CHANNEL: &str = "RYEOS_TEST_DUAL_CHANNEL";
+    const TEST_ROLE: &str = "RYEOS_TEST_DUAL_ROLE";
+    const TEST_ENTRY: &str = "workload_client_broker::tests::native_dual_ingress";
+
+    fn request() -> WorkloadClientRequestFrame {
+        WorkloadClientRequestFrame {
+            protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+            request_id: "same-caller-id".to_owned(),
+            operation: WorkloadClientOperation::Execute(WorkloadClientExecuteRequest {
+                item_ref: "tool:fixture/check".to_owned(),
+                ref_bindings: Default::default(),
+                params: json!({}),
+                call: None,
+            }),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged Linux PID/mount namespaces; no sudo or installed node"]
+    fn native_dual_ingress() {
+        match std::env::var(TEST_ROLE).ok().as_deref() {
+            Some("client") => {
+                let endpoint = std::env::var("RYEOS_TEST_DUAL_ENDPOINT").unwrap();
+                if let Some(binary) = std::env::var_os("RYEOS_TEST_DUAL_CLIENT_BINARY") {
+                    // Explicit second qualification mode exercises the real
+                    // restricted CLI executable, not just its wire grammar.
+                    let output = std::process::Command::new(binary)
+                        .args(["execute", "tool:fixture/check", "--params", "{}"])
+                        .env(WORKLOAD_CLIENT_ENDPOINT_ENV, endpoint)
+                        .output()
+                        .unwrap();
+                    assert!(!output.status.success());
+                    assert!(
+                        String::from_utf8(output.stderr)
+                            .unwrap()
+                            .contains("test-child-failed")
+                    );
+                    return;
+                }
+                let mut stream = lillux::LocalDuplexStream::connect_isolated_runtime_broker(
+                    Path::new(&endpoint),
+                )
+                .unwrap();
+                let mut stream =
+                    stream.with_deadline(MonotonicDeadline::after(Duration::from_secs(15)));
+                write_frame(&mut stream, &request()).unwrap();
+                let response: WorkloadClientResponseFrame = read_frame(&mut stream).unwrap();
+                response.validate().unwrap();
+                assert_eq!(response.request_id, "same-caller-id");
+                assert!(!response.outcome.succeeded());
+            }
+            Some("broker") => {
+                // SAFETY: this test's parent transfers the unique endpoint
+                // through Lillux across the namespace launcher before exec.
+                let channel =
+                    unsafe { lillux::take_inherited_duplex_channel_from_env(TEST_CHANNEL) }
+                        .unwrap();
+                let broker = start(
+                    channel,
+                    &[
+                        WorkloadClientIngress::Cli,
+                        WorkloadClientIngress::StructuredSession,
+                    ],
+                )
+                .unwrap();
+                let source = WorkloadInvocationSource::StructuredSession {
+                    upstream_session_id: "session".to_owned(),
+                    operation_id: "turn".to_owned(),
+                    call_id: "same-caller-id".to_owned(),
+                };
+                // The idle CLI listener must not reserve the only shared slot.
+                let response = broker.channel.submit(source.clone(), request()).unwrap();
+                assert!(broker.channel.submit(source, request()).is_err());
+                assert!(
+                    !response
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap()
+                        .outcome
+                        .succeeded()
+                );
+                let deadline = MonotonicDeadline::after(Duration::from_secs(2));
+                while *broker.channel.slots.0.lock().unwrap() == 0 {
+                    assert!(!deadline.has_elapsed());
+                    lillux::time::sleep(Duration::from_millis(1));
+                }
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", TEST_ENTRY, "--nocapture"])
+                    .env(TEST_ROLE, "client")
+                    .env("RYEOS_TEST_DUAL_ENDPOINT", broker.endpoint().unwrap())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            None => {
+                let (mut channel, child_channel) = lillux::inherited_duplex_channel_pair().unwrap();
+                // External test orchestration only: production namespaces and
+                // all peer/descriptor authority remain Lillux-owned. The tmpfs
+                // is mounted only inside this fresh unprivileged namespace.
+                let mut command = std::process::Command::new("unshare");
+                command
+                    .args([
+                        "--user",
+                        "--map-root-user",
+                        "--mount",
+                        "--pid",
+                        "--fork",
+                        "--mount-proc",
+                        "/bin/sh",
+                        "-c",
+                        "mount -t tmpfs -o mode=1777 tmpfs /tmp && exec \"$@\"",
+                        "probe",
+                    ])
+                    .arg(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", TEST_ENTRY, "--nocapture"])
+                    .env(TEST_ROLE, "broker");
+                child_channel
+                    .bind_to_command(&mut command, TEST_CHANNEL)
+                    .unwrap();
+                let mut child = command.spawn().unwrap();
+                drop(command);
+                let mut channel =
+                    channel.with_deadline(MonotonicDeadline::after(Duration::from_secs(20)));
+                write_frame(
+                    &mut channel,
+                    &WorkloadClientBootFrame {
+                        protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+                        grant_digest: "a".repeat(64),
+                        ingresses: vec![
+                            WorkloadClientIngress::Cli,
+                            WorkloadClientIngress::StructuredSession,
+                        ],
+                        execution_presentation: json!([{}]),
+                        max_lifetime_seconds: 20,
+                        max_in_flight: 1,
+                        max_request_bytes: 4096,
+                    },
+                )
+                .unwrap();
+                let ready: WorkloadClientReadyFrame = read_frame(&mut channel).unwrap();
+                ready.validate().unwrap();
+                let mut ids = std::collections::HashSet::new();
+                for ingress in [
+                    WorkloadClientIngress::StructuredSession,
+                    WorkloadClientIngress::Cli,
+                ] {
+                    let frame: WorkloadClientDispatchFrame = read_frame(&mut channel).unwrap();
+                    frame.validate().unwrap();
+                    assert_eq!(frame.source.ingress(), ingress);
+                    assert!(ids.insert(frame.request.request_id.clone()));
+                    write_frame(
+                        &mut channel,
+                        &failure_response(
+                            &frame.request.request_id,
+                            "test-child-failed",
+                            "deliberate test failure",
+                        ),
+                    )
+                    .unwrap();
+                }
+                assert!(child.wait().unwrap().success());
+            }
+            Some(other) => panic!("unknown test role {other}"),
+        }
     }
 }

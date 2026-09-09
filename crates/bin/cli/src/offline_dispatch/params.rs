@@ -202,6 +202,7 @@ mod tests {
                 no_project_flag: false,
                 request_project_path: true,
                 bind_parameter: Some(bind_parameter.into()),
+                bind_no_project_parameter: None,
             }),
             dispatch: CommandDispatch::ExecuteRef {
                 execute: "example:namespace/status".into(),
@@ -230,6 +231,66 @@ mod tests {
             json!({"project_path": project_path.to_string_lossy()})
         );
         assert!(params.get("project").is_none());
+    }
+
+    #[test]
+    fn projectless_projection_is_declared_and_shared_with_live_binding() {
+        let root = ryeos_engine::test_support::workspace_root();
+        for (file, expected, positionals) in [
+            ("remote-execute", true, vec!["test", "tool:test/read"]),
+            ("remote-status", true, vec!["test"]),
+            ("remote-list", true, vec![]),
+            ("remote-doctor", false, vec!["test"]),
+            ("fetch", false, vec!["tool:test/read"]),
+            (
+                "external-content-bind",
+                false,
+                vec![
+                    "stage",
+                    "request",
+                    "manifest",
+                    "worker:test/run",
+                    "installed_bundle",
+                ],
+            ),
+        ] {
+            let command: CommandDef = serde_yaml::from_str(
+                &std::fs::read_to_string(
+                    root.join(format!("bundles/core/.ai/node/commands/{file}.yaml")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let args: Vec<String> = positionals
+                .into_iter()
+                .chain(["--no-project"])
+                .map(str::to_owned)
+                .collect();
+            let offline = bind_params_minimal(&args, &command, ".").unwrap();
+            let mut live = json!({"no_project":true});
+            crate::dispatcher::apply_project_policy(&command, &mut live, None).unwrap();
+            assert_eq!(offline.get("no_project"), live.get("no_project"), "{file}");
+            assert_eq!(
+                live.get("no_project"),
+                expected.then_some(&json!(true)),
+                "{file}"
+            );
+            assert!(live.get("project").is_none());
+        }
+        let mut command = project_command("project_path");
+        let policy = command.project.as_mut().unwrap();
+        policy.no_project_flag = true;
+        policy.bind_no_project_parameter = Some("without_context".to_owned());
+        let mut supplied = json!({"no_project":true,"without_context":false});
+        assert!(crate::dispatcher::apply_project_policy(&command, &mut supplied, None).is_err());
+        assert_eq!(supplied["without_context"], false);
+        let mut explicit = json!({"no_project":true});
+        crate::dispatcher::apply_project_policy(&command, &mut explicit, None).unwrap();
+        assert_eq!(explicit, json!({"without_context":true}));
+        let mut positive = json!({});
+        crate::dispatcher::apply_project_policy(&command, &mut positive, Some(&root)).unwrap();
+        assert_eq!(positive["project_path"], root.to_string_lossy().as_ref());
+        assert!(positive.get("without_context").is_none());
     }
 
     #[test]

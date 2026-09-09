@@ -894,8 +894,40 @@ fn resolve_command_for_daemon_with_commands(
             .as_ref()
             .and_then(|project| project.bind_parameter.as_deref()),
     )?;
-    let mut parameters = bind_command_parameters_for_daemon(parameter_tail, &matched.command)?;
-    let project_path = apply_project_policy(&matched.command, &mut parameters, default_project)?;
+    let (parameters, project_path) = if direct_execute && matched.command.project.is_some() {
+        // The direct command selects an arbitrary item. Its structured input
+        // belongs to that item, not this command's control namespace. Resolve
+        // only argv selectors through the existing project-policy owner;
+        // never strip an item's JSON `project`/`no_project` fields or infer a
+        // project fallback in the daemon to compensate for lost parameters.
+        let (payload_tail, controls) =
+            crate::arg_bind::separate_project_control_flags(parameter_tail)?;
+        let mut controls = Value::Object(controls);
+        let project_path = apply_project_policy(&matched.command, &mut controls, default_project)?;
+        let mut parameters = bind_command_parameters_for_daemon(&payload_tail, &matched.command)?;
+        // Honor explicit signed selector-to-payload bindings if declared, but
+        // refuse a competing item value rather than silently overwriting it.
+        for (field, value) in controls
+            .as_object()
+            .expect("project controls are an object")
+        {
+            let obj = parameters.as_object_mut().ok_or_else(|| {
+                CliError::ProjectResolution("command parameters must be a JSON object".into())
+            })?;
+            if obj.contains_key(field) {
+                return Err(CliError::ProjectResolution(format!(
+                    "parameter '{field}' conflicts with the command's runtime-bound project selector"
+                )));
+            }
+            obj.insert(field.clone(), value.clone());
+        }
+        (parameters, project_path)
+    } else {
+        let mut parameters = bind_command_parameters_for_daemon(parameter_tail, &matched.command)?;
+        let project_path =
+            apply_project_policy(&matched.command, &mut parameters, default_project)?;
+        (parameters, project_path)
+    };
     if control.pin_project_at_admission && project_path.is_none() {
         return Err(CliError::Local {
             detail:
@@ -1313,6 +1345,15 @@ pub(crate) fn apply_project_policy(
             bind_parameter.replace('_', "-")
         )));
     }
+    if let Some(field) = &project.bind_no_project_parameter
+        && field != "no_project"
+        && obj.contains_key(field)
+    {
+        return Err(CliError::ProjectResolution(format!(
+            "--{} is runtime-bound from the projectless selector; use --no-project instead",
+            field.replace('_', "-"),
+        )));
+    }
     // These fields select project authority, not ordinary payload values.
     // Absence permits the descriptor's default; malformed supplied controls
     // must never be erased and reinterpreted as that absence. Validate before
@@ -1383,8 +1424,11 @@ pub(crate) fn apply_project_policy(
             Value::String(path.to_string_lossy().into_owned()),
         );
     }
-    if no_project && project.bind_parameter.is_none() && !project.request_project_path {
-        obj.insert("no_project".to_string(), Value::Bool(true));
+    // Selector support is not permission to invent a service argument.
+    // The signed command declares whether/where its consumer needs this value;
+    // never infer it from a command spelling, item kind, or positive path binding.
+    if no_project && let Some(field) = &project.bind_no_project_parameter {
+        obj.insert(field.clone(), Value::Bool(true));
     }
 
     if project.request_project_path {
@@ -1986,6 +2030,7 @@ mod tests {
                 no_project_flag: false,
                 request_project_path: false,
                 bind_parameter: None,
+                bind_no_project_parameter: None,
             }),
             dispatch: ryeos_runtime::CommandDispatch::ExecuteRef {
                 execute: "tool:test/command".into(),
@@ -2276,6 +2321,7 @@ mod tests {
                 no_project_flag: true,
                 request_project_path: true,
                 bind_parameter: None,
+                bind_no_project_parameter: None,
             }),
             dispatch: ryeos_runtime::CommandDispatch::DirectExecuteItemRef {
                 item_ref_arg: "item_ref".into(),
@@ -2786,6 +2832,81 @@ mod tests {
     }
 
     #[test]
+    fn direct_execute_structured_payload_is_not_project_control() {
+        let outer = tempfile::tempdir().unwrap();
+        let input = outer.path().join("params.json");
+        for payload in [
+            serde_json::json!({"project":"/not-a-local-selector", "no_project":false, "project_path":"verbatim"}),
+            serde_json::json!({"project":{"kind":"pinned"}, "no_project":true, "nested":[null, 7, false]}),
+        ] {
+            let json = payload.to_string();
+            std::fs::write(&input, &json).unwrap();
+            for input_tail in [
+                s(&[&json]),
+                s(&["--input", &json]),
+                s(&["--input", input.to_str().unwrap()]),
+            ] {
+                for project_tail in [
+                    s(&["--no-project"]),
+                    s(&["--project", outer.path().to_str().unwrap()]),
+                    s(&[]),
+                ] {
+                    let mut argv = s(&["execute", "service:test/operation"]);
+                    argv.extend(input_tail.clone());
+                    argv.extend(project_tail.clone());
+                    let resolved = resolve_command_for_daemon_with_commands(
+                        &argv,
+                        &[direct_execute_command()],
+                        &ryeos_runtime::CommandRegistrationPolicy::default(),
+                        Some(outer.path()),
+                    )
+                    .unwrap();
+                    assert_eq!(resolved.parameters, payload);
+                    assert_eq!(
+                        resolved.project_path.as_deref(),
+                        if project_tail == s(&["--no-project"]) {
+                            None
+                        } else {
+                            Some(outer.path())
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_execute_structured_payload_does_not_hide_invalid_selectors() {
+        for tail in [
+            s(&["--project", "--no-project"]),
+            s(&["--project="]),
+            s(&["--no-project=invalid"]),
+            s(&["--project", ".", "--no-project"]),
+            s(&["--project=", "--project=."]),
+            s(&["--no-project=invalid", "--no-project"]),
+            s(&["--limit", "4"]),
+            s(&["--input={}"]),
+        ] {
+            let mut argv = s(&[
+                "execute",
+                "tool:test/run",
+                "--input",
+                "{\"project\":\"payload\"}",
+            ]);
+            argv.extend(tail);
+            assert!(
+                resolve_command_for_daemon_with_commands(
+                    &argv,
+                    &[direct_execute_command()],
+                    &ryeos_runtime::CommandRegistrationPolicy::default(),
+                    None,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn direct_execute_input_preserves_tail_project_flag() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("params.json");
@@ -3129,18 +3250,14 @@ dispatch:
 
     #[test]
     fn remote_execute_forms_preserve_declared_optional_project() {
-        let mut command = command(
-            &["remote", "execute"],
-            vec![
-                vec![
-                    ("remote", CommandArgumentKind::String),
-                    ("item_ref", CommandArgumentKind::CanonicalRef),
-                ],
-                vec![("item_ref", CommandArgumentKind::CanonicalRef)],
-            ],
-            CommandProjectResolution::Optional,
-        );
-        command.project.as_mut().unwrap().no_project_flag = true;
+        let command: CommandDef = serde_yaml::from_str(
+            &std::fs::read_to_string(
+                ryeos_engine::test_support::workspace_root()
+                    .join("bundles/core/.ai/node/commands/remote-execute.yaml"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         for (argv, expected) in [
             (
                 s(&[
@@ -3174,7 +3291,12 @@ dispatch:
                 None,
             )
             .unwrap();
-            assert_eq!(resolved.parameters, expected);
+            let mut expected_fields = command.defaults.clone();
+            expected_fields.extend(expected.as_object().unwrap().clone());
+            assert_eq!(
+                resolved.parameters,
+                serde_json::to_value(expected_fields).unwrap()
+            );
             assert!(resolved.project_path.is_none());
         }
     }

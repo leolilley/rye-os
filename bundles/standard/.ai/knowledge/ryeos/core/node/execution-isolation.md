@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T00:26:31Z:c476af9dda0bbaaa81d9dd0a094c0eb33bbdcc93682c8bbf20815918b404a1b2:kV/5EgWHLWOxXfz9K+cAil3AMJkh3LsMFQgb1geLwQutDvQ/gWtzPfMqqA5YR8V4ixv880rcMX4DGXnm3QU0AQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T08:19:40Z:716444de2384b9bbcbd569105983bc50a4de9e4520a6cebff00365fa1fa0fada:c9x/OrWm7fAHCdATwi2EQaIKKSGhV+VfEkddz53RqByBHF5bznlf5Mjd6v0E1Y4So3NSQ16Nm6qPJbSqtyQWBw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -296,6 +296,20 @@ refusal is not an executed workload's nonzero exit result.
   `{node_trusted_keys}`, and `{verified_code}`.
 - `filesystem.writable` accepts absolute paths plus `{project}`, `{cwd}`, and
   `{checkpoint_dir}`.
+- A retained immutable-input or live-project authority intersects an explicit
+  writable `{project}` grant into an exact read-only project mount. The bare
+  read-only access ceiling does not grant project visibility. Immutable input
+  mounts require the state-issued materialization proof for the execution input
+  (not the definition generation), recheck its complete contents, and retain its
+  descriptor. Unproved project paths cannot expose protected node storage.
+  Explicit readable project grants retain the same protected-root floor.
+  Code-only launches can instead rely on admitted code/bundle mounts.
+  A writable node ceiling
+  does not make an immutable child input or evaluator candidate writable, and
+  does not erase its read access. Missing project grants still refuse execution;
+  unrelated writable paths are not converted to readable mounts. Under captured
+  execution, this exact project mount survives alongside verified code and
+  separately admitted dependencies, without ambient node-state access.
 - `network.mode` is `host` or `isolated`.
 - `environment.allow` entries are exact names, `*`, or prefix patterns ending
   in one `*`.

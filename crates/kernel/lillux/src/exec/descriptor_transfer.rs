@@ -9,6 +9,7 @@ use std::io;
 use std::mem::{size_of, size_of_val, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
+use super::duplex_deadline::wait_ready;
 use super::{
     InheritedDescriptorAuthority, SubprocessRequest, bind_inherited_channel_to_subprocess_request,
     retain_fork_sensitive_descriptors,
@@ -352,47 +353,6 @@ fn control_buffer(count: usize) -> Vec<usize> {
 
 /// Kernel readiness wait, not a timer-based inspection loop. EINTR, readiness
 /// races and every subsequent I/O attempt share the caller's original expiry.
-fn wait_ready(fd: RawFd, events: i16, deadline: MonotonicDeadline) -> io::Result<()> {
-    loop {
-        let remaining = deadline.remaining();
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "descriptor transfer deadline elapsed",
-            ));
-        }
-        let timeout_ms = remaining
-            .as_millis()
-            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
-            .min(i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        // SAFETY: poll receives exactly one valid pollfd.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if descriptor.revents & libc::POLLNVAL != 0 {
-            return Err(invalid("descriptor transfer endpoint is not live"));
-        }
-        if ready != 0 {
-            if deadline.has_elapsed() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "descriptor transfer deadline elapsed",
-                ));
-            }
-            return Ok(());
-        }
-    }
-}
 
 fn send_packet(
     fd: RawFd,

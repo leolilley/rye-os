@@ -2577,6 +2577,7 @@ pub(crate) async fn dispatch_method(
             .apply_awaiting_attachment_with_provenance(
                 subprocess_request,
                 ryeos_engine::isolation::IsolationLaunchContext {
+                    immutable_project: None,
                     workspace_view: workspace_view.as_ref(),
                     project_path: request.project_path,
                     project_authority: request.provenance.isolation_project_authority(),
@@ -5564,6 +5565,62 @@ pub fn preflight_root_resolution(
         .map_err(|error| DispatchError::InvalidRef(item_ref.to_string(), error.to_string()))?;
     validate_root_resolution_inner(&canonical_ref, project_binding, ctx, state, launch_timings)
         .map(|validated| validated.subject)
+}
+
+/// Present one finite workload operation from the same admitted resolution
+/// closure dispatch will consume. This is a projection, not a route registry
+/// or execution probe: no synthetic arguments and no mutable workspace read.
+pub fn present_workload_execution(
+    ceiling: &ryeos_runtime::workload_client::WorkloadClientExecutionCeiling,
+    project_binding: &ryeos_app::thread_lifecycle::AdmittedProjectBinding,
+    ctx: &ExecutionContext,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    use ryeos_runtime::workload_client::WorkloadClientCallCeiling;
+    let canonical = CanonicalRef::parse(&ceiling.item_ref)
+        .map_err(|error| DispatchError::InvalidRef(ceiling.item_ref.clone(), error.to_string()))?;
+    let validated = validate_root_resolution_inner(&canonical, project_binding, ctx, state, None)?;
+    let schema = ctx.engine.kinds.get(&canonical.kind).ok_or_else(|| {
+        DispatchError::Internal(anyhow::anyhow!(
+            "admitted workload item lost its kind schema"
+        ))
+    })?;
+    let execution = schema.execution().ok_or_else(|| {
+        DispatchError::Internal(anyhow::anyhow!(
+            "admitted workload item has no execution contract"
+        ))
+    })?;
+    let output = validated.closure.output();
+    let mut descriptor = ryeos_engine::inventory::descriptor_from_parsed_item(
+        &canonical,
+        schema,
+        &output.composed.composed,
+        &output.root.source_path,
+    );
+    // Presentation includes public invocation inputs, not runtime metadata or
+    // secret requirements. Existing inventory owns schema/description selection.
+    descriptor.extra.clear();
+    let calls = ceiling
+        .calls
+        .iter()
+        .map(|call| {
+            let selected = match call {
+                WorkloadClientCallCeiling::Default => None,
+                WorkloadClientCallCeiling::Method { name } => Some(name.as_str()),
+            };
+            if execution.methods.is_empty() && selected.is_none() {
+                return Ok(serde_json::json!({"call":call,"method":null,"args":null}));
+            }
+            let (name, method) = resolve_requested_method(selected, execution, &canonical.kind)?;
+            Ok(serde_json::json!({"call":call,"method":name,"args":method.args}))
+        })
+        .collect::<Result<Vec<_>, DispatchError>>()?;
+    Ok(
+        serde_json::json!({"item":descriptor,"ceiling":ceiling,"calls":calls,
+        "source_digest":output.root.source_content_digest,
+        "effective_definition_digest":ryeos_state::objects::canonical_value_digest(&output.composed.composed)
+            .map_err(DispatchError::Internal)?}),
+    )
 }
 
 /// Preflight the dispatch route for accepted/background launch.

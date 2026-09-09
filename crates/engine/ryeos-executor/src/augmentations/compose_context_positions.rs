@@ -821,6 +821,7 @@ pub async fn run(
                     // immutable input payload, not a mutable execution view.
                     // Its prospective parent has no admitted process/workspace
                     // owner yet. Never create or borrow a writable overlay here.
+                    immutable_project: None,
                     workspace_view: None,
                     project_path,
                     project_authority: ryeos_engine::isolation::IsolationProjectAuthority::ReadOnly,

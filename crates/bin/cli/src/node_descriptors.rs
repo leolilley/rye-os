@@ -151,6 +151,7 @@ mod tests {
                     no_project_flag: false,
                     request_project_path: false,
                     bind_parameter: None,
+                    bind_no_project_parameter: None,
                 }),
                 dispatch: ryeos_runtime::CommandDispatch::ExecuteRef {
                     execute: "tool:bundle/sign".into(),

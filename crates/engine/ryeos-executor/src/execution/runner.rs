@@ -2665,6 +2665,7 @@ pub(crate) struct PreparedProcessInputs {
     pub(crate) path: PathBuf,
     pub(crate) lifeline: Option<Arc<TempDirGuard>>,
     pub(crate) isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
+    pub(crate) isolation_immutable_project: Option<ryeos_state::PinnedProjectMaterialization>,
     pub(crate) isolation_live_access_authority:
         Option<ryeos_engine::isolation::IsolationLiveAccessAuthority>,
     pub(crate) external: Option<super::external_content::BoundExternalRealizations>,
@@ -2958,10 +2959,27 @@ pub(crate) fn prepare_process_inputs(
     if let Some(budget) = budget.as_ref() {
         budget.emit_metrics(thread_id)?;
     }
+    // Private copied inputs have their own scratch authority. Only an exact
+    // unchanged immutable input may carry the retained materialization proof.
+    let isolation_immutable_project = if isolation_project_authority
+        == ryeos_engine::isolation::IsolationProjectAuthority::ReadOnly
+    {
+        let proof = provenance.execution_input_materialization();
+        if let Some(proof) = proof {
+            anyhow::ensure!(
+                proof.owns_path(&path)?,
+                "immutable process input does not match retained materialization"
+            );
+        }
+        proof.cloned()
+    } else {
+        None
+    };
     Ok(PreparedProcessInputs {
         path,
         lifeline,
         isolation_project_authority,
+        isolation_immutable_project,
         isolation_live_access_authority,
         external,
         source,
@@ -3759,6 +3777,7 @@ pub async fn run_and_wait(
         path: process_path,
         lifeline: process_input_lifeline,
         isolation_project_authority: wait_isolation_project_authority,
+        isolation_immutable_project: wait_isolation_immutable_project,
         isolation_live_access_authority: wait_isolation_live_access_authority,
         external: wait_bound_external,
         source: wait_bound_source,
@@ -3935,6 +3954,7 @@ pub async fn run_and_wait(
             roots: wait_roots,
             isolation: wait_isolation,
             isolation_project_authority: wait_isolation_project_authority,
+            isolation_immutable_project: wait_isolation_immutable_project,
             isolation_workspace_view: wait_workspace_view,
             isolation_live_access_authority: wait_isolation_live_access_authority,
             isolation_external_read_only_mounts: wait_external_mounts,
@@ -4685,6 +4705,7 @@ pub async fn run_detached(
         path: process_path,
         lifeline: process_input_lifeline,
         isolation_project_authority: bg_isolation_project_authority,
+        isolation_immutable_project: bg_isolation_immutable_project,
         isolation_live_access_authority: bg_isolation_live_access_authority,
         external: bg_bound_external,
         source: bg_bound_source,
@@ -4839,6 +4860,7 @@ pub async fn run_detached(
         bg_candidate_operation_authority,
         bg_state_root,
         bg_isolation_project_authority,
+        bg_isolation_immutable_project,
         bg_isolation_live_access_authority,
         isolation_daemon_socket_path,
         bg_temp_dir,
@@ -4929,7 +4951,7 @@ impl DetachedDispatchKind {
         bg_project_path, bg_state_root,
         bg_project_authority,
         bg_candidate_operation_authority,
-        bg_isolation_project_authority, bg_isolation_daemon_socket_path, bg_temp_dir,
+        bg_isolation_project_authority, bg_isolation_immutable_project, bg_isolation_daemon_socket_path, bg_temp_dir,
         bg_process_input_dir,
         bg_skip_resume_snapshot_pin, bg_terminal_publication, bg_external_realizations,
         bg_source_closure,
@@ -4966,6 +4988,7 @@ async fn dispatch_detached_bg_task(
     >,
     bg_state_root: Option<PathBuf>,
     bg_isolation_project_authority: ryeos_engine::isolation::IsolationProjectAuthority,
+    bg_isolation_immutable_project: Option<ryeos_state::PinnedProjectMaterialization>,
     bg_isolation_live_access_authority: Option<
         ryeos_engine::isolation::IsolationLiveAccessAuthority,
     >,
@@ -5149,6 +5172,7 @@ async fn dispatch_detached_bg_task(
             roots,
             isolation: isolation_for_spawn,
             isolation_project_authority: bg_isolation_project_authority,
+            isolation_immutable_project: bg_isolation_immutable_project,
             isolation_workspace_view: bg_workspace_view,
             isolation_live_access_authority: bg_isolation_live_access_authority,
             isolation_external_read_only_mounts: bg_external_mounts,
@@ -7045,6 +7069,7 @@ async fn run_existing_recovered_thread(
         path: process_path,
         lifeline: process_input_lifeline,
         isolation_project_authority: bg_isolation_project_authority,
+        isolation_immutable_project: bg_isolation_immutable_project,
         isolation_live_access_authority: bg_isolation_live_access_authority,
         external: bg_external_realizations,
         source: bg_source_closure,
@@ -7323,6 +7348,7 @@ async fn run_existing_recovered_thread(
         bg_candidate_operation_authority,
         bg_state_root,
         bg_isolation_project_authority,
+        bg_isolation_immutable_project,
         bg_isolation_live_access_authority,
         isolation_daemon_socket_path,
         bg_temp_dir,

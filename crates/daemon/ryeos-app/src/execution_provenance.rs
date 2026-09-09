@@ -1388,6 +1388,31 @@ impl ExecutionProvenance {
         }
     }
 
+    /// Exact process input, which differs from definition/subject authority
+    /// for immutable children. Launch must not substitute the parent's pinned
+    /// materialization merely because it resolves the same signed operation.
+    pub fn execution_input_materialization(
+        &self,
+    ) -> Option<&ryeos_state::PinnedProjectMaterialization> {
+        match self {
+            Self::ChildImmutableWorkspaceInput {
+                input_pinned_materialization,
+                ..
+            } => input_pinned_materialization.verified(),
+            Self::RootPinnedGeneration {
+                pinned_materialization,
+                ..
+            }
+            | Self::ChildPinnedGeneration {
+                pinned_materialization,
+                ..
+            } => pinned_materialization.verified(),
+            Self::Projectless { .. }
+            | Self::RootLiveProject { .. }
+            | Self::ChildLiveProject { .. } => None,
+        }
+    }
+
     pub fn immutable_workspace_input_materialization(
         &self,
     ) -> Option<&ryeos_state::PinnedProjectMaterialization> {
@@ -1842,6 +1867,17 @@ mod tests {
             assert_eq!(
                 borrowed.immutable_workspace_input_snapshot_hash(),
                 Some(input_hash.as_str())
+            );
+            assert_eq!(
+                borrowed
+                    .execution_input_materialization()
+                    .unwrap()
+                    .snapshot_hash(),
+                input_hash
+            );
+            assert_eq!(
+                borrowed.pinned_materialization().unwrap().snapshot_hash(),
+                candidate_hash
             );
             assert_eq!(
                 borrowed

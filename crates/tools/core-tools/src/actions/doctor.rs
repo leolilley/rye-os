@@ -443,6 +443,7 @@ fn import_one(
         &[],
         isolation,
         IsolationLaunchContext {
+            immutable_project: None,
             workspace_view: None,
             project_path,
             project_authority: IsolationProjectAuthority::ReadOnly,

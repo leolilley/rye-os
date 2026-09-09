@@ -126,7 +126,7 @@ impl RuntimeDispatchEvidence {
 ///
 /// Both return identical-shape unary outcomes; this struct binds
 /// that contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallbackDispatchResponse {
     /// Finalized (or, for detached launches, currently-running)
@@ -150,6 +150,31 @@ pub struct CallbackDispatchResponse {
 }
 
 impl CallbackDispatchResponse {
+    /// Classify execution success using the existing terminator contract, not
+    /// an item kind or payload keys guessed by each ingress. Service results
+    /// are domain values even when they contain `status`/`success`; the
+    /// daemon-authored `thread.recorded` discriminator identifies that case.
+    /// A replay may carry a null thread and a retained runtime envelope.
+    pub fn execution_succeeded(&self) -> bool {
+        if self.dispatch.validate().is_err() {
+            return false;
+        }
+        if matches!(self.thread.get("recorded"), Some(Value::Bool(_))) {
+            return true;
+        }
+        if !self.thread.is_null() {
+            let status = self
+                .thread
+                .get("status")
+                .and_then(Value::as_str)
+                .and_then(ryeos_state::objects::ThreadStatus::from_str_lossy);
+            if status != Some(ryeos_state::objects::ThreadStatus::Completed) {
+                return false;
+            }
+        }
+        crate::envelope::envelope_succeeded(&self.result)
+    }
+
     /// Try to extract a continuation ID from `result.continuation_id`.
     /// Returns `None` for terminal results.
     ///
@@ -212,6 +237,42 @@ mod tests {
         });
         let parsed: CallbackDispatchResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(parsed.continuation_id(), None);
+    }
+
+    #[test]
+    fn workload_success_uses_dispatch_contract_not_domain_payload() {
+        let mut response = CallbackDispatchResponse {
+            thread: json!({"status":"completed"}),
+            result: json!({"success":false}),
+            dispatch: live_dispatch(),
+        };
+        assert!(!response.execution_succeeded());
+        response.result = json!({"success":true});
+        // A status-looking domain fragment is not a terminal envelope. Reuse
+        // the same complete contract that graph/follow dispatch validates.
+        assert!(!response.execution_succeeded());
+        response.result = json!({
+            "success": true,
+            "status": "completed",
+            "result": {},
+            "outputs": {},
+            "warnings": [],
+            "cost": null
+        });
+        assert!(response.execution_succeeded());
+        for status in ["failed", "cancelled", "running", "unknown"] {
+            response.thread = json!({"status":status});
+            assert!(!response.execution_succeeded(), "{status}");
+        }
+        response.thread = Value::Null;
+        assert!(response.execution_succeeded());
+        response.result = json!({"success":false,"status":"failed"});
+        assert!(!response.execution_succeeded());
+        // Service results can contain domain-level failure/status values.
+        response.thread = json!({"recorded":true});
+        assert!(response.execution_succeeded());
+        response.dispatch.action_digest = "not-a-digest".to_owned();
+        assert!(!response.execution_succeeded());
     }
 
     #[test]

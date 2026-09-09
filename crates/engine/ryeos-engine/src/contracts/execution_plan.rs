@@ -185,6 +185,7 @@ pub struct EngineContext {
     pub app_root: PathBuf,
     pub isolation: Arc<crate::isolation::IsolationRuntime>,
     pub isolation_project_authority: crate::isolation::IsolationProjectAuthority,
+    pub isolation_immutable_project: Option<ryeos_state::PinnedProjectMaterialization>,
     /// Exact view borrowed from the admitted workspace owner. Unlike
     /// `isolation_workspace`, this is operational descriptor authority, not a
     /// path for projectless materialization. Enforced RuntimeWorkspace launch

@@ -13,6 +13,9 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
 use clap::Subcommand;
 
+mod duplex_deadline;
+pub use duplex_deadline::DeadlineDuplexStream;
+
 #[cfg(target_os = "linux")]
 mod descriptor_transfer;
 #[cfg(target_os = "linux")]
@@ -1130,6 +1133,42 @@ pub fn inherited_duplex_channel_pair()
 }
 
 impl InheritedDuplexChannel {
+    pub fn with_deadline(
+        &mut self,
+        deadline: crate::time::MonotonicDeadline,
+    ) -> DeadlineDuplexStream<'_> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            DeadlineDuplexStream::new(self.stream.file().as_fd(), deadline)
+        }
+        #[cfg(not(unix))]
+        {
+            DeadlineDuplexStream::unsupported(deadline)
+        }
+    }
+
+    /// Wake all aliases blocked in channel I/O without closing a borrowed FD
+    /// or waiting for its writer lock. Used by exact channel lifecycle owners.
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the registered inherited authority retains this socket.
+            if unsafe { libc::shutdown(self.stream.file().as_raw_fd(), libc::SHUT_RDWR) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "duplex shutdown is unavailable",
+            ))
+        }
+    }
+
     pub fn try_clone(&self) -> std::io::Result<Self> {
         #[cfg(unix)]
         {

@@ -17,18 +17,18 @@ class DevelopmentEnvironmentTests(unittest.TestCase):
     def setUp(self):
         self.environment = load(".ai/config/development/ryeos/worker-environment.yaml")
 
-    def test_root_composes_authoring_and_restricted_client_not_child_compiler(self):
+    def test_root_composes_authoring_and_protocol_ingress_not_child_compiler(self):
         baseline = load("bundles/codex/.ai/config/codex/environments/authoring.yaml")
         self.assertEqual(self.environment["schema"], baseline["schema"])
         self.assertEqual(self.environment["worker_ref"], baseline["worker_ref"])
         declarations = {entry["id"]: entry for entry in self.environment["external_content"]}
-        self.assertEqual(set(declarations), {"authoring-tools", "workload-client"})
+        self.assertEqual(set(declarations), {"authoring-tools"})
         self.assertEqual(declarations["authoring-tools"]["digest"],
                          baseline["external_content"][0]["digest"])
-        client = self.environment["workload_client"]["client"]
-        self.assertEqual(client, {"realization_id": "workload-client", "relative_path": "bin/ryeos"})
-        self.assertIn({"realization_id": client["realization_id"], "relative_directory": "bin"},
-                      self.environment["configuration"]["executable_search"])
+        binding, = self.environment["workload_client"]["bindings"]
+        self.assertEqual(binding, {"kind": "structured_session"})
+        self.assertEqual(self.environment["configuration"]["executable_search"],
+                         [{"realization_id": "authoring-tools", "relative_directory": "bin"}])
         self.assertIsNone(baseline["workload_client"])
 
     def test_child_grants_match_exact_existing_signed_operations(self):

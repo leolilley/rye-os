@@ -13,7 +13,8 @@ use serde_json::{Map, Value, json};
 mod workload_client_broker;
 
 const WIRE_PROTOCOL: &str = "ryeos.structured-session";
-const WIRE_VERSION: u32 = 1;
+const WIRE_VERSION: u32 = 2;
+const OBSERVATION_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_APP_SERVER_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENTS: usize = 4_096;
@@ -54,11 +55,16 @@ struct StructuredWorkload {
     incoming: Receiver<Result<Value, String>>,
     responses: HashMap<String, Value>,
     server_requests: HashMap<String, PendingServerRequest>,
+    workload_channel: Option<workload_client_broker::WorkloadClientChannel>,
+    workload_invocations: Vec<PendingWorkloadInvocation>,
     expired_server_requests: VecDeque<ExpiredServerRequest>,
     seen_server_request_ids: HashSet<String>,
     events: Arc<Mutex<EventQueue>>,
     pending_controls: Receiver<PendingControl>,
     control_results: SyncSender<WorkloadCommandResult>,
+    command_progress: Option<String>,
+    active_progress_notifications: Vec<String>,
+    early_command_observations: Vec<Value>,
     next_id: u64,
     fatal: Option<String>,
     workspace: String,
@@ -77,6 +83,14 @@ struct StructuredWorkload {
 struct EventQueue {
     events: VecDeque<Value>,
     bytes: usize,
+    command_progress: Option<CommandProgressBarrier>,
+}
+
+struct CommandProgressBarrier {
+    request_id: String,
+    digest: String,
+    acknowledged: bool,
+    deadline: MonotonicDeadline,
 }
 
 struct PendingControl {
@@ -90,6 +104,21 @@ struct PendingServerRequest {
     expires_at: MonotonicDeadline,
 }
 
+struct PendingWorkloadInvocation {
+    rpc_id: Value,
+    response_schema: String,
+    response_template: ValueTemplate,
+    delivery: WorkloadInvocationDelivery,
+}
+
+enum WorkloadInvocationDelivery {
+    AwaitingProgress {
+        source: ryeos_runtime::workload_client::WorkloadInvocationSource,
+        request: ryeos_runtime::workload_client::WorkloadClientRequestFrame,
+    },
+    Submitted(Receiver<ryeos_runtime::workload_client::WorkloadClientResponseFrame>),
+}
+
 struct ExpiredServerRequest {
     id: String,
     request_digest: String,
@@ -101,7 +130,12 @@ struct PendingObservationBatch {
     deadline: MonotonicDeadline,
 }
 
-type WorkloadCommandResult = (String, std::result::Result<Value, String>);
+#[derive(Debug)]
+enum WorkloadCommandOutput {
+    Delta(Value),
+    Final(Value),
+}
+type WorkloadCommandResult = (String, std::result::Result<WorkloadCommandOutput, String>);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +146,7 @@ struct StructuredSessionProfile {
     workload_executable: String,
     workload_args: Vec<String>,
     workload_home_env: String,
+    required_process_environment: Vec<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     workload_client: Option<StructuredSessionWorkloadClient>,
     baseline_config: String,
@@ -131,7 +166,11 @@ struct StructuredSessionProfile {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StructuredSessionWorkloadClient {
-    endpoint_env: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    cli_endpoint_env: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    structured_session:
+        Option<ryeos_engine::structured_session_profile::StructuredSessionInvocationMapping>,
 }
 
 fn deserialize_required_nullable<'de, D, T>(
@@ -192,6 +231,8 @@ struct RouteRule {
     session_binding: Option<SessionBindingRule>,
     #[serde(default)]
     post_success_routes: Vec<String>,
+    #[serde(default)]
+    progress_notifications: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -269,6 +310,7 @@ enum ResultRetention {
 struct NotificationRule {
     method: String,
     schema: String,
+    upstream_session_pointer: Option<String>,
     event_type: String,
     durable: bool,
     payload: ValueTemplate,
@@ -348,6 +390,10 @@ enum ValueTemplate {
     Digest {
         pointer: String,
     },
+    JsonString {
+        pointer: String,
+        max_bytes: usize,
+    },
 }
 
 fn default_template_string_limit() -> usize {
@@ -381,10 +427,12 @@ fn validate_structured_session_profile(profile: &StructuredSessionProfile) -> Re
     ryeos_engine::protocol_vocabulary::validate_env_name(&profile.workload_home_env)
         .map_err(|error| anyhow!(error))?;
     if let Some(workload_client) = &profile.workload_client {
-        ryeos_engine::protocol_vocabulary::validate_env_name(&workload_client.endpoint_env)
-            .map_err(|error| anyhow!(error))?;
-        if workload_client.endpoint_env
-            != ryeos_runtime::workload_client::WORKLOAD_CLIENT_ENDPOINT_ENV
+        if workload_client
+            .cli_endpoint_env
+            .as_deref()
+            .is_some_and(|endpoint| {
+                endpoint != ryeos_runtime::workload_client::WORKLOAD_CLIENT_ENDPOINT_ENV
+            })
         {
             bail!("structured-session workload-client endpoint environment is not current");
         }
@@ -583,6 +631,14 @@ fn load_profile_schemas(
     for request in &profile.server_requests {
         identities.insert(request.schema.clone());
     }
+    if let Some(mapping) = profile
+        .workload_client
+        .as_ref()
+        .and_then(|client| client.structured_session.as_ref())
+    {
+        identities.insert(mapping.request_schema.clone());
+        identities.insert(mapping.response_schema.clone());
+    }
     if identities.len() > 512 {
         bail!("structured-session profile references too many schemas");
     }
@@ -683,7 +739,9 @@ fn run() -> Result<()> {
     }
     let profile: StructuredSessionProfile =
         serde_json::from_slice(&profile_bytes).context("decode structured-session profile")?;
-    if profile.schema_version != 2 {
+    if profile.schema_version
+        != ryeos_engine::structured_session_profile::STRUCTURED_SESSION_PROFILE_SCHEMA_VERSION
+    {
         bail!("unsupported structured-session profile schema");
     }
     validate_structured_session_profile(&profile)?;
@@ -762,15 +820,26 @@ fn run() -> Result<()> {
             )
             .map_err(anyhow::Error::msg)?
         };
-        let broker = workload_client_broker::start(channel)?;
-        if session_process_environment
-            .insert(
-                workload_client.endpoint_env.clone(),
-                broker.endpoint().to_owned(),
-            )
-            .is_some()
-        {
-            bail!("workload-client endpoint collided with admitted process environment");
+        let mut supported = Vec::new();
+        if workload_client.cli_endpoint_env.is_some() {
+            supported.push(ryeos_runtime::workload_client::WorkloadClientIngress::Cli);
+        }
+        if workload_client.structured_session.is_some() {
+            supported
+                .push(ryeos_runtime::workload_client::WorkloadClientIngress::StructuredSession);
+        }
+        let broker = workload_client_broker::start(channel, &supported)?;
+        if let Some(endpoint) = broker.endpoint() {
+            let endpoint_env = workload_client
+                .cli_endpoint_env
+                .as_ref()
+                .ok_or_else(|| anyhow!("CLI ingress lacks admitted endpoint environment"))?;
+            if session_process_environment
+                .insert(endpoint_env.clone(), endpoint.to_owned())
+                .is_some()
+            {
+                bail!("workload-client endpoint collided with admitted process environment");
+            }
         }
         Some(broker)
     } else {
@@ -798,6 +867,11 @@ fn run() -> Result<()> {
     let events = Arc::new(Mutex::new(EventQueue::default()));
     let (workload_result_sender, workload_results) = sync_channel::<WorkloadCommandResult>(32);
     let (pending_control_sender, pending_controls) = sync_channel::<PendingControl>(32);
+    for name in &profile.required_process_environment {
+        if !session_process_environment.contains_key(name) {
+            bail!("required process environment `{name}` is absent from admitted session inputs");
+        }
+    }
     let mut app = StructuredWorkload::start(
         executable.to_str().ok_or_else(|| {
             anyhow!("pinned structured-session workload executable path is not UTF-8")
@@ -821,6 +895,9 @@ fn run() -> Result<()> {
     // Retain the broker owner for the complete workload lifetime. Its worker
     // threads retain the listener and protected channel; this guard documents
     // that their endpoint is scoped to this bridge boot.
+    app.workload_channel = workload_client_broker
+        .as_ref()
+        .map(|broker| broker.channel());
     let _workload_client_broker = workload_client_broker;
     if let Err(error) = app.initialize() {
         // Upstream stderr can contain credentials and must stay private.
@@ -943,9 +1020,34 @@ fn run() -> Result<()> {
             continue;
         }
         while let Ok((request_id, outcome)) = workload_results.try_recv() {
-            if cancelled_requests.remove(&request_id) {
+            if cancelled_requests.contains(&request_id) {
+                // Progress is not settlement: retain the cancellation marker
+                // until this command's terminal output has also been drained.
+                if !matches!(&outcome, Ok(WorkloadCommandOutput::Delta(_))) {
+                    cancelled_requests.remove(&request_id);
+                }
                 continue;
             }
+            let outcome = match outcome {
+                Ok(WorkloadCommandOutput::Delta(body)) => {
+                    if active_request.as_deref() != Some(request_id.as_str()) {
+                        bail!("structured-session progress names an inactive command");
+                    }
+                    write_frame(
+                        &mut channel,
+                        &Frame {
+                            protocol: WIRE_PROTOCOL.to_owned(),
+                            version: WIRE_VERSION,
+                            kind: FrameKind::Delta,
+                            request_id: Some(request_id),
+                            body: Some(body),
+                        },
+                    )?;
+                    continue;
+                }
+                Ok(WorkloadCommandOutput::Final(body)) => Ok(body),
+                Err(error) => Err(error),
+            };
             if active_controls.remove(&request_id) {
                 match outcome {
                     Ok(result) => write_final(&mut channel, &request_id, result)?,
@@ -995,7 +1097,7 @@ fn run() -> Result<()> {
                 pending_observation = Some(PendingObservationBatch {
                     through_sequence,
                     digest,
-                    deadline: MonotonicDeadline::after(Duration::from_secs(30)),
+                    deadline: MonotonicDeadline::after(OBSERVATION_ACK_TIMEOUT),
                 });
             }
         }
@@ -1004,6 +1106,15 @@ fn run() -> Result<()> {
             .is_some_and(|pending| pending.deadline.has_elapsed())
         {
             bail!("RyeOS did not durably acknowledge the observation batch");
+        }
+        if events
+            .lock()
+            .map_err(|_| anyhow!("event queue is poisoned"))?
+            .command_progress
+            .as_ref()
+            .is_some_and(|progress| !progress.acknowledged && progress.deadline.has_elapsed())
+        {
+            bail!("RyeOS did not durably acknowledge command progress");
         }
         let frame = match session_incoming.recv_timeout(Duration::from_millis(50)) {
             Ok(Ok(frame)) => frame,
@@ -1067,12 +1178,16 @@ fn run() -> Result<()> {
                             .lock()
                             .map_err(|_| "structured-session workload state is poisoned".to_owned())
                             .and_then(|mut workload| {
+                                workload.command_progress = Some(request_id.clone());
                                 let result = if control {
                                     workload.handle_control(body)
                                 } else {
                                     workload.handle(body, &workspace)
                                 };
-                                result.map_err(|error| error.to_string())
+                                workload.command_progress = None;
+                                result
+                                    .map(WorkloadCommandOutput::Final)
+                                    .map_err(|error| error.to_string())
                             });
                         let _ = sender.send((request_id, outcome));
                     })
@@ -1106,6 +1221,24 @@ fn run() -> Result<()> {
                 cancelled_workload = true;
             }
             FrameKind::ObservationAck => {
+                if let Some(request_id) = frame.request_id.as_deref() {
+                    let body = frame
+                        .body
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            anyhow!("command progress acknowledgement is not an object")
+                        })?;
+                    require_exact_keys(body, &["command_progress_digest"])?;
+                    events
+                        .lock()
+                        .map_err(|_| anyhow!("event queue is poisoned"))?
+                        .acknowledge_command_progress(
+                            request_id,
+                            body["command_progress_digest"].as_str(),
+                        )?;
+                    continue;
+                }
                 let pending = pending_observation
                     .take()
                     .ok_or_else(|| anyhow!("unsolicited observation acknowledgement"))?;
@@ -1540,11 +1673,16 @@ impl StructuredWorkload {
             incoming,
             responses: HashMap::new(),
             server_requests: HashMap::new(),
+            workload_channel: None,
+            workload_invocations: Vec::new(),
             expired_server_requests: VecDeque::new(),
             seen_server_request_ids: HashSet::new(),
             events,
             pending_controls,
             control_results,
+            command_progress: None,
+            active_progress_notifications: Vec::new(),
+            early_command_observations: Vec::new(),
             next_id: 1,
             fatal: None,
             workspace: workspace.to_owned(),
@@ -1807,9 +1945,41 @@ impl StructuredWorkload {
             &mut params,
         )?;
         apply_route_parameters(&route, &mut params, workspace)?;
+        if let Some(mapping) = self
+            .profile
+            .workload_client
+            .as_ref()
+            .and_then(|client| client.structured_session.as_ref())
+            .filter(|mapping| mapping.registration_route == route_id)
+            && let Some(channel) = self.workload_channel.as_ref().filter(|channel| {
+                channel.admits(
+                    ryeos_runtime::workload_client::WorkloadClientIngress::StructuredSession,
+                )
+            })
+        {
+            // Caller collision was rejected by the route's forbidden-fields
+            // contract above. Only this admission-derived presentation may
+            // populate the signed registration mapping.
+            let template: ValueTemplate = serde_json::from_value(mapping.registration.clone())?;
+            let registration = evaluate_template(
+                &template,
+                &json!({"workload":{"executions":channel.execution_presentation()}}),
+            )?;
+            params
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("registration route params are not an object"))?
+                .insert(mapping.registration_field.clone(), registration);
+        }
         self.validate_schema(&route.request_schema, &params)?;
         let observed_params = params.clone();
-        let response = self.call_raw(method, params, ROUTE_CALL_TIMEOUT)?;
+        if !self.active_progress_notifications.is_empty() {
+            bail!("nested route cannot replace active progress authority");
+        }
+        self.active_progress_notifications = route.progress_notifications.clone();
+        self.early_command_observations.clear();
+        let response = self.call_raw(method, params, ROUTE_CALL_TIMEOUT);
+        self.active_progress_notifications.clear();
+        let response = response?;
         if response.get("error").is_none() {
             self.validate_schema(
                 &route.response_schema,
@@ -1830,6 +2000,23 @@ impl StructuredWorkload {
         } else {
             Vec::new()
         };
+        if !route.progress_notifications.is_empty()
+            && self.early_command_observations.is_empty()
+            && !observations.is_empty()
+        {
+            // A vendor may answer before emitting its progress notification.
+            // Correlate the schema-validated response through the same delta
+            // acceptance path before any subsequent callback can dispatch.
+            self.emit_command_progress(&observations)?;
+        }
+        if !self
+            .early_command_observations
+            .iter()
+            .all(|early| observations.contains(early))
+        {
+            bail!("final command response contradicts its earlier lifecycle observations");
+        }
+        self.early_command_observations.clear();
         if response.get("error").is_none() {
             settle_session_binding(
                 route.session_binding.as_ref(),
@@ -2011,6 +2198,7 @@ impl StructuredWorkload {
             };
             let outcome = self
                 .handle_control(control.body)
+                .map(WorkloadCommandOutput::Final)
                 .map_err(|error| error.to_string());
             self.control_results
                 .send((control.request_id, outcome))
@@ -2030,6 +2218,7 @@ impl StructuredWorkload {
     }
 
     fn receive_one(&mut self, timeout: Duration) -> Result<()> {
+        self.settle_workload_invocations()?;
         match self.incoming.recv_timeout(timeout) {
             Ok(Ok(message)) => self.route(message),
             Ok(Err(reason)) => {
@@ -2045,6 +2234,7 @@ impl StructuredWorkload {
 
     fn drain_incoming(&mut self) -> Result<()> {
         loop {
+            self.settle_workload_invocations()?;
             match self.incoming.try_recv() {
                 Ok(Ok(message)) => self.route(message)?,
                 Ok(Err(reason)) => {
@@ -2065,6 +2255,16 @@ impl StructuredWorkload {
         let method = object.get("method").and_then(Value::as_str);
         match (id, method) {
             (Some(id), Some(method)) => {
+                if let Some(mapping) = self
+                    .profile
+                    .workload_client
+                    .as_ref()
+                    .and_then(|client| client.structured_session.as_ref())
+                    .filter(|mapping| mapping.method == method)
+                    .cloned()
+                {
+                    return self.handle_workload_invocation(id.clone(), message, mapping);
+                }
                 let rule = self
                     .profile
                     .server_requests
@@ -2168,8 +2368,38 @@ impl StructuredWorkload {
                     return Ok(());
                 }
                 let context = json!({"message":message});
+                if let Some(pointer) = &rule.upstream_session_pointer {
+                    let session_id = context
+                        .pointer(pointer)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty() && value.len() <= 256)
+                        .ok_or_else(|| anyhow!("notification lacks bounded session correlation"))?;
+                    if self.bound_session_id.as_deref() != Some(session_id) {
+                        bail!("notification does not target the bound upstream session");
+                    }
+                }
                 let payload = evaluate_template(&rule.payload, &context)?;
-                let observations = evaluate_observations(&rule.observations, &context)?;
+                let mut observations = evaluate_observations(&rule.observations, &context)?;
+                if self
+                    .active_progress_notifications
+                    .iter()
+                    .any(|allowed| allowed == method)
+                {
+                    self.emit_command_progress(&observations)?;
+                    // The notification's lifecycle authority is request-correlated,
+                    // not duplicated in the independent pushed-observation stream.
+                    return self.push_event(json!({"event_type":rule.event_type,"payload":payload,"session_observations":[]}));
+                }
+                if self.profile.routes.iter().any(|route| {
+                    route
+                        .progress_notifications
+                        .iter()
+                        .any(|allowed| allowed == method)
+                }) {
+                    // A late progress notification cannot acquire command
+                    // authority by becoming an uncorrelated lifecycle batch.
+                    observations.clear();
+                }
                 if rule.ceremony_clear {
                     self.ceremony_active = false;
                 }
@@ -2183,12 +2413,259 @@ impl StructuredWorkload {
         }
     }
 
+    fn handle_workload_invocation(
+        &mut self,
+        rpc_id: Value,
+        message: Value,
+        mapping: ryeos_engine::structured_session_profile::StructuredSessionInvocationMapping,
+    ) -> Result<()> {
+        use ryeos_runtime::workload_client::{
+            WORKLOAD_CLIENT_PROTOCOL, WorkloadClientIngress, WorkloadClientOperation,
+            WorkloadClientRequestFrame, WorkloadInvocationSource,
+        };
+        let _channel = self
+            .workload_channel
+            .as_ref()
+            .filter(|channel| channel.admits(WorkloadClientIngress::StructuredSession))
+            .ok_or_else(|| anyhow!("structured workload invocation ingress was not admitted"))?
+            .clone();
+        self.validate_schema(
+            &mapping.request_schema,
+            message.get("params").unwrap_or(&Value::Null),
+        )?;
+        let context = json!({"message": message});
+        // A signed null identity explicitly means absent-or-null, never any
+        // caller-selected namespace. Non-null assertions remain exact.
+        if !invocation_identity_matches(&mapping.required_values, &context) {
+            bail!("structured workload invocation violates its exact signed identity");
+        }
+        let correlation = |pointer: &str| -> Result<String> {
+            context
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("structured workload invocation lacks correlation"))
+        };
+        let source = WorkloadInvocationSource::StructuredSession {
+            upstream_session_id: correlation(&mapping.session_pointer)?,
+            operation_id: correlation(&mapping.operation_pointer)?,
+            call_id: correlation(&mapping.call_pointer)?,
+        };
+        let request_id = source.request_id()?;
+        if self.bound_session_id.as_deref()
+            != context
+                .pointer(&mapping.session_pointer)
+                .and_then(Value::as_str)
+        {
+            bail!("workload invocation does not target the bound upstream session");
+        }
+        let key = canonical_id(&rpc_id)?;
+        if self.seen_server_request_ids.len() >= MAX_EVENTS
+            || !self.seen_server_request_ids.insert(key)
+        {
+            bail!("workload invocation exhausted or reused a server-request identity");
+        }
+        let request_template: ValueTemplate = serde_json::from_value(mapping.request)?;
+        let request = serde_json::from_value(evaluate_template(&request_template, &context)?)?;
+        let frame = WorkloadClientRequestFrame {
+            protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+            request_id,
+            operation: WorkloadClientOperation::Execute(request),
+        };
+        frame.validate()?;
+        let response_template = serde_json::from_value(mapping.response)?;
+        if self.workload_invocations.len()
+            >= usize::from(ryeos_runtime::workload_client::MAX_WORKLOAD_CLIENT_IN_FLIGHT)
+        {
+            return self.send_workload_invocation_result(
+                &rpc_id,
+                &mapping.response_schema,
+                &response_template,
+                ryeos_runtime::workload_client::WorkloadClientOutcome::Failed {
+                    code: "ingress-full".to_owned(),
+                    message: "workload ingress result bound exhausted before dispatch".to_owned(),
+                    retryable: false,
+                },
+            );
+        }
+        // Submit returns immediately. Child execution may freeze this bridge;
+        // the daemon owns child settlement and thaw independently of this
+        // response consumer. Never wait for a child under the App Server lock.
+        self.workload_invocations.push(PendingWorkloadInvocation {
+            rpc_id,
+            response_schema: mapping.response_schema,
+            response_template,
+            delivery: WorkloadInvocationDelivery::AwaitingProgress {
+                source,
+                request: frame,
+            },
+        });
+        Ok(())
+    }
+
+    fn settle_workload_invocations(&mut self) -> Result<()> {
+        let mut index = 0;
+        while index < self.workload_invocations.len() {
+            if let WorkloadInvocationDelivery::AwaitingProgress { source, request } =
+                &self.workload_invocations[index].delivery
+            {
+                let acknowledged = self
+                    .events
+                    .lock()
+                    .map_err(|_| anyhow!("event queue is poisoned"))?
+                    .command_progress
+                    .as_ref()
+                    .is_none_or(|progress| progress.acknowledged);
+                if !acknowledged
+                    || (!self.active_progress_notifications.is_empty()
+                        && self.early_command_observations.is_empty())
+                {
+                    index += 1;
+                    continue;
+                }
+                let channel = self
+                    .workload_channel
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("pending invocation lost its admitted channel"))?;
+                match channel.submit(source.clone(), request.clone()) {
+                    Ok(receiver) => {
+                        self.workload_invocations[index].delivery =
+                            WorkloadInvocationDelivery::Submitted(receiver)
+                    }
+                    Err(_) => {
+                        let pending = self.workload_invocations.swap_remove(index);
+                        self.send_workload_invocation_result(
+                            &pending.rpc_id,
+                            &pending.response_schema,
+                            &pending.response_template,
+                            ryeos_runtime::workload_client::WorkloadClientOutcome::Failed {
+                                code: "ingress-refused".to_owned(),
+                                message: "workload ingress refused this request before dispatch"
+                                    .to_owned(),
+                                retryable: false,
+                            },
+                        )?;
+                        continue;
+                    }
+                }
+            }
+            let WorkloadInvocationDelivery::Submitted(receiver) =
+                &self.workload_invocations[index].delivery
+            else {
+                unreachable!()
+            };
+            let frame = match receiver.try_recv() {
+                Ok(frame) => frame,
+                Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    bail!("workload invocation lost its outcome channel")
+                }
+            };
+            frame.validate()?;
+            let pending = self.workload_invocations.swap_remove(index);
+            self.send_workload_invocation_result(
+                &pending.rpc_id,
+                &pending.response_schema,
+                &pending.response_template,
+                frame.outcome,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_command_progress(&mut self, observations: &[Value]) -> Result<()> {
+        let request_id = self
+            .command_progress
+            .as_ref()
+            .ok_or_else(|| anyhow!("progress has no active command coordinate"))?;
+        if observations.len() != 1 || !self.early_command_observations.is_empty() {
+            bail!("command progress must contain one unique lifecycle observation");
+        }
+        let body = json!({"events":[],"session_observations":observations});
+        let digest = ryeos_state::objects::canonical_value_digest(&body)?;
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| anyhow!("event queue is poisoned"))?;
+        if events
+            .command_progress
+            .as_ref()
+            .is_some_and(|progress| !progress.acknowledged)
+        {
+            bail!("previous command progress has not been acknowledged");
+        }
+        events.command_progress = Some(CommandProgressBarrier {
+            request_id: request_id.clone(),
+            digest,
+            acknowledged: false,
+            deadline: MonotonicDeadline::after(OBSERVATION_ACK_TIMEOUT),
+        });
+        self.early_command_observations = observations.to_vec();
+        self.control_results
+            .try_send((request_id.clone(), Ok(WorkloadCommandOutput::Delta(body))))
+            .map_err(|_| anyhow!("bounded command progress channel is unavailable"))
+    }
+
+    fn send_workload_invocation_result(
+        &mut self,
+        rpc_id: &Value,
+        schema: &str,
+        template: &ValueTemplate,
+        outcome: ryeos_runtime::workload_client::WorkloadClientOutcome,
+    ) -> Result<()> {
+        let result = render_workload_invocation_result(template, outcome)?;
+        self.validate_schema(schema, &result)?;
+        self.send(&json!({"id":rpc_id,"result":result}))
+    }
+
     fn push_event(&mut self, event: Value) -> Result<()> {
         self.events
             .lock()
             .map_err(|_| anyhow!("structured-session event queue is poisoned"))?
             .push(event)
     }
+}
+
+fn render_workload_invocation_result(
+    template: &ValueTemplate,
+    outcome: ryeos_runtime::workload_client::WorkloadClientOutcome,
+) -> Result<Value> {
+    use ryeos_runtime::workload_client::WorkloadClientOutcome;
+    let success = outcome.succeeded();
+    let result = match outcome {
+        WorkloadClientOutcome::Dispatched { response } => response.result,
+        WorkloadClientOutcome::Failed {
+            code,
+            message,
+            retryable,
+        } => json!({"code":code,"message":message,"retryable":retryable}),
+    };
+    match evaluate_template(
+        template,
+        &json!({"outcome":{"success":success,"result":result}}),
+    ) {
+        Ok(response) => Ok(response),
+        // The child may already have committed. A presentation-byte refusal
+        // must neither kill the parent session nor imply it is safe to rerun.
+        // Keep the authoritative result in its ordinary execution owner.
+        Err(_) => evaluate_template(
+            template,
+            &json!({"outcome":{
+                "success":false,
+                "result":{"code":"result-unavailable","retryable":false,
+                    "execution_may_have_completed":true}
+            }}),
+        ),
+    }
+}
+
+fn invocation_identity_matches(required: &BTreeMap<String, Value>, context: &Value) -> bool {
+    required
+        .iter()
+        .all(|(pointer, expected)| context.pointer(pointer).unwrap_or(&Value::Null) == expected)
 }
 
 fn approval_expired_event(rule: &ServerRequestRule, context: &Value) -> Result<Value> {
@@ -2234,6 +2711,24 @@ fn require_successful_internal_route(result: &Value, stage: &str) -> Result<()> 
 }
 
 impl EventQueue {
+    fn acknowledge_command_progress(
+        &mut self,
+        request_id: &str,
+        digest: Option<&str>,
+    ) -> Result<()> {
+        let pending = self
+            .command_progress
+            .as_mut()
+            .ok_or_else(|| anyhow!("unsolicited command progress acknowledgement"))?;
+        if pending.acknowledged
+            || pending.request_id != request_id
+            || digest != Some(pending.digest.as_str())
+        {
+            bail!("command progress acknowledgement contradicts its exact request/batch");
+        }
+        pending.acknowledged = true;
+        Ok(())
+    }
     fn push(&mut self, event: Value) -> Result<()> {
         if self.events.len() >= MAX_EVENTS {
             bail!("structured workload event backlog is exhausted");
@@ -2256,6 +2751,15 @@ impl EventQueue {
         first_sequence: u64,
         previous_digest: Option<&str>,
     ) -> Result<Option<(Value, u64, String)>> {
+        // The independent pushed-event channel must not outrun an earlier
+        // request-correlated lifecycle commit (for example fast completion).
+        if self
+            .command_progress
+            .as_ref()
+            .is_some_and(|progress| !progress.acknowledged)
+        {
+            return Ok(None);
+        }
         if self.events.is_empty() {
             return Ok(None);
         }
@@ -2361,6 +2865,16 @@ fn evaluate_template(template: &ValueTemplate, context: &Value) -> Result<Value>
             Ok(Value::String(ryeos_state::objects::canonical_value_digest(
                 value,
             )?))
+        }
+        ValueTemplate::JsonString { pointer, max_bytes } => {
+            let value = context
+                .pointer(pointer)
+                .ok_or_else(|| anyhow!("JSON string mapping pointer is absent"))?;
+            let encoded = lillux::canonical_json(value)?;
+            if encoded.len() > *max_bytes {
+                bail!("JSON string mapping exceeds its admitted byte bound");
+            }
+            Ok(Value::String(encoded))
         }
     }
 }
@@ -2651,7 +3165,7 @@ fn validate_incoming_frame(frame: &Frame) -> Result<()> {
         {
             Ok(())
         }
-        FrameKind::ObservationAck if frame.request_id.is_none() && frame.body.is_some() => Ok(()),
+        FrameKind::ObservationAck if frame.body.is_some() => Ok(()),
         _ => bail!("daemon sent an invalid frame shape"),
     }
 }
@@ -2738,6 +3252,88 @@ mod tests {
     use std::os::unix::process::CommandExt as _;
 
     #[test]
+    fn invocation_identity_and_progress_ack_are_exact() {
+        let required = BTreeMap::from([
+            ("/message/params/tool".to_owned(), json!("execute")),
+            ("/message/params/namespace".to_owned(), Value::Null),
+        ]);
+        for params in [
+            json!({"tool":"execute"}),
+            json!({"tool":"execute","namespace":null}),
+        ] {
+            assert!(invocation_identity_matches(
+                &required,
+                &json!({"message":{"params":params}})
+            ));
+        }
+        for params in [
+            json!({"tool":"other"}),
+            json!({"tool":"execute","namespace":"other"}),
+        ] {
+            assert!(!invocation_identity_matches(
+                &required,
+                &json!({"message":{"params":params}})
+            ));
+        }
+        let mut queue = EventQueue::default();
+        queue.command_progress = Some(CommandProgressBarrier {
+            request_id: "command-one".to_owned(),
+            digest: "a".repeat(64),
+            acknowledged: false,
+            deadline: MonotonicDeadline::after(OBSERVATION_ACK_TIMEOUT),
+        });
+        assert!(
+            queue
+                .acknowledge_command_progress("command-two", Some(&"a".repeat(64)))
+                .is_err()
+        );
+        assert!(
+            queue
+                .acknowledge_command_progress("command-one", Some(&"b".repeat(64)))
+                .is_err()
+        );
+        assert!(!queue.command_progress.as_ref().unwrap().acknowledged);
+        queue
+            .push(json!({"event_type":"turn.completed","payload":{},"session_observations":[]}))
+            .unwrap();
+        assert!(queue.take_batch(128, 1, None).unwrap().is_none());
+        assert_eq!(queue.events.len(), 1);
+        queue
+            .acknowledge_command_progress("command-one", Some(&"a".repeat(64)))
+            .unwrap();
+        assert!(queue.take_batch(128, 1, None).unwrap().is_some());
+        assert!(
+            queue
+                .acknowledge_command_progress("command-one", Some(&"a".repeat(64)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn oversized_invocation_presentation_is_failure_not_rerun_permission() {
+        let template: ValueTemplate = serde_json::from_value(json!({"op":"object","fields":{
+            "success":{"op":"pointer","pointer":"/outcome/success"},
+            "text":{"op":"json_string","pointer":"/outcome/result","max_bytes":256}
+        }}))
+        .unwrap();
+        let response = render_workload_invocation_result(
+            &template,
+            ryeos_runtime::workload_client::WorkloadClientOutcome::Failed {
+                code: "child-failure".to_owned(),
+                message: "x".repeat(1024),
+                retryable: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(response["success"], false);
+        let result: Value = serde_json::from_str(response["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            json!({"code":"result-unavailable","retryable":false,"execution_may_have_completed":true})
+        );
+    }
+
+    #[test]
     fn forbidden_fields_reject_presence_including_null() {
         let rule: RouteRule = serde_json::from_value(json!({
             "id":"record.open",
@@ -2784,13 +3380,9 @@ mod tests {
         assert_eq!(queue.events.len(), 8 - usize::try_from(count).unwrap());
     }
 
-    #[test]
-    fn in_flight_upstream_call_services_a_gating_approval() {
-        let root = tempfile::tempdir().unwrap();
-        let workload_home = root.path().join("home");
-        std::fs::create_dir(&workload_home).unwrap();
-        let profile: StructuredSessionProfile = serde_json::from_value(json!({
-            "schema_version":2,
+    fn gating_approval_profile() -> StructuredSessionProfile {
+        serde_json::from_value(json!({
+            "schema_version":ryeos_engine::structured_session_profile::STRUCTURED_SESSION_PROFILE_SCHEMA_VERSION,
             "configuration_authority":"immutable_argv",
             "workload_realization_id":"test-realization",
             "workload_executable":"sh",
@@ -2799,6 +3391,7 @@ mod tests {
                 "IFS= read -r request; printf '%s\\n' '{\"id\":\"approval-one\",\"method\":\"approval/request\",\"params\":{\"session\":\"session-one\",\"operation\":\"operation-one\",\"command\":\"true\"}}'; IFS= read -r decision; printf '%s\\n' '{\"id\":1,\"result\":{\"ok\":true}}'"
             ],
             "workload_home_env":"TEST_WORKLOAD_HOME",
+            "required_process_environment":[],
             "workload_client":null,
             "baseline_config":"baseline.conf",
             "baseline_destination":"config.toml",
@@ -2845,7 +3438,197 @@ mod tests {
                 "display":{"op":"literal","value":{"command":"true"}}
             }]
         }))
+        .unwrap()
+    }
+
+    #[test]
+    fn protocol_invocation_subprocess_entry() {
+        const CHANNEL_ENV: &str = "RYEOS_TEST_INVOCATION_CHANNEL";
+        if std::env::var_os(CHANNEL_ENV).is_none() {
+            return;
+        }
+        // SAFETY: the parent test binds and transfers this unique endpoint
+        // through Lillux before exec. No borrowed or ambient FD is adopted.
+        let channel =
+            unsafe { lillux::take_inherited_duplex_channel_from_env(CHANNEL_ENV) }.unwrap();
+        let broker = workload_client_broker::start(
+            channel,
+            &[ryeos_runtime::workload_client::WorkloadClientIngress::StructuredSession],
+        )
         .unwrap();
+        assert!(broker.endpoint().is_none());
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = gating_approval_profile();
+        let progress_test = std::env::var_os("RYEOS_TEST_INVOCATION_PROGRESS").is_some();
+        profile.workload_args = vec!["-c".to_owned(),
+            "IFS= read -r request; printf '%s\\n' '{\"id\":\"rpc-one\",\"method\":\"operation/execute\",\"params\":{\"session\":\"session-one\",\"turn\":\"turn-one\",\"call\":\"call-one\",\"name\":\"execute\",\"arguments\":{\"item_ref\":\"tool:fixture/check\",\"ref_bindings\":{},\"params\":{}}}}'; IFS= read -r reply; case \"$reply\" in *'\"success\":false'*) printf '%s\\n' '{\"id\":1,\"result\":{\"ok\":true}}';; *) exit 9;; esac".to_owned()];
+        let mapping = serde_json::from_value(json!({
+            "registration_route":"session.start","registration_field":"tools",
+            "registration":{"op":"literal","value":[]},
+            "method":"operation/execute","request_schema":"invoke.json","response_schema":"invoked.json",
+            "session_pointer":"/message/params/session","operation_pointer":"/message/params/turn","call_pointer":"/message/params/call",
+            "required_values":{"/message/params/name":"execute"},
+            "request":{"op":"pointer","pointer":"/message/params/arguments"},
+            "response":{"op":"object","fields":{"success":{"op":"pointer","pointer":"/outcome/success"}}}
+        })).unwrap();
+        profile.workload_client = Some(StructuredSessionWorkloadClient {
+            cli_endpoint_env: None,
+            structured_session: Some(mapping),
+        });
+        if progress_test {
+            profile.workload_args[1] = profile.workload_args[1].replacen("IFS= read -r request;", r#"IFS= read -r request; printf '%s\n' '{"method":"operation/started","params":{"session":"session-one","turn":"turn-one"}}';"#, 1);
+            profile.notifications.push(serde_json::from_value(json!({
+                "method":"operation/started","schema":"progress.json","event_type":"operation.started","durable":true,
+                "upstream_session_pointer":"/message/params/session",
+                "payload":{"op":"literal","value":{}},"ceremony_clear":false,
+                "observations":[{"when":[],"value":{"op":"literal","value":{
+                    "kind":"state","expected":"idle","next":"turn_running","turn_id":"turn-one"
+                }}}]
+            })).unwrap());
+        }
+        let (_, controls) = sync_channel(1);
+        let (results, progress_results) = sync_channel(1);
+        let mut workload = StructuredWorkload::start("/bin/sh", root.path().to_str().unwrap(), root.path().to_str().unwrap(),
+            profile, "session".to_owned(), HashSet::from([RouteEffectClass::SessionMutation]),
+            HashMap::from([("invoke.json".to_owned(),json!({"type":"object"})),
+                ("invoked.json".to_owned(),json!({"type":"object","required":["success"],"properties":{"success":{"type":"boolean"}}}))]),
+            Arc::new(Mutex::new(EventQueue::default())), controls, results, "/bin/sh", None, &BTreeMap::new(), Vec::new()).unwrap();
+        workload.bound_session_id = Some("session-one".to_owned());
+        workload.workload_channel = Some(broker.channel());
+        let reply = if progress_test {
+            workload
+                .schemas
+                .insert("progress.json".to_owned(), json!({"type":"object"}));
+            workload.command_progress = Some("command-one".to_owned());
+            workload.active_progress_notifications = vec!["operation/started".to_owned()];
+            assert!(
+                workload
+                    .route(json!({"method":"operation/started",
+                "params":{"session":"different-session","turn":"turn-one"}}))
+                    .is_err()
+            );
+            assert!(progress_results.try_recv().is_err());
+            assert!(workload.early_command_observations.is_empty());
+            let key = canonical_id(&json!(1)).unwrap();
+            workload.outstanding.insert(key.clone());
+            workload
+                .send(&json!({"id":1,"method":"operation/run","params":{}}))
+                .unwrap();
+            workload.receive_one(Duration::from_secs(1)).unwrap();
+            let (request_id, progress) = progress_results
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let WorkloadCommandOutput::Delta(progress) = progress.unwrap() else {
+                panic!("expected progress delta")
+            };
+            workload.receive_one(Duration::from_secs(1)).unwrap();
+            workload.settle_workload_invocations().unwrap();
+            assert!(matches!(
+                workload.workload_invocations[0].delivery,
+                WorkloadInvocationDelivery::AwaitingProgress { .. }
+            ));
+            {
+                let mut events = workload.events.lock().unwrap();
+                assert!(events.take_batch(128, 1, None).unwrap().is_none());
+                events
+                    .acknowledge_command_progress(
+                        &request_id,
+                        Some(&ryeos_state::objects::canonical_value_digest(&progress).unwrap()),
+                    )
+                    .unwrap();
+            }
+            let deadline = MonotonicDeadline::after(Duration::from_secs(5));
+            while !workload.responses.contains_key(&key) {
+                assert!(!deadline.has_elapsed());
+                workload.receive_one(Duration::from_millis(10)).unwrap();
+            }
+            workload.responses.remove(&key).unwrap()
+        } else {
+            workload
+                .call_raw("operation/run", json!({}), Duration::from_secs(5))
+                .unwrap()
+        };
+        assert_eq!(reply["result"]["ok"], true);
+        assert!(workload.workload_invocations.is_empty());
+        workload.child.wait().unwrap();
+    }
+
+    #[test]
+    fn in_flight_upstream_call_services_a_gating_workload_invocation() {
+        run_gating_invocation(false);
+    }
+
+    #[test]
+    fn invocation_waits_for_exact_progress_acceptance_before_dispatch() {
+        run_gating_invocation(true);
+    }
+
+    fn run_gating_invocation(progress: bool) {
+        use ryeos_runtime::workload_client::*;
+        let (mut channel, child_channel) = lillux::inherited_duplex_channel_pair().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        if progress {
+            command.env("RYEOS_TEST_INVOCATION_PROGRESS", "1");
+        }
+        command.args([
+            "--exact",
+            "tests::protocol_invocation_subprocess_entry",
+            "--nocapture",
+        ]);
+        child_channel
+            .bind_to_command(&mut command, "RYEOS_TEST_INVOCATION_CHANNEL")
+            .unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        let deadline = MonotonicDeadline::after(Duration::from_secs(10));
+        let mut channel = channel.with_deadline(deadline);
+        write_frame(
+            &mut channel,
+            &WorkloadClientBootFrame {
+                protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+                grant_digest: "a".repeat(64),
+                ingresses: vec![WorkloadClientIngress::StructuredSession],
+                execution_presentation: json!([{}]),
+                max_in_flight: 1,
+                max_request_bytes: 4096,
+                max_lifetime_seconds: 10,
+            },
+        )
+        .unwrap();
+        let ready: WorkloadClientReadyFrame = read_frame(&mut channel).unwrap();
+        ready.validate().unwrap();
+        let request: WorkloadClientDispatchFrame = read_frame(&mut channel).unwrap();
+        request.validate().unwrap();
+        assert_eq!(
+            request.source,
+            WorkloadInvocationSource::StructuredSession {
+                upstream_session_id: "session-one".to_owned(),
+                operation_id: "turn-one".to_owned(),
+                call_id: "call-one".to_owned(),
+            }
+        );
+        write_frame(
+            &mut channel,
+            &WorkloadClientResponseFrame {
+                protocol: WORKLOAD_CLIENT_PROTOCOL.to_owned(),
+                request_id: request.request.request_id,
+                outcome: WorkloadClientOutcome::Failed {
+                    code: "test-child-failed".to_owned(),
+                    message: "deliberately failed child".to_owned(),
+                    retryable: false,
+                },
+            },
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn in_flight_upstream_call_services_a_gating_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let workload_home = root.path().join("home");
+        std::fs::create_dir(&workload_home).unwrap();
+        let profile = gating_approval_profile();
         let schemas = HashMap::from([
             (
                 "request.json".to_owned(),
@@ -2940,7 +3723,10 @@ mod tests {
         assert_eq!(result["response"]["result"], json!({"ok":true}));
         let (control_id, control_result) = results.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(control_id, "control-one");
-        assert_eq!(control_result.unwrap(), json!({"resolved":true}));
+        let WorkloadCommandOutput::Final(control_result) = control_result.unwrap() else {
+            panic!("expected final control result")
+        };
+        assert_eq!(control_result, json!({"resolved":true}));
 
         let sentinel = "DEVICE-CREDENTIAL-SENTINEL";
         let schema_error = workload

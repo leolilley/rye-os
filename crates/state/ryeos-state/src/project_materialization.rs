@@ -294,6 +294,16 @@ impl PinnedProjectMaterialization {
         self.root.ensure_path_binding()
     }
 
+    /// Export the retained inode for an immutable execution mount, after
+    /// rechecking its complete content. Root identity alone is insufficient:
+    /// this proof can also originate from retained mutable workspace recovery.
+    pub fn verified_mount_descriptor(
+        &self,
+    ) -> anyhow::Result<lillux::InheritedDescriptorAuthority> {
+        self.ensure_path_binding()?;
+        self.root.inherited_descriptor_authority()
+    }
+
     pub fn owns_path(&self, path: &Path) -> anyhow::Result<bool> {
         if self.path() != path {
             return Ok(false);

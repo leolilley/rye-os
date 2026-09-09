@@ -21,6 +21,8 @@ struct DispatchActionParams {
     hook_dispatch: Option<ryeos_runtime::callback::HookDispatchIdentity>,
     #[serde(default)]
     effect_dispatch: Option<ryeos_runtime::callback::EffectDispatchRequest>,
+    #[serde(default)]
+    workload_invocation: Option<ryeos_runtime::workload_client::WorkloadInvocationSource>,
 }
 
 /// Exact, threadless callee admission captured before a durable-effect lookup.
@@ -52,6 +54,7 @@ struct PreparedWorkloadWorkspaceOperation {
     project_authority_digest: String,
     grant_digest: String,
     input_base_snapshot_hash: String,
+    invocation: ryeos_runtime::workload_client::WorkloadInvocationSource,
 }
 
 impl PreparedWorkloadWorkspaceOperation {
@@ -64,6 +67,7 @@ impl PreparedWorkloadWorkspaceOperation {
             worker_boot_identity_hash: &self.worker_boot_identity_hash,
             project_authority_digest: &self.project_authority_digest,
             workload_client_grant_digest: &self.grant_digest,
+            invocation: self.invocation.clone(),
         }
     }
 }
@@ -72,6 +76,17 @@ fn canonical_authority_digest(value: &impl serde::Serialize) -> Result<String> {
     let value = serde_json::to_value(value)?;
     let canonical = lillux::canonical_json(&value)?;
     Ok(lillux::sha256_hex(canonical.as_bytes()))
+}
+
+fn verify_workload_owner_project_authority(
+    owner_authority: &ryeos_state::objects::ExecutionProjectAuthority,
+    admitted_digest: &str,
+) -> Result<String> {
+    let digest = canonical_authority_digest(owner_authority)?;
+    if digest != admitted_digest {
+        anyhow::bail!("workload-client grant project authority changed after boot");
+    }
+    Ok(digest)
 }
 
 fn prepare_workload_workspace_operation(
@@ -83,6 +98,7 @@ fn prepare_workload_workspace_operation(
     authoritative_origin_site_id: &str,
     child_provenance: &ryeos_app::execution_provenance::ExecutionProvenance,
     access: ryeos_engine::kind_registry::WorkspaceAccess,
+    invocation: &ryeos_runtime::workload_client::WorkloadInvocationSource,
 ) -> Result<PreparedWorkloadWorkspaceOperation> {
     let grant = cap
         .workload_client_grant
@@ -149,11 +165,16 @@ fn prepare_workload_workspace_operation(
     {
         anyhow::bail!("workload-client caller is not the authoritative chain placement");
     }
-    let project_authority_digest =
-        canonical_authority_digest(child_provenance.project_authority())?;
-    if project_authority_digest != grant.project_authority_digest {
-        anyhow::bail!("workload-client grant project authority changed after boot");
-    }
+    // The boot grant binds the owning placement's sealed project authority.
+    // Borrowed-child derivation intentionally replaces COW publication with
+    // Discard, so its digest is NOT that grant identity. Keep this owner check
+    // exact; do not undo for_child() or omit publication from the hash to make
+    // them match. Child authority remains separately bound by the action
+    // request hash and is used below for workspace/child admission.
+    let project_authority_digest = verify_workload_owner_project_authority(
+        cap.provenance.project_authority(),
+        &grant.project_authority_digest,
+    )?;
     let input_base_snapshot_hash = child_provenance
         .pinned_snapshot_hash()
         .ok_or_else(|| anyhow::anyhow!("shared-workspace execution requires pinned provenance"))?
@@ -185,6 +206,7 @@ fn prepare_workload_workspace_operation(
         project_authority_digest,
         grant_digest: grant.digest()?,
         input_base_snapshot_hash,
+        invocation: invocation.clone(),
     })
 }
 
@@ -463,7 +485,49 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
             );
         }
         grant.authorize_action(&params.action)?;
+        let source = params.workload_invocation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("workload dispatch has no trusted ingress provenance")
+        })?;
+        if !grant.ingresses.contains(&source.ingress())
+            || params.action.operation_id.as_deref()
+                != Some(source.runtime_operation_id(&grant.digest()?)?.as_str())
+        {
+            anyhow::bail!("workload dispatch occurrence contradicts admitted ingress authority");
+        }
+        if matches!(
+            source,
+            ryeos_runtime::workload_client::WorkloadInvocationSource::StructuredSession { .. }
+        ) && let Some(retained) = state
+            .state_store
+            .runtime_action_for_protocol_invocation(&params.thread_id, source)?
+            && params.action.operation_id.as_deref() != Some(retained.operation_id.as_str())
+        {
+            // Reattachment rotates the grant, never the logical callback.
+            // Cross-boot outcome recovery must use the original retained
+            // intent, not authorize a fresh child from the successor grant.
+            return Err(runtime_action_outcome_unknown(
+                &retained.operation_id,
+                "protocol call is fenced to its original boot's runtime action; no new child was authorized",
+            ));
+        }
+    } else if params.workload_invocation.is_some() {
+        anyhow::bail!("ordinary callback cannot assert workload ingress provenance");
     }
+    // Join the existing root gate before input preflight or reservation.
+    // Queued bytes are not accepted execution authority; a terminalizer may
+    // refuse them, but must drain every invocation admitted through this gate.
+    // Retain this one lease through child settlement, not a second broker gate.
+    let _hosted_root_operation = if cap.workload_client_grant.is_some() {
+        Some(
+            ryeos_app::hosted_operation::try_begin_hosted_child_operation_async(
+                &state.state_store,
+                &params.thread_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let launch_owner = cap
         .launch_owner
         .as_deref()
@@ -570,22 +634,6 @@ pub async fn handle(params: &Value, state: &AppState) -> Result<Value> {
             &params.action.item_id,
             prepared.preflight.workspace_access,
         )?)
-    } else {
-        None
-    };
-
-    // Root terminalization, freeze and handoff already drain this gate. Keep
-    // one ordinary hosted operation live across reservation, exact process
-    // quiescence, child execution and settlement; a second workspace gate
-    // would race those existing owners.
-    let _hosted_root_operation = if workload_workspace_access.is_some() {
-        Some(
-            ryeos_app::hosted_operation::begin_hosted_root_operation_async(
-                &state.state_store,
-                &params.thread_id,
-            )
-            .await?,
-        )
     } else {
         None
     };
@@ -1001,6 +1049,9 @@ async fn handle_execute(
                 authoritative_origin_site_id,
                 &child_provenance,
                 access,
+                params.workload_invocation.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("workspace operation lost its workload ingress provenance")
+                })?,
             )
         })
         .transpose()?;
@@ -2018,6 +2069,59 @@ mod tests {
     use lillux::time::{Duration, MonotonicDeadline};
     use std::sync::Arc;
 
+    #[test]
+    fn workload_grant_binds_owner_not_downgraded_child_publication() {
+        use ryeos_state::objects::{
+            EnvironmentAuthority, ExecutionProjectAuthority, PinnedProjectRealization,
+            PinnedTerminalPublication,
+        };
+        for terminal_publication in [
+            PinnedTerminalPublication::RetainResult,
+            PinnedTerminalPublication::RetainCurrentHead {
+                principal_key: "b".repeat(64),
+                project_hash: "c".repeat(64),
+                expected_hash: "a".repeat(64),
+            },
+        ] {
+            let owner = ExecutionProjectAuthority::pinned(
+                "site:fixture:project".into(),
+                Some(std::path::PathBuf::from("/fixture")),
+                "a".repeat(64),
+                PinnedProjectRealization::Cow {
+                    terminal_publication,
+                },
+                EnvironmentAuthority::None,
+                Vec::new(),
+            )
+            .unwrap();
+            let child = owner.clone().for_child().unwrap();
+            let owner_digest = canonical_authority_digest(&owner).unwrap();
+            let child_digest = canonical_authority_digest(&child).unwrap();
+            assert_ne!(owner_digest, child_digest);
+            assert_eq!(
+                verify_workload_owner_project_authority(&owner, &owner_digest).unwrap(),
+                owner_digest
+            );
+            assert!(verify_workload_owner_project_authority(&owner, &child_digest).is_err());
+            assert!(verify_workload_owner_project_authority(&child, &owner_digest).is_err());
+            assert!(matches!(
+                child,
+                ExecutionProjectAuthority::PinnedGeneration {
+                    realization: PinnedProjectRealization::Cow {
+                        terminal_publication: PinnedTerminalPublication::Discard
+                    },
+                    ..
+                }
+            ));
+            let mut changed = owner.clone();
+            if let ExecutionProjectAuthority::PinnedGeneration { snapshot_hash, .. } = &mut changed
+            {
+                *snapshot_hash = "d".repeat(64);
+            }
+            assert!(verify_workload_owner_project_authority(&changed, &owner_digest).is_err());
+        }
+    }
+
     // ── V5.5 P2: enforce_callback_caps ──────────────────────────────
 
     fn test_auth() -> ryeos_runtime::authorizer::Authorizer {
@@ -2163,6 +2267,7 @@ mod tests {
             },
             hook_dispatch,
             effect_dispatch: None,
+            workload_invocation: None,
         }
     }
 

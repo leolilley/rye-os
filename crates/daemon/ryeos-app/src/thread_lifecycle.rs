@@ -7287,16 +7287,25 @@ pub(super) fn build_execution_plan_for_request(
         .and_then(|admission| admission.admitted_request_snapshot())
     {
         Some(authority) => {
-            let project_root = resolved
+            let admission = resolved
                 .root_admission
                 .as_ref()
-                .and_then(|admission| admission.execution_workspace())
-                .ok_or_else(|| {
-                    anyhow!("content-addressed execution plan has no admitted project root")
-                })?;
+                .expect("admitted request snapshot belongs to a root admission");
+            let project_root = admission.resolution_workspace().ok_or_else(|| {
+                anyhow!("content-addressed execution plan has no admitted project root")
+            })?;
+            // Definitions/config and their materialization proof belong to the
+            // admitted resolution generation. An independent candidate operation
+            // intentionally executes against a different workspace. Keep that
+            // execution context, but use the base subject for source planning;
+            // neither re-admit candidate definitions nor weaken the engine's
+            // exact materialization check to make these coordinates agree.
+            let mut plan_context = resolved.plan_context.clone();
+            plan_context.subject_resolution_authority =
+                admission.resolution_subject_authority().clone();
             engine
                 .build_plan_under_admitted_authority(
-                    &resolved.plan_context,
+                    &plan_context,
                     verified,
                     &resolved.parameters,
                     &resolved.plan_context.execution_hints,

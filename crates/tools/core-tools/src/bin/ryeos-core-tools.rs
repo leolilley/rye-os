@@ -1311,7 +1311,7 @@ fn run_bundle_verify(
                 .expect("could not determine XDG data directory")
         });
     let dependency_roots = bundle_verify_dependency_roots(&source_path, registry_roots, &app_root)?;
-    let isolation = ryeos_app::engine_init::load_locked_registered_isolation(&app_root)
+    let isolation = ryeos_app::engine_init::load_locked_registered_definition_isolation(&app_root)
         .context("load node isolation policy")?;
 
     let preflight_report = ryeos_bundle::preflight::preflight_verify_bundle_report_in_context(
