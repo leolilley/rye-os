@@ -517,7 +517,7 @@ mod imp {
                     enter_namespaces(LinuxSandboxNetwork::Isolated)?;
                     let directory = reanchor_mount_source(inherited_directory.file().as_raw_fd())?;
                     mount_private_root()?;
-                    create_minimal_devices()?;
+                    create_minimal_devices(nested)?;
                     create_private_tmp()?;
                     let staging = SealedSourceStaging::create()?;
                     let bytes = materialize_sealed_mount_source(
@@ -613,7 +613,7 @@ mod imp {
         // The detached template is NOT an ordinary mount source: reanchoring
         // it would replace the admitted filesystem with unrelated path bytes.
         if request.minimal_devices {
-            create_minimal_devices()?;
+            create_minimal_devices(request.nested_sandbox)?;
         }
         if request.private_tmp {
             create_private_tmp()?;
@@ -1230,7 +1230,7 @@ mod imp {
         .map_err(|error| format!("mount private sandbox tmp: {error}"))
     }
 
-    fn create_minimal_devices() -> Result<(), String> {
+    fn create_minimal_devices(nested: bool) -> Result<(), String> {
         let dev = format!("{ROOT}/dev");
         mkdir_path(&dev, 0o755)?;
         mount_raw(
@@ -1241,7 +1241,21 @@ mod imp {
             Some("mode=0755"),
         )
         .map_err(|error| format!("mount minimal device filesystem: {error}"))?;
-        for name in ["null", "zero", "random", "urandom"] {
+        // Linux's synthetic device floor, not a workload package dependency.
+        // Nested runtimes reconstruct this surface inside their own namespace.
+        // /dev/tty is only exposed when whole-execution containment permits a
+        // fresh target session; that child must lose its inherited terminal.
+        for (name, major, minor) in [
+            ("null", 1, 3),
+            ("zero", 1, 5),
+            ("full", 1, 7),
+            ("random", 1, 8),
+            ("urandom", 1, 9),
+            ("tty", 5, 0),
+        ] {
+            if name == "tty" && !nested {
+                continue;
+            }
             let source = format!("/dev/{name}");
             let source_c = CString::new(source.as_str()).expect("static device path");
             let fd = unsafe {
@@ -1257,6 +1271,20 @@ mod imp {
                 ));
             }
             let file = unsafe { File::from_raw_fd(fd) };
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            syscall_zero(
+                unsafe { libc::fstat(file.as_raw_fd(), metadata.as_mut_ptr()) },
+                "inspect pinned minimal device",
+            )?;
+            let metadata = unsafe { metadata.assume_init() };
+            if metadata.st_mode & libc::S_IFMT != libc::S_IFCHR
+                || libc::major(metadata.st_rdev) != major
+                || libc::minor(metadata.st_rdev) != minor
+            {
+                return Err(format!(
+                    "minimal device {source} is not its exact kernel device"
+                ));
+            }
             let target = PathBuf::from(format!("{dev}/{name}"));
             create_regular_target(&target)?;
             bind_fd_to_path(file.as_raw_fd(), &target, false)?;
@@ -1264,7 +1292,9 @@ mod imp {
             // on their bind mounts would make the deliberately admitted
             // `/dev/null`, `/dev/zero`, and random devices unusable.
             set_mount_attributes(&target, true, false, false)?;
-            prove_minimal_device_usable(&target)?;
+            if name != "tty" {
+                prove_minimal_device_usable(&target)?;
+            }
         }
         Ok(())
     }
@@ -1284,6 +1314,35 @@ mod imp {
             ));
         }
         close_fd(fd);
+        Ok(())
+    }
+
+    fn detach_nested_target_terminal() -> Result<(), String> {
+        // Called in the freshly forked PID-namespace child, never the adapter
+        // or an ordinary process-group-contained target. Scope containment
+        // owns this child's lifetime even after its process-session change.
+        if unsafe { libc::setsid() } < 0 {
+            return Err(format!(
+                "detach nested target controlling terminal: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let fd = unsafe {
+            libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd >= 0 {
+            close_fd(fd);
+            return Err("nested target retained a controlling terminal".to_owned());
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO) {
+            return Err(format!(
+                "verify detached nested terminal: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
         Ok(())
     }
 
@@ -1620,6 +1679,9 @@ mod imp {
                 }
                 mount_pid_namespace_proc(nested)?;
                 pivot_into_private_root()?;
+                if nested {
+                    detach_nested_target_terminal()?;
+                }
                 if std::fs::read_link("/proc/self").map_err(|error| error.to_string())?
                     != PathBuf::from("1")
                     || std::path::Path::new(&format!("/proc/{parent_pid}")).exists()
@@ -1863,6 +1925,9 @@ mod imp {
             mount_pid_namespace_proc(request.nested_sandbox)?;
         }
         pivot_into_private_root()?;
+        if request.nested_sandbox {
+            detach_nested_target_terminal()?;
+        }
         let mut mapped_channels = Vec::with_capacity(request.target_channels.len());
         for (source, target) in &request.target_channels {
             let source = raw_fd(*source)?;
@@ -3307,6 +3372,30 @@ mod imp {
             };
             verify_target_namespace_capabilities().unwrap();
             assert_eq!(unsafe { libc::getuid() }, NAMESPACE_USER_ID);
+            // Exercise the device surface after the real private-root exec,
+            // not merely the namespace probe's construction-time opens.
+            {
+                use std::io::{Read as _, Write as _};
+                let mut zero = [1_u8];
+                std::fs::File::open("/dev/zero")
+                    .unwrap()
+                    .read_exact(&mut zero)
+                    .unwrap();
+                assert_eq!(zero, [0]);
+                let error = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap()
+                    .write_all(b"bounded full-device probe")
+                    .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                if std::env::var_os("LILLUX_PROBE_NESTED").is_some() {
+                    let error = std::fs::File::open("/dev/tty").unwrap_err();
+                    assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
+                } else {
+                    assert!(!std::path::Path::new("/dev/tty").exists());
+                }
+            }
             // Exec and same-UID transitions may not regain setup authority. This
             // runs in both the initial target and its fresh-exec descendant.
             assert_eq!(

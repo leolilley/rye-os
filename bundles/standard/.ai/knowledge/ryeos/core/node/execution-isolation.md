@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-08T23:22:09Z:da010017f13beb5afa5deaf126862678ab31ef2a15ee3be94c37d2a195a388d6:LHvlEUooewe0YAHLOzcJHB4mvJA25FxAG0GflLg4nskEbmCM41NSjznYHEWTD/zsU69zq4muceaYitbb7zZjCQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T00:18:13Z:2492c49d1dad12fdc88c32f252d2a0ec616c85d431b26e66b8df58bed6908f54:f9zBrfVoWPlgvRdIzXHXkFz0KyLAsqb5dJTj01NxnSWphN+Od9XQWk/VtjTvqHCiLUvyay5lxGFZSD5Ex3huAQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
-version: "1.20.0"
+version: "1.21.0"
 description: >
   Node contract for the node-owned subprocess isolation: strict policy
   schema, startup pickup, enforcement behavior, diagnostics, and limits.
@@ -508,6 +508,16 @@ dropping capabilities alone does not remove root's file-owner permissions.
 Before release and during generation qualification it checks that selected
 global proc control files cannot be opened for writing. No control value is
 written by these checks.
+
+The Lillux Linux minimal-device surface pins and verifies the exact kernel
+character devices for null, zero, full, random and urandom; it does not expose
+the host device directory. Nested mode additionally supplies the tty device
+needed by namespace constructors. Before release, its freshly forked target
+starts a new process session and proves it has no controlling terminal.
+Ordinary process-group-contained targets do not receive this tty device or
+change process session. Qualification exercises the device surface after
+private-root exec, including full-device write refusal and nested terminal
+detachment; construction-time mount success alone is insufficient evidence.
 
 Fresh child namespaces cannot promote inherited read-only mounts or reveal
 masked lower mounts. Targets receive no scope-control descriptors or mounts;
