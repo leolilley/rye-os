@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import stat
+import tomllib
 import unittest
 
 import yaml
@@ -68,6 +69,29 @@ def source_manifest_digest() -> str:
 
 
 class CodexContractTests(unittest.TestCase):
+    def test_shell_environment_retains_only_exact_child_transport_and_locale(self) -> None:
+        for profile_name in ("structured-session.profile.json", "authoring.profile.json"):
+            profile = json.loads((SOURCE / profile_name).read_text())
+            args = [arg for arg in profile["workload_args"]
+                    if arg.startswith("shell_environment_policy=")]
+            self.assertEqual(len(args), 1)
+            policy = tomllib.loads(args[0])["shell_environment_policy"]
+            baseline = tomllib.loads((SOURCE / profile["baseline_config"]).read_text())
+            self.assertEqual(policy, baseline["shell_environment_policy"])
+            # Includes filter the inherited set; they cannot restore a broker
+            # variable discarded earlier by inherit=core. The allowlist must
+            # remain finite: never expose all RYEOS_* or credential variables.
+            self.assertEqual(policy["inherit"], "all")
+            self.assertFalse(policy["ignore_default_excludes"])
+            self.assertNotIn("set", policy)
+            self.assertEqual({key for key, value in policy["filters"].items()
+                              if value == "include"}, {
+                "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+                "RYEOS_WORKLOAD_CLIENT_ENDPOINT",
+            })
+            for name in ("HOME", "CODEX_HOME", "DBUS_*", "SSH_*", "*PROXY"):
+                self.assertEqual(policy["filters"][name], "exclude")
+
     def test_profile_discovery_uses_owner_scoped_generic_service(self) -> None:
         command = yaml.safe_load((BUNDLE / ".ai/node/commands/profile-list.yaml").read_text())
         service = yaml.safe_load((BUNDLE.parent / "core/.ai/services/credential-profiles/list.yaml").read_text())

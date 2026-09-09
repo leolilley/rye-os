@@ -12,10 +12,18 @@ web_search = "disabled"
 allow_login_shell = false
 
 [shell_environment_policy]
-inherit = "core"
+# Start from the bridge's admitted environment, then keep only this finite
+# child-facing surface. `core` drops the broker endpoint before filters run.
+inherit = "all"
 ignore_default_excludes = false
 
 [shell_environment_policy.filters]
+"PATH" = "include"
+"LANG" = "include"
+"LC_ALL" = "include"
+"LC_CTYPE" = "include"
+"TERM" = "include"
+"RYEOS_WORKLOAD_CLIENT_ENDPOINT" = "include"
 "HOME" = "exclude"
 "CODEX_HOME" = "exclude"
 "DBUS_*" = "exclude"

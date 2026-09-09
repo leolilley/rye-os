@@ -1,6 +1,6 @@
-# ryeos:signed:2026-09-06T03:45:22Z:7178f446a41b7a8fff80f64554d51db4f3d613b6e57def54982f29e9290b55cc:R1zAzkVhHlX1CIziBGktkgRMNsQFDb2iont1MWCPjnyHKEiv/vkd6j6nVWuXTBSIJzHbVG+Hna5TgY6HCvUlBQ==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
+# ryeos:signed:2026-09-09T00:37:00Z:d7933be433e45a878aa557c9fbd5d203028b214c06fae32e0d5c86d1b698aff7:MXVXmtCl+NQcRvigfSrE/9KfzaNyRIerEMxFYV48zoiqyLZSXzdfqCi0nE3SwaXp7D5+Ibh/2omhPqG3CHIfDA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea
 category: "codex"
-version: "1.0.1"
+version: "1.0.2"
 executor_id: "@subprocess"
 description: "Codex App Server profile for one RyeOS session-bound worker execution."
 execution_protocol: protocol:ryeos/core/structured_session
@@ -17,7 +17,7 @@ session_resources:
 source:
   root: "lib/hosted"
   entry: "structured-session.profile.json"
-  digest: "eb79967f7d95958574d5c40063617fdeb770b87c949971895e8b4707e224d708"
+  digest: "22455334617b0b2605ef33f7019882ead3af809332c249a850c60bda5f0f7faa"
 
 external_content:
   - id: codex

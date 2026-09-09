@@ -1,8 +1,8 @@
-<!-- ryeos:signed:2026-09-05T02:30:04Z:2f32504805760b564f85bde444868e160753492bd28d139b1aa4263b2bb819c1:FnkbCxYpaQzPg6kBf6I6MdhcWcvX5YDKDZJ0mfid5W+O9knwtJqEEkJNzTB/pGP4OnjpeR5Jx+n89VGBj1wdBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-09T00:37:00Z:089b733e4bdb8c5751a73108a9efc02dd6a68a383643137eed659abda321792d:eBcd4kTG5ymSR5n1Ym9mlBM8kXTILmS+mO6K3JN6iV2OGKc41JPnj9nrbAs7kCIwSNdOO5khpJyg0kngE1OKAw==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: codex
 tags: [codex, hosted-execution, structured-session, credentials, acceptance]
-version: "1.8.0"
+version: "1.9.0"
 description: >
   Activation, credential ceremony, command routes, and release acceptance for
   the pinned Codex structured-session workload.
@@ -168,6 +168,15 @@ configured-operator forwarding route to inspect profiles on a remote node.
    prove the pinned Codex sandbox can connect under this exact rule. Never
    widen tmp access or relocate the endpoint into project content to make that
    check pass.
+
+   Both signed Codex profiles pass only PATH, selected locale/terminal
+   variables and the exact `RYEOS_WORKLOAD_CLIENT_ENDPOINT` into shell
+   children. They filter the bridge's admitted environment with a finite
+   include list; `inherit="core"` would discard the broker coordinate before
+   that filtering. HOME, CODEX_HOME, credentials, proxy configuration and
+   other RYEOS variables are not child environment. This names the existing
+   restricted broker, never an operator CLI endpoint or a new grant. See the
+   [Codex shell-environment semantics](https://learn.chatgpt.com/docs/config-file/config-advanced#shell-environment-policy).
 4. Keep the source operator private key at its operator endpoint and the
    hosted node's independent local operator private key at the hosted node.
    First admit the source node key on the target
