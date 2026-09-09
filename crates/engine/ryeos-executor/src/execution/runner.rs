@@ -7397,20 +7397,26 @@ pub(crate) fn retained_workspace_provenance_for_native_resume(
         super::project_source::PinnedContextRealization::ReadOnly,
     )
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let authority = super::pinned_state_authority(state)?;
-    let cas_guard = authority.acquire_shared_guard()?;
-    let closure = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
-        &authority.cas_store()?,
-        snapshot_hash,
-    )?;
-    let materialization =
+    let materialization = {
+        let authority = super::pinned_state_authority(state)?;
+        let cas_guard = authority.acquire_shared_guard()?;
+        let closure = ryeos_state::project_materialization::VerifiedProjectSnapshotClosure::load(
+            &authority.cas_store()?,
+            snapshot_hash,
+        )?;
         ryeos_state::PinnedProjectMaterialization::recover_retained_workspace_from_closure(
             &authority,
             &cas_guard,
             &closure,
             &layout.project,
             expected_project_identity,
-        )?;
+        )?
+    };
+    // The materialization now owns its exact pinned root, CAS and loaded tree;
+    // it does not borrow the mutation guard. End that guard's fork-sensitive
+    // descriptor lease before rebind/Create can spawn the workspace creator.
+    // Never carry CAS locking through process preparation or weaken Lillux's
+    // fork admission to make cold reconstruction succeed.
     state.state_store.rebind_execution_workspace_for_recovery(
         &workspace.workspace_id,
         thread_id,

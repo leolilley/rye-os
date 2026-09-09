@@ -725,13 +725,19 @@ fn verify_completed_bounded_candidate_result(
     Ok(())
 }
 
+/// Use the lifecycle owner's typed terminal classification, as retained-result
+/// import and product qualification do. Outcome labels belong to the admitted
+/// execution (for example `exit:0` for a subprocess), not to this generic
+/// candidate authority. Completion does not imply evaluator acceptance.
+fn candidate_execution_succeeded(thread: &ryeos_state::objects::ThreadSnapshot) -> bool {
+    thread.status == ryeos_state::objects::ThreadStatus::Completed && thread.error.is_none()
+}
+
 fn require_bounded_candidate_result_terminal(
     thread: &ryeos_state::objects::ThreadSnapshot,
     candidate: &str,
 ) -> Result<(), HandlerError> {
-    if thread.status != ryeos_state::objects::ThreadStatus::Completed
-        || thread.outcome_code.as_deref() != Some("success")
-        || thread.error.is_some()
+    if !candidate_execution_succeeded(thread)
         || thread.result_project_snapshot_hash.as_deref() != Some(candidate)
     {
         return Err(internal(
@@ -7962,9 +7968,7 @@ fn verify_candidate_evaluation_testimony(
         .ok_or_else(|| internal("candidate evaluator terminal event has no CAS hash"))?;
     if evaluator.thread_id != evaluator_terminal_thread_id
         || evaluator.chain_root_id != evaluator_chain_root_id
-        || evaluator.status != ryeos_state::objects::ThreadStatus::Completed
-        || evaluator.outcome_code.as_deref() != Some("success")
-        || evaluator.error.is_some()
+        || !candidate_execution_succeeded(&evaluator)
         || evaluator.requested_by.as_deref() != Some(session.owner_principal.as_str())
         || evaluator.current_site_id != source.current_site_id
         || evaluator.origin_site_id != source.origin_site_id
@@ -8521,9 +8525,7 @@ fn verify_candidate_integration_terminal(
         .ok_or_else(|| internal("integration terminal event has no CAS hash"))?;
     if integration.thread_id != coordinate.terminal_thread_id
         || integration.chain_root_id != coordinate.chain_root_id
-        || integration.status != ryeos_state::objects::ThreadStatus::Completed
-        || integration.outcome_code.as_deref() != Some("success")
-        || integration.error.is_some()
+        || !candidate_execution_succeeded(&integration)
         || integration.requested_by.as_deref() != Some(session.owner_principal.as_str())
         || integration.current_site_id != source.current_site_id
         || integration.origin_site_id != source_origin_site
@@ -9421,9 +9423,7 @@ async fn qualify_candidate(
         .ok_or_else(|| internal("evaluator terminal event has no CAS hash"))?;
     if evaluator.thread_id != req.evaluator_terminal_thread_id
         || evaluator.chain_root_id != req.evaluator_chain_root_id
-        || evaluator.status != ryeos_state::objects::ThreadStatus::Completed
-        || evaluator.outcome_code.as_deref() != Some("success")
-        || evaluator.error.is_some()
+        || !candidate_execution_succeeded(&evaluator)
         || evaluator.requested_by.as_deref() != Some(session.owner_principal.as_str())
         || evaluator_last_event.event_type != ryeos_state::event_types::THREAD_COMPLETED
         || evaluator_last_event.chain_root_id != req.evaluator_chain_root_id
@@ -10665,6 +10665,74 @@ mod tests {
     }
 
     #[test]
+    fn candidate_terminal_uses_lifecycle_status_not_execution_outcome_labels() {
+        use ryeos_state::objects::{ThreadSnapshotBuilder, ThreadStatus};
+        let mut terminal = ThreadSnapshotBuilder::new(
+            "T-evaluator",
+            "T-evaluator",
+            "tool",
+            "tool:test/evaluate",
+            "runtime:test",
+        )
+        .status(ThreadStatus::Completed)
+        .build();
+        // The installed subprocess evaluator reported this exact terminal
+        // combination. No outcome-code allowlist belongs at this boundary.
+        for outcome in [
+            None,
+            Some("success"),
+            Some("exit:0"),
+            Some("verifier_complete"),
+        ] {
+            terminal.outcome_code = outcome.map(str::to_owned);
+            assert!(super::candidate_execution_succeeded(&terminal));
+        }
+        terminal.outcome_code = Some("exit:0".to_owned());
+        for status in [
+            ThreadStatus::Created,
+            ThreadStatus::Running,
+            ThreadStatus::Failed,
+            ThreadStatus::Cancelled,
+            ThreadStatus::Killed,
+            ThreadStatus::TimedOut,
+            ThreadStatus::Continued,
+        ] {
+            terminal.status = status;
+            assert!(!super::candidate_execution_succeeded(&terminal));
+        }
+        terminal.status = ThreadStatus::Completed;
+        terminal.error = Some(serde_json::json!({"code":"execution_failed"}));
+        assert!(!super::candidate_execution_succeeded(&terminal));
+    }
+
+    #[test]
+    fn candidate_evaluator_completion_does_not_override_negative_acceptance() {
+        let candidate = "c".repeat(64);
+        let base = "b".repeat(64);
+        for accepted in [true, false] {
+            let value = serde_json::json!({
+                "schema_version":1,
+                "candidate_snapshot_hash":candidate,
+                "base_snapshot_hash":base,
+                "accepted":accepted,
+                "evidence":{},
+            });
+            let result =
+                super::validate_candidate_evaluation_result(value.clone(), &candidate, &base)
+                    .unwrap();
+            assert_eq!(result.accepted, accepted);
+            // A rejected candidate remains a valid negative evaluation, never
+            // positive testimony merely because its evaluator completed.
+            assert!(
+                super::validate_candidate_evaluation_result(value.clone(), &base, &base).is_err()
+            );
+            assert!(
+                super::validate_candidate_evaluation_result(value, &candidate, &candidate).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn bounded_candidate_return_waits_for_exact_root_finalization() {
         use ryeos_state::objects::{ThreadSnapshotBuilder, ThreadStatus};
         let candidate = "c".repeat(64);
@@ -10683,6 +10751,8 @@ mod tests {
         root.status = ThreadStatus::Completed;
         root.outcome_code = Some("success".to_owned());
         root.result_project_snapshot_hash = Some(candidate.clone());
+        super::require_bounded_candidate_result_terminal(&root, &candidate).unwrap();
+        root.outcome_code = Some("exit:0".to_owned());
         super::require_bounded_candidate_result_terminal(&root, &candidate).unwrap();
         root.result_project_snapshot_hash = Some("d".repeat(64));
         assert!(super::require_bounded_candidate_result_terminal(&root, &candidate).is_err());

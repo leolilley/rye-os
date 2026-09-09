@@ -20,6 +20,8 @@ __pycache__/
 !execution-comparison/README.md
 !environment-products/README.md
 !authoring-environment/invocation-qualification-v18-20260909.json
+!authoring-environment/invocation-qualification-v19-20260910.json
+!authoring-environment/invocation-qualification-v20-20260910.json
 !environment-products/assert-live-response.py
 !environment-products/test_response_assertions.py
 !environment-products/check-fixture.sh
