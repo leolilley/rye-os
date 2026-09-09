@@ -170,7 +170,7 @@ mod tests {
             },
         )
         .with_result(&result)
-        .with_dispatch(&dispatch)
+        .with_post_action_dispatch(Some(&dispatch), None)
         .render_json(&compiled)
         .unwrap();
 
@@ -262,13 +262,6 @@ impl<'a> ExpressionScope<'a> {
     pub(crate) fn with_result(mut self, result: &'a Value) -> Self {
         self.result = Some(result);
         self
-    }
-
-    pub(crate) fn with_dispatch(
-        self,
-        dispatch: &'a ryeos_runtime::callback_contract::RuntimeDispatchEvidence,
-    ) -> Self {
-        self.with_post_action_dispatch(Some(dispatch), None)
     }
 
     pub(crate) fn with_post_action_dispatch(
