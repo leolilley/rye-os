@@ -19,7 +19,8 @@ In the actual repository file
 `crates/engine/ryeos-isolation-protocol/src/lib.rs`, insert the exact contents of
 `tests/e2e/development-cargo/strict-json-key-amendment.txt` immediately before
 the attribute of `strict_json_rejects_duplicate_keys_at_every_depth()`.
-Preserve indentation and add nothing else. This adds one regression covering
+Preserve indentation and separate the added function from the following test
+with one blank line; add nothing else. This adds one regression covering
 escape-equivalent duplicate keys and distinct Unicode keys without changing
 production behavior, dependencies or protocol versions.
 

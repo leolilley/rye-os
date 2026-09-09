@@ -47,7 +47,7 @@ class CandidateEvaluationTests(unittest.TestCase):
                     addition = (Path(__file__).parent / "strict-json-key-amendment.txt").read_bytes()
                     anchor = b"    #[test]\n    fn strict_json_rejects_duplicate_keys_at_every_depth()"
                     self.assertEqual(data.count(anchor), 1)
-                    data = data.replace(anchor, addition + anchor)
+                    data = data.replace(anchor, addition + b"\n" + anchor)
             self.assertEqual(hashlib.sha256(data).hexdigest(), assertion["sha256"])
             path.write_bytes(data)
         return configured

@@ -8,4 +8,3 @@
         let decoded = from_json_str_strict::<Value>(distinct).unwrap();
         assert_eq!(decoded, serde_json::json!({"a": 1, "α": 2}));
     }
-
