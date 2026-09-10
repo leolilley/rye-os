@@ -19,6 +19,7 @@ const STATE_DIRECTORY: &str = "state";
 const RUN_PROGRAM: &str = "run";
 const DOWN_MARKER: &str = "down";
 const CONTROL: &str = "control";
+const NATIVE_SCRIPT_INTERPRETER: &str = "/bin/sh";
 // `sv` probes `ok` before submitting its request through `control`. Both are
 // native runit IPC endpoints, deliberately contained in this adapter.
 const OPERATOR_SUPERVISOR_FIFOS: [&str; 2] = ["ok", CONTROL];
@@ -184,6 +185,7 @@ fn canonical_launch(launch: &HostServiceLaunch) -> Result<Vec<u8>> {
     }
     launch.account.validate().map_err(anyhow::Error::msg)?;
     validate_launch_program(launch)?;
+    validate_root_executable(Path::new(NATIVE_SCRIPT_INTERPRETER), "service interpreter")?;
     // Validate the native rendering at admission/discovery too. Otherwise a
     // malformed administrator record could be accepted as data and fail only
     // when runit later invokes its shell.
@@ -217,6 +219,38 @@ fn validate_launch_program(launch: &HostServiceLaunch) -> Result<()> {
     Ok(())
 }
 
+fn validate_root_executable(path: &Path, label: &str) -> Result<()> {
+    // Native interpreter names conventionally traverse administrator-owned
+    // compatibility symlinks (`/bin/sh`, and often `/bin` itself). Resolve
+    // that fixed host pathname inside Lillux, then pin and validate the exact
+    // resulting regular file. Re-resolving after the descriptor checks
+    // detects replacement during admission; an administrator racing its own
+    // root namespace remains outside the unprivileged threat boundary.
+    let resolved =
+        crate::canonicalize_existing_path(path).with_context(|| format!("resolve {label}"))?;
+    let parent = PinnedDirectory::open_owned_hierarchy(
+        resolved
+            .parent()
+            .with_context(|| format!("{label} has no parent"))?,
+        0,
+    )?
+    .with_context(|| format!("{label} directory is absent"))?;
+    let executable = parent
+        .open_pinned_regular(
+            resolved
+                .file_name()
+                .with_context(|| format!("{label} has no filename"))?,
+            false,
+        )?
+        .with_context(|| format!("{label} is absent"))?;
+    executable.require_owner(0)?;
+    executable.require_executable()?;
+    if crate::canonicalize_existing_path(path)? != resolved {
+        bail!("{label} changed during admission");
+    }
+    Ok(())
+}
+
 fn manager_bytes() -> Result<Vec<u8>> {
     Ok(
         crate::canonical_json(&serde_json::to_value(RunitConfiguration {
@@ -243,7 +277,7 @@ fn run_program(launch: &HostServiceLaunch) -> Result<Vec<u8>> {
         .executable
         .to_str()
         .context("host executable is not UTF-8")?;
-    let mut body = String::from("#!/bin/sh\n");
+    let mut body = format!("#!{NATIVE_SCRIPT_INTERPRETER}\n");
     for (name, value) in &launch.environment {
         if name.is_empty()
             || !name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())

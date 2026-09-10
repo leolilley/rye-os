@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Override the app rootectory (default: XDG data dir / ryeos)
+    /// Override the app root (default: XDG data dir / ryeos)
     #[arg(long)]
     pub app_root: Option<PathBuf>,
 

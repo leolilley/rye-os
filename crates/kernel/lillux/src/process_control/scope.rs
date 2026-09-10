@@ -5,8 +5,7 @@
 //! or kernel coordinates. Adding an OS must not add cgroup/job-object branches
 //! to an application, generic subprocess request, or durable workspace service.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -50,39 +49,6 @@ impl ControllerAccount {
         Err("current controller account is unavailable on this OS".to_owned())
     }
 
-    /// The minimal native environment required for an administrator-installed
-    /// controller service. Applications consume this as opaque launch data;
-    /// they never select platform runtime locations themselves.
-    ///
-    /// This is deliberately an exact, account-owned runtime directory rather
-    /// than a `/tmp` fallback. A durable host service must not share a
-    /// world-writable local-control namespace with another node or account.
-    pub fn host_service_environment(&self) -> Result<BTreeMap<String, String>, String> {
-        self.validate()?;
-        #[cfg(target_os = "linux")]
-        {
-            let AccountBackend::Unix { uid, .. } = self.0;
-            let runtime = PathBuf::from("/run/user").join(uid.to_string());
-            let directory = crate::PinnedDirectory::open(&runtime)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "controller runtime directory is absent: {}",
-                        runtime.display()
-                    )
-                })?;
-            self.require_directory_owner(&directory)
-                .map_err(|error| error.to_string())?;
-            Ok(BTreeMap::from([(
-                "XDG_RUNTIME_DIR".to_owned(),
-                directory.path().to_string_lossy().into_owned(),
-            )]))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err("controller runtime environment is unavailable on this platform".to_owned())
-        }
-    }
     /// Apply the selected identity only in the child, before user code. Reuse
     /// this for maintenance observations as well as scope-controller launch;
     /// the privileged parent must never temporarily change its own credentials.
