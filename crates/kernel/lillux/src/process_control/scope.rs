@@ -17,6 +17,9 @@ const SCOPE_ALLOCATION_VERSION: u32 = 2;
 /// primary group gets traversal only, so it can reach its exact `0600` FIFO
 /// without listing or changing the supervisor namespace.
 const DELEGATED_CONTROL_DIRECTORY_MODE: libc::mode_t = 0o710;
+/// Root-owned host testimony may be read by its selected controller, but only
+/// the administrator may alter the namespace or its records.
+const DELEGATED_READONLY_DIRECTORY_MODE: libc::mode_t = 0o750;
 
 /// Administrator-selected host account for a controller, not a RyeOS signing
 /// identity. Native account coordinates and credential-drop interpretation
@@ -108,6 +111,52 @@ impl ControllerAccount {
         }
         #[cfg(not(unix))]
         anyhow::bail!("host file grants are unavailable on this OS")
+    }
+
+    /// Give the selected account read/traversal access to an exact
+    /// administrator-owned host-state directory without granting mutation.
+    ///
+    /// This is for public association and recovery testimony that the account
+    /// must corroborate during an ordinary lifecycle operation. It is not a
+    /// place for credentials or private operator data: root retains ownership
+    /// and writes, while the selected primary group gets `r-x` only.
+    pub fn grant_readonly_host_directory(
+        &self,
+        directory: &crate::PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::fs::MetadataExt as _;
+
+            directory.require_owner(0)?;
+            let descriptor = directory.try_clone_descriptor()?;
+            let metadata = descriptor.metadata()?;
+            let AccountBackend::Unix { gid, .. } = self.0;
+            if unsafe { libc::geteuid() } != 0
+                || metadata.mode() & libc::S_IFMT != libc::S_IFDIR
+                || metadata.mode() & 0o022 != 0
+                || (metadata.gid() != 0 && metadata.gid() != gid)
+            {
+                anyhow::bail!(
+                    "read-only host directory grant requires administrator authority and a safe root directory"
+                );
+            }
+            if unsafe { libc::fchown(descriptor.as_raw_fd(), 0, gid) } != 0
+                || unsafe {
+                    libc::fchmod(descriptor.as_raw_fd(), DELEGATED_READONLY_DIRECTORY_MODE)
+                } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            anyhow::bail!("read-only host directory grants are unavailable on this OS")
+        }
     }
 
     #[cfg(unix)]
@@ -1495,6 +1544,13 @@ mod tests {
         assert_eq!(DELEGATED_CONTROL_DIRECTORY_MODE & 0o700, 0o700);
         assert_eq!(DELEGATED_CONTROL_DIRECTORY_MODE & 0o070, 0o010);
         assert_eq!(DELEGATED_CONTROL_DIRECTORY_MODE & 0o007, 0);
+    }
+
+    #[test]
+    fn delegated_host_state_directory_is_readable_but_not_mutable() {
+        assert_eq!(DELEGATED_READONLY_DIRECTORY_MODE & 0o700, 0o700);
+        assert_eq!(DELEGATED_READONLY_DIRECTORY_MODE & 0o070, 0o050);
+        assert_eq!(DELEGATED_READONLY_DIRECTORY_MODE & 0o007, 0);
     }
 
     #[test]

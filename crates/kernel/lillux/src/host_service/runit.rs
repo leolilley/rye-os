@@ -318,10 +318,11 @@ fn require_published_service(
     if let Some(marker) = directory.open_pinned_regular(OsStr::new(DOWN_MARKER), false)? {
         marker.require_owner(0)?;
     }
-    records
+    let state = records
         .open_child_directory(OsStr::new(STATE_DIRECTORY))?
-        .context("configured host service has no client state directory")?
-        .require_owner(0)?;
+        .context("configured host service has no client state directory")?;
+    state.require_owner(0)?;
+    launch.account.grant_readonly_host_directory(&state)?;
     Ok(())
 }
 
@@ -338,9 +339,9 @@ fn build_staged_service(directory: &PinnedDirectory, launch: &HostServiceLaunch)
     // marker. The client-owned desired record remains the authority for
     // ordinary start/stop and upgrade restoration.
     ensure_root_regular(directory, DOWN_MARKER, b"", 0o644)?;
-    records
-        .open_or_create_child(OsStr::new(STATE_DIRECTORY), 0o700)?
-        .require_owner(0)?;
+    let state = records.open_or_create_child(OsStr::new(STATE_DIRECTORY), 0o700)?;
+    state.require_owner(0)?;
+    launch.account.grant_readonly_host_directory(&state)?;
     Ok(())
 }
 
