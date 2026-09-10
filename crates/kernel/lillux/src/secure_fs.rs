@@ -1180,6 +1180,29 @@ fn remove_flat_directory_generation(
 }
 
 impl PinnedRegularFile {
+    /// Require administrator-selected ownership of this exact file. Callers
+    /// must separately protect its containing namespace; mode bits on a file
+    /// alone cannot prevent replacement through a writable parent.
+    pub fn require_owner(&self, owner: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = self.file.metadata()?;
+            if metadata.uid() != owner || metadata.mode() & 0o022 != 0 || metadata.nlink() != 1 {
+                anyhow::bail!(
+                    "pinned file has unsafe ownership, permissions or links: {}",
+                    self.path.display()
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = owner;
+            anyhow::bail!("owned host files are unavailable on this platform")
+        }
+    }
+
     /// Return the pathname recorded when this authority was opened.
     ///
     /// This is diagnostic context only. It does not prove that the namespace
@@ -1593,6 +1616,51 @@ impl Drop for PinnedDirectoryLockInner {
 }
 
 impl PinnedDirectoryLock {
+    /// Replace this process while retaining the SAME locked open description.
+    /// Success never runs this guard's unlock destructor; failure keeps normal
+    /// RAII cleanup. Do not implement this as spawn + dropping the guard: an
+    /// explicit LOCK_UN would release the child's duplicated lock too.
+    /// `locator_env` carries only a descriptor locator. The receiver must call
+    /// require_inherited_exclusive_lock against its independently selected root.
+    pub fn exec_command_with_lock(
+        &self,
+        command: &mut std::process::Command,
+        locator_env: &str,
+    ) -> Result<std::convert::Infallible> {
+        if locator_env.is_empty() || locator_env.contains(['=', '\0']) {
+            anyhow::bail!("invalid inherited lock locator name");
+        }
+        #[cfg(unix)]
+        {
+            let lease = crate::exec::retain_fork_sensitive_descriptors();
+            let inherited = crate::exec::InheritedDescriptorAuthority::from_owned_file(
+                self.inner.file.try_clone()?,
+                &lease,
+            )
+            .map_err(anyhow::Error::msg)?;
+            drop(lease);
+            command.env(
+                locator_env,
+                inherited
+                    .inherited_descriptor()
+                    .map_err(anyhow::Error::msg)?
+                    .to_string(),
+            );
+            crate::configure_inherited_descriptor_authorities(
+                command,
+                std::slice::from_ref(&inherited),
+            )
+            .map_err(anyhow::Error::msg)?;
+            Err(crate::replace_current_process(command))
+                .context("exec while retaining directory transaction lock")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            anyhow::bail!("inherited directory transaction locks are unavailable on this OS")
+        }
+    }
+
     /// Prove that this guard protects the exact directory inode selected by
     /// `directory`. Cloned guards share one underlying flock and release it
     /// only after the last guard is dropped.
@@ -1620,6 +1688,128 @@ impl PinnedDirectoryLock {
 }
 
 impl PinnedDirectory {
+    /// Validate a transported flock without unlocking it on return. Identity
+    /// alone is insufficient: an independent open must contend and the supplied
+    /// open description must itself own exclusive access. A numeric descriptor
+    /// or environment flag alone grants nothing. The caller retains the original
+    /// inherited descriptor for its complete transaction lifetime.
+    pub fn require_inherited_exclusive_lock(&self, descriptor: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let descriptor =
+                i32::try_from(descriptor).context("inherited lock descriptor is out of range")?;
+            if descriptor <= libc::STDERR_FILENO {
+                anyhow::bail!("inherited lock overlaps stdio");
+            }
+            let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+            if duplicate < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let candidate = unsafe { File::from_raw_fd(duplicate) };
+            let held = candidate.metadata()?;
+            let expected = self.directory.metadata()?;
+            if !held.is_dir() || held.dev() != expected.dev() || held.ino() != expected.ino() {
+                anyhow::bail!("inherited transaction lock names a different directory");
+            }
+            let probe = self.independent_lock_descriptor()?;
+            if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                // Closing this independently-open probe releases only its own
+                // acquired lock. No candidate lock was held in this case.
+                anyhow::bail!("selected directory has no inherited transaction owner");
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(error).context("probe inherited transaction exclusion");
+            }
+            if unsafe { libc::flock(candidate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("supplied descriptor does not own the transaction lock");
+            }
+            // File drops close duplicates only. Never LOCK_UN this shared OFD.
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = descriptor;
+            anyhow::bail!("inherited directory transaction locks are unavailable on this OS")
+        }
+    }
+
+    /// Select this exact directory for a child/controller exec. Do not turn a
+    /// verified pin back into Command::current_dir(path): a mutable parent can
+    /// replace that spelling between admission and exec.
+    pub fn configure_command_cwd(&self, command: &mut std::process::Command) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let directory = self.directory.try_clone()?;
+            // SAFETY: the hook owns the descriptor through exec; fchdir is
+            // async-signal-safe and affects only the launching process.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(directory.as_raw_fd()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            anyhow::bail!("descriptor-selected working directories are unavailable")
+        }
+    }
+
+    /// Check this exact directory, not a pathname reopened after validation.
+    pub fn require_owner(&self, owner: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = self.directory.metadata()?;
+            if metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
+                anyhow::bail!(
+                    "pinned directory has unsafe ownership or permissions: {}",
+                    self.path.display()
+                );
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = owner;
+            anyhow::bail!("owned host directories are unavailable on this platform")
+        }
+    }
+
+    /// Open an absolute host-configuration path only through directories owned
+    /// by the selected administrator and not writable by others. Missing is
+    /// distinct from an unsafe ancestor/symlink and never conceals that error.
+    pub fn open_owned_hierarchy(path: &Path, owner: u32) -> Result<Option<Self>> {
+        if !path.is_absolute() {
+            anyhow::bail!("owned host hierarchy requires an absolute path");
+        }
+        let mut directory = Self::open(Path::new("/"))?
+            .ok_or_else(|| anyhow::anyhow!("host filesystem root is unavailable"))?;
+        directory.require_owner(owner)?;
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => continue,
+                std::path::Component::Normal(name) => {
+                    let Some(child) = directory.open_child_directory(name)? else {
+                        return Ok(None);
+                    };
+                    child.require_owner(owner)?;
+                    directory = child;
+                }
+                _ => anyhow::bail!("owned host hierarchy has a noncanonical component"),
+            }
+        }
+        Ok(Some(directory))
+    }
+
     /// Adopt an already-open directory descriptor as a descriptor-relative
     /// authority. `path` is diagnostic only; all subsequent traversal and
     /// mutation remains rooted in `directory`.
@@ -2628,13 +2818,25 @@ impl PinnedDirectory {
         }
     }
 
+    #[cfg(unix)]
+    fn independent_lock_descriptor(&self) -> Result<File> {
+        // dup/try_clone shares an open-file-description, so two acquisitions
+        // on the same PinnedDirectory would both succeed and either unlock
+        // would release the other's gate. Open "." relative to the retained
+        // descriptor: a new lock description for the exact same inode, never
+        // an ambient reopen of self.path(). Cloning an acquired guard remains
+        // intentionally shared through its existing Arc.
+        open_child_directory(&self.directory, c".", &self.path)?
+            .context("pinned directory disappeared while opening its lock description")
+    }
+
     /// Serialize cooperating mutations of this exact directory namespace.
     pub fn lock_exclusive(&self) -> Result<PinnedDirectoryLock> {
         #[cfg(not(unix))]
         anyhow::bail!("pinned directory locking is unavailable on this platform");
         #[cfg(unix)]
         {
-            let file = self.directory.try_clone()?;
+            let file = self.independent_lock_descriptor()?;
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
                 return Err(std::io::Error::last_os_error())
                     .with_context(|| format!("lock pinned directory {}", self.path.display()));
@@ -2642,6 +2844,31 @@ impl PinnedDirectory {
             Ok(PinnedDirectoryLock {
                 inner: Arc::new(PinnedDirectoryLockInner { file }),
             })
+        }
+    }
+
+    /// Attempt to serialize cooperating mutations of this exact directory
+    /// namespace. `Ok(None)` is exclusively the ordinary contention result;
+    /// callers do not need to interpret a native lock error or descriptor.
+    pub fn try_lock_exclusive(&self) -> Result<Option<PinnedDirectoryLock>> {
+        #[cfg(not(unix))]
+        anyhow::bail!("pinned directory locking is unavailable on this platform");
+        #[cfg(unix)]
+        {
+            let file = self.independent_lock_descriptor()?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(PinnedDirectoryLock {
+                    inner: Arc::new(PinnedDirectoryLockInner { file }),
+                }));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EWOULDBLOCK)
+            {
+                Ok(None)
+            } else {
+                Err(error).with_context(|| format!("lock pinned directory {}", self.path.display()))
+            }
         }
     }
 
@@ -2659,7 +2886,7 @@ impl PinnedDirectory {
         }
         #[cfg(unix)]
         {
-            let file = self.directory.try_clone()?;
+            let file = self.independent_lock_descriptor()?;
             let started = crate::time::MonotonicTimer::start();
             loop {
                 if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -6168,6 +6395,74 @@ fn restore_quarantined_regular(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn owned_host_files_reject_writable_modes_wrong_owners_and_links() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = PinnedDirectory::open(temporary.path()).unwrap().unwrap();
+        let owner = unsafe { libc::geteuid() };
+        root.require_owner(owner).unwrap();
+        assert!(root.require_owner(owner.wrapping_add(1)).is_err());
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(root.require_owner(owner).is_err());
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temporary.path().join("host.json");
+        std::fs::write(&path, b"exact").unwrap();
+        let file = root
+            .open_pinned_regular(OsStr::new("host.json"), false)
+            .unwrap()
+            .unwrap();
+        file.require_owner(owner).unwrap();
+        assert!(file.require_owner(owner.wrapping_add(1)).is_err());
+        file.set_mode(0o666).unwrap();
+        assert!(file.require_owner(owner).is_err());
+        file.set_mode(0o600).unwrap();
+        std::fs::hard_link(&path, temporary.path().join("alias")).unwrap();
+        assert!(file.require_owner(owner).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_directory_discovery_distinguishes_absence_from_occupied_names() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let directory = PinnedDirectory::open(root.path()).unwrap().unwrap();
+        assert!(
+            directory
+                .open_child_directory(OsStr::new("absent"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(root.path().join("file"), b"occupied").unwrap();
+        std::fs::create_dir(root.path().join("real-directory")).unwrap();
+        symlink("real-directory", root.path().join("directory-link")).unwrap();
+        symlink("missing", root.path().join("dangling-link")).unwrap();
+        for name in ["file", "directory-link", "dangling-link"] {
+            assert!(
+                directory.open_child_directory(OsStr::new(name)).is_err(),
+                "{name} must not become direct-node fallback"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_controller_cwd_survives_path_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("node");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("marker"), b"retained").unwrap();
+        let root = PinnedDirectory::open(&path).unwrap().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.env_clear().args(["-c", "test -f marker"]);
+        root.configure_command_cwd(&mut command).unwrap();
+        std::fs::rename(&path, temporary.path().join("old-node")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(root.ensure_path_binding().is_err());
+        assert!(command.status().unwrap().success());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn read_only_namespace_path_rejects_noncanonical_spelling_before_mount_checks() {
@@ -6825,6 +7120,134 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_lock_same_pin_acquisitions_are_independent_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("node");
+        std::fs::create_dir(&path).unwrap();
+        let directory = PinnedDirectory::open(&path).unwrap().unwrap();
+        let guard = directory.lock_exclusive().unwrap();
+        let retained = guard.clone();
+        assert!(
+            directory
+                .lock_exclusive_with_timeout(crate::time::Duration::ZERO)
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            directory
+                .lock_exclusive_with_timeout(crate::time::Duration::ZERO)
+                .is_err()
+        );
+        std::fs::rename(&path, root.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            directory
+                .lock_exclusive_with_timeout(crate::time::Duration::ZERO)
+                .is_err()
+        );
+        drop(retained);
+        let acquired = directory
+            .lock_exclusive_with_timeout(crate::time::Duration::ZERO)
+            .unwrap();
+        acquired.ensure_protects(&directory).unwrap();
+        assert!(
+            acquired
+                .ensure_protects(&PinnedDirectory::open(&path).unwrap().unwrap())
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_directory_lock_requires_owned_description_and_preserves_exclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = PinnedDirectory::open(temp.path()).unwrap().unwrap();
+        let unowned = directory.try_clone_descriptor().unwrap();
+        assert!(
+            directory
+                .require_inherited_exclusive_lock(unowned.as_raw_fd() as u32)
+                .is_err()
+        );
+        let guard = directory.lock_exclusive().unwrap();
+        let coordinate = guard.inner.file.as_raw_fd() as u32;
+        directory
+            .require_inherited_exclusive_lock(coordinate)
+            .unwrap();
+        assert!(
+            directory
+                .require_inherited_exclusive_lock(unowned.as_raw_fd() as u32)
+                .is_err()
+        );
+        let other_temp = tempfile::tempdir().unwrap();
+        let other = PinnedDirectory::open(other_temp.path()).unwrap().unwrap();
+        assert!(other.require_inherited_exclusive_lock(coordinate).is_err());
+        assert!(
+            directory
+                .lock_exclusive_with_timeout(std::time::Duration::ZERO)
+                .is_err()
+        );
+        drop(guard);
+        directory
+            .lock_exclusive_with_timeout(std::time::Duration::ZERO)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_directory_lock_survives_exec_and_releases_on_exit() {
+        const PHASE: &str = "LILLUX_LOCK_EXEC_TEST_PHASE";
+        const ROOT: &str = "LILLUX_LOCK_EXEC_TEST_ROOT";
+        const FD: &str = "LILLUX_LOCK_EXEC_TEST_FD";
+        const TEST: &str =
+            "secure_fs::tests::inherited_directory_lock_survives_exec_and_releases_on_exit";
+        match std::env::var(PHASE).ok().as_deref() {
+            Some("before") => {
+                let directory = PinnedDirectory::open(Path::new(&std::env::var(ROOT).unwrap()))
+                    .unwrap()
+                    .unwrap();
+                let guard = directory.lock_exclusive().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(PHASE, "after");
+                match guard.exec_command_with_lock(&mut command, FD) {
+                    Ok(never) => match never {},
+                    Err(error) => panic!("exec child while retaining lock: {error:#}"),
+                }
+            }
+            Some("after") => {
+                let directory = PinnedDirectory::open(Path::new(&std::env::var(ROOT).unwrap()))
+                    .unwrap()
+                    .unwrap();
+                directory
+                    .require_inherited_exclusive_lock(std::env::var(FD).unwrap().parse().unwrap())
+                    .unwrap();
+                assert!(
+                    directory
+                        .lock_exclusive_with_timeout(std::time::Duration::ZERO)
+                        .is_err()
+                );
+            }
+            None => {
+                let temp = tempfile::tempdir().unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(PHASE, "before")
+                    .env(ROOT, temp.path())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                let directory = PinnedDirectory::open(temp.path()).unwrap().unwrap();
+                directory
+                    .lock_exclusive_with_timeout(std::time::Duration::ZERO)
+                    .unwrap();
+            }
+            Some(other) => panic!("unexpected fixture phase {other}"),
+        }
     }
 
     #[cfg(unix)]

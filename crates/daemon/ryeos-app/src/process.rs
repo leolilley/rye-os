@@ -52,6 +52,28 @@ impl ExecutionProcessIdentity {
     }
 }
 
+/// Convert the kernel-neutral exact coordinate issued by Lillux into RyeOS's
+/// durable execution record. Kernel capture belongs in Lillux; this module
+/// owns only its application schema and optional admitted scope recovery.
+pub fn execution_process_identity_from_lillux(
+    identity: lillux::ExactProcessIdentity,
+    process_scope: Option<lillux::ProcessScopeRecovery>,
+) -> Result<ExecutionProcessIdentity> {
+    let identity = ExecutionProcessIdentity {
+        schema_version: PROCESS_IDENTITY_SCHEMA_VERSION,
+        boot_id: identity.boot_id,
+        target_pid: i64::from(identity.target_pid),
+        target_start_time_ticks: i64::try_from(identity.target_start_time_ticks)
+            .context("Lillux target birth is outside RyeOS durable range")?,
+        group_leader_pid: i64::from(identity.group_leader_pid),
+        group_leader_start_time_ticks: i64::try_from(identity.group_leader_start_time_ticks)
+            .context("Lillux group birth is outside RyeOS durable range")?,
+        process_scope,
+    };
+    validate_execution_process_identity_shape(&identity)?;
+    Ok(identity)
+}
+
 pub fn validate_execution_process_identity_shape(
     identity: &ExecutionProcessIdentity,
 ) -> Result<()> {

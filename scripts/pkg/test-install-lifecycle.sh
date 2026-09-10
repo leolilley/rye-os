@@ -152,3 +152,62 @@ test_stop_result=0
 test_after_status=running
 expect_refused_replacement stop
 printf 'installer lifecycle preflight and shutdown refusal: passed\n'
+
+# Supervised upgrades use the shared host journal, never current PID liveness
+# as the source of original intent. No sudo, node or host mutation in this test.
+(
+    target_dir="$test_release"
+    state_root="$test_dir/node"
+    restart_daemon=1
+    run_init=1
+    ryeos() { :; }
+    test_host_mode=supervised
+    test_host_intent=up
+    test_host_begin_status=0
+    host_upgrade_command() {
+        if [[ "$1" == --inspect ]]; then
+            printf '%s\n' "$test_host_mode"
+        else
+            printf '%s\n' "${*: -1}" >> "$test_log"
+            printf '%s\n' "$test_host_intent"
+            return "$test_host_begin_status"
+        fi
+    }
+    : > "$test_log"
+    prepare_host_upgrade
+    [[ "$host_upgrade_desired" == up && "$(<"$test_log")" == begin ]]
+    [[ "$host_upgrade_digest" =~ ^[a-f0-9]{64}$ ]]
+    : > "$test_log"
+    test_host_intent=down
+    prepare_host_upgrade
+    [[ "$host_upgrade_desired" == down && "$(<"$test_log")" == begin ]]
+
+    for skip in run_init restart_daemon; do
+        : > "$test_log"
+        if ( declare "$skip=0"; prepare_host_upgrade ); then
+            echo "supervised install accepted disabled $skip" >&2
+            exit 1
+        fi
+        [[ ! -s "$test_log" ]]
+    done
+    : > "$test_log"
+    test_host_mode=direct
+    run_init=0
+    restart_daemon=0
+    prepare_host_upgrade
+    [[ ! -s "$test_log" ]]
+    test_host_mode=unknown
+    if ( prepare_host_upgrade ); then
+        echo 'unknown host association result was accepted' >&2
+        exit 1
+    fi
+    test_host_mode=supervised
+    run_init=1
+    restart_daemon=1
+    test_host_begin_status=1
+    if ( prepare_host_upgrade ); then
+        echo 'failed journal publication was accepted' >&2
+        exit 1
+    fi
+)
+printf 'installer supervised upgrade boundary: passed\n'

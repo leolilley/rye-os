@@ -21,8 +21,80 @@ use std::time::{Duration, Instant};
 use crate::{PinnedDirectory, PinnedDirectoryIdentity};
 
 const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+const HOST_SERVICE_DELEGATIONS: &str = "lillux-host-services";
 // Bounded kernel interface records, not workload output or acquisition policy.
 const MAX_CONTROL_RECORD_BYTES: usize = 4096;
+
+/// Root-only selection of the native delegation parent for one installed host
+/// service. The path is deliberately owned by Lillux rather than supplied by
+/// an application or node policy. The returned child is not created/chowned
+/// until the scope controller launches, so provisioning leaves no runnable
+/// user-owned cgroup behind.
+pub(crate) fn provision_host_delegation(service_label: &str) -> Result<std::path::PathBuf, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("host delegation provisioning requires administrator authority".to_owned());
+    }
+    if service_label.is_empty()
+        || service_label.len() > 128
+        || !service_label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("host service label is not safe for a native delegation".to_owned());
+    }
+    let root = PinnedDirectory::open(Path::new("/sys/fs/cgroup"))
+        .map_err(display)?
+        .ok_or("cgroup-v2 root is absent")?;
+    let root_fd = root.try_clone_descriptor().map_err(display)?;
+    require_cgroup2(&root_fd)?;
+    let parent = root
+        .open_or_create_child(HOST_SERVICE_DELEGATIONS.as_ref(), 0o755)
+        .map_err(display)?;
+    parent.require_owner(0).map_err(display)?;
+    let metadata = parent
+        .try_clone_descriptor()
+        .map_err(display)?
+        .metadata()
+        .map_err(display)?;
+    if metadata.mode() & 0o022 != 0 {
+        return Err("Lillux host delegation parent has shared write access".to_owned());
+    }
+    let parent_fd = parent.try_clone_descriptor().map_err(display)?;
+    require_cgroup2(&parent_fd)?;
+    Ok(parent.path().join(service_label))
+}
+
+/// Read-only host-maintenance barrier. The host launch gate must exclude new
+/// controller launches throughout its use. Parent ownership prevents replacing
+/// the selected delegation; the kernel populated bit includes every descendant
+/// (including detached writers), not merely the daemon/controller leaf.
+pub(crate) fn require_controller_tree_empty(path: &Path, uid: u32) -> Result<(), String> {
+    let parent_path = path.parent().ok_or("controller delegation has no parent")?;
+    let parent = PinnedDirectory::open_owned_hierarchy(parent_path, 0)
+        .map_err(display)?
+        .ok_or("host delegation parent is absent")?;
+    require_cgroup2(&parent.try_clone_descriptor().map_err(display)?)?;
+    let Some(directory) = parent
+        .open_child_directory(
+            path.file_name()
+                .ok_or("controller delegation has no name")?,
+        )
+        .map_err(display)?
+    else {
+        // A populated cgroup cannot be removed by its delegated owner. Its
+        // parent namespace is administrator-owned and was verified above.
+        return Ok(());
+    };
+    directory.require_owner(uid).map_err(display)?;
+    let descriptor = directory.try_clone_descriptor().map_err(display)?;
+    require_cgroup2(&descriptor)?;
+    require_domain(&descriptor)?;
+    let events = open_control(&descriptor, c"cgroup.events", libc::O_RDONLY)?;
+    if parse_events(&read_control(&events)?)?.populated {
+        return Err("controller process tree still has live members; retained recovery must settle before package replacement".to_owned());
+    }
+    Ok(())
+}
 
 /// Host-supervisor bootstrap only. This is not a worker capability, a setuid
 /// helper or a long-lived privileged service. The caller must already be root
@@ -166,16 +238,10 @@ impl ControllerBootstrap {
                         io::Error::from_raw_os_error(libc::EIO)
                     });
                 }
-                if libc::setgroups(0, std::ptr::null()) != 0
-                    || libc::setresgid(gid, gid, gid) != 0
-                    || libc::setresuid(uid, uid, uid) != 0
-                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
                 Ok(())
             });
         }
+        super::scope::ControllerAccount::unix(uid, gid).configure_command(command)?;
         Ok(())
     }
 }

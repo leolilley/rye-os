@@ -16,9 +16,9 @@ mod cgroup;
 mod pid_namespace;
 mod scope;
 pub use scope::{
-    ProcessHostLifetime, ProcessScope, ProcessScopeAllocation, ProcessScopeCapability,
-    ProcessScopeConfiguration, ProcessScopeLaunchError, ProcessScopeProvider, ProcessScopeRecovery,
-    QuiescedProcessScope,
+    ControllerAccount, ProcessHostLifetime, ProcessScope, ProcessScopeAllocation,
+    ProcessScopeCapability, ProcessScopeConfiguration, ProcessScopeLaunchError,
+    ProcessScopeProvider, ProcessScopeRecovery, QuiescedProcessScope, require_administrator,
 };
 
 #[cfg(target_os = "linux")]
@@ -32,6 +32,37 @@ pub struct ExactProcessIdentity {
     pub target_start_time_ticks: u64,
     pub group_leader_pid: u32,
     pub group_leader_start_time_ticks: u64,
+}
+
+/// Capture an exact birth/group coordinate using a freshly opened kernel
+/// authority. Applications that already hold an authenticated peer or launch
+/// authority use their corresponding Lillux method instead.
+pub fn capture_exact_process_identity(
+    target_pid: u32,
+    expected_group_leader: Option<u32>,
+) -> Result<ExactProcessIdentity, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let pidfd = linux::open_pidfd(target_pid)?;
+        use std::os::fd::AsFd as _;
+        linux::capture_from_pidfd(target_pid, expected_group_leader, pidfd.as_fd())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (target_pid, expected_group_leader);
+        Err("exact process identity capture is unavailable on this OS".to_owned())
+    }
+}
+
+/// Kernel consumers which already retain the exact target descriptor call
+/// this internally; no application imports a pidfd or procfs branch.
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_exact_process_identity_from_pidfd(
+    target_pid: u32,
+    expected_group_leader: Option<u32>,
+    target_pidfd: std::os::fd::BorrowedFd<'_>,
+) -> Result<ExactProcessIdentity, String> {
+    linux::capture_from_pidfd(target_pid, expected_group_leader, target_pidfd)
 }
 
 /// One completed process barrier, retaining whichever exact lifecycle
@@ -313,7 +344,7 @@ fn resume_members<'a>(members: impl IntoIterator<Item = &'a PinnedMember>) -> Re
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::time::{Duration, Instant};
 
     use super::{ExactProcessIdentity, PinnedMember, QuiescedProcessGroup, resume_members};
@@ -550,6 +581,48 @@ mod linux {
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map(|value| value.trim().to_owned())
             .map_err(|error| format!("read Linux boot identity: {error}"))
+    }
+
+    pub(super) fn capture_from_pidfd(
+        target_pid: u32,
+        expected_group_leader: Option<u32>,
+        target_pidfd: BorrowedFd<'_>,
+    ) -> Result<ExactProcessIdentity, String> {
+        if target_pid <= 1 {
+            return Err("exact target PID is unsafe".to_owned());
+        }
+        pidfd_signal(target_pidfd.as_raw_fd(), 0, 0)
+            .map_err(|error| format!("probe exact target pidfd: {error}"))?;
+        let target = read_process_stat(target_pid)
+            .map_err(|error| format!("read exact target process stat: {error}"))?;
+        if matches!(target.state, 'Z' | 'X') {
+            return Err("exact target exited during identity capture".to_owned());
+        }
+        let group_leader_pid = expected_group_leader.unwrap_or_else(|| target.process_group as u32);
+        if group_leader_pid <= 1 || i64::from(group_leader_pid) != target.process_group {
+            return Err("exact target is not in the required process group".to_owned());
+        }
+        let group_pidfd = open_pidfd(group_leader_pid)?;
+        pidfd_signal(group_pidfd.as_raw_fd(), 0, 0)
+            .map_err(|error| format!("probe exact group leader pidfd: {error}"))?;
+        let group = read_process_stat(group_leader_pid)
+            .map_err(|error| format!("read exact group leader process stat: {error}"))?;
+        if matches!(group.state, 'Z' | 'X') || group.process_group != i64::from(group_leader_pid) {
+            return Err("exact group leader changed during identity capture".to_owned());
+        }
+        // Re-probe after every numeric /proc observation. This is what makes
+        // the retained descriptor, rather than a recycled PID, authoritative.
+        pidfd_signal(target_pidfd.as_raw_fd(), 0, 0)
+            .map_err(|error| format!("reprobe exact target pidfd: {error}"))?;
+        pidfd_signal(group_pidfd.as_raw_fd(), 0, 0)
+            .map_err(|error| format!("reprobe exact group leader pidfd: {error}"))?;
+        Ok(ExactProcessIdentity {
+            boot_id: read_boot_id()?,
+            target_pid,
+            target_start_time_ticks: target.start_time_ticks,
+            group_leader_pid,
+            group_leader_start_time_ticks: group.start_time_ticks,
+        })
     }
 
     pub(super) fn read_process_stat(pid: u32) -> std::io::Result<ProcessStat> {

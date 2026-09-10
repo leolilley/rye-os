@@ -235,7 +235,121 @@ fn prospective_node_config_validator(
     )
 }
 
+const INSTALL_TRANSACTION_FD_ENV: &str = "RYEOS_INSTALL_TRANSACTION_FD";
+const INSTALL_PREPARED_ENV: &str = "RYEOS_INSTALL_PREPARED";
+
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Some(config::DaemonCommand::HostProvision {
+        app_root,
+        controller_account_json,
+        home,
+    }) = &cli.command
+    {
+        lillux::require_administrator()?;
+        let account: lillux::ControllerAccount = serde_json::from_str(controller_account_json)
+            .context("parse explicit host controller account")?;
+        ryeos_node::supervision::provision_host_service(app_root, account, home)?;
+        println!("host service provisioned down; use ryeos start to request the first launch");
+        return Ok(());
+    }
+    if let Some(config::DaemonCommand::HostInstall {
+        package_root,
+        action,
+    }) = &cli.command
+    {
+        return match action {
+            config::HostInstallAction::Acquire {
+                installer,
+                installer_digest,
+                prepared,
+                args,
+            } => match lillux::exec_install_transaction(
+                package_root,
+                std::path::Path::new("/usr/bin/bash"),
+                installer,
+                installer_digest,
+                args,
+                &[(
+                    std::ffi::OsString::from(INSTALL_PREPARED_ENV),
+                    std::ffi::OsString::from(if *prepared { "1" } else { "0" }),
+                )],
+                INSTALL_TRANSACTION_FD_ENV,
+            ) {
+                Ok(never) => match never {},
+                Err(error) => Err(error),
+            },
+            config::HostInstallAction::Validate { transaction_fd } => {
+                lillux::validate_install_transaction(package_root, *transaction_fd)
+            }
+        };
+    }
+    if let Some(config::DaemonCommand::HostUpgrade {
+        app_root,
+        expected_daemon_sha256,
+        inspect,
+        action,
+    }) = &cli.command
+    {
+        let service = ryeos_node::supervision::InstalledService::discover_app_root(app_root)?;
+        if *inspect {
+            println!(
+                "{}",
+                if service.is_some() {
+                    "supervised"
+                } else {
+                    "direct"
+                }
+            );
+            return Ok(());
+        }
+        let service = service.context("host upgrade requires a configured service")?;
+        let digest = expected_daemon_sha256
+            .as_deref()
+            .context("host upgrade requires an image digest")?;
+        let action = action.context("host upgrade action is absent")?;
+        if !matches!(action, config::HostUpgradeAction::Observe) {
+            lillux::require_administrator()?;
+        }
+        match action {
+            config::HostUpgradeAction::Begin => {
+                let intent = service.begin_upgrade(digest)?;
+                println!(
+                    "{}",
+                    match intent.desired {
+                        ryeos_node::supervision::DesiredState::Up => "up",
+                        ryeos_node::supervision::DesiredState::Down => "down",
+                    }
+                );
+            }
+            config::HostUpgradeAction::ReplacementSafe => {
+                service.require_upgrade_replacement_safe(digest)?
+            }
+            config::HostUpgradeAction::RestoreReady => {
+                service.mark_upgrade_restore_ready(digest)?;
+            }
+            config::HostUpgradeAction::Finish => {
+                service.finish_upgrade(digest)?;
+            }
+            config::HostUpgradeAction::Observe => {
+                service.binding.account.require_current_process()?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(service.observe_upgrade(digest))?;
+            }
+        }
+        return Ok(());
+    }
+    if let Some(config::DaemonCommand::HostService { app_root }) = &cli.command {
+        // Must precede async threads, configuration loading, tracing and every
+        // node-state write. Lillux drops privileges before executing ryeosd.
+        lillux::require_administrator()?;
+        return match ryeos_node::supervision::exec_host_service(app_root) {
+            Ok(never) => match never {},
+            Err(error) => Err(error),
+        };
+    }
     ryeos_app::provider_object_contracts::install()
         .context("install application object contracts")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -243,7 +357,7 @@ fn main() -> Result<()> {
         .build()
         .context("build daemon async runtime")?;
     let mut process_state_lock = None;
-    let result = runtime.block_on(run(&mut process_state_lock));
+    let result = runtime.block_on(run(cli, &mut process_state_lock));
 
     // Tokio cannot cancel work already admitted to spawn_blocking. Never let
     // abandoned request work keep a lifecycle-complete daemon alive holding
@@ -286,12 +400,11 @@ fn build_handoff_phase_gate(
     ))))
 }
 
-async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<()> {
+async fn run(cli: Cli, process_state_lock: &mut Option<state_lock::StateLock>) -> Result<()> {
     // Capture process start before any configuration, verification, or state
     // opening so every lifecycle surface reports the same wall/monotonic origin.
     let process_started = Instant::now();
     let process_started_at = lillux::time::iso8601_now();
-    let cli = Cli::parse();
 
     #[cfg(feature = "handoff-test-support")]
     let handoff_phase_gate = build_handoff_phase_gate(&cli)?;
@@ -319,6 +432,17 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
     }
 
     let mut config = Config::load(&cli.to_sources())?;
+    // This runs as the node account. Host association is not permission to
+    // interpret user-owned node configuration while privileged, nor a reason
+    // to require administrator-owned ancestors above an ordinary app root.
+    let host_service = ryeos_node::supervision::InstalledService::discover(
+        &ryeos_node::NodeConfig::from_app_config(&config),
+    )?;
+    if let Some(service) = &host_service {
+        // Refuse a misconfigured root/wrong-account daemon before init checks,
+        // state-lock creation, tracing or lifecycle metadata writes.
+        service.binding.account.require_current_process()?;
+    }
     ryeosd::init_shutdown_channel();
 
     // Verify operator-owned node initialization before any local repairs
@@ -331,6 +455,18 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
     // their own state lock and must not conflict with the daemon's.
     if let Some(ref cmd) = cli.command {
         match cmd {
+            config::DaemonCommand::HostProvision { .. } => {
+                unreachable!("handled before node startup")
+            }
+            config::DaemonCommand::HostInstall { .. } => {
+                unreachable!("handled before node startup")
+            }
+            config::DaemonCommand::HostUpgrade { .. } => {
+                unreachable!("handled before node startup")
+            }
+            config::DaemonCommand::HostService { .. } => {
+                unreachable!("handled before runtime startup")
+            }
             config::DaemonCommand::BuildInfo { .. } => unreachable!("handled before config load"),
             config::DaemonCommand::RunService {
                 service_ref,
@@ -354,6 +490,7 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
     .context(
         "failed to acquire state lock — is another ryeosd instance or standalone service running?",
     )?;
+    state_lock.ensure_protects_app_root(&config.app_root)?;
     *process_state_lock = Some(state_lock);
 
     // Recheck the signed whole-init fence after acquiring the same lock as
@@ -479,6 +616,13 @@ async fn run(process_state_lock: &mut Option<state_lock::StateLock>) -> Result<(
             // Resolve every interrupted bundle tree/registration transaction before
             // the bootstrap loader consumes installed bundle registrations.
             let identity = NodeIdentity::load(&config.node_signing_key_path)?;
+            process_state_lock
+                .as_ref()
+                .context("daemon state lock is absent")?
+                .ensure_protects_app_root(&config.app_root)?;
+            if let Some(service) = &host_service {
+                service.verify_loaded_node_identity(&identity)?;
+            }
             ryeos_api::auth::validate_authorized_key_directory(
                 &config.authorized_keys_dir,
                 &identity,

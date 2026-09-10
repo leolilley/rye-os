@@ -2,6 +2,7 @@ pub mod atomic_fs;
 pub mod cas;
 pub mod crypto;
 pub mod exec;
+pub mod host_service;
 pub mod identity;
 pub mod local_ipc;
 pub mod locks;
@@ -40,18 +41,25 @@ pub use cas::{
     CanonicalJsonError, CasPutOutcome, CasStore, StreamedBlobOutcome, atomic_write_batch,
     atomic_write_batch_in_pinned_root, canonical_json, sha256_hex, shard_path, valid_hash,
 };
-pub use local_ipc::{LocalDuplexStream, OwnerPrivateLocalDuplexListener};
+pub use host_service::{
+    HostServiceController, HostServiceInstallation, HostServiceLaunch, discover_host_service,
+    exec_install_transaction, provision_host_service, run_as_administrator,
+    validate_install_transaction,
+};
+pub use local_ipc::{
+    LocalDuplexStream, OwnerPrivateLocalDuplexListener, authenticated_unix_peer_from_stream,
+};
 pub use locks::{
     ExactExclusiveFileLock, ExclusiveFileLock, SharedFileLock, with_exclusive_file_lock,
 };
 pub use process_control::{
-    ExactProcessIdentity, QuiescedProcessGroup, QuiescedProcesses,
-    prepare_process_group_controller, quiesce_exact_process_group,
+    ControllerAccount, ProcessHostLifetime, ProcessScope, ProcessScopeAllocation,
+    ProcessScopeCapability, ProcessScopeConfiguration, ProcessScopeLaunchError,
+    ProcessScopeProvider, ProcessScopeRecovery, QuiescedProcessScope, require_administrator,
 };
 pub use process_control::{
-    ProcessHostLifetime, ProcessScope, ProcessScopeAllocation, ProcessScopeCapability,
-    ProcessScopeConfiguration, ProcessScopeLaunchError, ProcessScopeProvider, ProcessScopeRecovery,
-    QuiescedProcessScope,
+    ExactProcessIdentity, QuiescedProcessGroup, QuiescedProcesses, capture_exact_process_identity,
+    prepare_process_group_controller, quiesce_exact_process_group,
 };
 
 #[cfg(target_os = "linux")]

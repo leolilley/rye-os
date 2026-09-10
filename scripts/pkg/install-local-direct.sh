@@ -415,6 +415,45 @@ stop_daemon_for_install() {
     return 0
 }
 
+# Shell owns external installation sequencing only. Protected association,
+# durable inhibition and whole-tree/image proofs remain in ryeos-node/Lillux.
+# Use the selected package's entrypoint so the pre-stop checks are the same
+# implementation being installed; no predecessor-command fallback.
+host_upgrade_command() {
+    [[ -n "${RYEOS_INSTALL_TRANSACTION_FD:-}" ]] || \
+        die "host upgrade requires the retained package installation transaction"
+    "$target_dir/ryeosd" host-install --package-root "$share_dir" validate \
+        --transaction-fd "$RYEOS_INSTALL_TRANSACTION_FD" || \
+        die "host upgrade lost its exact package installation transaction"
+    if [[ $(id -u) -eq 0 ]]; then
+        "$target_dir/ryeosd" host-upgrade --app-root "$state_root" "$@"
+    else
+        sudo "$target_dir/ryeosd" host-upgrade --app-root "$state_root" "$@"
+    fi
+}
+
+prepare_host_upgrade() {
+    host_upgrade_mode="$(host_upgrade_command --inspect)" || \
+        die "cannot inspect host service association; node lifecycle was not changed"
+    case "$host_upgrade_mode" in
+        direct) return 0 ;;
+        supervised) ;;
+        *) die "invalid host installation mode; refusing replacement" ;;
+    esac
+    [[ $restart_daemon -eq 1 && $run_init -eq 1 ]] || \
+        die "supervised installation requires lifecycle management and installed-state verification; omit --no-daemon-restart and --no-init"
+    command -v ryeos >/dev/null 2>&1 || die "supervised installation requires the installed lifecycle client"
+    command -v sha256sum >/dev/null 2>&1 || die "cannot measure staged daemon image before shutdown"
+    host_upgrade_digest="$(sha256sum -- "$target_dir/ryeosd")" || die "cannot hash staged daemon"
+    host_upgrade_digest="${host_upgrade_digest%% *}"
+    host_upgrade_desired="$(host_upgrade_command --expected-daemon-sha256 "$host_upgrade_digest" begin)" || \
+        die "cannot establish durable host upgrade inhibition; refusing replacement"
+    case "$host_upgrade_desired" in
+        up|down) ;;
+        *) die "invalid retained host intent; upgrade remains inhibited" ;;
+    esac
+}
+
 # Keep the policy helpers sourceable by their lightweight regression script.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
@@ -422,6 +461,10 @@ fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
+# Retain the exact caller argument vector. A root-owned daemon process later
+# re-execs this same installer while carrying the package transaction lock; it
+# must not reconstruct options from shell state or silently change scope.
+installer_original_args=("$@")
 
 ryeos_term_init
 install_started="$(_ryeos_term_now)"
@@ -567,6 +610,21 @@ share_dir="/usr/share/ryeos"
 doc_dir="/usr/share/doc/ryeos"
 target_dir="$repo_root/target/release"
 init_app_root="${RYEOS_APP_ROOT:-}"
+install_transaction_active=0
+
+# Only a root-owned Lillux lock on the exact shared package namespace permits
+# a re-exec'd installer to skip duplicate population. Environment text alone
+# is never trusted: validate the inherited lock descriptor before using the
+# prepared marker. This covers the whole replacement transaction, while the
+# node's short service gate remains a separate lifecycle authority.
+if [[ "${RYEOS_INSTALL_PREPARED:-}" == 1 ]]; then
+    [[ -n "${RYEOS_INSTALL_TRANSACTION_FD:-}" ]] || \
+        die "prepared installation is missing its inherited package transaction"
+    "$target_dir/ryeosd" host-install --package-root "$share_dir" validate \
+        --transaction-fd "$RYEOS_INSTALL_TRANSACTION_FD" || \
+        die "prepared installation has no valid package transaction"
+    install_transaction_active=1
+fi
 
 # Only user-facing binaries go in /usr/bin/.
 # All handler/runtime/tool binaries live inside bundles under
@@ -584,7 +642,7 @@ required_bins=(
 optional_bins=(lillux)
 installed_user_bins=("${required_bins[@]}")
 
-if [[ $run_populate -eq 1 ]]; then
+if [[ $run_populate -eq 1 && $install_transaction_active -eq 0 ]]; then
     [[ -s "$key" ]] || die "publisher key missing or empty: $key"
     # Be explicit about scope — never trigger a full workspace rebuild implicitly.
     if [[ -z "$crates" && $populate_all -eq 0 ]]; then
@@ -630,6 +688,8 @@ if [[ $run_populate -eq 1 ]]; then
         exit "$populate_status"
     fi
     ryeos_term_end success "INSTALL" "bundles populated"
+elif [[ $run_populate -eq 1 ]]; then
+    ryeos_term_info "reusing source closure prepared inside the retained package transaction"
 fi
 
 source_root_trust_doc="$repo_root/bundles/.ai/PUBLISHER_TRUST.toml"
@@ -689,8 +749,8 @@ done < <(ryeos_node_init_profile_names)
 # Reject an invalid profile-selection request before shutdown or package writes.
 # This selects arguments only; init's existing locked prospective-generation
 # compiler remains the authority for signed policy validation/publication.
+state_root="${init_app_root:-$invoking_user_home/.local/share/ryeos}"
 if [[ $run_init -eq 1 ]]; then
-    state_root="${init_app_root:-$invoking_user_home/.local/share/ryeos}"
     policy_generation_path="$state_root/.ai/node/policies"
     if [[ $reset_node_policy_generation -eq 1 ]]; then
         [[ -e "$policy_generation_path" && ! -L "$policy_generation_path" ]] || \
@@ -707,8 +767,39 @@ fi
 preflight_host_install "$target_dir" "${required_bins[@]}" || \
     die "host install preflight failed; node lifecycle was not changed"
 
+# Serialise the entire shared `/usr/share/ryeos` replacement, rather than only
+# the brief per-node stop/start window. The first pass completes all expensive
+# unprivileged build/closure checks before this root-owned entry acquires the
+# namespace lock. It then execs this script with an inherited descriptor; the
+# second pass validates it before any package mutation or skipped population.
+if [[ $install_transaction_active -eq 0 ]]; then
+    ryeos_term_info "acquiring exclusive shared package installation transaction"
+    installer_digest="$(sha256sum -- "$script_dir/install-local-direct.sh")" || \
+        die "cannot measure the selected installer script"
+    installer_digest="${installer_digest%% *}"
+    if [[ $(id -u) -eq 0 ]]; then
+        exec "$target_dir/ryeosd" host-install --package-root "$share_dir" acquire \
+            --installer "$script_dir/install-local-direct.sh" \
+            --installer-digest "$installer_digest" --prepared -- \
+            "${installer_original_args[@]}"
+    else
+        exec sudo "$target_dir/ryeosd" host-install --package-root "$share_dir" acquire \
+            --installer "$script_dir/install-local-direct.sh" \
+            --installer-digest "$installer_digest" --prepared -- \
+            "${installer_original_args[@]}"
+    fi
+fi
+
 daemon_was_running=0
-if [[ $restart_daemon -eq 1 ]] && command -v ryeos >/dev/null 2>&1; then
+prepare_host_upgrade
+if [[ "$host_upgrade_mode" == supervised ]]; then
+    ryeos_term_info "stopping supervised node under durable installation inhibition"
+    ryeos_term_suspend
+    ryeos_user 30 stop --force || die "supervised shutdown failed; upgrade remains inhibited"
+    host_upgrade_command --expected-daemon-sha256 "$host_upgrade_digest" replacement-safe || \
+        die "host process tree is not settled; refusing replacement and retaining upgrade inhibition"
+    [[ "$host_upgrade_desired" != up ]] || daemon_was_running=1
+elif [[ $restart_daemon -eq 1 ]] && command -v ryeos >/dev/null 2>&1; then
     if stop_daemon_for_install; then
         daemon_was_running=1
     fi
@@ -987,6 +1078,12 @@ if [[ $run_init -eq 1 ]]; then
     fi
 fi
 
+if [[ "$host_upgrade_mode" == supervised ]]; then
+    [[ $verification_skipped -eq 0 ]] || die "cannot restore supervised node without installed-state verification"
+    host_upgrade_command --expected-daemon-sha256 "$host_upgrade_digest" restore-ready || \
+        die "host upgrade restoration refused; journal retained"
+fi
+
 if [[ $daemon_was_running -eq 1 ]]; then
     if [[ $run_init -eq 1 ]]; then
         ryeos_term_end success VERIFY "installed bundle state"
@@ -1008,6 +1105,11 @@ if [[ $daemon_was_running -eq 1 ]]; then
         ryeos_term_end failure "INSTALL FAILED" "daemon verification · exit status $daemon_verify_status"
         exit "$daemon_verify_status"
     fi
+fi
+
+if [[ "$host_upgrade_mode" == supervised ]]; then
+    host_upgrade_command --expected-daemon-sha256 "$host_upgrade_digest" finish || \
+        die "restored host generation is unproved; upgrade journal retained"
 fi
 
 if [[ $run_init -eq 1 && $daemon_was_running -eq 0 ]]; then

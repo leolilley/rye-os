@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
-use std::os::fd::AsFd;
-
 use anyhow::{Context, Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// This is the existing async framing transport only. Native peer
+// authentication and every descriptor-derived authority must stay in Lillux
+// (`authenticated_unix_peer_from_stream` below); do not add `AsFd`, platform
+// branches or socket-control code to the daemon transport.
 use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -36,14 +37,11 @@ pub(super) async fn handle_connection(
         // Acquire the peer pidfd only for the one method that persists a
         // signalable process identity. Health/lifecycle traffic remains usable
         // on a host that cannot satisfy the runtime-attachment kernel contract.
-        #[cfg(target_os = "linux")]
         let peer = if request.method == "runtime.attach_process" {
             Some(authenticated_peer(&stream)?)
         } else {
             None
         };
-        #[cfg(not(target_os = "linux"))]
-        let peer: Option<super::AuthenticatedUnixPeer> = None;
 
         // INFO so the ndjson sink records span NEW/CLOSE per request — a
         // request that arrives and never closes is then attributable by
@@ -88,9 +86,8 @@ pub(super) async fn handle_connection(
     }
 }
 
-#[cfg(target_os = "linux")]
 fn authenticated_peer(stream: &UnixStream) -> Result<super::AuthenticatedUnixPeer> {
-    super::AuthenticatedUnixPeer::capture(stream.as_fd())
+    lillux::authenticated_unix_peer_from_stream(stream)
 }
 
 async fn read_frame(

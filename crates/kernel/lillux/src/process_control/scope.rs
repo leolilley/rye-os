@@ -14,6 +14,254 @@ const SCOPE_CONFIGURATION_VERSION: u32 = 3;
 const SCOPE_RECOVERY_VERSION: u32 = 4;
 const SCOPE_ALLOCATION_VERSION: u32 = 2;
 
+/// Administrator-selected host account for a controller, not a RyeOS signing
+/// identity. Native account coordinates and credential-drop interpretation
+/// stay in Lillux; applications retain this value without matching on its OS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ControllerAccount(AccountBackend);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "implementation", rename_all = "snake_case", deny_unknown_fields)]
+enum AccountBackend {
+    Unix { uid: u32, gid: u32 },
+}
+
+impl ControllerAccount {
+    /// Capture the current unprivileged account for an administrator-requested
+    /// host association. This observes native identity only; it does not grant
+    /// a worker any account-selection capability.
+    pub fn current() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            let account = Self::unix(unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+            account.validate()?;
+            Ok(account)
+        }
+        #[cfg(not(unix))]
+        Err("current controller account is unavailable on this OS".to_owned())
+    }
+    /// Apply the selected identity only in the child, before user code. Reuse
+    /// this for maintenance observations as well as scope-controller launch;
+    /// the privileged parent must never temporarily change its own credentials.
+    pub(crate) fn configure_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<(), String> {
+        self.validate()?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let AccountBackend::Unix { uid, gid } = self.0;
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setresgid(gid, gid, gid) != 0
+                        || libc::setresuid(uid, uid, uid) != 0
+                        || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = command;
+            Err("controller credential transition is unavailable on this OS".to_owned())
+        }
+    }
+
+    /// Administrator provisioning of one exact private intent directory.
+    /// The caller must hold its protected installation namespace. This does
+    /// not grant ownership of a service definition or follow an ambient path.
+    pub fn grant_private_directory(
+        &self,
+        directory: &crate::PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        #[cfg(unix)]
+        {
+            let file = directory.try_clone_descriptor()?;
+            self.grant_private_descriptor(&file, true)?;
+            self.require_directory_owner(directory)
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("host directory grants are unavailable on this OS")
+    }
+
+    /// Administrator provisioning of one already-open, single-link intent file.
+    pub fn grant_private_file(&self, file: &crate::PinnedRegularFile) -> anyhow::Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        #[cfg(unix)]
+        {
+            let descriptor = file.try_clone_descriptor()?;
+            self.grant_private_descriptor(&descriptor, false)?;
+            let AccountBackend::Unix { uid, .. } = self.0;
+            file.require_owner(uid)
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("host file grants are unavailable on this OS")
+    }
+
+    #[cfg(unix)]
+    fn grant_private_descriptor(
+        &self,
+        file: &std::fs::File,
+        directory: bool,
+    ) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let AccountBackend::Unix { uid, gid } = self.0;
+        let before = file.metadata()?;
+        if unsafe { libc::geteuid() } != 0
+            || (before.uid() != 0 && before.uid() != uid)
+            || before.mode() & 0o022 != 0
+            || (directory && !before.is_dir())
+            || (!directory && (!before.is_file() || before.nlink() != 1))
+        {
+            anyhow::bail!(
+                "private host grant requires administrator authority and an exact safe target"
+            );
+        }
+        let mode = if directory { 0o700 } else { 0o600 };
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0
+            || unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Give the selected account access to one existing native control FIFO.
+    /// Its containing directory stays administrator-owned. Never open a FIFO
+    /// blocking, follow a symlink, or grant write access to the namespace.
+    pub fn grant_private_control_fifo(
+        &self,
+        directory: &crate::PinnedDirectory,
+        name: &std::ffi::OsStr,
+    ) -> anyhow::Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
+            directory.require_owner(0)?;
+            let bytes = name.as_bytes();
+            if bytes.is_empty() || bytes.contains(&b'/') || bytes == b"." || bytes == b".." {
+                anyhow::bail!("control FIFO must be one exact child name");
+            }
+            let name = std::ffi::CString::new(bytes)?;
+            let parent = directory.try_clone_descriptor()?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let before = file.metadata()?;
+            let AccountBackend::Unix { uid, gid } = self.0;
+            if unsafe { libc::geteuid() } != 0
+                || before.mode() & libc::S_IFMT != libc::S_IFIFO
+                || before.nlink() != 1
+                || (before.uid() != 0 && before.uid() != uid)
+            {
+                anyhow::bail!(
+                    "host control grant requires an exact FIFO and administrator authority"
+                );
+            }
+            if unsafe { libc::fchmod(fd, 0o600) } != 0 || unsafe { libc::fchown(fd, uid, gid) } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // FIFOs are IPC objects, not durable regular files: no fsync.
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("native control FIFO grants are unavailable on this OS")
+    }
+
+    /// Used by native host provisioning. Deserialization alone grants no
+    /// credential-drop authority; exec_controller validates again before use.
+    pub fn unix(uid: u32, gid: u32) -> Self {
+        Self(AccountBackend::Unix { uid, gid })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.0 {
+            AccountBackend::Unix { uid, gid }
+                if uid != 0 && uid != u32::MAX && gid != 0 && gid != u32::MAX =>
+            {
+                Ok(())
+            }
+            _ => Err("controller requires an explicit non-root account".to_owned()),
+        }
+    }
+
+    /// Corroborate the account after controller exec. Account selection alone
+    /// is not evidence that credential drop actually happened.
+    pub fn require_current_process(&self) -> anyhow::Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        #[cfg(unix)]
+        {
+            let AccountBackend::Unix { uid, gid } = self.0;
+            if unsafe { libc::getuid() } != uid
+                || unsafe { libc::geteuid() } != uid
+                || unsafe { libc::getgid() } != gid
+                || unsafe { libc::getegid() } != gid
+            {
+                anyhow::bail!("controller process does not run as its selected non-root account");
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("controller account observation is unavailable on this OS")
+    }
+
+    pub fn require_directory_owner(
+        &self,
+        directory: &crate::PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        self.validate().map_err(anyhow::Error::msg)?;
+        #[cfg(unix)]
+        {
+            let AccountBackend::Unix { uid, .. } = self.0;
+            directory.require_owner(uid)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            anyhow::bail!("controller account ownership is unavailable on this OS")
+        }
+    }
+}
+
+/// Require the administrator identity for a host-maintenance entrypoint.
+///
+/// This is deliberately an OS boundary rather than a RyeOS policy decision:
+/// callers use it only before creating or replacing administrator-owned host
+/// configuration. It is not an execution capability and must never be
+/// threaded into worker requests, node policy, or durable execution state.
+pub fn require_administrator() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            anyhow::bail!("host maintenance requires administrator authority")
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("host maintenance authority is unavailable on this OS")
+}
+
 /// Coarse host-lifetime witness, never process-control or launch authority.
 /// A durable owner can retain this independently of its execution-row schema
 /// to prove that even an unobserved pre-attachment process cannot still exist.
@@ -211,22 +459,63 @@ enum QuiescedBackend {
 }
 
 impl ProcessScopeConfiguration {
+    /// Provision one administrator-owned host-service delegation and compile
+    /// the current platform's opaque scope contract. Applications supply only
+    /// their already-determined native service label; they never choose a
+    /// cgroup path, backend, or OS-specific delegation mechanism.
+    pub fn provision_host_delegation(service_label: &str) -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        {
+            let parent = super::cgroup::provision_host_delegation(service_label)?;
+            let configuration = Self {
+                version: SCOPE_CONFIGURATION_VERSION,
+                backend: BackendConfiguration::LinuxCgroupV2 { parent },
+            };
+            configuration.validate()?;
+            Ok(configuration)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = service_label;
+            Err("the current host has no supported process-scope backend".to_owned())
+        }
+    }
+
+    /// Host-maintenance observation, never a worker recovery or cleanup grant.
+    /// The caller must retain its launch exclusion and must not infer this
+    /// result from a controller PID or erase individual recovery obligations.
+    pub fn require_controller_tree_empty(&self, account: &ControllerAccount) -> Result<(), String> {
+        self.validate()?;
+        account.validate()?;
+        #[cfg(target_os = "linux")]
+        {
+            let BackendConfiguration::LinuxCgroupV2 { parent } = &self.backend;
+            let AccountBackend::Unix { uid, .. } = account.0;
+            super::cgroup::require_controller_tree_empty(parent, uid)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err("controller process-tree observation is unavailable on this OS".to_owned())
+    }
+
     /// Explicit host-supervisor entry, not worker execution. Replaces this
     /// administrator process with an unprivileged controller after exact
     /// placement. It installs no service and changes no application policy.
     pub fn exec_controller(
         &self,
-        uid: u32,
-        gid: u32,
-        executable: &std::path::Path,
+        account: &ControllerAccount,
+        executable: &crate::PinnedRegularFile,
         arguments: &[String],
-        cwd: &std::path::Path,
+        cwd: &crate::PinnedDirectory,
         environment: &[(String, String)],
     ) -> Result<std::convert::Infallible, String> {
         self.validate()?;
-        if !executable.is_absolute() || !cwd.is_absolute() {
+        account.validate()?;
+        if !executable.path().is_absolute() || !cwd.path().is_absolute() {
             return Err("controller executable and cwd must be explicit absolute paths".to_owned());
         }
+        executable
+            .require_executable()
+            .map_err(|error| error.to_string())?;
         let mut names = BTreeSet::new();
         for (name, value) in environment {
             if name.is_empty()
@@ -240,15 +529,30 @@ impl ProcessScopeConfiguration {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt as _;
+            // Retain the exact selected directory across provisioning and
+            // credential drop. Reopening cwd.path() here would discard the
+            // caller's host association check if its parent were renamed.
             let BackendConfiguration::LinuxCgroupV2 { parent } = &self.backend;
+            let AccountBackend::Unix { uid, gid } = account.0;
+            // Derive transport from the verified file, never reopen its original
+            // pathname after provisioning or credential drop. Use the existing
+            // inherited-authority owner rather than another raw-FD protocol.
+            let image = executable
+                .inherited_descriptor_authority()
+                .map_err(|error| error.to_string())?;
+            let mut command = std::process::Command::new(image.path());
+            crate::configure_inherited_descriptor_authorities(
+                &mut command,
+                std::slice::from_ref(&image),
+            )?;
             let bootstrap = super::cgroup::provision_controller(parent, uid, gid)?;
-            let mut command = std::process::Command::new(executable);
             command
                 .args(arguments)
-                .current_dir(cwd)
                 .env_clear()
                 .envs(environment.iter().map(|(key, value)| (key, value)));
             bootstrap.configure_command(&mut command)?;
+            cwd.configure_command_cwd(&mut command)
+                .map_err(|error| error.to_string())?;
             Err(format!(
                 "exec unprivileged scope controller: {}",
                 command.exec()
@@ -256,7 +560,7 @@ impl ProcessScopeConfiguration {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (uid, gid, arguments);
+            let _ = (account, arguments);
             Err("scope controller provisioning is unavailable on this OS".to_owned())
         }
     }
@@ -1096,27 +1400,24 @@ mod tests {
     fn controller_bootstrap_rejects_ambient_or_privileged_requests_before_host_mutation() {
         let configuration: ProcessScopeConfiguration =
             serde_json::from_value(configuration()).unwrap();
+        let cwd = crate::PinnedDirectory::open(std::path::Path::new("/"))
+            .unwrap()
+            .unwrap();
+        let image_path = std::env::current_exe().unwrap();
+        let image_parent = crate::PinnedDirectory::open(image_path.parent().unwrap())
+            .unwrap()
+            .unwrap();
+        let image = image_parent
+            .open_pinned_regular(image_path.file_name().unwrap(), false)
+            .unwrap()
+            .unwrap();
         assert!(
             configuration
                 .exec_controller(
-                    1000,
-                    1000,
-                    std::path::Path::new("relative"),
+                    &ControllerAccount::unix(1000, 1000),
+                    &image,
                     &[],
-                    std::path::Path::new("/"),
-                    &[]
-                )
-                .unwrap_err()
-                .contains("absolute")
-        );
-        assert!(
-            configuration
-                .exec_controller(
-                    1000,
-                    1000,
-                    std::path::Path::new("/absent"),
-                    &[],
-                    std::path::Path::new("/"),
+                    &cwd,
                     &[
                         ("X".to_owned(), "a".to_owned()),
                         ("X".to_owned(), "b".to_owned())
@@ -1128,16 +1429,33 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(
             configuration
-                .exec_controller(
-                    0,
-                    0,
-                    std::path::Path::new("/absent"),
-                    &[],
-                    std::path::Path::new("/"),
-                    &[]
-                )
+                .exec_controller(&ControllerAccount::unix(0, 0), &image, &[], &cwd, &[])
                 .unwrap_err()
                 .contains("non-root account")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_account_observation_does_not_accept_privilege_or_another_account() {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let selected = ControllerAccount::unix(uid, gid);
+        if uid != 0 && gid != 0 {
+            selected.require_current_process().unwrap();
+        } else {
+            assert!(selected.require_current_process().is_err());
+        }
+        assert!(
+            ControllerAccount::unix(0, 0)
+                .require_current_process()
+                .is_err()
+        );
+        let other_uid = if uid == 1 { 2 } else { 1 };
+        assert!(
+            ControllerAccount::unix(other_uid, gid.max(1))
+                .require_current_process()
+                .is_err()
         );
     }
 

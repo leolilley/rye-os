@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T10:43:33Z:178348aa4c86140ceea4d0cb9e6dccb8af857a5fa4f3e58c66942aaa54f267e9:Wd7H6tWAzBkIw9UjGvX5ErLZUz+5AVk1hA02MtrgIaI8f8g29GMck6ml6wVNQeRA0Sxcyt65l/Hb+8wrEmXpCg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-10T01:21:41Z:133544f6a0868a4b2ba5e576813ae66d7d9e82090660753a07d72817cfd5d7fa:4wLKBw0tZGdecL1uFEcoA0Q3baIFDe+Vqo7k2qwqB7u97OHECugl0BPDEI+spRAgkUAWyXjxR0hsA7HdckVjDg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [node, isolation, security, subprocess, node-policy]
@@ -564,43 +564,52 @@ reboot-ephemeral inode. Generation admission captures the exact live directory;
 allocation v2 and recovery v4 retain that incarnation and boot. Allocation,
 cleanup and compilation reject a different incarnation at the same path.
 
-For a supervisor that owns host installation, `lillux exec scope-controller`
-is the explicit bootstrap entry. It requires an already privileged caller and
-an explicitly selected non-root UID/GID. It creates or verifies one selected
-delegation beneath an administrator-owned cgroup parent, keeps parent lifecycle
-controls administrator-owned, places itself in a separate private controller
-leaf, drops credentials and execs the selected command with an exact environment.
-Occupied or frozen controller leaves refuse startup. It does not become a
-setuid helper, stay resident as a privileged service, mount host facilities,
-enable resource controllers, install a supervisor, or sign node policy.
-Its delegation and account selections must come from the administrator-owned
-supervisor configuration. Do not let worker input or a node-writable policy
-file select a privileged provisioning target. The node's signed policy must
-agree with that installed host selection; it cannot amend the host grant.
+## Supported host supervision
 
-For example, a root-owned supervisor entry can supply these **operator-chosen**
-values (the names below are placeholders, not automatic node discovery):
+Most nodes remain ordinary account-owned direct nodes. An app root may live
+under the account's home directory; RyeOS does not require an administrator-owned
+app-root parent, a workload-named root, or a host-local node registry.
+
+When a node is to host dedicated workers whose selected Lillux backend needs
+host delegation, the operator performs one explicit local setup after that node
+has been initialized:
 
 ```sh
-exec /usr/bin/lillux exec scope-controller \
-  --configuration "$NODE_SCOPE_CONFIGURATION" \
-  --uid "$NODE_UID" --gid "$NODE_GID" \
-  --cmd /usr/bin/ryeosd --cwd "$NODE_APP_ROOT" \
-  --arg=--app-root --arg "$NODE_APP_ROOT" \
-  --env "HOME=$NODE_HOME" --env 'PATH=/usr/bin:/bin'
+ryeos node host setup --confirm [--app-root <existing-node-root>]
 ```
 
-`NODE_SCOPE_CONFIGURATION` is the same complete Lillux configuration selected
-by the node's signed isolation member, for example
-`{"version":3,"backend":{"implementation":"linux_cgroup_v2","parent":"/sys/fs/cgroup/ryeos-example"}}`.
-The node member separately selects its control deadline and nested permission.
-Initialize that ordinary app root under its own unprivileged account and apply
-its complete policies through the existing node CLI before activation. Verify
-that the installed host Lillux binary supplies this entry; it is not injected
-into worker environments. Direct `ryeos node start` does not secretly obtain
-administrator authority or discover/replace a supervisor. Supervised service
-start/stop remains owned by the chosen host supervisor, as for container service
-lifecycle; the node CLI still reports and controls the node itself.
+This is an administrator-maintenance transition, not a worker operation. The
+CLI selects the already initialized app root and its current account; Lillux
+performs the host-specific elevation, native service provisioning, executable
+pinning and selected process-scope delegation. RyeOS receives only the opaque
+Lillux scope configuration and keeps its generic app-root, node-identity,
+account, desired-lifecycle and upgrade testimony. Neither node policy nor
+worker input can select a privileged executable, service manager, host account
+or scope parent.
+
+The configured association is deliberately fail-closed. After setup, ordinary
+`ryeos start`, `ryeos stop`, and `ryeos node status` use the installed native
+service through Lillux. A missing, changed or unhealthy configured service is
+an error; RyeOS never silently starts a direct replacement daemon. Nodes with
+no association retain the ordinary direct lifecycle. Setup leaves a new service
+down, so provisioning does not unexpectedly start a node. That native boot
+disposition remains inert after a host reboot; an operator explicitly uses
+`ryeos start` when the node should run again.
+
+The native adapter is a Lillux concern. Its first qualified implementation is
+the local Artix/runit adapter; systemd, launchd and Windows require their own
+Lillux adapter and host qualification before RyeOS claims support. Manager
+files, manager controls and OS-specific delegation paths do not appear in
+RyeOS policy, bundles, worker environments or project configuration. Workloads
+never receive host-service control or elevation authority.
+
+The protected association detects an app-root replacement, but it does not
+pretend that a user-owned home is immutable against that account. The worker
+security boundary remains the admitted filesystem, process, network and
+workload-client authority. Installation stages and validates a new package
+generation before it inhibits a configured service, retains prior up/down
+intent through replacement, and verifies the installed generation before
+restoring that intent.
 
 The node's runtime store retains one independent host-lifetime reset fence
 before scope allocation. Exact last retirement clears it. If execution schemas

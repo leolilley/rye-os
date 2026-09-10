@@ -30,6 +30,151 @@ pub struct AuthenticatedUnixPeer {
 }
 
 impl AuthenticatedUnixPeer {
+    /// Capture the durable birth/group coordinate from this already
+    /// kernel-authenticated peer. Applications receive a portable Lillux
+    /// value, never a borrowed pidfd or a platform branch.
+    pub fn exact_process_identity(
+        &self,
+        expected_group_leader: Option<u32>,
+    ) -> Result<crate::ExactProcessIdentity> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd as _;
+            crate::process_control::capture_exact_process_identity_from_pidfd(
+                u32::try_from(self.pid).context("authenticated peer PID is outside range")?,
+                expected_group_leader,
+                self.pidfd.as_fd(),
+            )
+            .map_err(anyhow::Error::msg)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_group_leader;
+            bail!("authenticated exact process identity is unavailable on this OS")
+        }
+    }
+    /// Diagnostic executable-name guard on an already-pinned peer. This is
+    /// not content authentication (use executable_digest_exact for that).
+    /// Linux comm is mutable and becomes an FD number after descriptor exec;
+    /// inspect the kernel executable link, fenced by the retained pidfd.
+    pub fn require_executable_name(&self, expected: &OsStr) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            if self.has_exited()? {
+                bail!("peer exited before executable-name observation");
+            }
+            let executable = std::fs::read_link(format!("/proc/{}/exe", self.pid))
+                .context("observe pinned peer executable")?;
+            let name = executable
+                .file_name()
+                .context("peer executable has no filename")?;
+            let bytes = name.as_bytes();
+            // Kernel spelling for a still-running unlinked executable, not a
+            // predecessor schema or alternate executable-name fallback.
+            let bytes = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
+            if bytes != expected.as_bytes() || self.has_exited()? {
+                bail!("pinned peer does not have the expected live executable name");
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected;
+            bail!("peer executable observation is unavailable on this OS")
+        }
+    }
+    /// Observe the exact authenticated process, never a numeric-PID lookup.
+    pub fn has_exited(&self) -> Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            let mut descriptor = libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                bail!("authenticated process observation descriptor failed");
+            }
+            Ok(descriptor.revents & libc::POLLIN != 0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("authenticated process exit observation is unavailable on this OS")
+    }
+
+    pub fn request_termination(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.signal(libc::SIGTERM)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("authenticated process termination is unavailable on this OS")
+    }
+
+    pub fn force_termination(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.signal(libc::SIGKILL)
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("authenticated process termination is unavailable on this OS")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signal(&self, signal: libc::c_int) -> Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Digest the actual executable image of this still-live peer at the
+    /// caller-admitted size. Replacing the installed pathname cannot turn an
+    /// old running daemon into evidence for a new installation. The executable
+    /// is reobserved to reject exit/PID reuse or exec during the bounded read.
+    pub fn executable_digest_exact(&self, expected_bytes: u64) -> Result<String> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.has_exited()? {
+                bail!("authenticated process already exited");
+            }
+            // Deliberately follow the kernel executable link, not an authored
+            // filesystem path. The independent pidfd fences PID reuse.
+            let path = format!("/proc/{}/exe", self.pid);
+            let image = std::fs::File::open(&path)?;
+            let (digest, _) =
+                crate::secure_fs::digest_open_regular_file_stable_exact(&image, expected_bytes)?;
+            let current = std::fs::File::open(&path)?;
+            if self.has_exited()? || !crate::secure_fs::same_open_file_identity(&image, &current)? {
+                bail!("authenticated process executable changed during observation");
+            }
+            Ok(digest)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_bytes;
+            bail!("authenticated executable observation is unavailable on this OS")
+        }
+    }
+
     #[cfg(unix)]
     pub fn capture(stream: std::os::fd::BorrowedFd<'_>) -> Result<Self> {
         #[cfg(not(target_os = "linux"))]
@@ -90,6 +235,21 @@ impl AuthenticatedUnixPeer {
     }
 }
 
+/// Capture a peer from an accepted Unix stream without exposing the native
+/// descriptor type to an application. The platform-specific socket authority
+/// remains entirely in Lillux.
+#[cfg(unix)]
+pub fn authenticated_unix_peer_from_stream<S: std::os::fd::AsFd>(
+    stream: &S,
+) -> Result<AuthenticatedUnixPeer> {
+    AuthenticatedUnixPeer::capture(stream.as_fd())
+}
+
+#[cfg(not(unix))]
+pub fn authenticated_unix_peer_from_stream<S>(_stream: &S) -> Result<AuthenticatedUnixPeer> {
+    bail!("authenticated Unix peer capture is unavailable on this OS")
+}
+
 /// Probe the same peer-identity mechanism used by runtime attachment. No
 /// synthetic descriptor or numeric-PID fallback may qualify this capability.
 pub fn validate_peer_process_control_support() -> Result<()> {
@@ -112,6 +272,18 @@ pub struct LocalDuplexStream {
 }
 
 impl LocalDuplexStream {
+    /// Capture the kernel-authenticated peer for this exact connected local
+    /// channel. Applications do not receive a Unix stream or descriptor.
+    pub fn authenticated_peer(&self) -> Result<AuthenticatedUnixPeer> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            AuthenticatedUnixPeer::capture(self.stream.as_fd())
+        }
+        #[cfg(not(unix))]
+        bail!("authenticated local duplex peer capture is unavailable on this OS")
+    }
+
     pub fn with_deadline(
         &mut self,
         deadline: crate::time::MonotonicDeadline,
@@ -476,6 +648,32 @@ mod peer_process_tests {
     use std::os::fd::{AsFd as _, AsRawFd as _};
 
     #[test]
+    #[ignore = "native Linux SO_PEERPIDFD qualification; sandboxed kernels may deny the socket option"]
+    fn unix_peer_executable_digest_is_exact_and_size_bounded() {
+        let (stream, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+        let peer = AuthenticatedUnixPeer::capture(stream.as_fd()).unwrap();
+        assert!(!peer.has_exited().unwrap());
+        let image_path = std::env::current_exe().unwrap();
+        peer.require_executable_name(image_path.file_name().unwrap())
+            .unwrap();
+        assert!(
+            peer.require_executable_name(OsStr::new("not-this-executable"))
+                .is_err()
+        );
+        let executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let size = executable.metadata().unwrap().len();
+        assert!(
+            peer.executable_digest_exact(size.saturating_add(1))
+                .is_err()
+        );
+        let expected = crate::secure_fs::digest_open_regular_file_stable_exact(&executable, size)
+            .unwrap()
+            .0;
+        assert_eq!(peer.executable_digest_exact(size).unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "native Linux SO_PEERPIDFD qualification; sandboxed kernels may deny the socket option"]
     fn unix_peer_retains_kernel_pidfd_and_receiver_namespace_coordinate() {
         let (stream, other) = std::os::unix::net::UnixStream::pair().unwrap();
         let peer = AuthenticatedUnixPeer::capture(stream.as_fd()).unwrap();

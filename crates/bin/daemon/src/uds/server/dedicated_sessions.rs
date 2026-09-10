@@ -511,28 +511,16 @@ fn create_dedicated_runtime_workspace(
                 mount_identity: None,
             },
             &|held| {
-                #[cfg(target_os = "linux")]
-                {
-                    let identity =
-                        ryeos_app::process::capture_execution_process_identity_from_pidfd(
-                            i64::from(held.pid()),
-                            Some(i64::from(held.pgid())),
-                            held.pidfd(),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    state
-                        .state_store
-                        .attach_workspace_creator(workspace_id, thread_id, launch_owner, &identity)
-                        .map_err(|error| error.to_string())
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = held;
-                    Err(
-                        "workspace creator attachment requires exact process identity support"
-                            .to_owned(),
-                    )
-                }
+                let identity = ryeos_app::process::execution_process_identity_from_lillux(
+                    held.exact_process_identity()
+                        .map_err(|error| format!("capture workspace creator identity: {error}"))?,
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+                state
+                    .state_store
+                    .attach_workspace_creator(workspace_id, thread_id, launch_owner, &identity)
+                    .map_err(|error| error.to_string())
             },
         )
         .map_err(|error| anyhow!(error.to_string()))?;

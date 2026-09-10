@@ -2579,6 +2579,25 @@ impl ProcessAwaitingAttachment {
         self.pgid
     }
 
+    /// Capture a portable exact identity through the held launch descriptor.
+    /// This is the only valid route for attachment-pending children: reopening
+    /// a numeric PID would lose the launch barrier's incarnation proof.
+    pub fn exact_process_identity(&self) -> Result<crate::ExactProcessIdentity, String> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::process_control::capture_exact_process_identity_from_pidfd(
+                self.pid,
+                Some(
+                    u32::try_from(self.pgid)
+                        .map_err(|_| "attachment-pending process group is outside range")?,
+                ),
+                self.pidfd.as_fd(),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err("attachment-pending exact process identity is unavailable on this OS".to_owned())
+    }
+
     /// Borrow the already-pinned exact process identity. Durable lifecycle
     /// code must capture identity through this descriptor rather than reopen a
     /// potentially recycled numeric PID.
@@ -3607,7 +3626,7 @@ pub fn lib_spawn(request: SubprocessRequest) -> Result<RunningProcess, Subproces
             "Failed to spawn: attachment-bearing supervision requires spawn_awaiting_attachment",
         ));
     }
-    lib_spawn_with_stdio(request, false, None, None)
+    lib_spawn_with_stdio(request, false, None, None, None)
 }
 
 /// Spawn with inherited terminal stdio while retaining the same session,
@@ -3627,7 +3646,7 @@ pub fn lib_spawn_inherited_stdio(
             "Failed to spawn: attachment-bearing supervision requires spawn_awaiting_attachment",
         ));
     }
-    lib_spawn_with_stdio(request, true, None, None)
+    lib_spawn_with_stdio(request, true, None, None, None)
 }
 
 /// Spawn a Linux subprocess whose final trusted setup completes before the
@@ -3664,7 +3683,7 @@ pub(crate) fn lib_spawn_awaiting_attachment_in_scope(
             ));
         }
         let timeout = request.timeout;
-        let running = lib_spawn_with_stdio(request, false, None, process_scope)?;
+        let running = lib_spawn_with_stdio(request, false, None, process_scope, None)?;
         if running.attachment_release.is_none() {
             return Err(running.into_spawn_failure(spawn_failure(
                 start,
@@ -3788,7 +3807,7 @@ pub(crate) fn lib_spawn_awaiting_attachment_in_scope(
     // inherit an advisory lock and deadlock the owner's durable attach path.
     let worker = thread::Builder::new()
         .name("lillux-attachment-spawn".to_string())
-        .spawn(move || lib_spawn_with_stdio(request, false, Some(gate), process_scope))
+        .spawn(move || lib_spawn_with_stdio(request, false, Some(gate), process_scope, None))
         .map_err(|error| {
             spawn_failure(
                 start,
@@ -4170,6 +4189,7 @@ fn lib_spawn_with_stdio(
     #[cfg(target_os = "linux")] mut attachment_gate: Option<AttachmentWorkerGate>,
     #[cfg(not(target_os = "linux"))] _attachment_gate: Option<()>,
     process_scope: Option<crate::ProcessScope>,
+    account: Option<&crate::ControllerAccount>,
 ) -> Result<RunningProcess, SubprocessResult> {
     let start = Instant::now();
     let SubprocessRequest {
@@ -4468,6 +4488,11 @@ fn lib_spawn_with_stdio(
         }
     }
 
+    if let Some(account) = account {
+        account
+            .configure_command(&mut command)
+            .map_err(|error| spawn_failure(start, error))?;
+    }
     let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return Err(spawn_failure(start, format!("Failed to spawn: {e}"))),
@@ -6167,6 +6192,25 @@ pub fn lib_run(request: SubprocessRequest) -> SubprocessResult {
     }
 }
 
+/// Administrator-owned maintenance subprocess, using the same bounded output,
+/// deadline and exact child cleanup as ordinary execution. Account selection is
+/// not a serializable workload request field and cannot come from a worker.
+pub fn lib_run_as_account(
+    request: SubprocessRequest,
+    account: &crate::ControllerAccount,
+) -> SubprocessResult {
+    if request.supervised_status.is_some() {
+        return spawn_failure(
+            Instant::now(),
+            "maintenance account execution cannot carry worker supervision",
+        );
+    }
+    match lib_spawn_with_stdio(request, false, None, None, Some(account)) {
+        Ok(running) => running.wait(),
+        Err(result) => result,
+    }
+}
+
 pub fn lib_run_inherited_stdio(request: SubprocessRequest) -> SubprocessResult {
     match lib_spawn_inherited_stdio(request) {
         Ok(running) => running.wait(),
@@ -6355,7 +6399,34 @@ pub fn run(action: ExecAction) -> serde_json::Value {
                             .ok_or_else(|| "controller environment requires NAME=VALUE".to_owned())
                     })
                     .collect::<Result<_, _>>()?;
-                configuration.exec_controller(uid, gid, &cmd, &args, &cwd, &environment)
+                let cwd = crate::PinnedDirectory::open(&cwd)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "controller working directory is absent".to_owned())?;
+                if !cmd.is_absolute() {
+                    return Err(
+                        "controller executable must be an explicit absolute path".to_owned()
+                    );
+                }
+                let executable_parent = crate::PinnedDirectory::open(
+                    cmd.parent().ok_or("controller executable has no parent")?,
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or("controller executable directory is absent")?;
+                let executable = executable_parent
+                    .open_pinned_regular(
+                        cmd.file_name()
+                            .ok_or("controller executable has no filename")?,
+                        false,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or("controller executable is absent")?;
+                configuration.exec_controller(
+                    &crate::ControllerAccount::unix(uid, gid),
+                    &executable,
+                    &args,
+                    &cwd,
+                    &environment,
+                )
             })();
             match outcome {
                 Ok(never) => match never {},

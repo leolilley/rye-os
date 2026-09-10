@@ -41,6 +41,43 @@ pub struct PublicIdentityDoc {
     pub signature: SignatureDoc,
 }
 
+impl PublicIdentityDoc {
+    /// Verify the public document against its actual key, not its editable
+    /// principal-id text. This proves the self-signature, not possession by a
+    /// running process; live node authentication remains a separate boundary.
+    pub fn verified_fingerprint(&self) -> Result<String> {
+        if self.kind != "identity/v1" {
+            bail!("public node identity has an unsupported kind");
+        }
+        let encoded = self
+            .signing_key
+            .strip_prefix("ed25519:")
+            .context("public node identity requires an ed25519 key")?;
+        let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(encoded)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid public node key length"))?;
+        let key = VerifyingKey::from_bytes(&bytes)?;
+        let fingerprint = lillux::sha256_hex(&bytes);
+        let principal = format!("fp:{fingerprint}");
+        if self.principal_id != principal || self.signature.signer != principal {
+            bail!("public node identity does not name its actual signing key");
+        }
+        let signature = Signature::from_slice(
+            &base64::engine::general_purpose::STANDARD.decode(&self.signature.sig)?,
+        )?;
+        // Exactly the existing authoring contract in build_public_identity_at;
+        // do not introduce a second signature envelope for host supervision.
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "kind": self.kind, "principal_id": self.principal_id,
+            "signing_key": self.signing_key, "created_at": self.created_at,
+        }))?;
+        key.verify_strict(&payload, &signature)
+            .context("invalid public node identity self-signature")?;
+        Ok(fingerprint)
+    }
+}
+
 impl NodeIdentity {
     /// Generate a new signing key and persist. Errors if key already exists.
     pub fn create(key_path: &Path) -> Result<Self> {
@@ -873,6 +910,21 @@ pub fn reconcile_authorized_key_toml_scopes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_identity_checks_key_and_existing_self_signature() {
+        let key = SigningKey::from_bytes(&[27; 32]);
+        let node = NodeIdentity::from_signing_key(key).unwrap();
+        let mut document = node
+            .build_public_identity_at("2026-09-10T00:00:00Z")
+            .unwrap();
+        assert_eq!(document.verified_fingerprint().unwrap(), node.fingerprint());
+        document.principal_id = format!("fp:{}", "b".repeat(64));
+        assert!(document.verified_fingerprint().is_err());
+        document.principal_id = node.principal_id();
+        document.created_at = "2026-09-11T00:00:00Z".to_owned();
+        assert!(document.verified_fingerprint().is_err());
+    }
     use lillux::crypto::SigningKey;
     use rand::rngs::OsRng;
 

@@ -1,4 +1,4 @@
-<!-- ryeos:signed:2026-09-09T06:30:46Z:f8666cf6f790cb78f52e262ec757b8b866533afd0b488e8e902a60db1cc01acd:snr4wjyMI5Ed+yv18YR+ItnLgJnRLMF28iNe0wGVn9qNxuNtJPhWvUrwwhrg03rwHoMZ3tCSoTwHsI2U+T7bBg==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
+<!-- ryeos:signed:2026-09-10T01:21:41Z:4dca22fc2ef0c14069ced0e8f4b4e796c335b02877a77bf7510530cc4a9c9d65:Ll3KjE2RhKoR9o8aVPMdmkEFzetLn5Eaz7ruNEgNyY/VXC++V4x+6dNraNpP+9FULGM6ZosNsqpBPcciSYDgCA==:741a8bc609b398aaec0685e5aefb682faf5129a66bd192f888d23bb642c18eea -->
 ---
 category: ryeos/core/node
 tags: [reference, cli, verbs, aliases, lifecycle]
@@ -77,8 +77,11 @@ ryeos start [--app-root <dir>]
 ```
 
 Starts the local daemon. Fails if not initialized, succeeds immediately
-if already running, and uses the lifecycle start flock. The readiness timeout
-is 15 minutes so verified projection recovery can finish. Interactive terminals
+if already running, and uses the lifecycle start flock. A node with no host
+association starts directly. A node explicitly configured with host supervision
+requests the installed service through Lillux; missing or unhealthy supervision
+is an error and never falls back to direct spawning. The readiness timeout is
+15 minutes so verified projection recovery can finish. Interactive terminals
 show the daemon's typed startup phases and counters in one redrawn boot line;
 redirected output remains plain and deterministic.
 
@@ -94,6 +97,34 @@ Connects to a configured live UDS, captures the kernel-authenticated peer with
 `--force` takes a fresh socket peer pidfd before escalating to `SIGKILL` and
 waiting two more seconds. Neither mode signals a PID from `daemon.json` or an
 RPC response.
+
+For a configured supervised node, stop first publishes native down intent and
+then terminates the exact pinned daemon. The daemon disappearing is not worker
+scope-settlement evidence; normal restart recovery retains any remaining worker
+cleanup obligations.
+
+### `ryeos node host setup`
+
+```bash
+ryeos node host setup --confirm [--app-root <dir>]
+```
+
+One-time administrator-maintenance setup for an existing initialized node that
+will host dedicated workers requiring an OS delegation. It records an exact
+account, app-root identity, node identity and installed daemon image in
+administrator-owned host configuration, then leaves the new service down.
+Lillux chooses and provisions the supported native service-manager and scope
+delegation; these are not node-policy or project settings. Afterwards the
+ordinary `ryeos start`, `ryeos stop` and `ryeos node status` commands operate
+the configured service without granting any host authority to workers.
+
+Setup intentionally leaves the native service inert across host boot. Running
+the node remains an explicit `ryeos start` decision, rather than an implicit
+host reboot side effect.
+
+Nodes without this explicit association remain supported direct nodes. If an
+association exists but its native service is absent, unhealthy or mismatched,
+lifecycle commands fail closed rather than start an un-supervised replacement.
 
 ### `ryeos node status`
 

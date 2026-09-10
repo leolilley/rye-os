@@ -859,21 +859,11 @@ async fn handle_attach_process(
     // host PID. The exact callback launch owner and existing immutable process
     // attachment remain authoritative. Do not add a namespace translation,
     // claimed PID, or runtime/kind-specific exception here.
-    let process_identity = {
-        #[cfg(target_os = "linux")]
-        {
-            ryeos_app::process::capture_execution_process_identity_from_pidfd(
-                peer.pid(),
-                None,
-                peer.pidfd(),
-            )
-            .context("capture runtime process identity from Unix peer pidfd")?
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            anyhow::bail!("runtime.attach_process requires Linux SO_PEERPIDFD support");
-        }
-    };
+    let process_identity = ryeos_app::process::execution_process_identity_from_lillux(
+        peer.exact_process_identity(None)
+            .context("capture runtime process identity from authenticated Unix peer")?,
+        None,
+    )?;
     let params = ThreadAttachProcessParams {
         thread_id: wire.thread_id,
         pid: peer.pid(),

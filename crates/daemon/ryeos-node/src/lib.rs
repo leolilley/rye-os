@@ -10,6 +10,7 @@ pub mod model_setup;
 pub mod start;
 pub mod status;
 pub mod stop;
+pub mod supervision;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -209,9 +210,10 @@ impl LocalLifecycleEnv {
         Self::RPC_TIMEOUT
     }
 
-    /// Acquire the (flock-based) start lock guarding concurrent
-    /// `ryeos start` invocations. Self-clearing on process death.
-    pub fn try_acquire_start_lock(&self) -> std::io::Result<LifecycleStartLock> {
+    /// Acquire the Lillux-pinned lifecycle lock guarding concurrent start and
+    /// stop operations. The returned `None` is ordinary contention; the lease
+    /// is self-clearing on process death.
+    pub fn try_acquire_start_lock(&self) -> Result<Option<LifecycleStartLock>> {
         LifecycleStartLock::try_acquire(&self.config.app_root)
     }
 }
@@ -253,6 +255,12 @@ impl LifecycleController {
     }
 
     pub async fn status(&self) -> Result<LifecycleStatus> {
+        // One native-manager check per explicit status operation, not on every
+        // daemon-readiness poll. A configured but missing supervisor is never
+        // reported as an ordinary stopped/direct node.
+        if let Some(service) = supervision::InstalledService::discover(self.config())? {
+            service.check_supervisor()?;
+        }
         status::status(&self.env).await
     }
 

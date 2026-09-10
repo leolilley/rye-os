@@ -15,6 +15,7 @@
 //!   - `ryeos node reset authorization` — retire grants and restore the operator
 //!   - `ryeos node reset policy-generation` — explicit node-policy schema cut
 //!   - `ryeos node policy-apply` — replace one member of the complete signed policy generation
+//!   - `ryeos node host setup` — one-time administrator-owned host association
 //!
 //! `ryeos identity` is local as a bootstrap affordance: remote
 //! operators need to copy their node public key before the daemon is running.
@@ -112,6 +113,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
         category: "maintenance",
     },
     LocalCommandDescriptor {
+        tokens: &["node", "host", "setup"],
+        summary: "Provision one administrator-owned local hosted-worker service",
+        category: "lifecycle",
+    },
+    LocalCommandDescriptor {
         tokens: &["help"],
         summary: "Open the compact TTY help screen",
         category: "meta",
@@ -198,6 +204,10 @@ pub async fn try_dispatch(
             run_node_policy_apply_command(&argv[2..], console).map_err(map_local_err)?;
             Ok(true)
         }
+        ("node", Some("host")) if argv.get(2).map(String::as_str) == Some("setup") => {
+            run_node_host_setup_command(&argv[3..], console).map_err(map_local_err)?;
+            Ok(true)
+        }
         ("start", _) => {
             run_start_command(&argv[1..], console)
                 .await
@@ -212,6 +222,55 @@ pub async fn try_dispatch(
         }
         _ => Ok(false),
     }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "ryeos node host setup",
+    about = "Provision one explicit administrator-owned hosted-worker service",
+    long_about = "Creates the supported local host association for this existing node and account. It records the selected account, durable app-root identity, installed daemon image and Lillux process-scope delegation in administrator-owned host configuration, then leaves the service down. It never reads worker input or node policy as root. This is a one-time host operation; normal ryeos start/stop/status remain unprivileged afterwards.",
+    no_binary_name = true
+)]
+struct NodeHostSetupArgs {
+    /// Existing app root (defaults to the normal local node).
+    #[arg(long)]
+    app_root: Option<PathBuf>,
+
+    /// Required acknowledgement that this installs a root-owned service
+    /// association for the current account and node.
+    #[arg(long)]
+    confirm: bool,
+}
+
+fn run_node_host_setup_command(argv: &[String], _console: &crate::tty::Console) -> Result<()> {
+    let Some(args) = parse_or_render_help::<NodeHostSetupArgs>(argv, _console)? else {
+        return Ok(());
+    };
+    if !args.confirm {
+        anyhow::bail!("host setup requires --confirm");
+    }
+    let config = ryeos_node::NodeConfig::load_local(args.app_root)?;
+    ryeos_node::require_initialized(&config.app_root)?;
+    let account = lillux::ControllerAccount::current().map_err(anyhow::Error::msg)?;
+    let home =
+        lillux::current_user_home().context("host setup requires a canonical current-user HOME")?;
+    let daemon = std::env::current_exe()
+        .context("locate installed ryeos CLI")?
+        .parent()
+        .context("installed ryeos CLI has no binary directory")?
+        .join("ryeosd");
+    let arguments = vec![
+        "host-provision".into(),
+        "--app-root".into(),
+        config.app_root.into_os_string(),
+        "--controller-account-json".into(),
+        serde_json::to_string(&account)?.into(),
+        "--home".into(),
+        home.into_os_string(),
+    ];
+    lillux::run_as_administrator(&daemon, &arguments)
+        .with_context(|| format!("run administrator host setup through {}", daemon.display()))?;
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
