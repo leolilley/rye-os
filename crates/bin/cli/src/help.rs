@@ -325,6 +325,10 @@ fn build_top_level_help(
         crate::tty::Row::key_value("stop", "Gracefully stop the local node runtime"),
         crate::tty::Row::key_value("node status", "Show local node lifecycle status"),
         crate::tty::Row::key_value(
+            "node host setup",
+            "Provision one administrator-owned local hosted-worker service",
+        ),
+        crate::tty::Row::key_value(
             "node doctor",
             "Offline checklist answering \"why won't it start\"",
         ),
@@ -895,6 +899,11 @@ fn build_lifecycle_command_help(command_tokens: &[String]) -> crate::tty::Docume
             "Show local node lifecycle status",
             "ryeos node status [--json] [--app-root <DIR>]",
         ),
+        "node host setup" => (
+            "ryeos node host setup",
+            "Provision one administrator-owned local hosted-worker service",
+            "ryeos node host setup --confirm [--app-root <DIR>]",
+        ),
         "node doctor" => (
             "ryeos node doctor",
             "Diagnose the local node environment",
@@ -989,6 +998,13 @@ fn build_lifecycle_command_help(command_tokens: &[String]) -> crate::tty::Docume
             ("--app-root <DIR>", "Application root"),
         ],
         "setup" => &[("--app-root <DIR>", "Application root")],
+        "node host setup" => &[
+            (
+                "--confirm",
+                "Confirm provisioning the administrator-owned host association",
+            ),
+            ("--app-root <DIR>", "Existing initialized application root"),
+        ],
         "execute" => &[
             (
                 "--async",
@@ -1095,6 +1111,22 @@ mod tests {
         assert!(item.is_offline_dispatch());
         assert_eq!(item.schema.get("project").unwrap(), "string?");
         assert_eq!(usage_tail(&command, Some(&item)), " <remote>");
+    }
+
+    #[test]
+    fn host_setup_help_is_available_without_installed_descriptors() {
+        let document = build_lifecycle_command_help(&[
+            "node".to_owned(),
+            "host".to_owned(),
+            "setup".to_owned(),
+        ]);
+        assert_eq!(document.title.as_deref(), Some("ryeos node host setup"));
+        assert!(document.sections.iter().any(|section| {
+            section
+                .rows
+                .iter()
+                .any(|row| row.key.as_deref() == Some("--confirm"))
+        }));
     }
 
     #[test]

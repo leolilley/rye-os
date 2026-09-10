@@ -849,6 +849,10 @@ fn local_detail(tokens: &str, description: &str) -> String {
             "ryeos node status [--json] [--app-root <DIR>]",
             "--json            emit structured status\n--app-root <DIR>  application root",
         ),
+        "node host setup" => (
+            "ryeos node host setup --confirm [--app-root <DIR>]",
+            "--confirm         confirm administrator-owned host-service provisioning\n--app-root <DIR>  existing initialized application root",
+        ),
         "node doctor" => (
             "ryeos node doctor [--json] [--no-bundles] [--app-root <DIR>]",
             "--json            emit structured diagnostics\n--no-bundles      skip bundle diagnostics\n--app-root <DIR>  application root",
