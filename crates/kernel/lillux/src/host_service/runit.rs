@@ -101,13 +101,13 @@ impl RunitService {
 
     fn control(&self, operation: &str) -> Result<()> {
         self.directory.ensure_path_binding()?;
-        let supervise = self
-            .directory
-            .open_child_directory(OsStr::new("supervise"))?
-            .context(
-                "configured runit supervisor is missing; refusing direct lifecycle fallback",
-            )?;
-        supervise.require_owner(0)?;
+        // The selected account receives traversal, not read/list access, to
+        // runit's root-owned `supervise` directory. Do not reopen it through
+        // `PinnedDirectory`: its read-only descriptor contract correctly
+        // requires directory read permission and would force us to widen the
+        // native delegation. The fixed root-owned `sv` executable below is
+        // the native live-supervisor operation; its failure is propagated and
+        // never selects a direct-process fallback.
         let executable = self.executable.inherited_descriptor_authority()?;
         let directory = self.directory.inherited_descriptor_authority()?;
         let result = crate::run(SubprocessRequest {

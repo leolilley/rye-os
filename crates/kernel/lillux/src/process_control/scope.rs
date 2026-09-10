@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 const SCOPE_CONFIGURATION_VERSION: u32 = 3;
 const SCOPE_RECOVERY_VERSION: u32 = 4;
 const SCOPE_ALLOCATION_VERSION: u32 = 2;
+/// Root owns native supervisor control directories. The selected controller's
+/// primary group gets traversal only, so it can reach its exact `0600` FIFO
+/// without listing or changing the supervisor namespace.
+const DELEGATED_CONTROL_DIRECTORY_MODE: libc::mode_t = 0o710;
 
 /// Administrator-selected host account for a controller, not a RyeOS signing
 /// identity. Native account coordinates and credential-drop interpretation
@@ -137,8 +141,15 @@ impl ControllerAccount {
     }
 
     /// Give the selected account access to one existing native control FIFO.
-    /// Its containing directory stays administrator-owned. Never open a FIFO
-    /// blocking, follow a symlink, or grant write access to the namespace.
+    ///
+    /// The containing directory remains administrator-owned, but gets only
+    /// group traversal (`0710 root:<controller-gid>`). Native supervisors
+    /// commonly create their control FIFO beneath a root-only directory; a
+    /// `0600` FIFO alone is unreachable through that directory. Traversal
+    /// exposes neither directory listing nor namespace mutation, while the
+    /// FIFO itself remains owned and readable/writable only by the exact
+    /// selected account. Never open a FIFO blocking, follow a symlink, or
+    /// grant write access to the namespace.
     pub fn grant_private_control_fifo(
         &self,
         directory: &crate::PinnedDirectory,
@@ -156,6 +167,27 @@ impl ControllerAccount {
             }
             let name = std::ffi::CString::new(bytes)?;
             let parent = directory.try_clone_descriptor()?;
+            let parent_metadata = parent.metadata()?;
+            let AccountBackend::Unix { uid, gid } = self.0;
+            if parent_metadata.uid() != 0
+                || parent_metadata.mode() & libc::S_IFMT != libc::S_IFDIR
+                || parent_metadata.mode() & 0o022 != 0
+                || (parent_metadata.gid() != 0 && parent_metadata.gid() != gid)
+            {
+                anyhow::bail!(
+                    "host control grant requires a safe administrator-owned control directory"
+                );
+            }
+            // A named FIFO must be traversable by its one selected controller,
+            // but the controller must never list or mutate the supervisor's
+            // namespace. This native access-control translation belongs in
+            // Lillux; callers only supply an already admitted account.
+            if unsafe { libc::fchown(parent.as_raw_fd(), 0, gid) } != 0
+                || unsafe { libc::fchmod(parent.as_raw_fd(), DELEGATED_CONTROL_DIRECTORY_MODE) }
+                    != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
             let fd = unsafe {
                 libc::openat(
                     parent.as_raw_fd(),
@@ -168,7 +200,6 @@ impl ControllerAccount {
             }
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let before = file.metadata()?;
-            let AccountBackend::Unix { uid, gid } = self.0;
             if unsafe { libc::geteuid() } != 0
                 || before.mode() & libc::S_IFMT != libc::S_IFIFO
                 || before.nlink() != 1
@@ -1457,6 +1488,13 @@ mod tests {
                 .require_current_process()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn delegated_native_control_directory_is_traversable_but_not_mutable_or_listable() {
+        assert_eq!(DELEGATED_CONTROL_DIRECTORY_MODE & 0o700, 0o700);
+        assert_eq!(DELEGATED_CONTROL_DIRECTORY_MODE & 0o070, 0o010);
+        assert_eq!(DELEGATED_CONTROL_DIRECTORY_MODE & 0o007, 0);
     }
 
     #[test]
