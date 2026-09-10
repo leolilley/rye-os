@@ -19,16 +19,6 @@ use serde::{Deserialize, Serialize};
 const DAEMON_CONFIG_MAX_BYTES: u64 = 64 * 1024;
 const RETIRED_ACCOUNTING_ISSUE_ACCEPTANCE_WINDOW_MS: u64 = 60_000;
 
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    unsafe { libc::geteuid() }
-}
-
-#[cfg(not(unix))]
-fn current_uid() -> u32 {
-    0
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -283,7 +273,7 @@ impl Config {
                 .uds_path
                 .clone()
                 .or_else(|| file_cfg.as_ref().and_then(|cfg| cfg.uds_path.clone()))
-                .unwrap_or_else(|| defaults.uds_path.clone()),
+                .unwrap_or(default_uds_path(&app_root)?),
             app_root: app_root.clone(),
             node_signing_key_path: file_cfg
                 .as_ref()
@@ -319,20 +309,27 @@ impl Config {
         let app_root = base_dirs.data_dir().join("ryeos");
         let runtime_root = RuntimeRoot::new(app_root.clone());
 
-        let socket_runtime_root = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| env::temp_dir().join(format!("ryeosd-{}", current_uid())));
-
         Ok(Self {
             bind,
             db_path: runtime_root.state().join("runtime.sqlite3"),
-            uds_path: socket_runtime_root.join("ryeosd.sock"),
+            uds_path: default_uds_path(&app_root)?,
             app_root: app_root.clone(),
             node_signing_key_path: runtime_root.node_signing_key_path(),
             operator_signing_key_path: runtime_root.operator_signing_key_path(),
             authorized_keys_dir: runtime_root.authorized_keys_dir(),
         })
     }
+}
+
+/// Each app root is an independently authoritative node and therefore needs
+/// its own default local control endpoint. Explicit persisted/CLI endpoints
+/// still win; this only prevents fresh second roots sharing the primary UDS.
+fn default_uds_path(app_root: &Path) -> Result<PathBuf> {
+    let runtime = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .context("RyeOS local control requires XDG_RUNTIME_DIR")?;
+    let digest = lillux::sha256_hex(app_root.as_os_str().as_encoded_bytes());
+    Ok(runtime.join(format!("ryeosd-{}.sock", &digest[..16])))
 }
 
 #[cfg(test)]
