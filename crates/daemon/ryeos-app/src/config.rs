@@ -364,6 +364,23 @@ mod tests {
     }
 
     #[test]
+    fn default_control_endpoints_are_distinct_per_app_root() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first-node");
+        let second = tmp.path().join("second-node");
+
+        let first_endpoint = default_uds_path(&first).unwrap();
+        let second_endpoint = default_uds_path(&second).unwrap();
+
+        assert_ne!(first_endpoint, second_endpoint);
+        assert_eq!(first_endpoint.parent(), second_endpoint.parent());
+        assert_ne!(first_endpoint.file_name(), second_endpoint.file_name());
+        assert!(!first_endpoint.to_string_lossy().contains("first-node"));
+        assert!(!second_endpoint.to_string_lossy().contains("second-node"));
+    }
+
+    #[test]
     fn explicit_init_cutover_retires_pre_policy_fields_once() {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("state");
