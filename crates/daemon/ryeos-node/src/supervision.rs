@@ -115,18 +115,12 @@ fn service_name(app_root: &Path) -> Result<String> {
 /// host-maintenance inputs plus the public node identity; it intentionally
 /// never loads account-owned node config or policy while privileged. The
 /// selected service remains DOWN after publication.
-pub fn provision_host_service(
-    app_root: &Path,
-    account: lillux::ControllerAccount,
-    home: &Path,
-) -> Result<()> {
+pub fn provision_host_service(app_root: &Path, account: lillux::ControllerAccount) -> Result<()> {
     lillux::require_administrator()?;
     let association_name = service_name(app_root)?;
     account.validate().map_err(anyhow::Error::msg)?;
     let app_root = PinnedDirectory::open(app_root)?.context("host setup app root is absent")?;
     account.require_directory_owner(&app_root)?;
-    let home = PinnedDirectory::open(home)?.context("host setup account home is absent")?;
-    account.require_directory_owner(&home)?;
     let identity_path = Path::new(ryeos_engine::AI_DIR).join("node/identity/public-identity.json");
     let identity_file = app_root
         .open_pinned_regular_descendant(&identity_path, false)?
@@ -159,6 +153,9 @@ pub fn provision_host_service(
     let process_scopes =
         lillux::ProcessScopeConfiguration::provision_host_delegation(&association_name)
             .map_err(anyhow::Error::msg)?;
+    let environment = account
+        .host_service_environment()
+        .map_err(anyhow::Error::msg)?;
     let binding = HostServiceBinding {
         schema_version: 1,
         app_root: app_root.path().to_path_buf(),
@@ -167,13 +164,7 @@ pub fn provision_host_service(
         account,
         daemon_executable: daemon.path().to_path_buf(),
         process_scopes,
-        environment: BTreeMap::from([
-            (
-                "HOME".to_owned(),
-                home.path().to_string_lossy().into_owned(),
-            ),
-            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-        ]),
+        environment,
     };
     let launch = expected_native_launch(&binding);
     lillux::provision_host_service(&association_name, &launch)?;

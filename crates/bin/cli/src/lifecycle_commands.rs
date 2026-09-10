@@ -252,8 +252,6 @@ fn run_node_host_setup_command(argv: &[String], _console: &crate::tty::Console) 
     let config = ryeos_node::NodeConfig::load_local(args.app_root)?;
     ryeos_node::require_initialized(&config.app_root)?;
     let account = lillux::ControllerAccount::current().map_err(anyhow::Error::msg)?;
-    let home =
-        lillux::current_user_home().context("host setup requires a canonical current-user HOME")?;
     let daemon = std::env::current_exe()
         .context("locate installed ryeos CLI")?
         .parent()
@@ -265,8 +263,6 @@ fn run_node_host_setup_command(argv: &[String], _console: &crate::tty::Console) 
         config.app_root.into_os_string(),
         "--controller-account-json".into(),
         serde_json::to_string(&account)?.into(),
-        "--home".into(),
-        home.into_os_string(),
     ];
     lillux::run_as_administrator(&daemon, &arguments)
         .with_context(|| format!("run administrator host setup through {}", daemon.display()))?;

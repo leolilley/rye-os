@@ -243,13 +243,12 @@ fn main() -> Result<()> {
     if let Some(config::DaemonCommand::HostProvision {
         app_root,
         controller_account_json,
-        home,
     }) = &cli.command
     {
         lillux::require_administrator()?;
         let account: lillux::ControllerAccount = serde_json::from_str(controller_account_json)
             .context("parse explicit host controller account")?;
-        ryeos_node::supervision::provision_host_service(app_root, account, home)?;
+        ryeos_node::supervision::provision_host_service(app_root, account)?;
         println!("host service provisioned down; use ryeos start to request the first launch");
         return Ok(());
     }
