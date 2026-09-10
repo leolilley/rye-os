@@ -19,6 +19,9 @@ const STATE_DIRECTORY: &str = "state";
 const RUN_PROGRAM: &str = "run";
 const DOWN_MARKER: &str = "down";
 const CONTROL: &str = "control";
+// `sv` probes `ok` before submitting its request through `control`. Both are
+// native runit IPC endpoints, deliberately contained in this adapter.
+const OPERATOR_SUPERVISOR_FIFOS: [&str; 2] = ["ok", CONTROL];
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -370,7 +373,7 @@ fn require_activation_link(name: &str, service_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn await_and_grant_control(
+fn await_and_grant_operator_fifos(
     service: &PinnedDirectory,
     account: &crate::ControllerAccount,
 ) -> Result<()> {
@@ -378,16 +381,23 @@ fn await_and_grant_control(
     loop {
         if let Some(supervise) = service.open_child_directory(OsStr::new("supervise"))? {
             supervise.require_owner(0)?;
-            match supervise.entry_no_follow(OsStr::new(CONTROL))? {
-                Some(entry) if entry.entry_type == PinnedEntryType::Fifo => {
-                    return account.grant_private_control_fifo(&supervise, OsStr::new(CONTROL));
+            let mut ready = true;
+            for name in OPERATOR_SUPERVISOR_FIFOS {
+                match supervise.entry_no_follow(OsStr::new(name))? {
+                    Some(entry) if entry.entry_type == PinnedEntryType::Fifo => {}
+                    Some(_) => bail!("runit supervisor {name} endpoint is not a FIFO"),
+                    None => ready = false,
                 }
-                Some(_) => bail!("runit supervisor control is not a FIFO"),
-                None => {}
+            }
+            if ready {
+                for name in OPERATOR_SUPERVISOR_FIFOS {
+                    account.grant_private_control_fifo(&supervise, OsStr::new(name))?;
+                }
+                return Ok(());
             }
         }
         if deadline.has_elapsed() {
-            bail!("runit did not create the configured service control FIFO");
+            bail!("runit did not create the configured service IPC endpoints");
         }
         crate::time::sleep(crate::time::Duration::from_millis(25));
     }
@@ -416,7 +426,7 @@ pub(super) fn provision(name: &str, launch: &HostServiceLaunch) -> Result<()> {
         }
     };
     publish_activation_link(name, service.path())?;
-    await_and_grant_control(&service, &launch.account)
+    await_and_grant_operator_fifos(&service, &launch.account)
 }
 
 pub(super) fn discover(name: &str) -> Result<Option<HostServiceInstallation>> {
@@ -503,5 +513,10 @@ mod tests {
     fn run_program_rejects_invalid_environment_syntax_and_control_values() {
         assert!(run_program(&launch(serde_json::json!({"BAD-NAME": "value"}))).is_err());
         assert!(run_program(&launch(serde_json::json!({"HOME": "line\nbreak"}))).is_err());
+    }
+
+    #[test]
+    fn operator_delegation_covers_runit_probe_before_control() {
+        assert_eq!(OPERATOR_SUPERVISOR_FIFOS, ["ok", "control"]);
     }
 }
